@@ -398,7 +398,10 @@ async fn load_handoff_connection(app_state: Option<&AppState>, connection_id: &s
     }
 }
 
-fn matching_snapshot_connection_name<'a>(item: &HandoffItem, snapshot: &'a AgentRuntimeSnapshot) -> Option<&'a str> {
+fn matching_snapshot_connection_name<'a>(
+    item: &HandoffItem,
+    snapshot: &'a AgentRuntimeSnapshot,
+) -> Option<&'a str> {
     let handoff_connection_id = item.connection_id.trim();
     let active_connection_id = snapshot.active_connection_id.as_deref().map(str::trim)?;
     if handoff_connection_id.is_empty() || handoff_connection_id != active_connection_id {
@@ -408,8 +411,10 @@ fn matching_snapshot_connection_name<'a>(item: &HandoffItem, snapshot: &'a Agent
 }
 
 fn conservative_production_risk(sql: &str) -> dbx_core::sql_safety::RiskMetadata {
-    let mut risk =
-        risk_for(sql, RiskContext { connection_name: "unknown", color: None, environment_label: Some("Production") });
+    let mut risk = risk_for(
+        sql,
+        RiskContext { connection_name: "unknown", color: None, environment_label: Some("Production") },
+    );
     risk.is_production = true;
     risk.risk_level = match classify_sql(sql) {
         OperationClass::Ddl => RiskLevel::Critical,
@@ -553,7 +558,11 @@ mod tests {
         AgentRuntimeState { app_state: Some(Arc::new(AppState::new(storage))), ..runtime_state() }
     }
 
-    fn connection_config(id: &str, name: &str, color: Option<&str>) -> dbx_core::models::connection::ConnectionConfig {
+    fn connection_config(
+        id: &str,
+        name: &str,
+        color: Option<&str>,
+    ) -> dbx_core::models::connection::ConnectionConfig {
         dbx_core::models::connection::ConnectionConfig {
             id: id.to_string(),
             name: name.to_string(),
