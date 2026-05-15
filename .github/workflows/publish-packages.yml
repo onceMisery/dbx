@@ -267,3 +267,68 @@ jobs:
             --prerelease=false \
             --latest
           echo "::notice::Release ${TAG} promoted from prerelease to latest release"
+
+  notify-qq:
+    name: QQ Notify
+    needs: [promote-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build message
+        id: msg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          RELEASE_JSON=$(gh release view "${TAG}" --repo "${{ github.repository }}" --json tagName,name,url,body)
+          export RELEASE_TAG=$(echo "$RELEASE_JSON" | jq -r '.tagName')
+          export RELEASE_URL=$(echo "$RELEASE_JSON" | jq -r '.url')
+          export RELEASE_BODY=$(echo "$RELEASE_JSON" | jq -r '.body' | head -c 800)
+
+          python3 - <<'PYEOF'
+          import os, re
+
+          tag = os.environ["RELEASE_TAG"]
+          url = os.environ["RELEASE_URL"]
+          body = os.environ.get("RELEASE_BODY", "")
+
+          body = re.sub(r'#{1,6}\s*', '', body)
+          body = re.sub(r'\*\*(.+?)\*\*', r'\1', body)
+          body = re.sub(r'\*(.+?)\*', r'\1', body)
+          body = re.sub(r'`(.+?)`', r'\1', body)
+          body = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', body)
+          body = re.sub(r'\n{3,}', '\n\n', body)
+          body = body.strip()
+
+          msg = "\n".join([
+              "━━━━━━━━━━━━━━━",
+              f"🚀 新版本发布  {tag}",
+              "━━━━━━━━━━━━━━━",
+              "",
+              body,
+              "",
+              f"下载: {url}",
+              "━━━━━━━━━━━━━━━",
+          ])
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              delim = "EOF_MSG"
+              f.write(f"msg<<{delim}\n{msg}\n{delim}\n")
+          PYEOF
+
+      - name: Send to QQ group
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          ASTRBOT_API_KEY: ${{ secrets.ASTRBOT_API_KEY }}
+          MSG_CONTENT: ${{ steps.msg.outputs.msg }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          MSG=$(echo "$MSG_CONTENT" | jq -Rs .)
+          ssh "root@${HOST}" "curl -s -X POST http://localhost:6185/api/v1/im/message \
+            -H 'Authorization: Bearer ${ASTRBOT_API_KEY}' \
+            -H 'Content-Type: application/json' \
+            -d '{\"umo\": \"default:GroupMessage:1087880322\", \"message\": ${MSG}}'"
