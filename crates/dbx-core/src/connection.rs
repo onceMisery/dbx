@@ -438,6 +438,12 @@ pub fn redacted_connection_url_for_endpoint(config: &ConnectionConfig, host: &st
 }
 
 pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, database: &str) -> serde_json::Value {
+    let connection_string = if config.db_type == DatabaseType::MongoDb {
+        config.connection_url_with_host(host, port)
+    } else {
+        config.connection_string.as_deref().unwrap_or("").to_string()
+    };
+
     serde_json::json!({
         "host": host,
         "port": port,
@@ -445,7 +451,7 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
         "username": config.username,
         "password": config.password,
         "url_params": config.url_params.as_deref().unwrap_or(""),
-        "connection_string": config.connection_string.as_deref().unwrap_or(""),
+        "connection_string": connection_string,
     })
 }
 
@@ -537,6 +543,21 @@ mod tests {
         assert_eq!(params["username"], "informix");
         assert_eq!(params["password"], "in4mix");
         assert_eq!(params["url_params"], "INFORMIXSERVER=informix;CLIENT_LOCALE=en_US.utf8");
+    }
+
+    #[test]
+    fn agent_connect_params_build_mongodb_connection_string_from_form_fields() {
+        let mut config = mysql_config(Some("RestCloud_V45PUB_Gateway"));
+        config.db_type = DatabaseType::MongoDb;
+        config.host = "172.22.4.42".to_string();
+        config.port = 27017;
+        config.username = "mongouser".to_string();
+        config.password = "secret".to_string();
+        config.url_params = Some("authSource=admin&authMechanism=SCRAM-SHA-1".to_string());
+
+        let params = agent_connect_params(&config, "172.22.4.42", 27017, "RestCloud_V45PUB_Gateway");
+
+        assert_eq!(params["connection_string"], "mongodb://mongouser:secret@172.22.4.42:27017/RestCloud%5FV45PUB%5FGateway?authSource=admin&authMechanism=SCRAM-SHA-1");
     }
 
     async fn test_app_state() -> (AppState, std::path::PathBuf) {

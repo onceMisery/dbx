@@ -9,6 +9,74 @@ use dbx_core::database_capabilities;
 use dbx_core::db;
 use dbx_core::models::connection::{rewrite_jdbc_url_host, ConnectionConfig, DatabaseType};
 
+fn mongo_legacy_connect_params(config: &ConnectionConfig, host: &str, port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "connection": agent_connect_params(config, host, port, config.effective_database().unwrap_or(""))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mongo_legacy_connect_params;
+    use dbx_core::models::connection::{ConnectionConfig, DatabaseType, ProxyType};
+
+    fn mongodb_config() -> ConnectionConfig {
+        ConnectionConfig {
+            id: "mongo".to_string(),
+            name: "MongoDB".to_string(),
+            db_type: DatabaseType::MongoDb,
+            driver_profile: Some("mongodb".to_string()),
+            driver_label: Some("MongoDB".to_string()),
+            url_params: Some("authSource=admin&authMechanism=SCRAM-SHA-1".to_string()),
+            host: "172.22.4.42".to_string(),
+            port: 27017,
+            username: "mongouser".to_string(),
+            password: "secret".to_string(),
+            database: Some("RestCloud_V45PUB_Gateway".to_string()),
+            visible_databases: None,
+            attached_databases: Vec::new(),
+            color: None,
+            ssh_enabled: false,
+            ssh_host: String::new(),
+            ssh_port: 22,
+            ssh_user: String::new(),
+            ssh_password: String::new(),
+            ssh_key_path: String::new(),
+            ssh_key_passphrase: String::new(),
+            ssh_expose_lan: false,
+            ssh_connect_timeout_secs: dbx_core::models::connection::default_ssh_connect_timeout_secs(),
+            proxy_enabled: false,
+            proxy_type: ProxyType::Socks5,
+            proxy_host: String::new(),
+            proxy_port: 1080,
+            proxy_username: String::new(),
+            proxy_password: String::new(),
+            ssl: false,
+            sysdba: false,
+            connection_string: Some(
+                "mongodb://mongouser:secret@172.22.4.42:27017/RestCloud_V45PUB_Gateway?authSource=admin".to_string(),
+            ),
+            external_config: None,
+            jdbc_driver_class: None,
+            jdbc_driver_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mongo_legacy_connect_params_preserve_auth_options() {
+        let config = mongodb_config();
+
+        let params = mongo_legacy_connect_params(&config, "172.22.4.42", 27017);
+
+        assert_eq!(params["connection"]["database"], "RestCloud_V45PUB_Gateway");
+        assert_eq!(params["connection"]["url_params"], "authSource=admin&authMechanism=SCRAM-SHA-1");
+        assert_eq!(
+            params["connection"]["connection_string"],
+            "mongodb://mongouser:secret@172.22.4.42:27017/RestCloud_V45PUB_Gateway?authSource=admin"
+        );
+    }
+}
+
 #[tauri::command]
 pub async fn save_connections(state: State<'_, Arc<AppState>>, configs: Vec<ConnectionConfig>) -> Result<(), String> {
     let configs: Vec<ConnectionConfig> = configs.into_iter().map(|config| config.canonicalized()).collect();
@@ -97,12 +165,9 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 if native_err.contains("wire version") {
                     let am = &state.agent_manager;
                     let mut client = am.spawn(&config.db_type, config.driver_profile.as_deref()).await?;
-                    let params = serde_json::json!({ "connection": {
-                        "host": host, "port": port,
-                        "database": config.effective_database().unwrap_or(""),
-                        "username": config.username, "password": config.password,
-                    }});
-                    client.call::<serde_json::Value>("connect", params).await?;
+                    client
+                        .call::<serde_json::Value>("connect", mongo_legacy_connect_params(&config, &host, port))
+                        .await?;
                     client.call::<serde_json::Value>("disconnect", serde_json::json!({})).await.ok();
                     Ok("Connection successful (via legacy driver)".to_string())
                 } else {
@@ -214,12 +279,9 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 log::info!("Native MongoDB driver failed ({native_err}), falling back to agent driver");
                 let mut client =
                     state.agent_manager.spawn(&db_config.db_type, db_config.driver_profile.as_deref()).await?;
-                let params = serde_json::json!({ "connection": {
-                    "host": host, "port": port,
-                    "database": db_config.effective_database().unwrap_or(""),
-                    "username": db_config.username, "password": db_config.password,
-                }});
-                client.call::<serde_json::Value>("connect", params).await?;
+                client
+                    .call::<serde_json::Value>("connect", mongo_legacy_connect_params(&db_config, &host, port))
+                    .await?;
                 PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
             } else {
                 return Err(native_err);
