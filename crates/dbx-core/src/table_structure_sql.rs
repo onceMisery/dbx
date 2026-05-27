@@ -327,12 +327,7 @@ fn build_table_comment_sql(options: &TableStructureSqlOptions, warnings: &mut Ve
             vec![format!("ALTER TABLE {table} MODIFY COMMENT {quoted};")]
         }
         StructureDialect::SqlServer => {
-            build_sqlserver_table_comment_sql(
-                &table,
-                options.schema.as_deref(),
-                &options.table_name,
-                new_comment,
-            )
+            build_sqlserver_table_comment_sql(&table, options.schema.as_deref(), &options.table_name, new_comment)
         }
         StructureDialect::Sqlite | StructureDialect::DuckDb | _ => {
             if !clean(new_comment).is_empty() {
@@ -563,14 +558,12 @@ fn build_column_sql(options: &TableStructureSqlOptions, warnings: &mut Vec<Strin
                 column,
                 if has_position_change { &position_clause } else { "" },
             )),
-            StructureDialect::SqlServer => {
-                statements.extend(build_sqlserver_existing_column_sql(
-                    &table,
-                    column,
-                    options.schema.as_deref(),
-                    &options.table_name,
-                ))
-            }
+            StructureDialect::SqlServer => statements.extend(build_sqlserver_existing_column_sql(
+                &table,
+                column,
+                options.schema.as_deref(),
+                &options.table_name,
+            )),
             StructureDialect::Sqlite => statements.extend(build_sqlite_existing_column_sql(&table, column, warnings)),
             _ => warnings.push(format!("Editing existing columns is not supported for {database_label} yet.")),
         }
@@ -732,13 +725,7 @@ fn build_add_column_sql(
         ));
     }
     if dialect == StructureDialect::SqlServer && !clean(&column.comment).is_empty() {
-        statements.extend(build_sqlserver_column_comment_sql(
-            table,
-            schema,
-            table_name,
-            &column.name,
-            &column.comment,
-        ));
+        statements.extend(build_sqlserver_column_comment_sql(table, schema, table_name, &column.name, &column.comment));
     }
     statements
 }
@@ -879,9 +866,7 @@ fn build_sqlserver_existing_column_sql(
     }
 
     // Build the ALTER COLUMN clause for type + nullability changes
-    if column.data_type.trim() != original.data_type.trim()
-        || column.is_nullable != original.is_nullable
-    {
+    if column.data_type.trim() != original.data_type.trim() || column.is_nullable != original.is_nullable {
         let null_clause = if column.is_nullable { "NULL" } else { "NOT NULL" };
         statements.push(format!(
             "ALTER TABLE {table} ALTER COLUMN {} {} {null_clause};",
@@ -893,9 +878,19 @@ fn build_sqlserver_existing_column_sql(
     // Default value changes via ADD/DROP CONSTRAINT
     if normalize_default(Some(&column.default_value)) != original_default(column) {
         let default_value = normalize_default(Some(&column.default_value));
-        let has_old_default =
-            !column.original.as_ref().and_then(|o| o.column_default.as_ref()).unwrap_or(&String::new()).trim().is_empty()
-                && !column.original.as_ref().and_then(|o| o.column_default.as_ref()).map(|d| d.trim().eq_ignore_ascii_case("null")).unwrap_or(false);
+        let has_old_default = !column
+            .original
+            .as_ref()
+            .and_then(|o| o.column_default.as_ref())
+            .unwrap_or(&String::new())
+            .trim()
+            .is_empty()
+            && !column
+                .original
+                .as_ref()
+                .and_then(|o| o.column_default.as_ref())
+                .map(|d| d.trim().eq_ignore_ascii_case("null"))
+                .unwrap_or(false);
 
         if has_old_default {
             statements.push(format!(
@@ -910,8 +905,11 @@ fn build_sqlserver_existing_column_sql(
         }
         if !default_value.is_empty() {
             let short_table = table.split('.').last().unwrap_or(table).trim_matches(|c: char| c == '[' || c == ']');
-            let constraint_name =
-                format!("DF_{short_table}_{col_name}", short_table = short_table, col_name = current_name.trim_matches(|c: char| c == '[' || c == ']'));
+            let constraint_name = format!(
+                "DF_{short_table}_{col_name}",
+                short_table = short_table,
+                col_name = current_name.trim_matches(|c: char| c == '[' || c == ']')
+            );
             statements.push(format!(
                 "ALTER TABLE {table} ADD CONSTRAINT [{constraint_name}] DEFAULT {default_value} FOR {};",
                 quote_ident(dialect, &current_name)
@@ -1153,13 +1151,7 @@ fn build_create_index_statements(
     if !comment.is_empty() && capabilities.index_comment && dialect == StructureDialect::Postgres {
         statements.push(format!("COMMENT ON INDEX {} IS {};", quote_ident(dialect, &name), quote_string(&comment)));
     } else if !comment.is_empty() && capabilities.index_comment && dialect == StructureDialect::SqlServer {
-        statements.extend(build_sqlserver_index_comment_sql(
-            table,
-            schema,
-            table_name,
-            &name,
-            &comment,
-        ));
+        statements.extend(build_sqlserver_index_comment_sql(table, schema, table_name, &name, &comment));
     } else if !comment.is_empty() && capabilities.index_comment {
         warnings.push(format!("Index comments are not supported for {} from this editor.", dialect_label(dialect)));
     }
