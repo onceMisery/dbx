@@ -1298,6 +1298,7 @@ export const useConnectionStore = defineStore("connection", () => {
       return;
     }
 
+    if (node.connectionId && !connectedIds.value.has(node.connectionId)) return;
     const expandedIds = collectExpandedNodeIds([node]);
     expandedIds.add(node.id);
     await clearPersistedTreeCacheForNode(node);
@@ -1505,6 +1506,7 @@ export const useConnectionStore = defineStore("connection", () => {
           continue;
         }
         if (!expandedIds.has(node.id)) continue;
+        if (node.connectionId && !connectedIds.value.has(node.connectionId)) continue;
         clearLoadedChildrenCache(node.id);
         node.children = [];
         await loadTreeNodeChildren(node, { force: true });
