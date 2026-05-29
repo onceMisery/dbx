@@ -5566,7 +5566,7 @@ dependencies = [
 [[package]]
 name = "postgres-protocol"
 version = "0.6.11"
-source = "git+https://github.com/t8y2/tokio-postgres-gaussdb.git?branch=master#18064f341f8a4a3ef73c98a07959cda19344e11c"
+source = "git+https://github.com/t8y2/tokio-postgres-gaussdb.git?branch=master#8d50befeee7cdeb8ecdb97c7b790c91010971063"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -5585,7 +5585,7 @@ dependencies = [
 [[package]]
 name = "postgres-types"
 version = "0.2.13"
-source = "git+https://github.com/t8y2/tokio-postgres-gaussdb.git?branch=master#18064f341f8a4a3ef73c98a07959cda19344e11c"
+source = "git+https://github.com/t8y2/tokio-postgres-gaussdb.git?branch=master#8d50befeee7cdeb8ecdb97c7b790c91010971063"
 dependencies = [
  "bytes",
  "chrono",
@@ -8264,7 +8264,7 @@ dependencies = [
 [[package]]
 name = "tokio-postgres"
 version = "0.7.17"
-source = "git+https://github.com/t8y2/tokio-postgres-gaussdb.git?branch=master#18064f341f8a4a3ef73c98a07959cda19344e11c"
+source = "git+https://github.com/t8y2/tokio-postgres-gaussdb.git?branch=master#8d50befeee7cdeb8ecdb97c7b790c91010971063"
 dependencies = [
  "async-trait",
  "byteorder",
