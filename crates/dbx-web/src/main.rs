@@ -22,6 +22,16 @@ use tower_http::cors::{Any, CorsLayer};
 
 use state::WebState;
 
+fn web_body_limit_bytes() -> usize {
+    const DEFAULT_MB: usize = 1024;
+    let mb = std::env::var("DBX_MAX_UPLOAD_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MB);
+    mb.saturating_mul(1024 * 1024)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -295,7 +305,7 @@ async fn main() {
     // Build app
     let mut app = Router::new()
         .nest("/api", api)
-        .layer(DefaultBodyLimit::max(300 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(web_body_limit_bytes()))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors);
 

@@ -13,6 +13,7 @@ use dbx_core::agent_service::{
 };
 use futures::Stream;
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 
 use crate::error::AppError;
@@ -132,9 +133,14 @@ pub async fn import_agents_from_zip(
             return Err(AppError("Offline driver package must be a .zip file".to_string()));
         }
 
-        let data = field.bytes().await.map_err(|err| AppError(err.to_string()))?;
         let zip_path = tmp_dir.join(format!("agent-offline-{}.zip", uuid::Uuid::new_v4()));
-        std::fs::write(&zip_path, &data).map_err(|err| AppError(err.to_string()))?;
+        let mut upload = tokio::fs::File::create(&zip_path).await.map_err(|err| AppError(err.to_string()))?;
+        let mut field = field;
+        while let Some(chunk) = field.chunk().await.map_err(|err| AppError(err.to_string()))? {
+            upload.write_all(&chunk).await.map_err(|err| AppError(err.to_string()))?;
+        }
+        upload.flush().await.map_err(|err| AppError(err.to_string()))?;
+        drop(upload);
 
         let tx = progress_sender(&state, "global").await;
         let result =
