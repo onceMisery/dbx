@@ -582,6 +582,7 @@ export default {
     queryError: "Error de consulta",
     dataUnavailable: "Los datos de la tabla deben volver a cargarse.",
     refresh: "Actualizar",
+    dataStaleRefresh: "Esta tabla puede haber cambiado en otra ventana. Actualiza para ver los datos.",
     commit: "Confirmar",
     rollback: "Revertir",
     transactionSaveHint: "Confirma {count} cambio(s) pendiente(s) en una transacción.",

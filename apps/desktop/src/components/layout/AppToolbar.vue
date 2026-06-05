@@ -91,7 +91,7 @@ function onToolbarDblClick(e: MouseEvent) {
   <div
     class="h-10 flex items-center gap-1 px-2 border-b bg-muted/30 shrink-0"
     :class="{ 'pl-17.5': shouldReserveMacTrafficLightInset(isMac, isFullscreen, isDesktop) }"
-    data-tauri-drag-region
+    data-window-drag-region
     @dblclick="onToolbarDblClick"
   >
     <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('new-connection')">
@@ -172,7 +172,7 @@ function onToolbarDblClick(e: MouseEvent) {
       </span>
     </Button>
 
-    <div class="flex-1" data-tauri-drag-region />
+    <div class="flex-1" data-window-drag-region />
 
     <Tooltip>
       <TooltipTrigger as-child>

@@ -505,6 +505,12 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                 variant="ghost"
                 size="sm"
                 class="h-6 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+                :class="
+                  activeTab.dataStale
+                    ? 'bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200'
+                    : ''
+                "
+                :title="activeTab.dataStale ? t('grid.dataStaleRefresh') : undefined"
                 :disabled="activeTab.isExecuting"
                 @click="refreshData"
               >
@@ -554,6 +560,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                 :initial-order-by-input="activeTab.orderByInput"
                 :sql="activeTab.lastExecutedSql || activeTab.sql"
                 :loading="activeTab.isExecuting"
+                :data-stale="activeTab.dataStale"
                 :editable="!!activeTab.queryAnalysis"
                 :source-columns="activeTab.querySourceColumns"
                 context="results"
@@ -804,12 +811,14 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
           :initial-order-by-input="activeTab.orderByInput"
           :sql="activeTab.sql"
           :loading="activeTab.isExecuting"
+          :data-stale="activeTab.dataStale"
           :editable="isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [])"
           context="table-data"
           :initial-where-input="activeTab.whereInput"
           :database-type="activeEffectiveDatabaseType"
           :connection-id="activeTab.connectionId"
           :database="activeTab.database"
+          :schema="activeTab.schema"
           :table-meta="activeDataTabTableMeta"
           :page-offset="activeTab.resultPageOffset"
           :page-limit="activeTab.resultPageLimit"

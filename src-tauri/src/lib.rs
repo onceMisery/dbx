@@ -6,6 +6,7 @@ mod window_state_guard;
 
 use commands::connection::AppState;
 use dbx_core::storage::{DesktopIconTheme, DesktopSettings, Storage};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 #[cfg(target_os = "macos")]
@@ -14,7 +15,7 @@ use tauri::{
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 #[cfg(any(windows, target_os = "linux"))]
 use tauri_plugin_deep_link::DeepLinkExt;
 
@@ -22,6 +23,33 @@ const DESKTOP_TRAY_ID: &str = "main-tray";
 #[cfg(target_os = "macos")]
 const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-macos-template.png");
 const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon-black.png");
+
+#[tauri::command]
+fn open_new_desktop_window(app: tauri::AppHandle, url: Option<String>) -> Result<(), String> {
+    let label = format!("main-{}", uuid::Uuid::new_v4());
+    let url = WebviewUrl::App(url.unwrap_or_else(|| "/?newWindow=1".to_string()).into());
+    let mut builder = WebviewWindowBuilder::new(&app, label, url)
+        .title("DBX")
+        .inner_size(1280.0, 800.0)
+        .min_inner_size(900.0, 600.0)
+        .resizable(true)
+        .fullscreen(false)
+        .visible(true);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .accept_first_mouse(true)
+            .traffic_light_position(tauri::LogicalPosition::new(16.0, 18.0))
+            .hidden_title(true);
+    }
+
+    let window = builder.build().map_err(|err| err.to_string())?;
+    window.show().map_err(|err| err.to_string())?;
+    window.set_focus().map_err(|err| err.to_string())?;
+    Ok(())
+}
 
 fn should_hide_window_on_close(target_os: &str) -> bool {
     matches!(target_os, "macos" | "windows")
@@ -35,6 +63,10 @@ fn should_show_main_window_after_setup() -> bool {
     true
 }
 
+fn should_register_single_instance(_target_os: &str) -> bool {
+    false
+}
+
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -43,14 +75,81 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
-fn open_connection_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
-    if links.is_empty() {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StartupPayload {
+    connection_links: Vec<String>,
+    sql_file_paths: Vec<String>,
+    db_file_paths: Vec<String>,
+}
+
+impl StartupPayload {
+    fn is_empty(&self) -> bool {
+        self.connection_links.is_empty() && self.sql_file_paths.is_empty() && self.db_file_paths.is_empty()
+    }
+}
+
+fn startup_payload_from_args<I, S>(args: I, cwd: &Path) -> StartupPayload
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args: Vec<String> = args.into_iter().map(|arg| arg.as_ref().to_string()).collect();
+    StartupPayload {
+        connection_links: commands::deep_link::connection_deep_links_from_args(args.iter()),
+        sql_file_paths: commands::external_sql::sql_file_paths_from_args(args.iter(), cwd),
+        db_file_paths: commands::external_db::db_file_paths_from_args(args.iter(), cwd),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn startup_payload_from_opened_urls(urls: &[tauri::Url]) -> StartupPayload {
+    let connection_links = urls
+        .iter()
+        .map(|url| url.to_string())
+        .filter_map(|url| commands::deep_link::connection_deep_link_from_arg(&url))
+        .collect();
+    let sql_file_paths = urls
+        .iter()
+        .filter_map(|url| url.to_file_path().ok())
+        .filter(|path| commands::external_sql::is_sql_file_path(path))
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    let db_file_paths = urls
+        .iter()
+        .filter_map(|url| url.to_file_path().ok())
+        .filter(|path| commands::external_db::is_db_file_path(path))
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+
+    StartupPayload { connection_links, sql_file_paths, db_file_paths }
+}
+
+fn open_startup_payload(app: &tauri::AppHandle, payload: StartupPayload) {
+    if payload.is_empty() {
         return;
     }
-    if let Some(state) = app.try_state::<commands::deep_link::DeepLinkOpenState>() {
-        state.push(links.clone());
+
+    if !payload.connection_links.is_empty() {
+        if let Some(state) = app.try_state::<commands::deep_link::DeepLinkOpenState>() {
+            state.push(payload.connection_links.clone());
+        }
+        let _ = app.emit("dbx-open-connection-links", payload.connection_links);
     }
-    let _ = app.emit("dbx-open-connection-links", links);
+
+    if !payload.sql_file_paths.is_empty() {
+        if let Some(state) = app.try_state::<commands::external_sql::ExternalSqlOpenState>() {
+            state.push(payload.sql_file_paths.clone());
+        }
+        let _ = app.emit("dbx-open-sql-files", payload.sql_file_paths);
+    }
+
+    if !payload.db_file_paths.is_empty() {
+        if let Some(state) = app.try_state::<commands::external_db::ExternalDbOpenState>() {
+            state.push(payload.db_file_paths.clone());
+        }
+        let _ = app.emit("dbx-open-db-files", payload.db_file_paths);
+    }
+
     show_main_window(app);
 }
 
@@ -167,7 +266,42 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 
 #[cfg(test)]
 mod tests {
-    use super::{should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup};
+    use super::{
+        should_hide_window_on_close, should_register_single_instance, should_setup_desktop_tray,
+        should_show_main_window_after_setup, startup_payload_from_args, StartupPayload,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn single_instance_is_disabled_for_all_desktop_platforms() {
+        assert!(!should_register_single_instance("windows"));
+        assert!(!should_register_single_instance("macos"));
+        assert!(!should_register_single_instance("linux"));
+        assert!(!should_register_single_instance("freebsd"));
+    }
+
+    #[test]
+    fn parses_all_startup_payload_types_from_args() {
+        let payload = startup_payload_from_args(
+            [
+                "dbx://connection/new?type=mysql&host=127.0.0.1",
+                "queries/report.sql",
+                "/tmp/local.sqlite",
+                "--ignored",
+                "/tmp/readme.txt",
+            ],
+            Path::new("/work"),
+        );
+
+        assert_eq!(
+            payload,
+            StartupPayload {
+                connection_links: vec!["dbx://connection/new?type=mysql&host=127.0.0.1".to_string()],
+                sql_file_paths: vec!["/work/queries/report.sql".to_string()],
+                db_file_paths: vec!["/tmp/local.sqlite".to_string()],
+            }
+        );
+    }
 
     #[test]
     fn hides_window_on_close_for_windows_and_macos() {
@@ -223,6 +357,20 @@ mod tests {
         assert!(source
             .contains("if should_show_main_window_after_setup() {\n                show_main_window(app.handle());"));
     }
+
+    #[test]
+    fn regular_startup_uses_shared_payload_dispatch() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("let startup_payload = startup_payload_from_args(std::env::args().skip(1), &cwd);"));
+        assert!(source.contains("open_startup_payload(app.handle(), startup_payload);"));
+    }
+
+    #[test]
+    fn single_instance_plugin_is_not_registered() {
+        let source = include_str!("lib.rs");
+        let plugin_init = concat!("tauri_plugin_", "single_instance", "::init");
+        assert!(!source.contains(plugin_init));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -230,33 +378,13 @@ pub fn run() {
     rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
 
     let startup_begin = Instant::now();
+    debug_assert!(!should_register_single_instance(std::env::consts::OS));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-            let links = commands::deep_link::connection_deep_links_from_args(args.clone());
-            open_connection_deep_links(app, links);
-
-            let paths = commands::external_sql::sql_file_paths_from_args(args.clone(), std::path::Path::new(&cwd));
-            if !paths.is_empty() {
-                if let Some(state) = app.try_state::<commands::external_sql::ExternalSqlOpenState>() {
-                    state.push(paths.clone());
-                }
-                let _ = app.emit("dbx-open-sql-files", paths);
-            }
-
-            let db_paths = commands::external_db::db_file_paths_from_args(args, std::path::Path::new(&cwd));
-            if !db_paths.is_empty() {
-                if let Some(state) = app.try_state::<commands::external_db::ExternalDbOpenState>() {
-                    state.push(db_paths.clone());
-                }
-                let _ = app.emit("dbx-open-db-files", db_paths);
-            }
-            show_main_window(app);
-        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -305,8 +433,9 @@ pub fn run() {
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
-            let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
-            open_connection_deep_links(app.handle(), startup_links);
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let startup_payload = startup_payload_from_args(std::env::args().skip(1), &cwd);
+            open_startup_payload(app.handle(), startup_payload);
 
             let app_handle = app.handle().clone();
             commands::mcp_bridge::start(app_handle, state);
@@ -526,6 +655,7 @@ pub fn run() {
             commands::agents::import_agents_from_zip,
             commands::agents::import_agent_jar_cmd,
             commands::system_fonts::list_system_fonts,
+            open_new_desktop_window,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -535,46 +665,7 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             if let RunEvent::Opened { urls } = &event {
-                let links: Vec<String> = urls
-                    .iter()
-                    .map(|url| url.to_string())
-                    .filter_map(|url| commands::deep_link::connection_deep_link_from_arg(&url))
-                    .collect();
-                open_connection_deep_links(app_handle, links);
-
-                let paths: Vec<String> = urls
-                    .iter()
-                    .filter_map(|url| url.to_file_path().ok())
-                    .filter(|path| commands::external_sql::is_sql_file_path(path))
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect();
-                if !paths.is_empty() {
-                    if let Some(state) = app_handle.try_state::<commands::external_sql::ExternalSqlOpenState>() {
-                        state.push(paths.clone());
-                    }
-                    let _ = app_handle.emit("dbx-open-sql-files", paths);
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
-                }
-
-                let db_paths: Vec<String> = urls
-                    .iter()
-                    .filter_map(|url| url.to_file_path().ok())
-                    .filter(|path| commands::external_db::is_db_file_path(path))
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect();
-                if !db_paths.is_empty() {
-                    if let Some(state) = app_handle.try_state::<commands::external_db::ExternalDbOpenState>() {
-                        state.push(db_paths.clone());
-                    }
-                    let _ = app_handle.emit("dbx-open-db-files", db_paths);
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
-                }
+                open_startup_payload(app_handle, startup_payload_from_opened_urls(urls));
             }
 
             #[cfg(target_os = "macos")]

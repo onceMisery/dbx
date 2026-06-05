@@ -362,6 +362,7 @@ export interface QueryTab {
   resultTotalRowCount?: number;
   resultSessionId?: string;
   resultAccessedAt?: number;
+  dataStale?: boolean;
   pinned?: boolean;
   result?: QueryResult;
   results?: QueryResult[];

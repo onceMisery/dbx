@@ -623,6 +623,7 @@ export default {
     queryError: "查询出错",
     dataUnavailable: "表数据需要重新加载。",
     refresh: "刷新",
+    dataStaleRefresh: "这个表可能已在其他窗口变更，刷新后可更新数据。",
     commit: "提交",
     rollback: "回滚",
     transactionSaveHint: "在事务中提交 {count} 项待保存更改。",

@@ -690,7 +690,7 @@ const messageRenderer = computed(() => {
       class="flex items-center gap-2 border-b px-3 shrink-0"
       :class="settings.editorSettings.appLayout === 'classic' ? 'h-9' : 'h-10'"
     >
-      <span class="flex flex-1 self-stretch items-center truncate text-xs font-medium" data-tauri-drag-region>
+      <span class="flex flex-1 self-stretch items-center truncate text-xs font-medium" data-window-drag-region>
         {{ chatTitle }}
       </span>
       <Button variant="ghost" size="icon" class="h-6 w-6" @click="startNewChat" :title="t('ai.newChat')">

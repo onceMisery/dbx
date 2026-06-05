@@ -32,6 +32,8 @@ import { tableMetaForDataTab } from "@/lib/tableDataTabMeta";
 import { quoteTableIdentifier } from "@/lib/tableSelectSql";
 import { connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { queryTimeoutSecsForConnection } from "@/lib/queryTimeout";
+import { detachedTabStorageKey } from "@/lib/desktopWindows";
+import type { TableMutationMessage } from "@/lib/tableMutationBroadcast";
 import * as api from "@/lib/api";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -40,6 +42,8 @@ import type { SavedSqlFile } from "@/types/database";
 const STORAGE_KEY = "dbx-open-tabs";
 const ACTIVE_TAB_KEY = "dbx-active-tab";
 const ORACLE_LIKE_METADATA_TYPES = new Set<string>(["oracle", "dameng", "oceanbase-oracle"]);
+const WINDOW_PARAMS = new URLSearchParams(window.location.search);
+const DISABLE_SHARED_TAB_PERSISTENCE = WINDOW_PARAMS.has("detachedTab") || WINDOW_PARAMS.get("newWindow") === "1";
 
 function markQueryResultRowsRaw(result: QueryResult): QueryResult {
   markRaw(result.rows);
@@ -91,6 +95,7 @@ function normalizeOracleLikeQueryAnalysis(
 }
 
 function saveTabs(tabs: QueryTab[], activeTabId: string | null) {
+  if (DISABLE_SHARED_TAB_PERSISTENCE) return;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(serializeOpenTabs(tabs)));
     localStorage.setItem(ACTIVE_TAB_KEY, activeTabId || "");
@@ -99,6 +104,15 @@ function saveTabs(tabs: QueryTab[], activeTabId: string | null) {
 
 function loadSavedTabs(): { tabs: QueryTab[]; activeTabId: string | null } {
   try {
+    const detachedTabKey = WINDOW_PARAMS.get("detachedTab");
+    if (detachedTabKey) {
+      const key = detachedTabStorageKey(detachedTabKey);
+      const raw = localStorage.getItem(key);
+      localStorage.removeItem(key);
+      return restoreOpenTabsState(raw ? `[${raw}]` : null, null);
+    }
+    if (WINDOW_PARAMS.get("newWindow") === "1") return { tabs: [], activeTabId: null };
+
     return restoreOpenTabsState(localStorage.getItem(STORAGE_KEY), localStorage.getItem(ACTIVE_TAB_KEY));
   } catch {
     return { tabs: [], activeTabId: null };
@@ -570,6 +584,45 @@ export const useQueryStore = defineStore("query", () => {
     if (tab) tab.tableMeta = meta;
   }
 
+  function tableIdentity(tab: QueryTab) {
+    const meta = tableMetaForDataTab(tab);
+    if (!meta?.tableName) return null;
+    return {
+      connectionId: tab.connectionId,
+      database: tab.database,
+      schema: meta.schema || "",
+      tableName: meta.tableName,
+    };
+  }
+
+  function isSameTable(
+    tab: QueryTab,
+    message: Pick<TableMutationMessage, "connectionId" | "database" | "schema" | "tableName">,
+  ) {
+    const identity = tableIdentity(tab);
+    return (
+      !!identity &&
+      identity.connectionId === message.connectionId &&
+      identity.database === message.database &&
+      identity.schema === (message.schema || "") &&
+      identity.tableName === message.tableName
+    );
+  }
+
+  function markTableTabsStale(
+    message: Pick<TableMutationMessage, "connectionId" | "database" | "schema" | "tableName" | "sourceTabId">,
+  ) {
+    for (const tab of tabs.value) {
+      if (tab.id === message.sourceTabId) continue;
+      if (isSameTable(tab, message)) tab.dataStale = true;
+    }
+  }
+
+  function clearDataStale(id: string) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (tab) tab.dataStale = undefined;
+  }
+
   function setObjectSource(id: string, objectSource: NonNullable<QueryTab["objectSource"]>) {
     const tab = tabs.value.find((t) => t.id === id);
     if (tab) tab.objectSource = objectSource;
@@ -820,6 +873,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.executionId = executionId;
     tab.lastExecutedSql = sql;
     tab.resultTotalRowCount = undefined;
+    tab.dataStale = undefined;
     const previousResultSessionClose = closeResultSession(tab, options?.pagination?.sessionId);
     if (!options?.preserveResultDuringExecution || !tab.result) {
       clearResultPayload(tab);
@@ -1493,6 +1547,8 @@ export const useQueryStore = defineStore("query", () => {
     updateSchema,
     updateConnection,
     setTableMeta,
+    markTableTabsStale,
+    clearDataStale,
     invalidateTableStructure,
     tableStructureRefreshVersion,
     setObjectSource,

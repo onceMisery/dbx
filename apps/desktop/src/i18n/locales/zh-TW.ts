@@ -622,6 +622,7 @@ export default {
     tableInfoNoResults: "沒有相符結果",
     queryError: "查詢出錯",
     refresh: "重新整理",
+    dataStaleRefresh: "這個資料表可能已在其他視窗變更，重新整理後可更新資料。",
     commit: "提交",
     rollback: "回溯",
     transactionSaveHint: "在事務中提交 {count} 項待儲存更改。",

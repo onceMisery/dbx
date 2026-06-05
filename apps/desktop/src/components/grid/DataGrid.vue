@@ -239,6 +239,7 @@ const props = defineProps<{
   totalRowCount?: number;
   loading?: boolean;
   cacheKey?: string;
+  dataStale?: boolean;
   onExecuteSql?: (sql: string) => Promise<void>;
   fullExportResult?: () => Promise<QueryResult | undefined>;
   customSave?: (changes: {
@@ -5816,6 +5817,12 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 variant="ghost"
                 size="sm"
                 class="h-5 text-xs px-1.5 shrink-0"
+                :class="
+                  props.dataStale
+                    ? 'bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200'
+                    : ''
+                "
+                :title="props.dataStale ? t('grid.dataStaleRefresh') : undefined"
                 :disabled="isSaving"
                 @click="onToolbarRefresh"
               >

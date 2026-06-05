@@ -633,6 +633,7 @@ export default {
     queryError: "Errore Query",
     dataUnavailable: "I dati della tabella devono essere ricaricati.",
     refresh: "Aggiorna",
+    dataStaleRefresh: "Questa tabella potrebbe essere cambiata in un'altra finestra. Aggiorna per vedere i dati.",
     commit: "Commit",
     rollback: "Rollback",
     transactionSaveHint: "Applica {count} modifica/he in sospeso in una transazione.",

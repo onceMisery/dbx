@@ -80,6 +80,10 @@ export function isNewQueryShortcut(event: ShortcutLikeEvent, shortcuts?: Partial
   return matchesShortcut(event, actionShortcut("newQuery", shortcuts));
 }
 
+export function isNewWindowShortcut(event: ShortcutLikeEvent): boolean {
+  return matchesShortcut(event, "Mod+Shift+N");
+}
+
 export function isFocusSearchShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("focusSearch", shortcuts));
 }

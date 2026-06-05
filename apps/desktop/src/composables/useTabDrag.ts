@@ -31,6 +31,7 @@ let pending: {
   sourceEl: HTMLElement | null;
 } | null = null;
 let onDropCallback: ((draggedId: string, targetId: string, position: TabDropPosition) => void) | null = null;
+let onDetachCallback: ((draggedId: string) => void) | null = null;
 let ghostEl: HTMLElement | null = null;
 
 function createGhost(sourceEl: HTMLElement, x: number, y: number) {
@@ -95,8 +96,23 @@ function onMouseMove(event: MouseEvent) {
   }
 
   if (state.active) {
+    if (state.draggedId && onDetachCallback && isOutsideViewport(event)) {
+      const draggedId = state.draggedId;
+      onDetachCallback(draggedId);
+      reset();
+      return;
+    }
     moveGhost(event.clientX, event.clientY);
   }
+}
+
+function isOutsideViewport(event: MouseEvent) {
+  return (
+    event.clientX <= 0 ||
+    event.clientY <= 0 ||
+    event.clientX >= window.innerWidth - 1 ||
+    event.clientY >= window.innerHeight - 1
+  );
 }
 
 function onMouseUp() {
@@ -128,9 +144,13 @@ function ensureListeners() {
   listenersAttached = true;
 }
 
-export function useTabDrag(onDrop: (draggedId: string, targetId: string, position: TabDropPosition) => void) {
+export function useTabDrag(
+  onDrop: (draggedId: string, targetId: string, position: TabDropPosition) => void,
+  onDetach?: (draggedId: string) => void,
+) {
   ensureListeners();
   onDropCallback = onDrop;
+  onDetachCallback = onDetach || null;
 
   function startDrag(event: MouseEvent, tabId: string) {
     if (event.button !== 0) return;

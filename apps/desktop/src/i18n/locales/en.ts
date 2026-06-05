@@ -628,6 +628,7 @@ export default {
     queryError: "Query Error",
     dataUnavailable: "Table data needs to be reloaded.",
     refresh: "Refresh",
+    dataStaleRefresh: "This table may have changed in another window. Refresh to update.",
     commit: "Commit",
     rollback: "Rollback",
     transactionSaveHint: "Commit {count} pending change(s) in a transaction.",

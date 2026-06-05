@@ -23,6 +23,7 @@ import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useTabScroll } from "@/composables/useTabScroll";
 import { useTabDrag } from "@/composables/useTabDrag";
+import { openDesktopWindow } from "@/lib/desktopWindows";
 import {
   connectionColor,
   shouldShowTabOverflowControls,
@@ -45,9 +46,14 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
-const tabDrag = useTabDrag((draggedId, targetId, position) => {
-  queryStore.reorderTab(draggedId, targetId, position);
-});
+const tabDrag = useTabDrag(
+  (draggedId, targetId, position) => {
+    queryStore.reorderTab(draggedId, targetId, position);
+  },
+  (draggedId) => {
+    void detachTabToNewWindow(draggedId);
+  },
+);
 const editingTabId = ref<string | null>(null);
 const editingTitle = ref("");
 const compactTabTitle = computed({
@@ -85,6 +91,13 @@ function commitRenameTab(tab: QueryTab) {
 
 function cancelRenameTab() {
   editingTabId.value = null;
+}
+
+async function detachTabToNewWindow(tabId: string) {
+  const tab = queryStore.tabs.find((item) => item.id === tabId);
+  if (!tab) return;
+  const opened = await openDesktopWindow({ detachedTab: tab });
+  if (opened) queryStore.closeTab(tab.id);
 }
 
 function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
@@ -271,6 +284,7 @@ const tabOverflowControlClass = computed(() =>
 <template>
   <div
     v-if="queryStore.tabs.length > 0 || showDriverStore"
+    data-app-tab-bar
     class="relative flex border-b shrink-0"
     :class="
       settingsStore.editorSettings.appLayout === 'classic'
@@ -415,7 +429,7 @@ const tabOverflowControlClass = computed(() =>
           <X class="h-3 w-3" />
         </button>
       </div>
-      <div :class="tabTailDragRegionClass" data-tauri-drag-region />
+      <div :class="tabTailDragRegionClass" data-window-drag-region />
     </div>
     <div v-if="showTabOverflowControls" class="relative z-30 flex shrink-0 items-center">
       <button

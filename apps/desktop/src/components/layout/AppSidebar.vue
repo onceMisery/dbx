@@ -62,10 +62,10 @@ defineExpose({ focusSearch });
         class="flex items-center gap-px px-3 text-xs font-medium text-muted-foreground border-b bg-muted/20"
         :class="classicLayout ? 'h-9' : 'h-10'"
       >
-        <span class="flex self-stretch items-center truncate" data-tauri-drag-region>{{
+        <span class="flex self-stretch items-center truncate" data-window-drag-region>{{
           t("sidebar.connections")
         }}</span>
-        <span class="flex-1 self-stretch" data-tauri-drag-region />
+        <span class="flex-1 self-stretch" data-window-drag-region />
         <Tooltip>
           <TooltipTrigger as-child>
             <span class="inline-flex">

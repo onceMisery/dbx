@@ -130,6 +130,7 @@ impl Storage {
 
     async fn init_schema(&self) -> Result<(), String> {
         self.db.with_connection(|conn| {
+            configure_app_storage_connection(conn)?;
             for statement in SCHEMA_STATEMENTS {
                 conn.execute(statement, []).map_err(|e| e.to_string())?;
             }
@@ -146,6 +147,14 @@ impl Storage {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || db.with_connection(f)).await.map_err(|e| e.to_string())?
     }
+}
+
+fn configure_app_storage_connection(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;",
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn ensure_history_columns_sync(conn: &Connection) -> Result<(), String> {
@@ -1139,6 +1148,7 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::{DesktopIconTheme, DesktopSettings, Storage};
+    use crate::history::HistoryEntry;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
@@ -1152,6 +1162,68 @@ mod tests {
         let storage = Storage::open(&path).await.unwrap();
 
         assert_eq!(storage.load_desktop_settings().await.unwrap(), DesktopSettings::default());
+    }
+
+    #[tokio::test]
+    async fn app_storage_supports_two_handles_opening_and_writing_same_db() {
+        let path = temp_db_path("multi-instance-shared-store");
+        let first = Storage::open(&path).await.unwrap();
+        let second = Storage::open(&path).await.unwrap();
+
+        first
+            .save_desktop_settings(&DesktopSettings { show_tray_icon: false, icon_theme: DesktopIconTheme::Black })
+            .await
+            .unwrap();
+        second.save_sidebar_layout(&serde_json::json!({"conn-1": ["db", "schema"]})).await.unwrap();
+
+        let first_history = HistoryEntry {
+            id: "history-1".to_string(),
+            connection_id: "conn-1".to_string(),
+            connection_name: "Local".to_string(),
+            database: "main".to_string(),
+            sql: "select 1".to_string(),
+            executed_at: "2026-06-05T00:00:00Z".to_string(),
+            execution_time_ms: 1,
+            success: true,
+            error: None,
+            activity_kind: "query".to_string(),
+            operation: String::new(),
+            target: String::new(),
+            affected_rows: None,
+            rollback_sql: None,
+            details_json: None,
+        };
+        let second_history = HistoryEntry {
+            id: "history-2".to_string(),
+            connection_id: "conn-2".to_string(),
+            connection_name: "Local 2".to_string(),
+            database: "main".to_string(),
+            sql: "select 2".to_string(),
+            executed_at: "2026-06-05T00:00:01Z".to_string(),
+            execution_time_ms: 2,
+            success: true,
+            error: None,
+            activity_kind: "query".to_string(),
+            operation: String::new(),
+            target: String::new(),
+            affected_rows: None,
+            rollback_sql: None,
+            details_json: None,
+        };
+        let write_first = first.save_history_entry(&first_history);
+        let write_second = second.save_history_entry(&second_history);
+
+        let (first_result, second_result) = tokio::join!(write_first, write_second);
+        first_result.unwrap();
+        second_result.unwrap();
+
+        assert_eq!(
+            second.load_desktop_settings().await.unwrap(),
+            DesktopSettings { show_tray_icon: false, icon_theme: DesktopIconTheme::Black }
+        );
+        assert_eq!(first.load_sidebar_layout().await.unwrap(), Some(serde_json::json!({"conn-1": ["db", "schema"]})));
+        let history = first.load_history_entries(10, 0).await.unwrap();
+        assert_eq!(history.len(), 2);
     }
 
     #[tokio::test]
