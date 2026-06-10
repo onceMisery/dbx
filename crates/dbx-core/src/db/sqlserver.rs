@@ -853,9 +853,10 @@ fn sqlserver_indexes_sql(schema: &str, table: &str) -> String {
                 WHERE ic3.object_id = i.object_id AND ic3.index_id = i.index_id AND ic3.is_included_column = 1 \
                 ORDER BY ic3.index_column_id \
                 FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 1, '') AS included_cols, \
-         i.filter_definition \
-         OUTER APPLY (SELECT CAST(ep.value AS NVARCHAR(MAX)) AS value FROM sys.extended_properties ep WHERE ep.major_id = i.object_id AND ep.minor_id = i.index_id AND ep.name = N'MS_Description' AND ep.class = 7) ep \
+         i.filter_definition, \
+         ep.value AS index_comment \
          FROM sys.indexes i \
+         OUTER APPLY (SELECT CAST(ep.value AS NVARCHAR(MAX)) AS value FROM sys.extended_properties ep WHERE ep.major_id = i.object_id AND ep.minor_id = i.index_id AND ep.name = N'MS_Description' AND ep.class = 7) ep \
          WHERE i.object_id = OBJECT_ID('{s}.{t}') AND i.name IS NOT NULL \
          ORDER BY i.name",
         s = schema.replace('\'', "''"),

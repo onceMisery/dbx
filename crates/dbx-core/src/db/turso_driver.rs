@@ -634,7 +634,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn split_sql_statements_splits_on_semicolons() {
         assert_eq!(split_sql_statements("SELECT 1"), vec!["SELECT 1"]);
         assert_eq!(
