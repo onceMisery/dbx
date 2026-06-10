@@ -2303,42 +2303,10 @@ pub async fn build_sqlserver_ddl(
         ));
     }
 
-    let escaped_schema = schema.replace('\'', "''");
-    let escaped_table = table.replace('\'', "''");
-
-    if let Some(comment) = table_comment.as_deref().filter(|s| !s.is_empty()) {
-        let escaped_comment = comment.replace('\'', "''");
-        ddl.push_str(&format!(
-            "\nEXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{escaped_comment}', \
-             @level0type=N'SCHEMA', @level0name=N'{escaped_schema}', \
-             @level1type=N'TABLE', @level1name=N'{escaped_table}';"
-        ));
-    }
-
-    for col in &columns {
-        if let Some(comment) = col.comment.as_deref().filter(|s| !s.is_empty()) {
-            let escaped_comment = comment.replace('\'', "''");
-            let escaped_col = col.name.replace('\'', "''");
-            ddl.push_str(&format!(
-                "\nEXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{escaped_comment}', \
-                 @level0type=N'SCHEMA', @level0name=N'{escaped_schema}', \
-                 @level1type=N'TABLE', @level1name=N'{escaped_table}', \
-                 @level2type=N'COLUMN', @level2name=N'{escaped_col}';"
-            ));
-        }
-    }
-
-    for idx in &indexes {
-        if let Some(comment) = idx.comment.as_deref().filter(|s| !s.is_empty()) {
-            let escaped_comment = comment.replace('\'', "''");
-            let escaped_idx = idx.name.replace('\'', "''");
-            ddl.push_str(&format!(
-                "\nEXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{escaped_comment}', \
-                 @level0type=N'SCHEMA', @level0name=N'{escaped_schema}', \
-                 @level1type=N'TABLE', @level1name=N'{escaped_table}', \
-                 @level2type=N'INDEX', @level2name=N'{escaped_idx}';"
-            ));
-        }
+    let comment_ddl = render_sqlserver_comment_ddl(schema, table, table_comment.as_deref(), &columns, &indexes);
+    if !comment_ddl.is_empty() {
+        ddl.push('\n');
+        ddl.push_str(comment_ddl.trim_end());
     }
 
     Ok(ddl)
