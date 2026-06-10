@@ -2049,6 +2049,67 @@ mod ddl_tests {
             "SELECT pg_get_tabledef('\"tenant''s schema\".\"active users\"')"
         );
     }
+
+    #[test]
+    fn sqlserver_comment_ddl_includes_table_comment() {
+        let ddl = render_sqlserver_comment_ddl("dbo", "users", Some("User accounts table"), &[], &[]);
+
+        assert!(ddl.contains("EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'User accounts table'"));
+        assert!(ddl.contains("@level0type=N'SCHEMA', @level0name=N'dbo'"));
+        assert!(ddl.contains("@level1type=N'TABLE', @level1name=N'users'"));
+    }
+
+    #[test]
+    fn sqlserver_comment_ddl_includes_column_comments() {
+        let mut email_col = column("email", "nvarchar(255)");
+        email_col.comment = Some("User's email address".to_string());
+        let mut name_col = column("name", "nvarchar(100)");
+        name_col.comment = Some("User's display name".to_string());
+        let columns = vec![email_col, name_col];
+
+        let ddl = render_sqlserver_comment_ddl("dbo", "users", None, &columns, &[]);
+
+        assert!(ddl.contains("@level2type=N'COLUMN', @level2name=N'email'"));
+        assert!(ddl.contains("@value=N'User''s email address'"));
+        assert!(ddl.contains("@level2type=N'COLUMN', @level2name=N'name'"));
+        assert!(ddl.contains("@value=N'User''s display name'"));
+    }
+
+    #[test]
+    fn sqlserver_comment_ddl_includes_index_comments() {
+        let idx = db::IndexInfo {
+            name: "IX_users_email".to_string(),
+            columns: vec!["email".to_string()],
+            is_unique: true,
+            is_primary: false,
+            filter: None,
+            index_type: Some("NONCLUSTERED".to_string()),
+            included_columns: None,
+            comment: Some("Unique email index".to_string()),
+        };
+        let indexes = vec![idx];
+
+        let ddl = render_sqlserver_comment_ddl("dbo", "users", None, &[], &indexes);
+
+        assert!(ddl.contains("@level2type=N'INDEX', @level2name=N'IX_users_email'"));
+        assert!(ddl.contains("@value=N'Unique email index'"));
+    }
+
+    #[test]
+    fn sqlserver_comment_ddl_skips_empty_comments() {
+        let ddl = render_sqlserver_comment_ddl("dbo", "users", Some(""), &[], &[]);
+        assert!(ddl.is_empty());
+
+        let ddl = render_sqlserver_comment_ddl("dbo", "users", None, &[], &[]);
+        assert!(ddl.is_empty());
+    }
+
+    #[test]
+    fn sqlserver_comment_ddl_escapes_single_quotes() {
+        let ddl = render_sqlserver_comment_ddl("dbo", "users", Some("User's table for 'admin'"), &[], &[]);
+
+        assert!(ddl.contains("@value=N'User''s table for ''admin'''"));
+    }
 }
 
 pub async fn mysql_ddl(pool: &db::mysql::MySqlPool, table: &str) -> Result<String, String> {
@@ -2189,6 +2250,7 @@ pub async fn build_sqlserver_ddl(
     let columns = db::sqlserver::get_columns(client, schema, table).await?;
     let indexes = db::sqlserver::list_indexes(client, schema, table).await?;
     let fkeys = db::sqlserver::list_foreign_keys(client, schema, table).await?;
+    let table_comment = db::sqlserver::get_table_comment(client, schema, table).await?;
 
     let mut ddl = format!("CREATE TABLE [{schema}].[{table}] (\n");
     let col_lines: Vec<String> = columns
@@ -2240,5 +2302,93 @@ pub async fn build_sqlserver_ddl(
             idx.name
         ));
     }
+
+    let escaped_schema = schema.replace('\'', "''");
+    let escaped_table = table.replace('\'', "''");
+
+    if let Some(comment) = table_comment.as_deref().filter(|s| !s.is_empty()) {
+        let escaped_comment = comment.replace('\'', "''");
+        ddl.push_str(&format!(
+            "\nEXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{escaped_comment}', \
+             @level0type=N'SCHEMA', @level0name=N'{escaped_schema}', \
+             @level1type=N'TABLE', @level1name=N'{escaped_table}';"
+        ));
+    }
+
+    for col in &columns {
+        if let Some(comment) = col.comment.as_deref().filter(|s| !s.is_empty()) {
+            let escaped_comment = comment.replace('\'', "''");
+            let escaped_col = col.name.replace('\'', "''");
+            ddl.push_str(&format!(
+                "\nEXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{escaped_comment}', \
+                 @level0type=N'SCHEMA', @level0name=N'{escaped_schema}', \
+                 @level1type=N'TABLE', @level1name=N'{escaped_table}', \
+                 @level2type=N'COLUMN', @level2name=N'{escaped_col}';"
+            ));
+        }
+    }
+
+    for idx in &indexes {
+        if let Some(comment) = idx.comment.as_deref().filter(|s| !s.is_empty()) {
+            let escaped_comment = comment.replace('\'', "''");
+            let escaped_idx = idx.name.replace('\'', "''");
+            ddl.push_str(&format!(
+                "\nEXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{escaped_comment}', \
+                 @level0type=N'SCHEMA', @level0name=N'{escaped_schema}', \
+                 @level1type=N'TABLE', @level1name=N'{escaped_table}', \
+                 @level2type=N'INDEX', @level2name=N'{escaped_idx}';"
+            ));
+        }
+    }
+
     Ok(ddl)
+}
+
+fn render_sqlserver_comment_ddl(
+    schema: &str,
+    table: &str,
+    table_comment: Option<&str>,
+    columns: &[db::ColumnInfo],
+    indexes: &[db::IndexInfo],
+) -> String {
+    let mut ddl = String::new();
+    let escaped_schema = schema.replace('\'', "''");
+    let escaped_table = table.replace('\'', "''");
+
+    if let Some(comment) = table_comment.filter(|s| !s.is_empty()) {
+        let escaped_comment = comment.replace('\'', "''");
+        ddl.push_str(&format!(
+            "EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{escaped_comment}', \
+             @level0type=N'SCHEMA', @level0name=N'{escaped_schema}', \
+             @level1type=N'TABLE', @level1name=N'{escaped_table}';\n"
+        ));
+    }
+
+    for col in columns {
+        if let Some(comment) = col.comment.as_deref().filter(|s| !s.is_empty()) {
+            let escaped_comment = comment.replace('\'', "''");
+            let escaped_col = col.name.replace('\'', "''");
+            ddl.push_str(&format!(
+                "EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{escaped_comment}', \
+                 @level0type=N'SCHEMA', @level0name=N'{escaped_schema}', \
+                 @level1type=N'TABLE', @level1name=N'{escaped_table}', \
+                 @level2type=N'COLUMN', @level2name=N'{escaped_col}';\n"
+            ));
+        }
+    }
+
+    for idx in indexes {
+        if let Some(comment) = idx.comment.as_deref().filter(|s| !s.is_empty()) {
+            let escaped_comment = comment.replace('\'', "''");
+            let escaped_idx = idx.name.replace('\'', "''");
+            ddl.push_str(&format!(
+                "EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'{escaped_comment}', \
+                 @level0type=N'SCHEMA', @level0name=N'{escaped_schema}', \
+                 @level1type=N'TABLE', @level1name=N'{escaped_table}', \
+                 @level2type=N'INDEX', @level2name=N'{escaped_idx}';\n"
+            ));
+        }
+    }
+
+    ddl
 }

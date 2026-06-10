@@ -831,7 +831,7 @@ pub async fn list_indexes(client: &mut SqlServerClient, schema: &str, table: &st
                 } else {
                     Some(inc_str.split(',').map(|s| s.to_string()).collect())
                 },
-                comment: None,
+                comment: row.get::<&str, _>(7).filter(|s: &&str| !s.is_empty()).map(|s: &str| s.to_string()),
             }
         })
         .collect())
@@ -854,6 +854,7 @@ fn sqlserver_indexes_sql(schema: &str, table: &str) -> String {
                 ORDER BY ic3.index_column_id \
                 FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 1, '') AS included_cols, \
          i.filter_definition \
+         OUTER APPLY (SELECT CAST(ep.value AS NVARCHAR(MAX)) AS value FROM sys.extended_properties ep WHERE ep.major_id = i.object_id AND ep.minor_id = i.index_id AND ep.name = N'MS_Description' AND ep.class = 7) ep \
          FROM sys.indexes i \
          WHERE i.object_id = OBJECT_ID('{s}.{t}') AND i.name IS NOT NULL \
          ORDER BY i.name",
@@ -891,6 +892,29 @@ pub async fn list_foreign_keys(
             ref_column: row.get::<&str, _>(4).unwrap_or("").to_string(),
         })
         .collect())
+}
+
+pub async fn get_table_comment(
+    client: &mut SqlServerClient,
+    schema: &str,
+    table: &str,
+) -> Result<Option<String>, String> {
+    let sql = sqlserver_table_comment_sql(schema, table);
+    let stream = client.query(&*sql, &[]).await.map_err(|e| e.to_string())?;
+    let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
+    Ok(rows.first().and_then(|row| row.get::<&str, _>(0)).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+}
+
+fn sqlserver_table_comment_sql(schema: &str, table: &str) -> String {
+    let s = schema.replace('\'', "''");
+    let t = table.replace('\'', "''");
+    format!(
+        "SELECT CAST(ep.value AS NVARCHAR(MAX)) \
+         FROM sys.extended_properties ep \
+         WHERE ep.major_id = OBJECT_ID(QUOTENAME('{s}') + '.' + QUOTENAME('{t}')) \
+           AND ep.minor_id = 0 \
+           AND ep.name = N'MS_Description'"
+    )
 }
 
 pub async fn list_triggers(
@@ -1084,7 +1108,7 @@ mod tests {
     use super::{
         build_spatial_safe_sqlserver_query, is_sqlserver_spatial_column, requires_simple_query_batch,
         sqlserver_cell_to_json, sqlserver_columns_sql, sqlserver_indexes_sql, sqlserver_list_objects_sql,
-        SqlServerDescribedColumn, SqlServerResultSet,
+        sqlserver_table_comment_sql, SqlServerDescribedColumn, SqlServerResultSet,
     };
     use chrono::NaiveDate;
     use std::time::Instant;
@@ -1158,6 +1182,26 @@ mod tests {
         assert!(!sql.contains("STRING_AGG"));
         assert!(sql.contains("FOR XML PATH"));
         assert!(sql.contains("OBJECT_ID('dbo.DF_Rule')"));
+    }
+
+    #[test]
+    fn sqlserver_indexes_sql_includes_index_comment_via_extended_properties() {
+        let sql = sqlserver_indexes_sql("dbo", "orders");
+
+        assert!(sql.contains("sys.extended_properties ep"));
+        assert!(sql.contains("ep.minor_id = i.index_id"));
+        assert!(sql.contains("MS_Description"));
+    }
+
+    #[test]
+    fn sqlserver_table_comment_sql_queries_extended_properties() {
+        let sql = sqlserver_table_comment_sql("dbo", "users");
+
+        assert!(sql.contains("sys.extended_properties ep"));
+        assert!(sql.contains("ep.minor_id = 0"));
+        assert!(sql.contains("MS_Description"));
+        assert!(sql.contains("QUOTENAME('dbo')"));
+        assert!(sql.contains("QUOTENAME('users')"));
     }
 
     #[test]
