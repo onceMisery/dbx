@@ -52,7 +52,8 @@ export type DatabaseType =
   | "etcd"
   | "iris"
   | "influxdb"
-  | "jdbc";
+  | "jdbc"
+  | "mq";
 
 export interface SqlSnippet {
   id: string;
@@ -100,6 +101,7 @@ export interface ConnectionConfig {
   redis_key_separator?: string;
   etcd_endpoints?: string;
   gbase_server?: string;
+  external_config?: unknown;
   one_time?: boolean;
   read_only?: boolean;
 }
@@ -419,6 +421,7 @@ export type TreeNodeType =
   | "fkey"
   | "trigger"
   | "redis-db"
+  | "mq-tenant"
   | "etcd-root"
   | "mongo-db"
   | "mongo-collection"
@@ -447,6 +450,7 @@ export interface TreeNode {
   pinned?: boolean;
   connectionId?: string;
   database?: string;
+  mqTenant?: string;
   schema?: string;
   tableName?: string;
   comment?: string | null;
@@ -517,7 +521,8 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "objects" | "structure" | "users";
+  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "mq" | "objects" | "structure" | "users";
+  mqTenant?: string;
   structureTableName?: string;
   objectBrowser?: {
     schema?: string;
