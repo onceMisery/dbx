@@ -8,6 +8,10 @@ license = "Apache-2.0"
 name = "dbx-web"
 path = "src/main.rs"
 
+[features]
+default = ["mq-admin"]
+mq-admin = ["dbx-core/mq-admin"]
+
 [dependencies]
 dbx-core = { path = "../dbx-core" }
 axum = { version = "0.8", features = ["multipart"] }
