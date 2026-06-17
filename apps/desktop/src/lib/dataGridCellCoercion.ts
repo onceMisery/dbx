@@ -80,11 +80,18 @@ function isPostgresArrayColumn(columnInfo: Pick<ColumnInfo, "data_type"> | undef
 }
 
 function normalizeSmartQuotedJsonInput(value: string): string {
-  // Check for various types of smart quotes that input methods might insert
-  // U+201C, U+201D, U+201E, U+201F, U+2018, U+2019, U+FF02
-  if (!hasSmartQuotes(value)) return value;
+  // Check for smart double quotes that input methods might insert.
+  // U+201C, U+201D, U+201E, U+201F, U+FF02
+  if (!hasSmartDoubleQuotes(value)) return value;
   const trimmed = value.trim();
   if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return value;
+
+  try {
+    JSON.parse(value);
+    return value;
+  } catch {
+    // Input methods can turn JSON delimiters into smart quotes.
+  }
 
   // Input methods (especially on macOS and with Chinese IME) can turn JSON delimiters
   // into smart quotes. Normalize them to standard ASCII quotes.
@@ -97,11 +104,11 @@ function normalizeSmartQuotedJsonInput(value: string): string {
   }
 }
 
-function hasSmartQuotes(value: string): boolean {
-  // Check for smart quotes: U+201C, U+201D, U+201E, U+201F, U+2018, U+2019, U+FF02
+function hasSmartDoubleQuotes(value: string): boolean {
+  // Check for smart double quotes: U+201C, U+201D, U+201E, U+201F, U+FF02
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
-    if (code === 0x201c || code === 0x201d || code === 0x201e || code === 0x201f || code === 0x2018 || code === 0x2019 || code === 0xff02) {
+    if (code === 0x201c || code === 0x201d || code === 0x201e || code === 0x201f || code === 0xff02) {
       return true;
     }
   }
@@ -115,9 +122,6 @@ function normalizeSmartQuotes(value: string): string {
     if (code === 0x201c || code === 0x201d || code === 0x201e || code === 0x201f || code === 0xff02) {
       // Convert to standard double quote
       result += '"';
-    } else if (code === 0x2018 || code === 0x2019) {
-      // Convert to standard single quote
-      result += "'";
     } else {
       result += value[i];
     }
