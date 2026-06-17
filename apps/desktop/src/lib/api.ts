@@ -156,6 +156,7 @@ export const buildDropSchemaSql = forward("buildDropSchemaSql");
 export const buildDuplicateTableStructureSql = forward("buildDuplicateTableStructureSql");
 export const buildExecutableObjectSourceStatements = forward("buildExecutableObjectSourceStatements");
 export const buildExecutableObjectSourceSql = forward("buildExecutableObjectSourceSql");
+export const buildEditableObjectSource = forward("buildEditableObjectSource");
 export const buildRoutineRenameObjectSourceStatements = forward("buildRoutineRenameObjectSourceStatements");
 export const buildViewDdlSql = forward("buildViewDdlSql");
 export const buildTableStructureChangeSql = forward("buildTableStructureChangeSql");

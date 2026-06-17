@@ -354,8 +354,15 @@ async function openSource(row: ObjectBrowserRow) {
   sourceLoading.value = true;
   try {
     const result = await api.getObjectSource(props.connection.id, props.database, row.schema || selectedSchema.value || props.database, row.name, row.type as ObjectSourceKind);
-    sourceContent.value = result.source;
-    sourceDraft.value = result.source;
+    const editable = await api.buildEditableObjectSource({
+      databaseType: effectiveDatabaseType.value,
+      objectType: row.type as ObjectSourceKind,
+      schema: row.schema || selectedSchema.value || props.database,
+      name: row.name,
+      source: result.source,
+    });
+    sourceContent.value = editable;
+    sourceDraft.value = editable;
     sourceEditing.value = row.type !== "SEQUENCE";
   } catch (e: any) {
     sourceError.value = e?.message || String(e);

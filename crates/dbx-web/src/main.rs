@@ -254,6 +254,7 @@ async fn main() {
             post(routes::query::build_executable_object_source_statements),
         )
         .route("/query/build-executable-object-source-sql", post(routes::query::build_executable_object_source_sql))
+        .route("/query/build-editable-object-source", post(routes::query::build_editable_object_source))
         .route(
             "/query/build-routine-rename-object-source-statements",
             post(routes::query::build_routine_rename_object_source_statements),

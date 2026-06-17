@@ -348,6 +348,13 @@ pub fn build_executable_object_source_sql(
 }
 
 #[tauri::command]
+pub fn build_editable_object_source(
+    input: dbx_core::object_source_sql::EditableObjectSourceSqlInput,
+) -> Result<String, String> {
+    Ok(dbx_core::object_source_sql::build_editable_object_source(input))
+}
+
+#[tauri::command]
 pub fn build_routine_rename_object_source_statements(
     input: dbx_core::object_source_sql::RoutineRenameObjectSourceInput,
 ) -> Result<Vec<String>, String> {

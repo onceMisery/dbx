@@ -615,6 +615,10 @@ pub async fn build_executable_object_source_sql(
     dbx_core::object_source_sql::build_executable_object_source_sql(req.input).map(Json).map_err(AppError)
 }
 
+pub async fn build_editable_object_source(Json(req): Json<BuildExecutableObjectSourceRequest>) -> Json<String> {
+    Json(dbx_core::object_source_sql::build_editable_object_source(req.input))
+}
+
 pub async fn build_routine_rename_object_source_statements(
     Json(req): Json<BuildRoutineRenameObjectSourceRequest>,
 ) -> Result<Json<Vec<String>>, AppError> {

@@ -655,6 +655,10 @@ export async function buildExecutableObjectSourceSql(input: BuildEditableObjectS
   return post("/api/query/build-executable-object-source-sql", { input });
 }
 
+export async function buildEditableObjectSource(input: BuildEditableObjectSourceSqlInput): Promise<string> {
+  return post("/api/query/build-editable-object-source", { input });
+}
+
 export async function buildRoutineRenameObjectSourceStatements(input: BuildRoutineRenameObjectSourceInput): Promise<string[]> {
   return post("/api/query/build-routine-rename-object-source-statements", { input });
 }
