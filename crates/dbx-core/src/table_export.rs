@@ -402,7 +402,12 @@ pub async fn export_table_data_core(
                 error_message: None,
             });
 
-            finish_streaming_xlsx_workbook(writer).map_err(|e| format!("Failed to finalize XLSX file: {e}"))?;
+            // Explicitly flush the XLSX writer's BufWriter so IO errors
+            // (e.g. disk-full) are surfaced rather than silently swallowed
+            // by Drop.
+            let mut xlsx_buf =
+                finish_streaming_xlsx_workbook(writer).map_err(|e| format!("Failed to finalize XLSX file: {e}"))?;
+            xlsx_buf.flush().map_err(|e| format!("Failed to flush XLSX file: {e}"))?;
         }
         "json" => {
             file.write_all(b"[\n").map_err(|e| format!("Failed to write JSON: {e}"))?;
