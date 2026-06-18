@@ -188,6 +188,7 @@ fn skips_tcp_probe_for_local_file_plugin_and_agent_types() {
     assert!(skips_tcp_probe(&DatabaseType::Gbase));
     assert!(skips_tcp_probe(&DatabaseType::Databend));
     assert!(skips_tcp_probe(&DatabaseType::InfluxDb));
+    assert!(skips_tcp_probe(&DatabaseType::MessageQueue));
     assert!(!skips_tcp_probe(&DatabaseType::Postgres));
     assert!(!skips_tcp_probe(&DatabaseType::Mysql));
     assert!(!skips_tcp_probe(&DatabaseType::Gaussdb));
