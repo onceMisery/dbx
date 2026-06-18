@@ -45,3 +45,21 @@ jobs:
           git remote add atomgit "https://t8y2:${ATOMGIT_TOKEN}@atomgit.com/t8y2/dbx.git"
           git push atomgit --all --force
           git push atomgit --tags --force
+
+  sync-gitee:
+    name: Sync to Gitee
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote add gitee "https://t8y2:${GITEE_TOKEN}@gitee.com/t8y2/dbx.git"
+          git push gitee --all --force
+          git push gitee --tags --force
