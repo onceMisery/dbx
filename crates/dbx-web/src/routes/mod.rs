@@ -14,6 +14,7 @@ pub mod mongo;
 pub mod mq;
 pub mod plugins;
 pub mod query;
+pub mod query_result_export;
 pub mod redis;
 pub mod redis_pubsub_ws;
 pub mod saved_sql;

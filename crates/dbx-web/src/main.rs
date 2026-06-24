@@ -387,6 +387,17 @@ async fn main() {
         .route("/export/table/progress/{exportId}", get(routes::table_export::table_export_progress))
         .route("/export/table/download/{exportId}", get(routes::table_export::table_export_download))
         .route("/export/table/cancel", post(routes::table_export::cancel_table_export))
+        // Query result export
+        .route("/export/query-result", post(routes::query_result_export::start_query_result_export))
+        .route(
+            "/export/query-result/progress/{exportId}",
+            get(routes::query_result_export::query_result_export_progress),
+        )
+        .route(
+            "/export/query-result/download/{exportId}",
+            get(routes::query_result_export::query_result_export_download),
+        )
+        .route("/export/query-result/cancel", post(routes::query_result_export::cancel_query_result_export))
         // SQL file
         .route("/sql-file/preview", post(routes::sql_file::preview_sql_file))
         .route("/sql-file/execute", post(routes::sql_file::execute_sql_file))
