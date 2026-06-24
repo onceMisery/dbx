@@ -58,6 +58,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "jdbc",
   "access",
   "influxdb",
+  "zookeeper",
 ] as const;
 
 export interface DbxDiagnostics {

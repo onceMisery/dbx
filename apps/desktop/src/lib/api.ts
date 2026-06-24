@@ -311,6 +311,12 @@ export const etcdGet = forward("etcdGet");
 export const etcdPut = forward("etcdPut");
 export const etcdDelete = forward("etcdDelete");
 
+// ZooKeeper
+export const zookeeperListPrefix = forward("zookeeperListPrefix");
+export const zookeeperGet = forward("zookeeperGet");
+export const zookeeperPut = forward("zookeeperPut");
+export const zookeeperDelete = forward("zookeeperDelete");
+
 // Message Queue
 export const mqTestConnection = forward("mqTestConnection");
 export const mqListTenants = forward("mqListTenants");
@@ -435,6 +441,9 @@ export type {
   KvKeySummary,
   KvListPrefixResponse,
   KvGetResponse,
+  KvWriteMode,
+  KvCreateMode,
+  KvPutOptions,
   KvPutResponse,
   KvDeleteResponse,
   MongoDocumentResult,

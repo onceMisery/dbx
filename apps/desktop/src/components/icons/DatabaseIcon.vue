@@ -85,6 +85,7 @@ const assetIcons: Record<string, string> = {
   nacos: "nacos.png",
   iris: "iris.png",
   influxdb: "influxdb",
+  zookeeper: "zookeeper",
 };
 
 const letterIcons: Record<string, { letter: string; color: string }> = {};

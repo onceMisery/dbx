@@ -11,7 +11,7 @@ export interface SqlTextRange {
   sql: string;
 }
 
-const NON_SQL_EXECUTION_TARGET_TYPES: ReadonlySet<DatabaseType> = new Set(["mongodb", "elasticsearch", "qdrant", "milvus", "weaviate", "etcd", "mq", "neo4j"]);
+const NON_SQL_EXECUTION_TARGET_TYPES: ReadonlySet<DatabaseType> = new Set(["mongodb", "elasticsearch", "qdrant", "milvus", "weaviate", "etcd", "zookeeper", "mq", "neo4j"]);
 
 export function supportsExecutionTargetPicker(databaseType?: DatabaseType): boolean {
   return !!databaseType && (databaseType === "redis" || !NON_SQL_EXECUTION_TARGET_TYPES.has(databaseType));
@@ -91,6 +91,7 @@ const DATABASE_SOFT_STATEMENT_KEYWORDS: Partial<Record<DatabaseType, readonly st
   weaviate: [],
   mq: [],
   etcd: [],
+  zookeeper: [],
 };
 
 const WITH_MAIN_STATEMENT_KEYWORDS = new Set(["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"]);

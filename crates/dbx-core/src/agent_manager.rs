@@ -255,10 +255,7 @@ mod tests {
             .expect("manifest launch should resolve");
 
         assert_eq!(launch.program, driver_dir.join("bin").join("dameng-agent"));
-        assert_eq!(
-            launch.args,
-            vec!["--config".to_string(), driver_dir.join("config.json").to_string_lossy().to_string()]
-        );
+        assert_eq!(launch.args, vec!["--config".to_string(), format!("{}/config.json", driver_dir.to_string_lossy())]);
         assert_eq!(launch.working_dir.as_deref(), Some(driver_dir.as_path()));
     }
 }
