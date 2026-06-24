@@ -7,7 +7,7 @@ use crate::csv_export::{format_query_result_csv, format_query_result_csv_rows};
 use crate::database_export::is_export_cancelled;
 pub use crate::database_export::ExportStatus;
 use crate::models::connection::DatabaseType;
-use crate::query::{close_query_session, execute_sql_statement_with_options, QueryExecutionOptions};
+use crate::query::{close_query_session, execute_sql_statement_with_options, QueryExecutionOptions, QUERY_CANCELED};
 use crate::query_result_sql::{
     build_query_pagination_execution_plan, QueryPagination, QueryPaginationExecutionPlanOptions,
 };
@@ -18,6 +18,7 @@ use serde_json::Value;
 use sqlparser::ast::{GroupByExpr, ObjectNamePart, OrderByKind, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use tokio_util::sync::CancellationToken;
 
 const AGENT_UNBOUNDED_ROW_LIMIT: usize = i32::MAX as usize;
 pub const XLSX_MAX_DATA_ROWS: usize = 1_048_575;
@@ -237,10 +238,11 @@ async fn build_keyset_plan(state: &AppState, request: &QueryResultExportRequest)
 pub async fn export_query_result_core(
     state: &AppState,
     request: &QueryResultExportRequest,
+    cancel_token: Option<CancellationToken>,
     on_progress: impl Fn(TableExportProgress),
 ) -> Result<(), String> {
     let mut session_id: Option<String> = None;
-    let result = export_query_result_core_inner(state, request, &on_progress, &mut session_id).await;
+    let result = export_query_result_core_inner(state, request, cancel_token, &on_progress, &mut session_id).await;
 
     if let Some(session_id) = session_id {
         let _ = close_query_session(
@@ -264,6 +266,7 @@ pub async fn export_query_result_core(
 async fn export_query_result_core_inner(
     state: &AppState,
     request: &QueryResultExportRequest,
+    cancel_token: Option<CancellationToken>,
     on_progress: &impl Fn(TableExportProgress),
     session_id: &mut Option<String>,
 ) -> Result<(), String> {
@@ -308,7 +311,9 @@ async fn export_query_result_core_inner(
     }
 
     loop {
-        if is_export_cancelled(&request.export_id).await {
+        if cancel_token.as_ref().is_some_and(|token| token.is_cancelled())
+            || is_export_cancelled(&request.export_id).await
+        {
             on_progress(progress(
                 request,
                 rows_exported,
@@ -379,16 +384,46 @@ async fn export_query_result_core_inner(
             }
         };
 
-        let mut result = execute_sql_statement_with_options(
+        let mut result = match execute_sql_statement_with_options(
             state,
             &request.connection_id,
             &request.database,
             &sql_to_execute,
             request.schema.as_deref(),
-            None,
+            cancel_token.clone(),
             options,
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if error == QUERY_CANCELED
+                    || cancel_token.as_ref().is_some_and(|token| token.is_cancelled())
+                    || is_export_cancelled(&request.export_id).await
+                {
+                    on_progress(progress(
+                        request,
+                        rows_exported,
+                        ExportStatus::Cancelled,
+                        Some("Export cancelled".to_string()),
+                    ));
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
+
+        if cancel_token.as_ref().is_some_and(|token| token.is_cancelled())
+            || is_export_cancelled(&request.export_id).await
+        {
+            on_progress(progress(
+                request,
+                rows_exported,
+                ExportStatus::Cancelled,
+                Some("Export cancelled".to_string()),
+            ));
+            return Ok(());
+        }
 
         if columns.is_empty() {
             columns = result.columns.clone();
@@ -446,7 +481,9 @@ async fn export_query_result_core_inner(
         }
         let should_continue =
             should_fetch_next_page(use_agent_result_session, result.has_more, fetched_row_count, row_count, plan_limit);
-        if is_export_cancelled(&request.export_id).await {
+        if cancel_token.as_ref().is_some_and(|token| token.is_cancelled())
+            || is_export_cancelled(&request.export_id).await
+        {
             on_progress(progress(
                 request,
                 rows_exported,

@@ -122,6 +122,44 @@ test("full query result CSV export streams through the backend without loading a
   assert.equal(exportProgressState.value.status, "Done");
 });
 
+test("query result CSV cancel handler passes export and execution ids", async () => {
+  const { composable, exportCancelHandler } = buildExportHarness();
+  let resolveExport!: () => void;
+  apiMock.startQueryResultExport.mockImplementationOnce(async (_request, onProgress) => {
+    await new Promise<void>((resolve) => {
+      resolveExport = () => {
+        onProgress({
+          exportId: _request.exportId,
+          tableName: "",
+          rowsExported: 1,
+          totalRows: 2,
+          status: "Cancelled",
+          errorMessage: "Export cancelled",
+        });
+        resolve();
+      };
+    });
+    return {
+      exportId: _request.exportId,
+      tableName: "",
+      rowsExported: 1,
+      totalRows: 2,
+      status: "Cancelled",
+      errorMessage: "Export cancelled",
+    };
+  });
+
+  const exportPromise = composable.exportCsv();
+  await vi.waitFor(() => assert.ok(exportCancelHandler.value));
+  await exportCancelHandler.value?.();
+
+  const request = apiMock.startQueryResultExport.mock.calls[0][0];
+  assert.deepEqual(apiMock.cancelQueryResultExport.mock.calls[0], [request.exportId, "exec-1"]);
+
+  resolveExport();
+  await exportPromise;
+});
+
 test("missing query result export request does not fall back to the in-memory path", async () => {
   const { composable, fullExportResult, queryResultExportRequest } = buildExportHarness();
   queryResultExportRequest.mockResolvedValueOnce(undefined);

@@ -102,7 +102,7 @@ CSV 和 XLSX 共享同一个分页循环，只在写盘器不同。
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `exportBatchSize` | `number` | `10000` | 每批读取行数，只表示分页批大小 |
+| `exportBatchSize` | `number` | `2000` | 每批读取行数，只表示分页批大小 |
 | `exportRowLimitEnabled` | `boolean` | `true` | 是否启用查询结果导出总行数上限 |
 | `exportRowLimit` | `number` | `100000` | 查询结果导出总行数上限 |
 | `queryExportKeysetOptimizationEnabled` | `boolean` | `true` | 是否允许对安全单表查询启用 keyset 优化 |
@@ -352,7 +352,7 @@ cancel_table_export(exportId)
 但前端 API 建议暴露语义化方法：
 
 ```ts
-cancelQueryResultExport(exportId)
+cancelQueryResultExport(exportId, executionId)
 ```
 
 内部可以转调同一个后端 cancel set。
@@ -414,7 +414,7 @@ export interface QueryResultExportRequest {
 
 ```ts
 startQueryResultExport(request, onProgress)
-cancelQueryResultExport(exportId)
+cancelQueryResultExport(exportId, executionId)
 ```
 
 ### 12.2 queryStore
@@ -465,7 +465,7 @@ const queryBaseSql = tab.resultBaseSql ?? sql;
 3. 打开进度 dialog。
 4. 调 `api.startQueryResultExport`。
 5. 按 progress 更新状态。
-6. 取消按钮调用 `cancelQueryResultExport(exportId)`。
+6. 取消按钮调用 `cancelQueryResultExport(exportId, executionId)`。
 
 ## 13. 兼容边界
 
@@ -532,7 +532,7 @@ const queryBaseSql = tab.resultBaseSql ?? sql;
 3. `exportRowLimitEnabled=false` 时 `rowLimit=null`。
 4. 选区导出仍走旧路径。
 5. JSON/Markdown/SQL 仍走旧路径。
-6. 取消按钮调用 `cancelQueryResultExport`。
+6. 取消按钮调用 `cancelQueryResultExport(exportId, executionId)`。
 
 ### 15.4 手工验证
 

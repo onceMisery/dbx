@@ -1334,8 +1334,11 @@ function downloadQueryResultExportFile(exportId: string, format: string): void {
   a.click();
 }
 
-export async function cancelQueryResultExport(exportId: string): Promise<void> {
-  return post("/api/export/query-result/cancel", { exportId });
+export async function cancelQueryResultExport(exportId: string, executionId?: string): Promise<void> {
+  return post("/api/export/query-result/cancel", {
+    exportId,
+    ...(executionId ? { executionId } : {}),
+  });
 }
 
 export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {

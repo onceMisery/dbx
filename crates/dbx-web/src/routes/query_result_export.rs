@@ -11,6 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Response, Sse};
 use axum::Json;
+use dbx_core::query_cancel::RunningTaskMetadata;
 use dbx_core::query_result_export::{self, QueryResultExportRequest};
 use dbx_core::table_export::{ExportStatus, TableExportProgress};
 use futures::stream::Stream;
@@ -29,6 +30,7 @@ pub struct StartQueryResultExportRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CancelQueryResultExportRequest {
     pub export_id: String,
+    pub execution_id: Option<String>,
 }
 
 pub async fn start_query_result_export(
@@ -62,7 +64,19 @@ pub async fn start_query_result_export(
     let cancelled_progress = cancelled.clone();
 
     tokio::spawn(async move {
-        let result = query_result_export::export_query_result_core(&app, &req, |progress| {
+        let execution_id = req.execution_id.clone().filter(|id| !id.trim().is_empty());
+        let registered_query = execution_id.as_ref().map(|id| {
+            app.running_queries.register_task(
+                id.clone(),
+                RunningTaskMetadata::query(
+                    req.connection_id.clone(),
+                    req.database.clone(),
+                    req.client_session_id.clone(),
+                ),
+            )
+        });
+        let cancel_token = registered_query.as_ref().map(|query| query.token());
+        let result = query_result_export::export_query_result_core(&app, &req, cancel_token, |progress| {
             if matches!(progress.status, ExportStatus::Cancelled) {
                 cancelled_progress.store(true, Ordering::SeqCst);
             }
@@ -71,6 +85,7 @@ pub async fn start_query_result_export(
             }
         })
         .await;
+        drop(registered_query);
 
         if let Err(e) = result {
             let _ = tokio::fs::remove_file(&req.file_path).await;
@@ -112,10 +127,13 @@ pub async fn query_result_export_progress(
 }
 
 pub async fn cancel_query_result_export(
-    State(_state): State<Arc<WebState>>,
+    State(state): State<Arc<WebState>>,
     Json(req): Json<CancelQueryResultExportRequest>,
 ) -> Json<serde_json::Value> {
     dbx_core::database_export::set_export_cancelled(&req.export_id).await;
+    if let Some(execution_id) = req.execution_id.filter(|id| !id.trim().is_empty()) {
+        state.app.running_queries.cancel(&execution_id);
+    }
     Json(serde_json::json!({ "cancelled": true }))
 }
 

@@ -901,7 +901,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     }
     if (exportProgressDialog) exportProgressDialog.value = true;
     if (exportCancelHandler) {
-      exportCancelHandler.value = () => api.cancelQueryResultExport(exportId);
+      exportCancelHandler.value = () => api.cancelQueryResultExport(exportId, request.executionId);
     }
 
     try {

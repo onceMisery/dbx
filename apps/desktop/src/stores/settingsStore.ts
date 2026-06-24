@@ -441,7 +441,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   columnFormatters: {},
   customColumnFormatters: {},
   snippets: DEFAULT_SQL_SNIPPETS,
-  exportBatchSize: 10000,
+  exportBatchSize: 2000,
   exportRowLimitEnabled: true,
   exportRowLimit: 100000,
   queryExportKeysetOptimizationEnabled: true,
@@ -450,6 +450,8 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
 
 export const STORAGE_KEY = "dbx-editor-settings";
 const OLD_FONT_SIZE_KEY = "dbx-query-editor-font-size";
+const EXPORT_BATCH_SIZE_DEFAULT_MIGRATION_KEY = "dbx-export-batch-size-default-migrated-v1";
+const LEGACY_DEFAULT_EXPORT_BATCH_SIZE = 10000;
 const MIN_UI_SCALE = 0.75;
 const MAX_UI_SCALE = 2;
 
@@ -622,6 +624,13 @@ function loadEditorSettings(): EditorSettings {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<EditorSettings>;
+      if (parsed.exportBatchSize === LEGACY_DEFAULT_EXPORT_BATCH_SIZE && localStorage.getItem(EXPORT_BATCH_SIZE_DEFAULT_MIGRATION_KEY) !== "1") {
+        parsed.exportBatchSize = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
+        localStorage.setItem(EXPORT_BATCH_SIZE_DEFAULT_MIGRATION_KEY, "1");
+        const migrated = normalizeEditorSettings(parsed);
+        saveEditorSettings(migrated);
+        return migrated;
+      }
       return normalizeEditorSettings(parsed);
     }
   } catch {

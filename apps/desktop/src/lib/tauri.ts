@@ -1815,8 +1815,8 @@ export async function startQueryResultExport(request: QueryResultExportRequest, 
   }
 }
 
-export async function cancelQueryResultExport(exportId: string): Promise<void> {
-  return invoke("cancel_query_result_export", { exportId });
+export async function cancelQueryResultExport(exportId: string, executionId?: string): Promise<void> {
+  return invoke("cancel_query_result_export", { exportId, executionId: executionId || null });
 }
 
 export async function exportDatabaseSql(request: DatabaseExportRequest, onProgress: (progress: ExportProgress) => void): Promise<void> {
