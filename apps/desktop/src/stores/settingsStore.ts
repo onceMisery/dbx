@@ -340,6 +340,9 @@ export interface EditorSettings {
   customColumnFormatters: Record<string, CustomColumnFormatterConfig>;
   snippets: SqlSnippet[];
   exportBatchSize: number;
+  exportRowLimitEnabled: boolean;
+  exportRowLimit: number;
+  queryExportKeysetOptimizationEnabled: boolean;
   toolbarItems: ToolbarItems;
 }
 
@@ -439,6 +442,9 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   customColumnFormatters: {},
   snippets: DEFAULT_SQL_SNIPPETS,
   exportBatchSize: 10000,
+  exportRowLimitEnabled: true,
+  exportRowLimit: 100000,
+  queryExportKeysetOptimizationEnabled: true,
   toolbarItems: { ...DEFAULT_TOOLBAR_ITEMS },
 };
 
@@ -603,6 +609,9 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     customColumnFormatters: normalizeCustomColumnFormatters(settings.customColumnFormatters),
     snippets: normalizeSqlSnippets(settings.snippets, existing?.snippets),
     exportBatchSize: typeof settings.exportBatchSize === "number" && settings.exportBatchSize >= 100 && settings.exportBatchSize <= 100000 ? Math.round(settings.exportBatchSize) : DEFAULT_EDITOR_SETTINGS.exportBatchSize,
+    exportRowLimitEnabled: typeof settings.exportRowLimitEnabled === "boolean" ? settings.exportRowLimitEnabled : DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled,
+    exportRowLimit: typeof settings.exportRowLimit === "number" && settings.exportRowLimit >= 100 && settings.exportRowLimit <= 2147483647 ? Math.round(settings.exportRowLimit) : DEFAULT_EDITOR_SETTINGS.exportRowLimit,
+    queryExportKeysetOptimizationEnabled: typeof settings.queryExportKeysetOptimizationEnabled === "boolean" ? settings.queryExportKeysetOptimizationEnabled : DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled,
     toolbarItems: normalizeToolbarItems(settings.toolbarItems),
   };
 }
@@ -763,6 +772,9 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.customColumnFormatters !== undefined) editorSettings.value.customColumnFormatters = partial.customColumnFormatters;
     if (partial.snippets !== undefined) editorSettings.value.snippets = normalizeSqlSnippets(partial.snippets);
     if (partial.exportBatchSize !== undefined) editorSettings.value.exportBatchSize = Math.min(100000, Math.max(100, Math.round(partial.exportBatchSize)));
+    if (partial.exportRowLimitEnabled !== undefined) editorSettings.value.exportRowLimitEnabled = partial.exportRowLimitEnabled;
+    if (partial.exportRowLimit !== undefined) editorSettings.value.exportRowLimit = Math.min(2147483647, Math.max(100, Math.round(partial.exportRowLimit)));
+    if (partial.queryExportKeysetOptimizationEnabled !== undefined) editorSettings.value.queryExportKeysetOptimizationEnabled = partial.queryExportKeysetOptimizationEnabled;
     if (partial.toolbarItems !== undefined) editorSettings.value.toolbarItems = normalizeToolbarItems(partial.toolbarItems);
     saveEditorSettings(editorSettings.value);
   }

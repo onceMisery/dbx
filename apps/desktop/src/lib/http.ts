@@ -71,6 +71,7 @@ import type {
   ExportProgress,
   TableExportRequest,
   TableExportProgress,
+  QueryResultExportRequest,
   TableCsvExportOptions,
   XlsxCellValue,
   QueryPaginationExecutionPlanOptions,
@@ -1280,6 +1281,61 @@ function downloadTableExportFile(exportId: string, format: string): void {
 
 export async function cancelTableExport(exportId: string): Promise<void> {
   return post("/api/export/table/cancel", { exportId });
+}
+
+export async function startQueryResultExport(request: QueryResultExportRequest, onProgress: (progress: TableExportProgress) => void): Promise<TableExportProgress> {
+  const { exportId } = request;
+
+  return new Promise((resolve, reject) => {
+    let started = false;
+    let settled = false;
+    const eventSource = new EventSource(`/api/export/query-result/progress/${exportId}`);
+
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      eventSource.close();
+      callback();
+    };
+
+    eventSource.onopen = () => {
+      if (started) return;
+      started = true;
+      post("/api/export/query-result", { request }).catch((error) => {
+        finish(() => reject(error));
+      });
+    };
+
+    eventSource.onmessage = (event) => {
+      const progress: TableExportProgress = JSON.parse(event.data);
+      onProgress(progress);
+      if (progress.status === "Done" || progress.status === "Error" || progress.status === "Cancelled") {
+        if (progress.status === "Error") {
+          finish(() => reject(new Error(progress.errorMessage || "Export failed")));
+        } else if (progress.status === "Done") {
+          downloadQueryResultExportFile(exportId, request.format);
+          finish(() => resolve(progress));
+        } else {
+          finish(() => resolve(progress));
+        }
+      }
+    };
+
+    eventSource.onerror = () => {
+      finish(() => reject(new Error("Export progress connection lost")));
+    };
+  });
+}
+
+function downloadQueryResultExportFile(exportId: string, format: string): void {
+  const a = document.createElement("a");
+  a.href = `/api/export/query-result/download/${exportId}`;
+  a.download = `query_result_export_${exportId}.${format}`;
+  a.click();
+}
+
+export async function cancelQueryResultExport(exportId: string): Promise<void> {
+  return post("/api/export/query-result/cancel", { exportId });
 }
 
 export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {

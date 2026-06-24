@@ -60,6 +60,21 @@ test("defaults export batch size to 10000 rows", () => {
   assert.equal(normalizeEditorSettings({ exportBatchSize: 2000 }).exportBatchSize, 2000);
 });
 
+test("defaults query-result export row limit settings", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled, true);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.exportRowLimit, 100000);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled, true);
+  assert.equal(normalizeEditorSettings({}).exportRowLimitEnabled, true);
+  assert.equal(normalizeEditorSettings({}).exportRowLimit, 100000);
+  assert.equal(normalizeEditorSettings({}).queryExportKeysetOptimizationEnabled, true);
+  assert.equal(normalizeEditorSettings({ exportRowLimitEnabled: false }).exportRowLimitEnabled, false);
+  assert.equal(normalizeEditorSettings({ exportRowLimitEnabled: "nope" as any }).exportRowLimitEnabled, true);
+  assert.equal(normalizeEditorSettings({ exportRowLimit: 250000 }).exportRowLimit, 250000);
+  assert.equal(normalizeEditorSettings({ exportRowLimit: 10 }).exportRowLimit, 100000);
+  assert.equal(normalizeEditorSettings({ queryExportKeysetOptimizationEnabled: false }).queryExportKeysetOptimizationEnabled, false);
+  assert.equal(normalizeEditorSettings({ queryExportKeysetOptimizationEnabled: "nope" as any }).queryExportKeysetOptimizationEnabled, true);
+});
+
 test("normalizes editor theme settings", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.theme, "app");
   assert.equal(normalizeEditorSettings({}).theme, "app");

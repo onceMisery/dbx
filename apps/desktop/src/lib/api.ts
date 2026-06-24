@@ -246,6 +246,8 @@ export const exportQueryResultJson = forward("exportQueryResultJson");
 export const exportQueryResultMarkdown = forward("exportQueryResultMarkdown");
 export const startTableExport = forward("startTableExport");
 export const cancelTableExport = forward("cancelTableExport");
+export const startQueryResultExport = forward("startQueryResultExport");
+export const cancelQueryResultExport = forward("cancelQueryResultExport");
 
 // Redis
 export const redisListDatabases = forward("redisListDatabases");
@@ -435,5 +437,6 @@ export type {
   TableExportProgress,
   TableExportStatus,
   TableExportRequest,
+  QueryResultExportRequest,
   AgentEvent,
 } from "./tauri";

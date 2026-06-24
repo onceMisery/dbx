@@ -187,6 +187,7 @@ export interface QueryPaginationExecutionPlanOptions {
   databaseType?: DatabaseType;
   pagination: QueryPagination;
   useAgentCursor: boolean;
+  firstPageUsesActualSql?: boolean;
 }
 
 export interface QueryPaginationExecutionPlan {
@@ -1708,6 +1709,26 @@ export interface TableExportProgress {
   errorMessage?: string;
 }
 
+export interface QueryResultExportRequest {
+  exportId: string;
+  connectionId: string;
+  database: string;
+  schema?: string;
+  sql: string;
+  queryBaseSql: string;
+  databaseType: DatabaseType;
+  useAgentCursor: boolean;
+  filePath: string;
+  format: "csv" | "xlsx";
+  pageSize: number;
+  rowLimit?: number | null;
+  totalRows?: number | null;
+  timeoutSecs?: number;
+  keysetOptimizationEnabled: boolean;
+  clientSessionId?: string;
+  executionId?: string;
+}
+
 export async function startTableExport(request: TableExportRequest, onProgress: (progress: TableExportProgress) => void): Promise<TableExportProgress> {
   let unlisten: UnlistenFn | undefined;
   let settled = false;
@@ -1750,6 +1771,51 @@ export async function startTableExport(request: TableExportRequest, onProgress: 
 }
 
 export async function cancelTableExport(exportId: string): Promise<void> {
+  return invoke("cancel_table_export", { exportId });
+}
+
+export async function startQueryResultExport(request: QueryResultExportRequest, onProgress: (progress: TableExportProgress) => void): Promise<TableExportProgress> {
+  let unlisten: UnlistenFn | undefined;
+  let settled = false;
+  let resolveTerminal: (progress: TableExportProgress) => void = () => {};
+  let rejectTerminal: (error: unknown) => void = () => {};
+
+  const terminalProgress = new Promise<TableExportProgress>((resolve, reject) => {
+    resolveTerminal = resolve;
+    rejectTerminal = reject;
+  });
+
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    unlisten?.();
+    callback();
+  };
+
+  try {
+    unlisten = await listen<TableExportProgress>("query-result-export-progress", (event) => {
+      if (event.payload.exportId !== request.exportId) return;
+      onProgress(event.payload);
+      if (event.payload.status === "Done" || event.payload.status === "Error" || event.payload.status === "Cancelled") {
+        if (event.payload.status === "Error") {
+          finish(() => rejectTerminal(new Error(event.payload.errorMessage || "Export failed")));
+        } else {
+          finish(() => resolveTerminal(event.payload));
+        }
+      }
+    });
+    await invoke("start_query_result_export", { request });
+    return await terminalProgress;
+  } catch (error) {
+    if (!settled) {
+      settled = true;
+      unlisten?.();
+    }
+    throw error;
+  }
+}
+
+export async function cancelQueryResultExport(exportId: string): Promise<void> {
   return invoke("cancel_table_export", { exportId });
 }
 

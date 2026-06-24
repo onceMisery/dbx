@@ -48,6 +48,12 @@ const ACTIVE_TAB_KEY = "dbx-active-tab";
 const ORACLE_LIKE_METADATA_TYPES = new Set<string>(["oracle", "dameng", "oceanbase-oracle"]);
 const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export"] as const;
 
+interface BuildQueryResultExportRequestOptions {
+  exportId: string;
+  filePath: string;
+  format: "csv" | "xlsx";
+}
+
 function tabClientSessionId(tab: Pick<QueryTab, "id">, suffix?: (typeof BACKGROUND_CLIENT_SESSION_SUFFIXES)[number]): string {
   return suffix ? `${tab.id}:${suffix}` : tab.id;
 }
@@ -2104,6 +2110,7 @@ export const useQueryStore = defineStore("query", () => {
     const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
     const useAgentCursor = conn?.db_type === "jdbc" || supportsDatabaseFeature(conn?.db_type, "driverManagement");
     const queryBaseSql = tab.resultBaseSql ?? sql;
+    const exportRowLimit = useSettingsStore().editorSettings.exportRowLimit;
     // Use the already-computed total row count as a progress estimate so the
     // export dialog shows a moving bar instead of a stuck 0 while paginating.
     const totalRows = typeof tab.resultTotalRowCount === "number" ? tab.resultTotalRowCount : null;
@@ -2117,17 +2124,21 @@ export const useQueryStore = defineStore("query", () => {
     const exportExecutionId = uuid();
 
     try {
-      while (true) {
+      while (rows.length < exportRowLimit) {
+        const remaining = exportRowLimit - rows.length;
+        const effectivePageLimit = Math.min(pageLimit, remaining);
         const plan = await api.prepareQueryPaginationExecutionPlan({
           sql,
           queryBaseSql,
           databaseType: effectiveDbType,
-          pagination: { limit: pageLimit, offset, sessionId },
+          pagination: { limit: effectivePageLimit, offset, sessionId },
           useAgentCursor,
+          firstPageUsesActualSql: true,
         });
         if (typeof plan.pageLimit !== "number" || typeof plan.pageOffset !== "number") return tab.result;
         const executionOptions = plan.useAgentResultSession
           ? {
+              maxRows: exportRowLimit,
               fetchSize: plan.pageLimit,
               pageSize: plan.pageLimit,
               resultSessionId: sessionId,
@@ -2144,7 +2155,7 @@ export const useQueryStore = defineStore("query", () => {
         onProgress?.({ rowsExported: rows.length, totalRows });
         sessionId = result.session_id ?? undefined;
         const shouldFetchNextPage = plan.useAgentResultSession ? result.has_more === true : result.rows.length >= plan.pageLimit;
-        if (!shouldFetchNextPage) break;
+        if (!shouldFetchNextPage || rows.length >= exportRowLimit) break;
         offset += result.rows.length;
       }
     } finally {
@@ -2159,6 +2170,45 @@ export const useQueryStore = defineStore("query", () => {
       execution_time_ms: executionTimeMs,
       truncated: false,
       has_more: false,
+    };
+  }
+
+  async function buildQueryResultExportRequest(id: string, options: BuildQueryResultExportRequestOptions) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab?.result || tab.mode !== "query") return undefined;
+
+    const sql = tab.resultSortedSql ?? tab.resultBaseSql ?? tab.lastExecutedSql ?? tab.sql;
+    if (!sql.trim()) return undefined;
+
+    const connStore = useConnectionStore();
+    await connStore.ensureConnected(tab.connectionId);
+    const conn = connStore.getConfig(tab.connectionId);
+    const settings = useSettingsStore().editorSettings;
+    const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
+    if (!effectiveDbType) return undefined;
+    const useAgentCursor = conn?.db_type === "jdbc" || supportsDatabaseFeature(conn?.db_type, "driverManagement");
+    const queryBaseSql = tab.resultBaseSql ?? sql;
+    const totalRows = typeof tab.resultTotalRowCount === "number" ? tab.resultTotalRowCount : null;
+    const clientSessionId = tabClientSessionId(tab, "export");
+
+    return {
+      exportId: options.exportId,
+      connectionId: tab.connectionId,
+      database: tab.database,
+      schema: tab.schema,
+      sql,
+      queryBaseSql,
+      databaseType: effectiveDbType,
+      useAgentCursor,
+      filePath: options.filePath,
+      format: options.format,
+      pageSize: settings.exportBatchSize,
+      rowLimit: settings.exportRowLimitEnabled ? settings.exportRowLimit : null,
+      totalRows,
+      timeoutSecs: queryTimeoutSecsForConnection(conn),
+      keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
+      clientSessionId,
+      executionId: uuid(),
     };
   }
 
@@ -2217,6 +2267,7 @@ export const useQueryStore = defineStore("query", () => {
     exportResultArchive,
     importResultArchive,
     fetchTabResultForExport,
+    buildQueryResultExportRequest,
     notifyConnectionMayBeLost,
   };
 });
