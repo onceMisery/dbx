@@ -32,6 +32,8 @@ pub struct QueryPaginationExecutionPlanOptions {
     pub database_type: Option<DatabaseType>,
     pub pagination: QueryPagination,
     pub use_agent_cursor: bool,
+    #[serde(default)]
+    pub first_page_uses_actual_sql: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,7 +130,9 @@ pub fn build_query_pagination_execution_plan(
     }
 
     if options.use_agent_cursor && options.pagination.offset == 0 {
-        plan.sql_to_execute = options.query_base_sql;
+        if !options.first_page_uses_actual_sql {
+            plan.sql_to_execute = options.query_base_sql;
+        }
         plan.page_limit = Some(options.pagination.limit);
         plan.page_offset = Some(options.pagination.offset);
         plan.use_agent_result_session = true;
@@ -832,6 +836,7 @@ mod tests {
             database_type: Some(DatabaseType::SqlServer),
             pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
             use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
         });
 
         assert_eq!(plan.sql_to_execute, sql);
@@ -1105,9 +1110,28 @@ mod tests {
             database_type: Some(DatabaseType::Oracle),
             pagination: QueryPagination { limit: 500, offset: 0, session_id: None },
             use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
         });
 
         assert_eq!(plan.sql_to_execute, "SELECT * FROM events");
+        assert_eq!(plan.page_limit, Some(500));
+        assert_eq!(plan.page_offset, Some(0));
+        assert!(plan.page_sql.is_none());
+        assert!(plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn export_agent_cursor_first_page_keeps_actual_sorted_sql() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM (SELECT * FROM events) t ORDER BY created_at DESC".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Oracle),
+            pagination: QueryPagination { limit: 500, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: true,
+        });
+
+        assert_eq!(plan.sql_to_execute, "SELECT * FROM (SELECT * FROM events) t ORDER BY created_at DESC");
         assert_eq!(plan.page_limit, Some(500));
         assert_eq!(plan.page_offset, Some(0));
         assert!(plan.page_sql.is_none());

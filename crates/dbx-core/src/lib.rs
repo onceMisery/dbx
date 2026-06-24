@@ -35,6 +35,7 @@ pub mod plugins;
 pub mod query;
 pub mod query_cancel;
 pub mod query_execution_sql;
+pub mod query_result_export;
 pub mod query_result_sql;
 pub mod redis_ops;
 pub mod saved_sql;
