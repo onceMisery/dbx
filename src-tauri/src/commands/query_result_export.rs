@@ -58,3 +58,9 @@ pub async fn start_query_result_export(
 
     Ok(())
 }
+
+#[tauri::command]
+pub async fn cancel_query_result_export(export_id: String) -> Result<(), String> {
+    dbx_core::database_export::set_export_cancelled(&export_id).await;
+    Ok(())
+}

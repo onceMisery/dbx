@@ -685,6 +685,7 @@ pub fn run() {
             commands::table_export::start_table_export,
             commands::table_export::cancel_table_export,
             commands::query_result_export::start_query_result_export,
+            commands::query_result_export::cancel_query_result_export,
             commands::csv_export::export_query_result_csv,
             commands::csv_export::export_table_data_csv,
             commands::xlsx_export::export_query_result_xlsx,
