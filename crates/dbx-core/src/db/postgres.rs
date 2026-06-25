@@ -718,8 +718,7 @@ pub async fn stream_query_rows(
     cancelled: &AtomicBool,
     mut on_row: impl FnMut(&[serde_json::Value]) -> Result<(), String>,
 ) -> Result<u64, String> {
-    let client =
-        pool.get().await.map_err(|e| format!("PostgreSQL connection failed: {}", pg_pool_error_to_string(e)))?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     match stream_query_rows_on_client(&client, sql, max_rows, cancelled, &mut on_row).await {
         Ok(rows) => Ok(rows),
         Err(error) if should_retry_postgres_text_query_message(&error.to_ascii_lowercase()) => {
@@ -797,7 +796,8 @@ async fn stream_query_rows_text_on_client(
 }
 
 pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, String> {
-    let postgres_url = postgres_connection_url(url)?;
+    let url_with_keepalive = inject_postgres_keepalive_params(url);
+    let postgres_url = postgres_connection_url(&url_with_keepalive)?;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
@@ -823,6 +823,8 @@ pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, Stri
             .max_size(10)
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(timeout))
+            .create_timeout(Some(timeout))
+            .recycle_timeout(Some(timeout))
             .build()
             .map_err(|e| format!("Failed to create PostgreSQL pool: {e}"))?;
 
@@ -843,10 +845,40 @@ pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, Stri
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct PostgresSslFiles {
-    sslcert: Option<String>,
-    sslkey: Option<String>,
-    sslrootcert: Option<String>,
+pub struct PostgresSslFiles {
+    pub sslcert: Option<String>,
+    pub sslkey: Option<String>,
+    pub sslrootcert: Option<String>,
+}
+
+/// TLS 上下文信息，用于 cancel 时重建 TLS connector。
+#[derive(Debug, Clone)]
+pub struct PostgresCancelContext {
+    pub ssl_files: PostgresSslFiles,
+    pub accepts_invalid_certs: bool,
+    pub verifies_hostname: bool,
+}
+
+/// 从连接 URL 构建 TLS cancel 上下文。
+/// 返回 None 表示 URL 解析失败或 sslmode=disable（无需 TLS cancel）。
+pub fn build_postgres_cancel_context(url: &str) -> Option<PostgresCancelContext> {
+    let postgres_url = postgres_connection_url(url).ok()?;
+    Some(PostgresCancelContext {
+        ssl_files: postgres_url.ssl_files,
+        accepts_invalid_certs: postgres_url.accepts_invalid_certs,
+        verifies_hostname: postgres_url.verifies_hostname,
+    })
+}
+
+/// 从 cancel context 重建 TLS connector，用于 TLS 连接取消。
+fn make_rustls_connect_from_context(
+    ctx: &PostgresCancelContext,
+) -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
+    // 构建一个最小 pg_config 仅用于 ssl_mode 判断
+    let mut pg_config = tokio_postgres::Config::new();
+    pg_config.ssl_mode(SslMode::Require);
+    let tls_config = postgres_tls_config(&pg_config, &ctx.ssl_files, ctx.accepts_invalid_certs, ctx.verifies_hostname)?;
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(tls_config))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -855,6 +887,20 @@ struct PostgresConnectionUrl {
     ssl_files: PostgresSslFiles,
     accepts_invalid_certs: bool,
     verifies_hostname: bool,
+}
+
+/// 注入 TCP keepalive 参数到 PostgreSQL URL（仅在用户未显式指定时）。
+/// 默认参数缩短半开连接检测时间，适合桌面/VPN/NAT 环境。
+fn inject_postgres_keepalive_params(url: &str) -> String {
+    let query = url.split('?').nth(1);
+    let has_keepalives = query
+        .map(|q| q.split('&').any(|p| p.split('=').next().is_some_and(|k| k.eq_ignore_ascii_case("keepalives"))))
+        .unwrap_or(false);
+    if has_keepalives {
+        return url.to_string(); // 用户已显式配置
+    }
+    let separator = if url.contains('?') { "&" } else { "?" };
+    format!("{url}{separator}keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_retries=3")
 }
 
 fn postgres_connection_url(url: &str) -> Result<PostgresConnectionUrl, String> {
@@ -1144,7 +1190,7 @@ fn validate_postgres_ssl_paths(url: &str) -> Result<(), String> {
 }
 
 pub async fn list_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT datname FROM pg_database \
@@ -1173,7 +1219,7 @@ pub async fn list_tables_filtered(
     let filter_pattern = like_contains_pattern(filter.unwrap_or("").trim());
     let limit_param = limit.and_then(|value| i64::try_from(value).ok());
     let offset_param = offset.and_then(|value| i64::try_from(value).ok()).unwrap_or(0);
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client.prepare_cached(postgres_tables_sql()).await.map_err(|e| e.to_string())?;
     let rows = client
         .query(&stmt, &[&schema, &filter_pattern, &limit_param, &offset_param])
@@ -1204,7 +1250,7 @@ pub async fn completion_assistant_search(
         request.object_kinds.clone()
     };
     let pattern = postgres_completion_like_pattern(&request.mask, request.match_mode.as_ref());
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let mut candidates = Vec::new();
 
     if kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::Schema)) {
@@ -1387,7 +1433,7 @@ fn postgres_completion_like_pattern(value: &str, mode: Option<&CompletionAssista
 
 pub async fn get_table_comment(pool: &Pool, schema: &str, table: &str) -> Result<Option<String>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client.prepare_cached(postgres_table_comment_sql()).await.map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[&schema, &table]).await.map_err(|e| e.to_string())?;
     Ok(rows.first().and_then(|row| row.try_get::<_, Option<String>>(0).ok().flatten()).filter(|s| !s.is_empty()))
@@ -1516,7 +1562,7 @@ fn list_objects_sql(include_timestamps: bool) -> &'static str {
 }
 
 pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client.prepare_cached(list_objects_sql(true)).await.map_err(|e| e.to_string())?;
     let rows = match client.query(&stmt, &[&schema]).await {
         Ok(rows) => rows,
@@ -1543,7 +1589,7 @@ pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, 
 
 pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<ObjectStatistics>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT c.relname, \
@@ -1573,7 +1619,7 @@ pub async fn list_schemas(pool: &Pool) -> Result<Vec<String>, String> {
 }
 
 pub async fn list_schema_infos(pool: &Pool) -> Result<Vec<SchemaInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT n.nspname AS schema_name, d.description AS schema_comment \
@@ -1720,7 +1766,7 @@ async fn get_columns_with_sql(
 
 pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     match get_columns_with_sql(&client, POSTGRES_COLUMNS_SQL, schema, table).await {
         Ok(columns) => Ok(columns),
         Err(primary_error) => match get_columns_with_sql(&client, POSTGRES_COLUMNS_COMPAT_SQL, schema, table).await {
@@ -1767,10 +1813,10 @@ pub async fn execute_query_with_max_rows(
     let row_limit = query_result_row_limit(max_rows);
 
     if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "WITH", "TABLE"]) {
-        let client = pool.get().await.map_err(|e| e.to_string())?;
+        let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
         execute_select_query(&client, sql, start, row_limit).await
     } else {
-        let client = pool.get().await.map_err(|e| e.to_string())?;
+        let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
         let affected = client.execute(sql, &[]).await.map_err(pg_error_to_string)?;
         clear_postgres_caches_after_ddl(pool, Some(&client), sql);
 
@@ -1794,11 +1840,14 @@ pub async fn execute_query_with_max_rows_and_cancel(
     max_rows: Option<usize>,
     cancel_token: Option<CancellationToken>,
     timeout_duration: Option<Duration>,
+    cancel_context: Option<PostgresCancelContext>,
 ) -> Result<QueryResult, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let checkout_timeout = crate::db::connection_timeout();
+    let client = checkout_postgres_client(pool, cancel_token.as_ref(), checkout_timeout).await?;
     let pg_cancel_token = client.cancel_token();
     wait_postgres_query(
         pg_cancel_token,
+        cancel_context,
         cancel_token,
         timeout_duration,
         execute_query_with_max_rows_inner(&client, sql, max_rows),
@@ -1818,7 +1867,7 @@ pub async fn execute_query_with_schema_and_max_rows(
 ) -> Result<QueryResult, String> {
     let start = Instant::now();
     let checkout_start = Instant::now();
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     log::info!(
         "[postgres][execute_with_schema:pool:done] elapsed_ms={} total_ms={} schema={}",
         checkout_start.elapsed().as_millis(),
@@ -1872,10 +1921,12 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
     max_rows: Option<usize>,
     cancel_token: Option<CancellationToken>,
     timeout_duration: Option<Duration>,
+    cancel_context: Option<PostgresCancelContext>,
 ) -> Result<QueryResult, String> {
     let start = Instant::now();
     let checkout_start = Instant::now();
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let checkout_timeout = crate::db::connection_timeout();
+    let client = checkout_postgres_client(pool, cancel_token.as_ref(), checkout_timeout).await?;
     log::info!(
         "[postgres][execute_with_schema:pool:done] elapsed_ms={} total_ms={} schema={}",
         checkout_start.elapsed().as_millis(),
@@ -1890,6 +1941,7 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
         let pg_cancel_token = client.cancel_token();
         return wait_postgres_query(
             pg_cancel_token,
+            cancel_context,
             cancel_token,
             timeout_duration,
             execute_query_with_max_rows_inner(&client, sql, max_rows),
@@ -1909,6 +1961,7 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
     let pg_cancel_token = client.cancel_token();
     let result = wait_postgres_query(
         pg_cancel_token,
+        cancel_context,
         cancel_token,
         timeout_duration,
         execute_query_with_max_rows_inner(&client, sql, max_rows),
@@ -1937,6 +1990,7 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
 
 async fn wait_postgres_query<T, F>(
     pg_cancel_token: tokio_postgres::CancelToken,
+    cancel_context: Option<PostgresCancelContext>,
     cancel_token: Option<CancellationToken>,
     timeout_duration: Option<Duration>,
     future: F,
@@ -1949,13 +2003,13 @@ where
             tokio::select! {
                 biased;
                 _ = token.cancelled() => {
-                    cancel_postgres_query(pg_cancel_token).await;
+                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref()).await;
                     Err(crate::query::canceled_error())
                 }
                 result = tokio::time::timeout(duration, future) => match result {
                     Ok(result) => result,
                     Err(_) => {
-                        cancel_postgres_query(pg_cancel_token).await;
+                        cancel_postgres_query(pg_cancel_token, cancel_context.as_ref()).await;
                         Err(format!("Query timed out after {} seconds", duration.as_secs()))
                     }
                 },
@@ -1964,7 +2018,7 @@ where
         (None, Some(duration)) => match tokio::time::timeout(duration, future).await {
             Ok(result) => result,
             Err(_) => {
-                cancel_postgres_query(pg_cancel_token).await;
+                cancel_postgres_query(pg_cancel_token, cancel_context.as_ref()).await;
                 Err(format!("Query timed out after {} seconds", duration.as_secs()))
             }
         },
@@ -1972,7 +2026,7 @@ where
             tokio::select! {
                 biased;
                 _ = token.cancelled() => {
-                    cancel_postgres_query(pg_cancel_token).await;
+                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref()).await;
                     Err(crate::query::canceled_error())
                 }
                 result = future => result,
@@ -1982,11 +2036,95 @@ where
     }
 }
 
-async fn cancel_postgres_query(pg_cancel_token: tokio_postgres::CancelToken) {
-    match tokio::time::timeout(Duration::from_secs(2), pg_cancel_token.cancel_query(NoTls)).await {
+/// 带 timeout 和 cancel token 的 PostgreSQL pool checkout。
+/// checkout 阶段卡住时，cancel token 可提前终止等待。
+/// timeout 错误消息包含 "checkout timed out"，确保 is_connection_error 能正确分类。
+pub async fn checkout_postgres_client(
+    pool: &Pool,
+    cancel_token: Option<&CancellationToken>,
+    checkout_timeout: Duration,
+) -> Result<deadpool_postgres::Object, String> {
+    let start = Instant::now();
+    let get_future = async {
+        tokio::time::timeout(checkout_timeout, pool.get())
+            .await
+            .map_err(|_| {
+                let elapsed = start.elapsed().as_millis();
+                log::warn!(
+                    "[db:pool.checkout:error] elapsed_ms={} timeout_ms={} error=checkout timed out",
+                    elapsed,
+                    checkout_timeout.as_millis()
+                );
+                format!("PostgreSQL connection pool checkout timed out ({}s)", checkout_timeout.as_secs())
+            })?
+            .map_err(|e| {
+                let elapsed = start.elapsed().as_millis();
+                let err = pg_pool_error_to_string(e);
+                log::warn!(
+                    "[db:pool.checkout:error] elapsed_ms={} timeout_ms={} error={}",
+                    elapsed,
+                    checkout_timeout.as_millis(),
+                    err
+                );
+                format!("PostgreSQL connection pool checkout failed: {err}")
+            })
+    };
+
+    let result = match cancel_token {
+        Some(token) => tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                log::info!(
+                    "[db:pool.checkout:cancelled] elapsed_ms={} timeout_ms={}",
+                    start.elapsed().as_millis(),
+                    checkout_timeout.as_millis()
+                );
+                return Err(crate::query::canceled_error());
+            }
+            result = get_future => result,
+        },
+        None => get_future.await,
+    };
+    if result.is_ok() {
+        log::debug!(
+            "[db:pool.checkout:done] elapsed_ms={} timeout_ms={}",
+            start.elapsed().as_millis(),
+            checkout_timeout.as_millis()
+        );
+    }
+    result
+}
+
+async fn cancel_postgres_query(
+    pg_cancel_token: tokio_postgres::CancelToken,
+    cancel_context: Option<&PostgresCancelContext>,
+) {
+    let cancel_timeout = Duration::from_secs(5);
+    // 尝试使用 TLS connector 发送 cancel 请求（与原连接兼容）
+    if let Some(ctx) = cancel_context {
+        match make_rustls_connect_from_context(ctx) {
+            Ok(tls) => match tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(tls)).await {
+                Ok(Ok(())) => return,
+                Ok(Err(err)) => {
+                    log::warn!("Failed to send PostgreSQL TLS cancel request: {err}; falling back to NoTls");
+                }
+                Err(_) => {
+                    log::warn!(
+                        "Timed out sending PostgreSQL TLS cancel request ({}s); falling back to NoTls",
+                        cancel_timeout.as_secs()
+                    );
+                }
+            },
+            Err(err) => {
+                log::warn!("Failed to build TLS connector for cancel, falling back to NoTls: {err}");
+            }
+        }
+    }
+    // 降级到 NoTls
+    match tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(NoTls)).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => log::warn!("Failed to send PostgreSQL cancel request: {err}"),
-        Err(_) => log::warn!("Timed out sending PostgreSQL cancel request"),
+        Err(_) => log::warn!("Timed out sending PostgreSQL cancel request ({}s)", cancel_timeout.as_secs()),
     }
 }
 
@@ -2118,7 +2256,7 @@ async fn list_indexes_with_sql(
 }
 
 pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     match list_indexes_with_sql(&client, POSTGRES_INDEXES_SQL, schema, table).await {
         Ok(indexes) => Ok(indexes),
         Err(primary_error) => match list_indexes_with_sql(&client, POSTGRES_INDEXES_COMPAT_SQL, schema, table).await {
@@ -2138,7 +2276,7 @@ pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<
 }
 
 pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT fk.constraint_name, fk.column_name, \
@@ -2179,7 +2317,7 @@ pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result
 }
 
 pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec<TriggerInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT trigger_name, event_manipulation, action_timing \
@@ -2203,7 +2341,7 @@ pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec
 }
 
 pub async fn list_functions(pool: &Pool, schema: &str) -> Result<Vec<FunctionInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     // Use pg_proc + pg_get_functiondef() instead of information_schema.routines
     // for reliable function definition retrieval (information_schema.routines.routine_definition
     // is NULL for non-SQL functions like plpgsql)
@@ -2245,7 +2383,7 @@ pub async fn list_functions(pool: &Pool, schema: &str) -> Result<Vec<FunctionInf
 }
 
 pub async fn list_sequences(pool: &Pool, schema: &str, with_last_values: bool) -> Result<Vec<SequenceInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     // Use pg_class + pg_sequence + pg_namespace instead of pg_sequences view
     // for better compatibility and permission handling
     let stmt = client
@@ -2305,7 +2443,7 @@ pub async fn list_sequences(pool: &Pool, schema: &str, with_last_values: bool) -
 }
 
 pub async fn list_rules(pool: &Pool, schema: &str) -> Result<Vec<RuleInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT schemaname, tablename, rulename, definition \
@@ -2328,7 +2466,7 @@ pub async fn list_rules(pool: &Pool, schema: &str) -> Result<Vec<RuleInfo>, Stri
 }
 
 pub async fn list_owners(pool: &Pool, schema: &str) -> Result<Vec<OwnerInfo>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stmt = client.prepare_cached(POSTGRES_OWNERS_SQL).await.map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[&schema]).await.map_err(|e| e.to_string())?;
 
@@ -2352,14 +2490,14 @@ pub async fn execute_batch(pool: &Pool, statements: &[String]) -> Result<(), Str
     if combined.is_empty() {
         return Ok(());
     }
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     client.batch_execute(&combined).await.map_err(pg_error_to_string)?;
     clear_postgres_caches_after_ddl(pool, Some(&client), &combined);
     Ok(())
 }
 
 pub async fn terminate_current_user_database_backends(pool: &Pool, database: &str) -> Result<u64, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     client
         .execute(
             "SELECT pg_terminate_backend(pid) \
@@ -2395,7 +2533,7 @@ fn invalidates_postgres_statement_cache(sql: &str) -> bool {
 /// `COPY table (col1, col2) TO STDOUT (FORMAT CSV, HEADER)`.
 /// Returns the raw COPY output bytes.
 pub async fn copy_out(pool: &Pool, sql: &str) -> Result<Vec<u8>, String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let stream = client.copy_out(sql).await.map_err(pg_error_to_string)?;
     tokio::pin!(stream);
     let mut result = Vec::new();
@@ -2409,7 +2547,7 @@ pub async fn copy_out(pool: &Pool, sql: &str) -> Result<Vec<u8>, String> {
 /// `COPY table (col1, col2) FROM STDIN (FORMAT CSV)`.
 /// `data` is the raw input in the format specified by the COPY command.
 pub async fn copy_in(pool: &Pool, sql: &str, data: &[u8]) -> Result<(), String> {
-    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
     let sink = client.copy_in::<str, bytes::Bytes>(sql).await.map_err(pg_error_to_string)?;
     let mut sink = Box::pin(sink);
     sink.as_mut().send(bytes::Bytes::copy_from_slice(data)).await.map_err(pg_error_to_string)?;

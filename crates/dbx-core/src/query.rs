@@ -38,6 +38,50 @@ pub enum PoolErrorAction {
     ReconnectAndRetry,
 }
 
+/// 统一数据库操作执行预算。
+/// query_timeout = None 仅表示 SQL 执行不设上限；
+/// checkout/connect/recycle/cancel/cleanup 始终有硬性上限，不允许禁用。
+#[derive(Debug, Clone)]
+pub struct DbOperationBudget {
+    pub checkout_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub recycle_timeout: Duration,
+    pub query_timeout: Option<Duration>,
+    pub cancel_timeout: Duration,
+    pub cleanup_timeout: Duration,
+}
+
+impl DbOperationBudget {
+    /// 从连接配置构建执行预算。
+    /// checkout/connect/recycle 使用 connect_timeout_secs（下限 1s，上限 300s）。
+    /// query_timeout 遵循 resolve_query_timeout 语义（Some(0) → None）。
+    /// cancel/cleanup 为固定值，不允许禁用。
+    pub fn from_config(connect_timeout_secs: u64, query_timeout_secs: Option<u64>) -> Self {
+        let infra_timeout = Duration::from_secs(connect_timeout_secs.clamp(1, 300));
+        Self {
+            checkout_timeout: infra_timeout,
+            connect_timeout: infra_timeout,
+            recycle_timeout: infra_timeout,
+            query_timeout: resolve_query_timeout(query_timeout_secs),
+            cancel_timeout: Duration::from_secs(5),
+            cleanup_timeout: Duration::from_secs(3),
+        }
+    }
+
+    /// 使用全局默认值（无连接配置时）。
+    pub fn with_defaults() -> Self {
+        let default_infra = crate::db::connection_timeout();
+        Self {
+            checkout_timeout: default_infra,
+            connect_timeout: default_infra,
+            recycle_timeout: default_infra,
+            query_timeout: Some(QUERY_TIMEOUT),
+            cancel_timeout: Duration::from_secs(5),
+            cleanup_timeout: Duration::from_secs(3),
+        }
+    }
+}
+
 /// Check read-only protection for a connection, blocking write SQL statements.
 /// Only clones the connection name when read-only mode is active, avoiding
 /// unnecessary allocations otherwise.
@@ -656,6 +700,7 @@ pub fn is_connection_error(err: &str) -> bool {
         || lower.contains("broken pipe")
         || lower.contains("reset by peer")
         || lower.contains("timed out")
+        || (lower.contains("pool") && lower.contains("timeout"))
         || lower.contains("closed")
         || lower.contains("关闭的连接")
         || lower.contains("连接已关闭")
@@ -913,6 +958,7 @@ pub async fn do_execute(
             let schema = schema.map(|s| s.to_string());
             let max_rows = options.max_rows;
             let query_timeout = query_timeout;
+            let cancel_context = state.get_postgres_cancel_context(pool_key).await;
             drop(connections);
             if let Some(schema) = schema {
                 db::postgres::execute_query_with_schema_and_max_rows_and_cancel(
@@ -922,11 +968,19 @@ pub async fn do_execute(
                     max_rows,
                     cancel_token,
                     query_timeout,
+                    cancel_context,
                 )
                 .await
             } else {
-                db::postgres::execute_query_with_max_rows_and_cancel(&p, sql, max_rows, cancel_token, query_timeout)
-                    .await
+                db::postgres::execute_query_with_max_rows_and_cancel(
+                    &p,
+                    sql,
+                    max_rows,
+                    cancel_token,
+                    query_timeout,
+                    cancel_context,
+                )
+                .await
             }
         }
         PoolKind::Sqlite(p) => {
@@ -2208,6 +2262,41 @@ mod tests {
     }
 
     #[test]
+    fn db_operation_budget_from_config() {
+        let budget = DbOperationBudget::from_config(10, Some(30));
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(10));
+        assert_eq!(budget.connect_timeout, Duration::from_secs(10));
+        assert_eq!(budget.recycle_timeout, Duration::from_secs(10));
+        assert_eq!(budget.query_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
+        assert_eq!(budget.cleanup_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn db_operation_budget_query_timeout_zero_means_no_limit() {
+        let budget = DbOperationBudget::from_config(10, Some(0));
+        assert_eq!(budget.query_timeout, None);
+        // Infrastructure timeouts still have hard limits
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(10));
+        assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn db_operation_budget_clamps_infra_timeout() {
+        let budget = DbOperationBudget::from_config(0, Some(30));
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(1)); // clamped to min 1s
+        let budget = DbOperationBudget::from_config(600, Some(30));
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(300)); // clamped to max 300s
+    }
+
+    #[test]
+    fn db_operation_budget_with_defaults() {
+        let budget = DbOperationBudget::with_defaults();
+        assert_eq!(budget.checkout_timeout, crate::db::connection_timeout());
+        assert_eq!(budget.query_timeout, Some(QUERY_TIMEOUT));
+    }
+
+    #[test]
     fn is_connection_error_detects_english_messages() {
         assert!(is_connection_error("connection reset"));
         assert!(is_connection_error("broken pipe"));
@@ -2253,6 +2342,20 @@ mod tests {
         assert!(!is_connection_error("ORA-00942: table or view does not exist"));
         assert!(!is_connection_error("syntax error at position 5"));
         assert!(!is_connection_error("os error 13"));
+    }
+
+    #[test]
+    fn is_connection_error_detects_deadpool_pool_timeouts() {
+        // deadpool-postgres PoolError::Timeout messages (contain "pool" + "timeout" but not "timed out")
+        assert!(is_connection_error("pool wait timeout"));
+        assert!(is_connection_error("pool create timeout"));
+        assert!(is_connection_error("pool recycle timeout"));
+        // checkout helper timeout messages
+        assert!(is_connection_error("PostgreSQL connection pool checkout timed out (5s)"));
+        assert!(is_connection_error("MySQL get connection timed out"));
+        assert!(is_connection_error("MySQL ping timed out"));
+        assert!(is_connection_error("MySQL kill connection checkout timed out"));
+        assert!(is_connection_error("MySQL KILL QUERY timed out"));
     }
 
     #[test]
