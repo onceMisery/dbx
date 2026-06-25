@@ -94,6 +94,29 @@ pub struct DbOperationBudget {
 
 其中 `query_timeout = None` 仅表示 SQL 执行不设上限；连接检出、健康检查、取消和清理仍必须有安全上限。
 
+#### SQL 执行超时与基础设施超时的边界原则
+
+本 PIP 区分两类超时，语义不可混淆：
+
+**1. SQL 执行超时 — 遵循用户配置**
+
+- `query_timeout_secs = 0`：表示 SQL 执行本身不设超时。前端不得静默将其变为有限值（如 60s）。现有代码已正确处理：前端 `withFrontendQueryTimeout` 在 `timeoutSecs === 0` 时直接返回 promise 不加超时；后端 `resolve_query_timeout` 在 `Some(0)` 时返回 `None`。
+- `query_timeout_secs > 0`：SQL 执行超时为用户配置值。前端兜底超时设为配置值的 2 倍，让后端先触发自己的超时，前端超时仅作为网络异常下的兜底。
+- `query_timeout_secs` 缺失或无效：使用默认值 30s（`DEFAULT_QUERY_TIMEOUT_SECS`）。
+
+**2. 基础设施超时 — 始终有硬性上限**
+
+以下阶段与 SQL 执行无关，即使用户设置 `query_timeout_secs = 0`，也必须有硬性超时上限，否则可能导致应用永久挂起：
+
+- pool checkout（连接池等待）
+- pool create（新建连接）
+- pool recycle（回收验证）
+- 健康检查（ping）
+- 取消请求（PostgreSQL cancel / MySQL KILL QUERY）
+- 连接池清理
+
+这些超时值由 `DbOperationBudget` 中对应的非 `Option` 字段控制，不受 `query_timeout_secs` 影响。
+
 #### checkout 阶段的 cancel token 集成
 
 `deadpool-postgres` 的 `pool.get()` 不原生接受 `CancellationToken`。当前代码中 `pool.get().await` 为裸调用，无法在 checkout 阶段响应取消请求。
@@ -195,7 +218,7 @@ async fn cancel_postgres_query(
 | `ensureConnected`（首次连接） | `connect_timeout_secs + 2s` | `connectionAttemptTimeoutMs(config)` | 已有实现，复用现有逻辑。Agent 驱动类型有 30s 下限。 |
 | `ensureConnected`（健康检查快路径） | 5s | 固定值 | 当 `hasRecentConnectionHealthCheck` 为 true 时跳过；否则调用 `checkConnectionHealth`，需加 5s 超时。当前代码缺少此超时。 |
 | `checkConnectionHealth` | `max(connect_timeout_secs * 2, 5s)` | 基于连接超时倍数 | 健康检查应在连接超时的 2 倍内完成，但不低于 5s。当前代码无超时保护。 |
-| `executeMulti`（SQL 执行） | `max(query_timeout_secs, 30s) + 5s` | 查询超时 + 网络余量 | 当 `query_timeout_secs = 0` 时使用 60s 兜底。复用 `metadataLoadTimeoutMs` 的模式。 |
+| `executeMulti`（SQL 执行） | `query_timeout_secs > 0` 时为 `query_timeout_secs * 2`；`query_timeout_secs = 0` 时为 `0`（不设超时） | 前端超时是后端超时的 2 倍，让后端先触发自己的超时 | 现有实现已正确处理：`queryTimeoutSecs === 0 ? 0 : frontendTimeoutSecs`。前端超时仅作为兜底，不是 SQL 执行本身的超时控制。 |
 | `cancelQuery` | 10s | 固定值 | 取消请求应在 10s 内返回。超时后强制清理 `isCancelling` 状态。当前代码无超时保护。 |
 | 连接树元数据刷新 | `max(query_timeout_secs + 5s, 15s)` | 复用 `metadataLoadTimeoutMs` | 已有实现，`query_timeout_secs = 0` 时使用 60s。 |
 
@@ -266,7 +289,12 @@ keepalive 是预防手段，不能替代超时和清池恢复。
 
 ### 查询超时
 
-`query_timeout_secs = 0` 继续表示不限制 SQL 执行时间。但连接检出、健康检查、取消、清理必须保留硬性上限，否则仍可能导致应用永久挂起。
+`query_timeout_secs = 0` 继续表示不限制 SQL 执行时间。这一语义在前后端必须保持一致：
+
+- **后端**：`resolve_query_timeout(Some(0))` 返回 `None`，SQL 执行不受 `tokio::time::timeout` 约束。
+- **前端**：`withFrontendQueryTimeout` 在 `timeoutSecs === 0` 时直接返回 promise，不施加前端超时。
+
+本 PIP 不得在任何路径中静默将 `query_timeout_secs = 0` 变为有限 SQL 超时。连接检出、健康检查、取消、清理属于基础设施阶段，必须有独立于 `query_timeout_secs` 的硬性上限（见"SQL 执行超时与基础设施超时的边界原则"）。
 
 ### MySQL session-scoped pool
 
