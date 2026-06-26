@@ -136,8 +136,8 @@ pub struct AppState {
     pub plugins: PluginRegistry,
     pub agent_manager: crate::agent_manager::AgentManager,
     pub nacos_registry: crate::nacos::NacosAdminRegistry,
-    /// PostgreSQL TLS cancel 上下文，keyed by pool_key。
-    /// 用于 cancel 时重建与原连接兼容的 TLS connector。
+    /// PostgreSQL TLS cancel context, keyed by pool_key.
+    /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
@@ -594,7 +594,7 @@ impl AppState {
         self.pool_activity.write().await.insert(pool_key.to_string(), PoolActivity::now());
     }
 
-    /// 获取 PostgreSQL TLS cancel 上下文（用于取消查询时重建 TLS connector）。
+    /// Get the PostgreSQL TLS cancel context (used to reconstruct the TLS connector when cancelling a query).
     pub async fn get_postgres_cancel_context(&self, pool_key: &str) -> Option<db::postgres::PostgresCancelContext> {
         self.postgres_cancel_contexts.read().await.get(pool_key).cloned()
     }
@@ -697,7 +697,7 @@ impl AppState {
             | DatabaseType::Questdb
             | DatabaseType::OpenGauss => {
                 let pg_pool = db::postgres::connect(&url, connect_timeout).await?;
-                // 构建 TLS cancel 上下文，用于取消时重建 TLS 连接
+                // Build TLS cancel context for reconstructing TLS connection during cancel
                 if let Some(ctx) = db::postgres::build_postgres_cancel_context(&url) {
                     self.postgres_cancel_contexts.write().await.insert(pool_key.clone(), ctx);
                 }

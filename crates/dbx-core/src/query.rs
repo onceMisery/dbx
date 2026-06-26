@@ -38,9 +38,9 @@ pub enum PoolErrorAction {
     ReconnectAndRetry,
 }
 
-/// 统一数据库操作执行预算。
-/// query_timeout = None 仅表示 SQL 执行不设上限；
-/// checkout/connect/recycle/cancel/cleanup 始终有硬性上限，不允许禁用。
+/// Unified database operation execution budget.
+/// query_timeout = None only means SQL execution has no upper limit;
+/// checkout/connect/recycle/cancel/cleanup always have hard upper limits and cannot be disabled.
 #[derive(Debug, Clone)]
 pub struct DbOperationBudget {
     pub checkout_timeout: Duration,
@@ -52,10 +52,10 @@ pub struct DbOperationBudget {
 }
 
 impl DbOperationBudget {
-    /// 从连接配置构建执行预算。
-    /// checkout/connect/recycle 使用 connect_timeout_secs（下限 1s，上限 300s）。
-    /// query_timeout 遵循 resolve_query_timeout 语义（Some(0) → None）。
-    /// cancel/cleanup 为固定值，不允许禁用。
+    /// Build an execution budget from connection config.
+    /// checkout/connect/recycle use connect_timeout_secs (clamped to 1s minimum, 300s maximum).
+    /// query_timeout follows resolve_query_timeout semantics (Some(0) -> None).
+    /// cancel/cleanup are fixed values and cannot be disabled.
     pub fn from_config(connect_timeout_secs: u64, query_timeout_secs: Option<u64>) -> Self {
         let infra_timeout = Duration::from_secs(connect_timeout_secs.clamp(1, 300));
         Self {
@@ -72,7 +72,7 @@ impl DbOperationBudget {
         Self::from_config(config.effective_connect_timeout_secs(), Some(config.query_timeout_secs))
     }
 
-    /// 使用全局默认值（无连接配置时）。
+    /// Use global default values (when no connection config is available).
     pub fn with_defaults() -> Self {
         let default_infra = db::connection_timeout();
         Self {
