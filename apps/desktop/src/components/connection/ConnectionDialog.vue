@@ -131,7 +131,7 @@ const defaultForm = (): ConnectionForm => ({
   connect_timeout_secs: 10,
   query_timeout_secs: 30,
   idle_timeout_secs: 60,
-  keepalive_interval_secs: 0,
+  keepalive_interval_secs: 30,
   ssl: false,
   ca_cert_path: "",
   client_cert_path: "",
@@ -866,7 +866,7 @@ watch(
         connect_timeout_secs: config.connect_timeout_secs || 10,
         query_timeout_secs: config.query_timeout_secs ?? 30,
         idle_timeout_secs: config.idle_timeout_secs ?? 60,
-        keepalive_interval_secs: config.keepalive_interval_secs ?? 0,
+        keepalive_interval_secs: config.keepalive_interval_secs ?? 30,
         ssl: config.ssl || false,
         ca_cert_path: config.ca_cert_path || "",
         client_cert_path: config.client_cert_path || "",
@@ -1469,7 +1469,7 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   const idleTimeout = Number(config.idle_timeout_secs);
   config.idle_timeout_secs = Number.isFinite(idleTimeout) && idleTimeout >= 0 ? idleTimeout : 60;
   const keepaliveInterval = Number(config.keepalive_interval_secs);
-  config.keepalive_interval_secs = Number.isFinite(keepaliveInterval) && keepaliveInterval >= 0 ? keepaliveInterval : 0;
+  config.keepalive_interval_secs = Number.isFinite(keepaliveInterval) && keepaliveInterval >= 0 ? keepaliveInterval : 30;
   if (config.db_type === "manticoresearch") {
     config.url_params = "";
   }

@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::{AppState, PoolKind};
 use crate::database_capabilities;
 use crate::db;
-use crate::models::connection::DatabaseType;
+use crate::models::connection::{ConnectionConfig, DatabaseType};
 #[cfg(feature = "duckdb-bundled")]
 use crate::sql::starts_with_duckdb_result_sql_keyword;
 use crate::sql::{split_sql_batches, split_sql_statements};
@@ -66,6 +66,10 @@ impl DbOperationBudget {
             cancel_timeout: Duration::from_secs(5),
             cleanup_timeout: Duration::from_secs(3),
         }
+    }
+
+    pub fn from_connection_config(config: &ConnectionConfig) -> Self {
+        Self::from_config(config.effective_connect_timeout_secs(), Some(config.query_timeout_secs))
     }
 
     /// 使用全局默认值（无连接配置时）。
@@ -886,14 +890,25 @@ pub async fn do_execute(
     let _activity_touch = state.pool_activity_touch(pool_key);
 
     let query_timeout = resolve_query_timeout(options.timeout_secs);
-    let (_duckdb_attached_names, conn_name_if_readonly) = {
+    let (_duckdb_attached_names, conn_name_if_readonly, operation_budget) = {
         let configs = state.configs.read().await;
         let config = crate::connection::config_for_pool_key(pool_key, &configs);
         let attached = config
             .map(|c| c.attached_databases.iter().map(|db| db.name.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
         let conn_name = config.filter(|c| c.read_only).map(|c| c.name.clone());
-        (attached, conn_name)
+        let budget = config
+            .map(|config| {
+                let mut budget = DbOperationBudget::from_connection_config(config);
+                budget.query_timeout = query_timeout;
+                budget
+            })
+            .unwrap_or_else(|| {
+                let mut budget = DbOperationBudget::with_defaults();
+                budget.query_timeout = query_timeout;
+                budget
+            });
+        (attached, conn_name, budget)
     };
     if let Some(name) = conn_name_if_readonly {
         crate::query_execution_sql::check_read_only(sql, &name)?;
@@ -957,7 +972,6 @@ pub async fn do_execute(
             let p = p.clone();
             let schema = schema.map(|s| s.to_string());
             let max_rows = options.max_rows;
-            let query_timeout = query_timeout;
             let cancel_context = state.get_postgres_cancel_context(pool_key).await;
             drop(connections);
             if let Some(schema) = schema {
@@ -967,7 +981,7 @@ pub async fn do_execute(
                     sql,
                     max_rows,
                     cancel_token,
-                    query_timeout,
+                    operation_budget.clone(),
                     cancel_context,
                 )
                 .await
@@ -977,7 +991,7 @@ pub async fn do_execute(
                     sql,
                     max_rows,
                     cancel_token,
-                    query_timeout,
+                    operation_budget.clone(),
                     cancel_context,
                 )
                 .await
@@ -2184,6 +2198,54 @@ mod tests {
     use super::*;
     use crate::models::connection::{default_redis_key_separator, ConnectionConfig, DatabaseType};
 
+    fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
+        ConnectionConfig {
+            id: "conn-1".to_string(),
+            name: "Connection".to_string(),
+            db_type,
+            driver_profile: None,
+            driver_label: None,
+            url_params: None,
+            host: "localhost".to_string(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            database: None,
+            visible_databases: None,
+            visible_schemas: None,
+            attached_databases: Vec::new(),
+            color: None,
+            transport_layers: Vec::new(),
+            connect_timeout_secs: 10,
+            query_timeout_secs: 30,
+            idle_timeout_secs: 60,
+            keepalive_interval_secs: 30,
+            ssl: false,
+            ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
+            sysdba: false,
+            oracle_connection_type: None,
+            connection_string: None,
+            redis_connection_mode: None,
+            redis_sentinel_master: String::new(),
+            redis_sentinel_nodes: String::new(),
+            redis_sentinel_username: String::new(),
+            redis_sentinel_password: String::new(),
+            redis_sentinel_tls: false,
+            redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
+            etcd_endpoints: String::new(),
+            gbase_server: String::new(),
+            informix_server: String::new(),
+            external_config: None,
+            jdbc_driver_class: None,
+            jdbc_driver_paths: Vec::new(),
+            one_time: false,
+            read_only: false,
+        }
+    }
+
     #[tokio::test]
     async fn wait_for_query_returns_cancelled_when_token_is_cancelled() {
         let token = CancellationToken::new();
@@ -2268,6 +2330,22 @@ mod tests {
         assert_eq!(budget.connect_timeout, Duration::from_secs(10));
         assert_eq!(budget.recycle_timeout, Duration::from_secs(10));
         assert_eq!(budget.query_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
+        assert_eq!(budget.cleanup_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn db_operation_budget_from_connection_config_uses_connection_settings() {
+        let mut config = test_connection_config(DatabaseType::Postgres);
+        config.connect_timeout_secs = 12;
+        config.query_timeout_secs = 0;
+
+        let budget = DbOperationBudget::from_connection_config(&config);
+
+        assert_eq!(budget.checkout_timeout, Duration::from_secs(12));
+        assert_eq!(budget.connect_timeout, Duration::from_secs(12));
+        assert_eq!(budget.recycle_timeout, Duration::from_secs(12));
+        assert_eq!(budget.query_timeout, None);
         assert_eq!(budget.cancel_timeout, Duration::from_secs(5));
         assert_eq!(budget.cleanup_timeout, Duration::from_secs(3));
     }

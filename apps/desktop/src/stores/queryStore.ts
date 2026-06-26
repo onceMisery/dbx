@@ -49,6 +49,7 @@ const STORAGE_KEY = "dbx-open-tabs";
 const ACTIVE_TAB_KEY = "dbx-active-tab";
 const ORACLE_LIKE_METADATA_TYPES = new Set<string>(["oracle", "dameng", "oceanbase-oracle"]);
 const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export"] as const;
+const CANCEL_QUERY_TIMEOUT_MS = 10_000;
 
 interface BuildQueryResultExportRequestOptions {
   exportId: string;
@@ -91,6 +92,20 @@ async function withFrontendQueryTimeout<T>(promise: Promise<T>, timeoutSecs: num
       promise,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error(message)), timeoutSecs * 1000);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function withCancelQueryTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Cancel request timed out after 10s.")), CANCEL_QUERY_TIMEOUT_MS);
       }),
     ]);
   } finally {
@@ -1946,7 +1961,7 @@ export const useQueryStore = defineStore("query", () => {
     if (!executionId) return false;
     tab.isCancelling = true;
     try {
-      const canceled = await api.cancelQuery(executionId);
+      const canceled = await withCancelQueryTimeout(api.cancelQuery(executionId));
       if (!canceled) {
         const current = tabs.value.find((t) => t.id === id);
         if (current && current.executionId === executionId) {
@@ -1962,7 +1977,10 @@ export const useQueryStore = defineStore("query", () => {
       if (tab) useConnectionStore().recordConnectionLostError(tab.connectionId, e);
       const current = tabs.value.find((t) => t.id === id);
       if (current && current.executionId === executionId) {
+        current.isExecuting = false;
         current.isCancelling = false;
+        current.executionId = undefined;
+        current.queryExecutionStartedAt = undefined;
         current.result = toErrorResult(e);
       }
       return false;

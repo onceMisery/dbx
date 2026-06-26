@@ -1015,7 +1015,7 @@ pub async fn connect_bare_with_pool_limit(
 }
 
 pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = match conn.query_iter("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME").await
     {
         Ok(result) => result,
@@ -1036,7 +1036,7 @@ pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, Strin
 }
 
 pub async fn list_databases_show(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = conn.query_iter("SHOW DATABASES").await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(database_infos_from_names(rows.iter().map(|row| get_str(row, 0)), true))
@@ -1067,7 +1067,7 @@ pub async fn list_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableIn
         "SELECT TABLE_NAME, TABLE_TYPE, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = {} ORDER BY TABLE_NAME",
         quote_value(database),
     );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = match conn.query_iter(&sql).await {
         Ok(result) => result,
         Err(err) => {
@@ -1115,7 +1115,7 @@ pub async fn completion_assistant_search(
         request.object_kinds.clone()
     };
     let pattern = mysql_completion_like_pattern(&request.mask, request.match_mode.as_ref());
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let mut candidates = Vec::new();
 
     if kinds
@@ -1338,7 +1338,7 @@ fn table_comment_sql(database: &str, table: &str) -> String {
 
 pub async fn get_table_comment(pool: &MySqlPool, database: &str, table: &str) -> Result<Option<String>, String> {
     let sql = table_comment_sql(database, table);
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(rows
@@ -1361,7 +1361,7 @@ async fn list_table_status_show(pool: &MySqlPool, database: &str) -> Result<Hash
     } else {
         format!("SHOW TABLE STATUS FROM {}", quote_identifier(database))
     };
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(rows
@@ -1384,7 +1384,7 @@ async fn list_table_status_show(pool: &MySqlPool, database: &str) -> Result<Hash
 
 async fn list_table_names_show(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
     let sql = show_tables_sql(database, true);
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let rows: Vec<mysql_async::Row> = match conn.query_iter(&sql).await {
         Ok(result) => result.collect_and_drop().await.map_err(|e| e.to_string())?,
         Err(_) => {
@@ -1506,7 +1506,7 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
 }
 
 pub async fn list_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
 
     let tables_sql = list_tables_objects_sql(database);
     let result = conn.query_iter(&tables_sql).await.map_err(|e| e.to_string())?;
@@ -1542,7 +1542,7 @@ pub async fn list_object_statistics(pool: &MySqlPool, database: &str) -> Result<
          ORDER BY TABLE_NAME",
         quote_value(database),
     );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(rows
@@ -1589,7 +1589,7 @@ pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result
 }
 
 async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let routines_sql = list_routines_sql(database);
     let result = conn.query_iter(&routines_sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
@@ -1597,7 +1597,7 @@ async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<Ob
 }
 
 pub async fn list_completion_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let mut objects = Vec::new();
 
     let routines_sql = list_routines_sql(database);
@@ -1940,7 +1940,7 @@ pub async fn get_conn_with_health_check(pool: &MySqlPool) -> Result<mysql_async:
     }
 }
 
-async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<mysql_async::Conn, String> {
+pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<mysql_async::Conn, String> {
     tokio::time::timeout(timeout, pool.get_conn())
         .await
         .map_err(|_| "MySQL get connection timed out".to_string())?
@@ -2384,7 +2384,7 @@ pub async fn list_indexes(pool: &MySqlPool, database: &str, table: &str) -> Resu
         quote_value(database),
         quote_value(table),
     );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
@@ -2422,7 +2422,7 @@ pub async fn list_foreign_keys(pool: &MySqlPool, database: &str, table: &str) ->
         quote_value(database),
         quote_value(table),
     );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
@@ -2449,7 +2449,7 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
         quote_value(database),
         quote_value(table),
     );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 

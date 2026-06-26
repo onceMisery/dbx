@@ -21,6 +21,7 @@ use tokio_postgres::{NoTls, Row, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
 use super::file_validator::validate_file_path;
+use crate::query::DbOperationBudget;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
     ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
@@ -857,16 +858,22 @@ pub struct PostgresCancelContext {
     pub ssl_files: PostgresSslFiles,
     pub accepts_invalid_certs: bool,
     pub verifies_hostname: bool,
+    pub ssl_mode: SslMode,
 }
 
 /// 从连接 URL 构建 TLS cancel 上下文。
 /// 返回 None 表示 URL 解析失败或 sslmode=disable（无需 TLS cancel）。
 pub fn build_postgres_cancel_context(url: &str) -> Option<PostgresCancelContext> {
     let postgres_url = postgres_connection_url(url).ok()?;
+    let pg_config = tokio_postgres::Config::from_str(&postgres_url.url).ok()?;
+    if pg_config.get_ssl_mode() == SslMode::Disable {
+        return None;
+    }
     Some(PostgresCancelContext {
         ssl_files: postgres_url.ssl_files,
         accepts_invalid_certs: postgres_url.accepts_invalid_certs,
         verifies_hostname: postgres_url.verifies_hostname,
+        ssl_mode: pg_config.get_ssl_mode(),
     })
 }
 
@@ -876,7 +883,7 @@ fn make_rustls_connect_from_context(
 ) -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
     // 构建一个最小 pg_config 仅用于 ssl_mode 判断
     let mut pg_config = tokio_postgres::Config::new();
-    pg_config.ssl_mode(SslMode::Require);
+    pg_config.ssl_mode(ctx.ssl_mode);
     let tls_config = postgres_tls_config(&pg_config, &ctx.ssl_files, ctx.accepts_invalid_certs, ctx.verifies_hostname)?;
     Ok(tokio_postgres_rustls::MakeRustlsConnect::new(tls_config))
 }
@@ -892,15 +899,22 @@ struct PostgresConnectionUrl {
 /// 注入 TCP keepalive 参数到 PostgreSQL URL（仅在用户未显式指定时）。
 /// 默认参数缩短半开连接检测时间，适合桌面/VPN/NAT 环境。
 fn inject_postgres_keepalive_params(url: &str) -> String {
-    let query = url.split('?').nth(1);
+    let (base, fragment) = url.split_once('#').map_or((url, ""), |(base, fragment)| (base, fragment));
+    let query = base.split('?').nth(1);
     let has_keepalives = query
         .map(|q| q.split('&').any(|p| p.split('=').next().is_some_and(|k| k.eq_ignore_ascii_case("keepalives"))))
         .unwrap_or(false);
     if has_keepalives {
         return url.to_string(); // 用户已显式配置
     }
-    let separator = if url.contains('?') { "&" } else { "?" };
-    format!("{url}{separator}keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_retries=3")
+    let separator = if base.contains('?') { "&" } else { "?" };
+    let injected =
+        format!("{base}{separator}keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_retries=3");
+    if fragment.is_empty() {
+        injected
+    } else {
+        format!("{injected}#{fragment}")
+    }
 }
 
 fn postgres_connection_url(url: &str) -> Result<PostgresConnectionUrl, String> {
@@ -1839,17 +1853,17 @@ pub async fn execute_query_with_max_rows_and_cancel(
     sql: &str,
     max_rows: Option<usize>,
     cancel_token: Option<CancellationToken>,
-    timeout_duration: Option<Duration>,
+    budget: DbOperationBudget,
     cancel_context: Option<PostgresCancelContext>,
 ) -> Result<QueryResult, String> {
-    let checkout_timeout = crate::db::connection_timeout();
-    let client = checkout_postgres_client(pool, cancel_token.as_ref(), checkout_timeout).await?;
+    let client = checkout_postgres_client(pool, cancel_token.as_ref(), budget.checkout_timeout).await?;
     let pg_cancel_token = client.cancel_token();
     wait_postgres_query(
         pg_cancel_token,
         cancel_context,
         cancel_token,
-        timeout_duration,
+        budget.query_timeout,
+        budget.cancel_timeout,
         execute_query_with_max_rows_inner(&client, sql, max_rows),
     )
     .await
@@ -1883,7 +1897,13 @@ pub async fn execute_query_with_schema_and_max_rows(
     }
 
     let set_schema_start = Instant::now();
-    client.execute(&format!("SET search_path TO {}", pg_quote_ident(schema)), &[]).await.map_err(pg_error_to_string)?;
+    execute_postgres_infra_statement(
+        &client,
+        &format!("SET search_path TO {}", pg_quote_ident(schema)),
+        crate::db::connection_timeout(),
+        "schema.set",
+    )
+    .await?;
     log::info!(
         "[postgres][execute_with_schema:set-search-path:done] elapsed_ms={} total_ms={}",
         set_schema_start.elapsed().as_millis(),
@@ -1904,12 +1924,26 @@ pub async fn execute_query_with_schema_and_max_rows(
 
     // Always reset search_path so the connection is clean when returned to the pool
     let reset_start = Instant::now();
-    let _ = client.execute("RESET search_path", &[]).await;
-    log::info!(
-        "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
-        reset_start.elapsed().as_millis(),
-        start.elapsed().as_millis()
-    );
+    match execute_postgres_infra_statement(
+        &client,
+        "RESET search_path",
+        crate::db::connection_timeout(),
+        "schema.reset",
+    )
+    .await
+    {
+        Ok(_) => log::info!(
+            "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
+            reset_start.elapsed().as_millis(),
+            start.elapsed().as_millis()
+        ),
+        Err(err) => log::warn!(
+            "[postgres][execute_with_schema:reset-search-path:error] elapsed_ms={} total_ms={} error={}",
+            reset_start.elapsed().as_millis(),
+            start.elapsed().as_millis(),
+            err
+        ),
+    }
 
     result
 }
@@ -1920,13 +1954,12 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
     sql: &str,
     max_rows: Option<usize>,
     cancel_token: Option<CancellationToken>,
-    timeout_duration: Option<Duration>,
+    budget: DbOperationBudget,
     cancel_context: Option<PostgresCancelContext>,
 ) -> Result<QueryResult, String> {
     let start = Instant::now();
     let checkout_start = Instant::now();
-    let checkout_timeout = crate::db::connection_timeout();
-    let client = checkout_postgres_client(pool, cancel_token.as_ref(), checkout_timeout).await?;
+    let client = checkout_postgres_client(pool, cancel_token.as_ref(), budget.checkout_timeout).await?;
     log::info!(
         "[postgres][execute_with_schema:pool:done] elapsed_ms={} total_ms={} schema={}",
         checkout_start.elapsed().as_millis(),
@@ -1943,14 +1976,21 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
             pg_cancel_token,
             cancel_context,
             cancel_token,
-            timeout_duration,
+            budget.query_timeout,
+            budget.cancel_timeout,
             execute_query_with_max_rows_inner(&client, sql, max_rows),
         )
         .await;
     }
 
     let set_schema_start = Instant::now();
-    client.execute(&format!("SET search_path TO {}", pg_quote_ident(schema)), &[]).await.map_err(pg_error_to_string)?;
+    execute_postgres_infra_statement(
+        &client,
+        &format!("SET search_path TO {}", pg_quote_ident(schema)),
+        budget.recycle_timeout,
+        "schema.set",
+    )
+    .await?;
     log::info!(
         "[postgres][execute_with_schema:set-search-path:done] elapsed_ms={} total_ms={}",
         set_schema_start.elapsed().as_millis(),
@@ -1963,7 +2003,8 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
         pg_cancel_token,
         cancel_context,
         cancel_token,
-        timeout_duration,
+        budget.query_timeout,
+        budget.cancel_timeout,
         execute_query_with_max_rows_inner(&client, sql, max_rows),
     )
     .await;
@@ -1978,14 +2019,33 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
     );
 
     let reset_start = Instant::now();
-    let _ = client.execute("RESET search_path", &[]).await;
-    log::info!(
-        "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
-        reset_start.elapsed().as_millis(),
-        start.elapsed().as_millis()
-    );
+    match execute_postgres_infra_statement(&client, "RESET search_path", budget.cleanup_timeout, "schema.reset").await {
+        Ok(_) => log::info!(
+            "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
+            reset_start.elapsed().as_millis(),
+            start.elapsed().as_millis()
+        ),
+        Err(err) => log::warn!(
+            "[postgres][execute_with_schema:reset-search-path:error] elapsed_ms={} total_ms={} error={}",
+            reset_start.elapsed().as_millis(),
+            start.elapsed().as_millis(),
+            err
+        ),
+    }
 
     result
+}
+
+async fn execute_postgres_infra_statement(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    timeout_duration: Duration,
+    stage: &str,
+) -> Result<u64, String> {
+    tokio::time::timeout(timeout_duration, client.execute(sql, &[]))
+        .await
+        .map_err(|_| format!("PostgreSQL {stage} timed out after {} seconds", timeout_duration.as_secs()))?
+        .map_err(pg_error_to_string)
 }
 
 async fn wait_postgres_query<T, F>(
@@ -1993,6 +2053,7 @@ async fn wait_postgres_query<T, F>(
     cancel_context: Option<PostgresCancelContext>,
     cancel_token: Option<CancellationToken>,
     timeout_duration: Option<Duration>,
+    cancel_timeout: Duration,
     future: F,
 ) -> Result<T, String>
 where
@@ -2003,13 +2064,13 @@ where
             tokio::select! {
                 biased;
                 _ = token.cancelled() => {
-                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref()).await;
+                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout).await;
                     Err(crate::query::canceled_error())
                 }
                 result = tokio::time::timeout(duration, future) => match result {
                     Ok(result) => result,
                     Err(_) => {
-                        cancel_postgres_query(pg_cancel_token, cancel_context.as_ref()).await;
+                        cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout).await;
                         Err(format!("Query timed out after {} seconds", duration.as_secs()))
                     }
                 },
@@ -2018,7 +2079,7 @@ where
         (None, Some(duration)) => match tokio::time::timeout(duration, future).await {
             Ok(result) => result,
             Err(_) => {
-                cancel_postgres_query(pg_cancel_token, cancel_context.as_ref()).await;
+                cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout).await;
                 Err(format!("Query timed out after {} seconds", duration.as_secs()))
             }
         },
@@ -2026,7 +2087,7 @@ where
             tokio::select! {
                 biased;
                 _ = token.cancelled() => {
-                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref()).await;
+                    cancel_postgres_query(pg_cancel_token, cancel_context.as_ref(), cancel_timeout).await;
                     Err(crate::query::canceled_error())
                 }
                 result = future => result,
@@ -2098,34 +2159,40 @@ pub async fn checkout_postgres_client(
 async fn cancel_postgres_query(
     pg_cancel_token: tokio_postgres::CancelToken,
     cancel_context: Option<&PostgresCancelContext>,
+    cancel_timeout: Duration,
 ) {
-    let cancel_timeout = Duration::from_secs(5);
-    // 尝试使用 TLS connector 发送 cancel 请求（与原连接兼容）
+    let cancel_timeout = postgres_cancel_attempt_timeout(cancel_timeout, cancel_context);
     if let Some(ctx) = cancel_context {
         match make_rustls_connect_from_context(ctx) {
             Ok(tls) => match tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(tls)).await {
                 Ok(Ok(())) => return,
                 Ok(Err(err)) => {
-                    log::warn!("Failed to send PostgreSQL TLS cancel request: {err}; falling back to NoTls");
+                    log::warn!("Failed to send PostgreSQL TLS cancel request: {err}");
+                    return;
                 }
                 Err(_) => {
-                    log::warn!(
-                        "Timed out sending PostgreSQL TLS cancel request ({}s); falling back to NoTls",
-                        cancel_timeout.as_secs()
-                    );
+                    log::warn!("Timed out sending PostgreSQL TLS cancel request ({}s)", cancel_timeout.as_secs());
+                    return;
                 }
             },
             Err(err) => {
-                log::warn!("Failed to build TLS connector for cancel, falling back to NoTls: {err}");
+                log::warn!("Failed to build TLS connector for cancel: {err}");
+                return;
             }
         }
     }
-    // 降级到 NoTls
     match tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(NoTls)).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => log::warn!("Failed to send PostgreSQL cancel request: {err}"),
         Err(_) => log::warn!("Timed out sending PostgreSQL cancel request ({}s)", cancel_timeout.as_secs()),
     }
+}
+
+fn postgres_cancel_attempt_timeout(
+    cancel_timeout: Duration,
+    _cancel_context: Option<&PostgresCancelContext>,
+) -> Duration {
+    cancel_timeout
 }
 
 fn is_transaction_recovery_statement(sql: &str) -> bool {
@@ -2908,6 +2975,38 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("sslkey"));
+    }
+
+    #[test]
+    fn inject_postgres_keepalive_params_preserves_url_fragment() {
+        let url = "postgres://localhost/app?sslmode=require#read-only";
+
+        assert_eq!(
+            inject_postgres_keepalive_params(url),
+            "postgres://localhost/app?sslmode=require&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_retries=3#read-only"
+        );
+    }
+
+    #[test]
+    fn postgres_cancel_attempt_timeout_is_single_budget() {
+        assert_eq!(postgres_cancel_attempt_timeout(Duration::from_secs(5), None), Duration::from_secs(5));
+        assert_eq!(
+            postgres_cancel_attempt_timeout(
+                Duration::from_secs(5),
+                Some(&PostgresCancelContext {
+                    ssl_files: PostgresSslFiles::default(),
+                    accepts_invalid_certs: true,
+                    verifies_hostname: false,
+                    ssl_mode: SslMode::Require,
+                })
+            ),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn postgres_cancel_context_omits_disabled_ssl_mode() {
+        assert!(build_postgres_cancel_context("postgres://localhost/app?sslmode=disable").is_none());
     }
 
     #[test]
