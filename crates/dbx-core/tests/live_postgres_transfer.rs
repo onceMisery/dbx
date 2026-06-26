@@ -45,6 +45,7 @@ fn postgres_test_config(id: &str, database: &str) -> ConnectionConfig {
         redis_sentinel_tls: false,
         redis_cluster_nodes: String::new(),
         redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
+        redis_scan_page_size: None,
         etcd_endpoints: String::new(),
         gbase_server: String::new(),
         informix_server: String::new(),
@@ -111,6 +112,14 @@ async fn live_postgres_transfer_preserves_data_and_schema_objects() {
             source_schema, source_schema
         ),
         format!(
+            "CREATE TABLE \"{}\".\"files\" (\
+                \"id\" integer PRIMARY KEY,\
+                \"payload\" bytea NOT NULL,\
+                \"note\" text NOT NULL\
+            )",
+            source_schema
+        ),
+        format!(
             "CREATE INDEX \"users_display_name_idx\" ON \"{}\".\"users\" USING btree (lower(display_name))",
             source_schema
         ),
@@ -137,6 +146,11 @@ async fn live_postgres_transfer_preserves_data_and_schema_objects() {
             "INSERT INTO \"{}\".\"users\" (\"email\", \"status\", \"active\", \"display_name\") VALUES \
              ('alpha@example.com', 'active', true, 'Alpha'), \
              ('beta@example.com', 'disabled', false, 'Beta')",
+            source_schema
+        ),
+        format!(
+            "INSERT INTO \"{}\".\"files\" (\"id\", \"payload\", \"note\") VALUES \
+             (1, decode('48656c6c6f', 'hex'), '0x48656c6c6f')",
             source_schema
         ),
         format!(
@@ -192,7 +206,7 @@ async fn live_postgres_transfer_preserves_data_and_schema_objects() {
         target_connection_id: target_connection_id.to_string(),
         target_database: target_database.clone(),
         target_schema: target_schema.clone(),
-        tables: vec!["users".to_string(), "audit_logs".to_string()],
+        tables: vec!["users".to_string(), "audit_logs".to_string(), "files".to_string()],
         create_table: true,
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
@@ -228,6 +242,27 @@ async fn live_postgres_transfer_preserves_data_and_schema_objects() {
     assert_eq!(
         query_scalar(&target_pool, &format!("SELECT count(*) FROM \"{}\".\"audit_logs\"", target_schema)).await,
         json!(2)
+    );
+    assert_eq!(
+        query_scalar(
+            &target_pool,
+            &format!("SELECT octet_length(\"payload\") FROM \"{}\".\"files\" WHERE \"id\" = 1", target_schema)
+        )
+        .await,
+        json!(5)
+    );
+    assert_eq!(
+        query_scalar(
+            &target_pool,
+            &format!("SELECT encode(\"payload\", 'hex') FROM \"{}\".\"files\" WHERE \"id\" = 1", target_schema)
+        )
+        .await,
+        json!("48656c6c6f")
+    );
+    assert_eq!(
+        query_scalar(&target_pool, &format!("SELECT \"note\" FROM \"{}\".\"files\" WHERE \"id\" = 1", target_schema))
+            .await,
+        json!("0x48656c6c6f")
     );
     assert_eq!(
         query_scalar(

@@ -30,10 +30,11 @@ const searchInputRef = ref<HTMLInputElement>();
 const pointerInsideTree = ref(false);
 const treeScrollerRef = ref<InstanceType<typeof RecycleScroller> | null>(null);
 const plainTreeScrollerRef = ref<HTMLElement | null>(null);
+const sidebarScrollbarTrackRef = ref<HTMLElement | null>(null);
 type SearchScope = "connection" | "database" | "schema" | "table" | "view";
 const selectedSearchScopes = ref<SearchScope[]>([]);
 const searchCollapsedIds = ref<Set<string>>(new Set());
-const searchRefreshedGroupIds = new Set<string>();
+const searchRefreshedNodeIds = new Set<string>();
 let searchTimer: number | undefined;
 
 watch(
@@ -58,30 +59,45 @@ watch(deferredSearchQuery, (newQuery, oldQuery) => {
   store.sidebarSearchQuery = newQuery;
   const tasks: Promise<void>[] = [];
   for (const root of store.treeNodes) {
-    collectExpandedObjectGroups(root, tasks, newQuery ? searchRefreshedGroupIds : undefined);
+    collectExpandedObjectSearchTargets(root, tasks, newQuery ? searchRefreshedNodeIds : undefined);
   }
   if (!newQuery && oldQuery) {
-    searchRefreshedGroupIds.clear();
+    searchRefreshedNodeIds.clear();
   }
   Promise.all(tasks).catch(() => {});
 });
 
 const searchableObjectGroupTypes = new Set<TreeNodeType>(["group-tables", "group-views", "group-materialized-views"]);
+const simpleObjectParentTypes = new Set<TreeNodeType>(["database", "schema", "linked-server-schema"]);
+const simpleObjectChildTypes = new Set<TreeNodeType>(["table", "view", "materialized_view", "procedure", "function", "sequence", "package", "package-body", "load-more"]);
 
-function collectExpandedObjectGroups(node: TreeNode, tasks: Promise<void>[], refreshedGroupIds?: Set<string>) {
-  if (refreshedGroupIds && node.isExpanded && node.children) {
+function isSimpleObjectSearchParent(node: TreeNode): boolean {
+  return settingsStore.editorSettings.sidebarObjectDisplay === "simple" && simpleObjectParentTypes.has(node.type) && node.isExpanded === true && !!node.children?.some((child) => simpleObjectChildTypes.has(child.type));
+}
+
+function collectExpandedObjectSearchTargets(node: TreeNode, tasks: Promise<void>[], refreshedNodeIds?: Set<string>) {
+  if (refreshedNodeIds && isSimpleObjectSearchParent(node)) {
+    refreshedNodeIds.add(node.id);
+    tasks.push(store.refreshTreeNode(node));
+    return;
+  }
+  if (refreshedNodeIds && node.isExpanded && node.children) {
     for (const child of node.children) {
       if (child.connectionId && searchableObjectGroupTypes.has(child.type)) {
-        refreshedGroupIds.add(child.id);
+        refreshedNodeIds.add(child.id);
         tasks.push(store.loadObjectGroupChildren(child, { force: true }));
       }
     }
-  } else if (!refreshedGroupIds && searchRefreshedGroupIds.has(node.id)) {
-    tasks.push(store.loadObjectGroupChildren(node, { force: true }));
+  } else if (!refreshedNodeIds && searchRefreshedNodeIds.has(node.id)) {
+    if (searchableObjectGroupTypes.has(node.type)) {
+      tasks.push(store.loadObjectGroupChildren(node, { force: true }));
+    } else if (simpleObjectParentTypes.has(node.type)) {
+      tasks.push(store.refreshTreeNode(node));
+    }
   }
   if (node.children) {
     for (const child of node.children) {
-      collectExpandedObjectGroups(child, tasks, refreshedGroupIds);
+      collectExpandedObjectSearchTargets(child, tasks, refreshedNodeIds);
     }
   }
 }
@@ -191,10 +207,34 @@ const activeTab = computed(() => queryStore.tabs.find((tab) => tab.id === queryS
 // component, tracking scroll offset to find the topmost visible database-level
 // ancestor. The overlay reuses <TreeItem>, so collapse/expand comes for free.
 const stickyScrollTop = ref(0);
+const sidebarScrollMetrics = ref({ scrollTop: 0, clientHeight: 0, scrollHeight: 0 });
+const isDraggingSidebarScrollbar = ref(false);
+let sidebarScrollbarResizeObserver: ResizeObserver | null = null;
+let sidebarScrollbarAnimationFrame = 0;
+let sidebarScrollbarDragOffset = 0;
+
+function updateSidebarScrollMetrics() {
+  const scroller = currentTreeScroller();
+  if (!scroller) {
+    sidebarScrollMetrics.value = { scrollTop: 0, clientHeight: 0, scrollHeight: 0 };
+    return;
+  }
+
+  if (useVirtualTree.value) stickyScrollTop.value = scroller.scrollTop;
+  sidebarScrollMetrics.value = {
+    scrollTop: scroller.scrollTop,
+    clientHeight: scroller.clientHeight,
+    scrollHeight: scroller.scrollHeight,
+  };
+}
+
+function scheduleSidebarScrollMetricsUpdate() {
+  window.cancelAnimationFrame(sidebarScrollbarAnimationFrame);
+  sidebarScrollbarAnimationFrame = window.requestAnimationFrame(updateSidebarScrollMetrics);
+}
 
 function onTreeScroll() {
-  const scroller = (treeScrollerRef.value?.$el as HTMLElement | undefined) ?? null;
-  if (scroller) stickyScrollTop.value = scroller.scrollTop;
+  scheduleSidebarScrollMetricsUpdate();
 }
 
 // RecycleScroller only emits scrollStart/scrollEnd, not continuous scroll, so
@@ -206,6 +246,27 @@ watch(
     if (!el) return;
     el.addEventListener("scroll", onTreeScroll, { passive: true });
     onCleanup(() => el.removeEventListener("scroll", onTreeScroll));
+  },
+  { flush: "post" },
+);
+
+watch(
+  [treeScrollerRef, plainTreeScrollerRef, useVirtualTree],
+  (_value, _oldValue, onCleanup) => {
+    sidebarScrollbarResizeObserver?.disconnect();
+    sidebarScrollbarResizeObserver = null;
+
+    const scroller = currentTreeScroller();
+    if (!scroller) return;
+
+    sidebarScrollbarResizeObserver = new ResizeObserver(scheduleSidebarScrollMetricsUpdate);
+    sidebarScrollbarResizeObserver.observe(scroller);
+    scheduleSidebarScrollMetricsUpdate();
+
+    onCleanup(() => {
+      sidebarScrollbarResizeObserver?.disconnect();
+      sidebarScrollbarResizeObserver = null;
+    });
   },
   { flush: "post" },
 );
@@ -248,9 +309,87 @@ const stickyHeaderStyle = computed<CSSProperties>(() => {
 // stale scrollTop doesn't keep the overlay mounted after a structural change.
 watch(flatNodes, () => {
   stickyScrollTop.value = 0;
+  void nextTick(scheduleSidebarScrollMetricsUpdate);
 });
 
 const sidebarTreeOverflowClass = computed(() => (settingsStore.editorSettings.sidebarAllowHorizontalScroll ? "overflow-x-auto sidebar-tree-horizontal-scroll" : "overflow-x-hidden"));
+
+const hasSidebarVerticalOverflow = computed(() => sidebarScrollMetrics.value.scrollHeight > sidebarScrollMetrics.value.clientHeight + 1);
+
+function sidebarScrollbarGeometry() {
+  const { scrollTop, clientHeight, scrollHeight } = sidebarScrollMetrics.value;
+  const trackHeight = sidebarScrollbarTrackRef.value?.clientHeight ?? Math.max(0, clientHeight - 8);
+  if (trackHeight <= 0 || scrollHeight <= clientHeight) {
+    return { thumbTop: 0, thumbHeight: 0, maxThumbTop: 0, maxScrollTop: 0 };
+  }
+
+  const thumbHeight = Math.max(24, Math.min(trackHeight, (clientHeight / scrollHeight) * trackHeight));
+  const maxThumbTop = Math.max(0, trackHeight - thumbHeight);
+  const maxScrollTop = Math.max(1, scrollHeight - clientHeight);
+  const thumbTop = Math.min(maxThumbTop, Math.max(0, (scrollTop / maxScrollTop) * maxThumbTop));
+  return { thumbTop, thumbHeight, maxThumbTop, maxScrollTop };
+}
+
+const sidebarScrollbarThumbStyle = computed<CSSProperties>(() => {
+  const { thumbTop, thumbHeight } = sidebarScrollbarGeometry();
+  return {
+    height: `${thumbHeight}px`,
+    transform: `translateY(${thumbTop}px)`,
+  };
+});
+
+function setSidebarScrollFromPointer(clientY: number, offset: number) {
+  const scroller = currentTreeScroller();
+  const track = sidebarScrollbarTrackRef.value;
+  if (!scroller || !track) return;
+
+  const rect = track.getBoundingClientRect();
+  const { maxThumbTop, maxScrollTop } = sidebarScrollbarGeometry();
+  if (maxThumbTop <= 0) return;
+
+  const thumbTop = Math.min(maxThumbTop, Math.max(0, clientY - rect.top - offset));
+  scroller.scrollTop = (thumbTop / maxThumbTop) * maxScrollTop;
+  updateSidebarScrollMetrics();
+}
+
+function stopSidebarScrollbarDrag() {
+  isDraggingSidebarScrollbar.value = false;
+  window.removeEventListener("pointermove", onSidebarScrollbarPointerMove);
+  window.removeEventListener("pointerup", stopSidebarScrollbarDrag);
+  window.removeEventListener("pointercancel", stopSidebarScrollbarDrag);
+}
+
+function onSidebarScrollbarPointerMove(event: PointerEvent) {
+  event.preventDefault();
+  setSidebarScrollFromPointer(event.clientY, sidebarScrollbarDragOffset);
+}
+
+function onSidebarScrollbarTrackPointerDown(event: PointerEvent) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  const { thumbHeight } = sidebarScrollbarGeometry();
+  sidebarScrollbarDragOffset = thumbHeight / 2;
+  setSidebarScrollFromPointer(event.clientY, sidebarScrollbarDragOffset);
+  isDraggingSidebarScrollbar.value = true;
+  window.addEventListener("pointermove", onSidebarScrollbarPointerMove);
+  window.addEventListener("pointerup", stopSidebarScrollbarDrag);
+  window.addEventListener("pointercancel", stopSidebarScrollbarDrag);
+}
+
+function onSidebarScrollbarThumbPointerDown(event: PointerEvent) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  const track = sidebarScrollbarTrackRef.value;
+  if (!track) return;
+
+  const rect = track.getBoundingClientRect();
+  const { thumbTop } = sidebarScrollbarGeometry();
+  sidebarScrollbarDragOffset = event.clientY - rect.top - thumbTop;
+  isDraggingSidebarScrollbar.value = true;
+  window.addEventListener("pointermove", onSidebarScrollbarPointerMove);
+  window.addEventListener("pointerup", stopSidebarScrollbarDrag);
+  window.addEventListener("pointercancel", stopSidebarScrollbarDrag);
+}
 
 provide(sidebarTreeContextKey, {
   getVisibleNodes: () => visibleNodes.value,
@@ -260,6 +399,12 @@ provide(sidebarTreeContextKey, {
 const pendingRenameGroupId = ref<string | null>(null);
 const highlightedNodeId = ref<string | null>(null);
 let highlightTimer: number | undefined;
+
+function topOcclusionHeightForSidebarNode(nodeId: string): number {
+  const sticky = stickyNode.value;
+  if (!useVirtualTree.value || !sticky || sticky.id === nodeId) return 0;
+  return SIDEBAR_TREE_ROW_HEIGHT;
+}
 
 async function scrollToSidebarNode(nodeId: string) {
   await nextTick();
@@ -272,6 +417,7 @@ async function scrollToSidebarNode(nodeId: string) {
     index,
     currentScrollTop: scroller.scrollTop,
     viewportHeight: scroller.clientHeight,
+    topOcclusionHeight: topOcclusionHeightForSidebarNode(nodeId),
   });
   if (nextScrollTop !== scroller.scrollTop) {
     scroller.scrollTop = nextScrollTop;
@@ -347,6 +493,12 @@ async function locateActiveTabInSidebar() {
     nodePath = target ? findNodePathForTarget(target, store.treeNodes) : null;
   }
 
+  if (!nodePath && cursorCandidate) {
+    await store.loadTableForLocate(cursorCandidate);
+    target = resolveLoadedLocateTarget(initialTarget, cursorCandidate);
+    nodePath = target ? findNodePathForTarget(target, store.treeNodes) : null;
+  }
+
   if (!nodePath && cursorCandidate && fallbackTarget) {
     await ensureTreeLoadedForTarget(fallbackTarget);
     target = fallbackTarget;
@@ -367,6 +519,8 @@ async function locateActiveTabInSidebar() {
   if (!match) return;
 
   store.selectedTreeNodeId = match.id;
+  store.selectedTreeNodeIds = [match.id];
+  store.treeSelectionAnchorId = match.id;
   await nextTick();
 
   window.clearTimeout(highlightTimer);
@@ -418,7 +572,7 @@ async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: 
         await store.loadMongoDatabases(connId);
       } else if (config.db_type === "elasticsearch") {
         await store.loadElasticsearchIndices(connId);
-      } else if (config.db_type === "qdrant" || config.db_type === "milvus" || config.db_type === "weaviate") {
+      } else if (config.db_type === "qdrant" || config.db_type === "milvus" || config.db_type === "weaviate" || config.db_type === "chromadb") {
         await store.loadVectorCollections(connId);
       } else if (config.db_type === "mq") {
         await store.loadMqTenants(connId, loadOptions);
@@ -555,6 +709,7 @@ async function selectActiveTabSidebarNode(options: { scroll: boolean }) {
     index,
     currentScrollTop: scroller.scrollTop,
     viewportHeight: scroller.clientHeight,
+    topOcclusionHeight: topOcclusionHeightForSidebarNode(match.id),
   });
   if (nextScrollTop !== scroller.scrollTop) {
     scroller.scrollTop = nextScrollTop;
@@ -622,6 +777,9 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener("keydown", onWindowKeydown);
+  stopSidebarScrollbarDrag();
+  sidebarScrollbarResizeObserver?.disconnect();
+  window.cancelAnimationFrame(sidebarScrollbarAnimationFrame);
 });
 
 defineExpose({ focusSearch, createNewGroup });
@@ -695,19 +853,27 @@ defineExpose({ focusSearch, createNewGroup });
       <div v-if="stickyNode" class="sticky-database-header pointer-events-auto absolute inset-x-0 top-0 z-[5] border-b border-border/60" :style="stickyHeaderStyle">
         <TreeItem :node="stickyNode.node" :depth="stickyNode.depth" :drag-disabled="true" @search-toggle="onSearchToggle" />
       </div>
+      <div v-if="hasSidebarVerticalOverflow" ref="sidebarScrollbarTrackRef" class="sidebar-tree-scrollbar" :class="{ 'sidebar-tree-scrollbar--dragging': isDraggingSidebarScrollbar }" @pointerdown="onSidebarScrollbarTrackPointerDown">
+        <div class="sidebar-tree-scrollbar__thumb" :style="sidebarScrollbarThumbStyle" @pointerdown.stop="onSidebarScrollbarThumbPointerDown" />
+      </div>
     </div>
-    <div v-else-if="flatNodes.length > 0" ref="plainTreeScrollerRef" class="sidebar-tree min-h-0 flex-1 overflow-y-auto" :class="sidebarTreeOverflowClass" @click="clearSidebarSelection">
-      <TreeItem
-        v-for="item in flatNodes"
-        :key="item.id"
-        :node="item.node"
-        :depth="item.depth"
-        :drag-disabled="isFiltering"
-        :pending-rename="pendingRenameGroupId === item.node.id"
-        :highlighted="highlightedNodeId === item.id"
-        @search-toggle="onSearchToggle"
-        @rename-started="pendingRenameGroupId = null"
-      />
+    <div v-else-if="flatNodes.length > 0" class="connection-tree-scroll-shell relative min-h-0 flex-1">
+      <div ref="plainTreeScrollerRef" class="sidebar-tree connection-tree-scroller h-full overflow-y-auto" :class="sidebarTreeOverflowClass" @click="clearSidebarSelection" @scroll.passive="onTreeScroll">
+        <TreeItem
+          v-for="item in flatNodes"
+          :key="item.id"
+          :node="item.node"
+          :depth="item.depth"
+          :drag-disabled="isFiltering"
+          :pending-rename="pendingRenameGroupId === item.node.id"
+          :highlighted="highlightedNodeId === item.id"
+          @search-toggle="onSearchToggle"
+          @rename-started="pendingRenameGroupId = null"
+        />
+      </div>
+      <div v-if="hasSidebarVerticalOverflow" ref="sidebarScrollbarTrackRef" class="sidebar-tree-scrollbar" :class="{ 'sidebar-tree-scrollbar--dragging': isDraggingSidebarScrollbar }" @pointerdown="onSidebarScrollbarTrackPointerDown">
+        <div class="sidebar-tree-scrollbar__thumb" :style="sidebarScrollbarThumbStyle" @pointerdown.stop="onSidebarScrollbarThumbPointerDown" />
+      </div>
     </div>
     <div v-if="store.treeNodes.length === 0" class="px-3 py-8 text-center text-muted-foreground text-xs">
       {{ t("sidebar.noConnections") }}
@@ -725,6 +891,10 @@ defineExpose({ focusSearch, createNewGroup });
   contain: content;
 }
 
+.connection-tree-scroller::-webkit-scrollbar:vertical {
+  width: 0;
+}
+
 .connection-tree-scroller :deep(.vue-recycle-scroller__item-view) {
   min-width: 100%;
   contain: style;
@@ -732,5 +902,42 @@ defineExpose({ focusSearch, createNewGroup });
 
 .connection-tree-scroller.sidebar-tree-horizontal-scroll :deep(.vue-recycle-scroller__item-view) {
   width: max-content;
+}
+
+.sidebar-tree-scrollbar {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  bottom: 4px;
+  z-index: 10;
+  width: 12px;
+  cursor: default;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.sidebar-tree-scrollbar:hover,
+.sidebar-tree-scrollbar--dragging {
+  opacity: 1;
+}
+
+.sidebar-tree-scrollbar__thumb {
+  position: absolute;
+  right: 2px;
+  width: 6px;
+  min-height: 24px;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--foreground) 30%, transparent);
+  transition:
+    background-color 120ms ease,
+    width 120ms ease,
+    right 120ms ease;
+}
+
+.sidebar-tree-scrollbar:hover .sidebar-tree-scrollbar__thumb,
+.sidebar-tree-scrollbar--dragging .sidebar-tree-scrollbar__thumb {
+  right: 1px;
+  width: 8px;
+  background: color-mix(in oklch, var(--foreground) 48%, transparent);
 }
 </style>

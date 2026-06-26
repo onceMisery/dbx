@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watchEffect } from "vue";
+import { computed, ref, watch, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
 import { Play, Loader2, Square, Database, Check, Table2, AlignLeft, GitBranch, Save, FolderOpen, Layers, X, Shield, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -25,6 +25,7 @@ const props = defineProps<{
   explainMode?: string;
   blockDangerousRedisCommands?: boolean;
   sqlKeywordCase: "preserve" | "upper" | "lower";
+  databaseRequiredSignal?: number;
 }>();
 
 const emit = defineEmits<{
@@ -61,7 +62,7 @@ const activeConnectionValue = computed(() => props.activeConnection?.id || "");
 const activeSchemaValue = computed(() => props.activeTab.schema || "");
 const supportsExplain = computed(() => {
   const dbType = props.activeConnection?.db_type;
-  return dbType !== "redis" && dbType !== "mongodb" && dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "weaviate" && dbType !== "etcd" && dbType !== "zookeeper" && dbType !== "mq" && dbType !== "nacos";
+  return dbType !== "redis" && dbType !== "mongodb" && dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "weaviate" && dbType !== "chromadb" && dbType !== "etcd" && dbType !== "zookeeper" && dbType !== "mq" && dbType !== "nacos";
 });
 const isSingleDb = computed(() => isSingleDatabase(props.activeConnection?.db_type));
 const hasDefaultDatabaseOption = computed(() => activeDatabaseOptions.value.includes(""));
@@ -80,6 +81,22 @@ const activeSchemaOptions = computed(() => {
   const connection = props.activeConnection;
   if (!connection) return [];
   return getSchemaOptionsForDb(connection.id, schemaDatabaseKey.value);
+});
+const databaseRequiredVisible = ref(false);
+
+watch(
+  () => props.databaseRequiredSignal,
+  (signal) => {
+    if (!signal) return;
+    databaseRequiredVisible.value = false;
+    requestAnimationFrame(() => {
+      databaseRequiredVisible.value = true;
+    });
+  },
+);
+
+watch(activeDatabaseValue, (database) => {
+  if (database) databaseRequiredVisible.value = false;
 });
 
 watchEffect(() => {
@@ -251,8 +268,11 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
           </template>
         </SearchableSelect>
       </div>
-      <div v-if="activeConnection?.db_type !== 'elasticsearch' && activeConnection?.db_type !== 'qdrant' && activeConnection?.db_type !== 'milvus' && activeConnection?.db_type !== 'weaviate' && activeConnection?.db_type !== 'zookeeper' && !isSingleDb" class="flex items-center gap-1">
-        <Database class="h-3.5 w-3.5 shrink-0" />
+      <div
+        v-if="activeConnection?.db_type !== 'elasticsearch' && activeConnection?.db_type !== 'qdrant' && activeConnection?.db_type !== 'milvus' && activeConnection?.db_type !== 'weaviate' && activeConnection?.db_type !== 'chromadb' && activeConnection?.db_type !== 'zookeeper' && !isSingleDb"
+        class="flex items-center gap-1"
+        :class="{ 'database-required-prompt': databaseRequiredVisible }"
+      >
         <SearchableSelect
           :model-value="activeDatabaseValue"
           :options="activeDatabaseOptions.length ? activeDatabaseOptions : activeDatabaseValue ? [activeDatabaseValue] : []"
@@ -262,6 +282,7 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
           :loading-text="t('common.loading')"
           :loading="loadingDatabaseOptions[activeConnection?.id || '']"
           :display-name="databaseDisplayName"
+          trigger-class="gap-1.5"
           @update:model-value="(database) => emit('changeDatabase', database)"
           @update:open="
             (open: boolean) => {
@@ -269,6 +290,10 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
             }
           "
         >
+          <template #trigger-label="{ label, loading }">
+            <Database class="h-3.5 w-3.5 shrink-0" />
+            <span class="truncate">{{ loading ? t("common.loading") : label }}</span>
+          </template>
           <template #option-label="{ label }">
             <TruncatedTextTooltip :text="label" class="min-w-0 flex-1" side="left" :side-offset="8" />
           </template>
@@ -316,3 +341,33 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
     </div>
   </div>
 </template>
+
+<style scoped>
+.database-required-prompt {
+  color: var(--destructive);
+  animation: database-required-shake 420ms ease;
+}
+
+.database-required-prompt :deep(button) {
+  color: var(--destructive);
+  border-color: color-mix(in oklch, var(--destructive) 55%, transparent);
+  background: color-mix(in oklch, var(--destructive) 10%, transparent);
+}
+
+@keyframes database-required-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  12%,
+  36%,
+  60% {
+    transform: translateX(-3px);
+  }
+  24%,
+  48%,
+  72% {
+    transform: translateX(3px);
+  }
+}
+</style>

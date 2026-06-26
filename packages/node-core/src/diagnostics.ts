@@ -23,6 +23,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "qdrant",
   "milvus",
   "weaviate",
+  "chromadb",
   "etcd",
   "dameng",
   "kingbase",

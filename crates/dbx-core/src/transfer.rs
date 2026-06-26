@@ -714,6 +714,10 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
             _ => n.to_string(),
         },
         serde_json::Value::String(s) => {
+            if let Some(binary_literal) = format_postgres_binary_sql_literal(s, db_type, column_type) {
+                return binary_literal;
+            }
+
             let literal = format_literal_string(s, db_type, column_type);
             let escaped = if is_postgres_family_target(db_type) {
                 literal.replace('\'', "''")
@@ -745,6 +749,29 @@ fn is_mysql_bit_type(column_type: &str) -> bool {
     let trimmed = column_type.trim();
     let lower = trimmed.to_ascii_lowercase();
     lower == "bit" || lower.starts_with("bit(") || lower.starts_with("bit ")
+}
+
+fn is_binary_transfer_column_type(column_type: &str) -> bool {
+    let lower = column_type.trim().to_ascii_lowercase();
+    let base = lower.split(['(', ' ', '\t', '\n']).next().unwrap_or("");
+    matches!(base, "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "bytea" | "image")
+}
+
+fn format_postgres_binary_sql_literal(
+    value: &str,
+    db_type: &DatabaseType,
+    column_type: Option<&str>,
+) -> Option<String> {
+    if !matches!(db_type, DatabaseType::Postgres) || !column_type.is_some_and(is_binary_transfer_column_type) {
+        return None;
+    }
+
+    let hex = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X"))?;
+    if hex.len() % 2 != 0 || !hex.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    Some(format!("decode('{hex}', 'hex')"))
 }
 
 pub fn format_pg_array_sql_literal(arr: &[serde_json::Value]) -> String {
@@ -3715,6 +3742,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -4661,6 +4689,24 @@ mod tests {
             sql,
             r#"INSERT INTO "public"."files" ("path") VALUES
 ('C:\tmp\file.txt')"#
+        );
+    }
+
+    #[test]
+    fn postgres_insert_formats_bytea_prefixed_hex_as_binary_literal() {
+        let sql = generate_insert_typed(
+            &[String::from("id"), String::from("payload"), String::from("note")],
+            &[Some(String::from("integer")), Some(String::from("BYTEA")), Some(String::from("text"))],
+            &[vec![json!(1), json!("0x48656c6c6f"), json!("0x48656c6c6f")]],
+            "files",
+            "public",
+            &DatabaseType::Postgres,
+        );
+
+        assert_eq!(
+            sql,
+            r#"INSERT INTO "public"."files" ("id", "payload", "note") VALUES
+(1, decode('48656c6c6f', 'hex'), '0x48656c6c6f')"#
         );
     }
 

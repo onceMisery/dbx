@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { canSaveVisibleDatabaseSelection, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
+import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
 import * as api from "@/lib/api";
 
 const props = defineProps<{
@@ -32,7 +32,7 @@ const isLoading = ref(false);
 const errorMessage = ref("");
 
 const connection = computed(() => connectionStore.getConfig(props.connectionId));
-const filterMode = computed<FilterMode>(() => (connection.value?.db_type === "oracle" || connection.value?.db_type === "dameng" ? "schema" : "database"));
+const filterMode = computed<FilterMode>(() => (connectionUsesVisibleSchemaFilter(connection.value) ? "schema" : "database"));
 const databaseKey = computed(() => connection.value?.database || "");
 const isSchemaFilterMode = computed(() => filterMode.value === "schema");
 const titleKey = computed(() => (isSchemaFilterMode.value ? "visibleSchemas.title" : "visibleDatabases.title"));

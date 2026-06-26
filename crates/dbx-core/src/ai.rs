@@ -155,12 +155,25 @@ pub struct ToolCallRef {
     pub arguments: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiTaskContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_request: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiCompletionRequest {
     pub config: AiConfig,
     pub system_prompt: String,
     pub messages: Vec<AiMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_contract: Option<AiTaskContract>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }
@@ -443,12 +456,17 @@ pub fn supports_temperature(config: &AiConfig) -> bool {
 
 fn add_temperature_if_supported_for_config(body: &mut serde_json::Value, config: &AiConfig, temperature: Option<f32>) {
     if supports_temperature(config) {
-        body["temperature"] = json!(temperature.unwrap_or(0.2));
+        body["temperature"] = temperature_value(temperature);
     }
 }
 
 pub fn add_temperature_if_supported(body: &mut serde_json::Value, request: &AiCompletionRequest) {
     add_temperature_if_supported_for_config(body, &request.config, request.temperature);
+}
+
+fn temperature_value(temperature: Option<f32>) -> serde_json::Value {
+    let value = ((temperature.unwrap_or(0.2) as f64) * 100.0).round() / 100.0;
+    json!(value)
 }
 
 fn responses_text(data: &serde_json::Value) -> String {
@@ -683,7 +701,7 @@ pub async fn call_claude(client: &reqwest::Client, request: AiCompletionRequest)
     let body = json!({
         "model": request.config.model,
         "max_tokens": request.max_tokens.unwrap_or(2048),
-        "temperature": request.temperature.unwrap_or(0.2),
+        "temperature": temperature_value(request.temperature),
         "system": claude_system_prompt(&request.system_prompt),
         "messages": request.messages,
     });
@@ -788,7 +806,7 @@ pub async fn call_gemini(client: &reqwest::Client, request: AiCompletionRequest)
         "contents": contents,
         "generationConfig": {
             "maxOutputTokens": request.max_tokens.unwrap_or(2048),
-            "temperature": request.temperature.unwrap_or(0.2),
+            "temperature": temperature_value(request.temperature),
         },
     });
 
@@ -908,7 +926,7 @@ pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionR
             let body = json!({
                 "model": &model,
                 "max_tokens": 16,
-                "temperature": 0.0,
+                "temperature": temperature_value(Some(0.0)),
                 "system": CLAUDE_DEFAULT_SYSTEM,
                 "messages": [{ "role": "user", "content": TEST_PROMPT }],
                 "stream": true,
@@ -934,7 +952,7 @@ pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionR
                 .query(&[("key", config.api_key.as_str()), ("alt", "sse")])
                 .json(&json!({
                     "contents": [{ "parts": [{ "text": TEST_PROMPT }], "role": "user" }],
-                    "generationConfig": { "maxOutputTokens": 16, "temperature": 0.0 },
+                    "generationConfig": { "maxOutputTokens": 16, "temperature": temperature_value(Some(0.0)) },
                 }))
                 .send()
                 .await
@@ -1112,7 +1130,7 @@ async fn stream_claude(
     let body = json!({
         "model": request.config.model,
         "max_tokens": request.max_tokens.unwrap_or(2048),
-        "temperature": request.temperature.unwrap_or(0.2),
+        "temperature": temperature_value(request.temperature),
         "system": claude_system_prompt(&request.system_prompt),
         "messages": request.messages,
         "stream": true,
@@ -1377,7 +1395,7 @@ async fn stream_gemini(
         "contents": contents,
         "generationConfig": {
             "maxOutputTokens": request.max_tokens.unwrap_or(2048),
-            "temperature": request.temperature.unwrap_or(0.2),
+            "temperature": temperature_value(request.temperature),
         },
     });
 
@@ -2101,8 +2119,8 @@ mod tests {
         add_temperature_if_supported_for_config, build_ai_http_client, claude_headers, claude_system_prompt,
         gemini_text, is_kimi_model, openai_response_text, openai_stream_reasoning, openai_stream_text,
         parse_model_list_response, resolve_endpoint, resolve_model_list_endpoint, responses_max_output_tokens,
-        responses_text, supports_temperature, validate_config, AiApiStyle, AiAuthMethod, AiConfig, AiModelInfo,
-        AiProvider, AiReasoningLevel, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
+        responses_text, supports_temperature, temperature_value, validate_config, AiApiStyle, AiAuthMethod, AiConfig,
+        AiModelInfo, AiProvider, AiReasoningLevel, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
     };
 
     #[test]
@@ -2395,6 +2413,14 @@ mod tests {
         assert_eq!(responses_max_output_tokens(Some(16)), 16);
         assert_eq!(responses_max_output_tokens(Some(2400)), 2400);
         assert_eq!(responses_max_output_tokens(None), 2048);
+    }
+
+    #[test]
+    fn temperature_value_rounds_f32_to_provider_safe_precision() {
+        assert_eq!(temperature_value(Some(0.15)), serde_json::json!(0.15));
+        assert_eq!(temperature_value(Some(0.149)), serde_json::json!(0.15));
+        assert_eq!(temperature_value(None), serde_json::json!(0.2));
+        assert_eq!(serde_json::to_string(&temperature_value(Some(0.15))).unwrap(), "0.15");
     }
 
     #[test]

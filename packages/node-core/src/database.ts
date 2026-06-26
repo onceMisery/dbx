@@ -13,6 +13,14 @@ export interface TableInfo {
   type: string;
 }
 
+export interface CollectionInfo {
+  name: string;
+  id?: string;
+  dimension?: number | null;
+}
+
+type CollectionListEntry = string | CollectionInfo;
+
 export interface ColumnInfo {
   name: string;
   data_type: string;
@@ -408,6 +416,13 @@ interface BridgeColumnInfo {
   character_maximum_length?: number | null;
 }
 
+export function collectionListToTableInfos(collections: CollectionListEntry[]): TableInfo[] {
+  return collections.map((collection) => ({
+    name: typeof collection === "string" ? collection : collection.name,
+    type: "COLLECTION",
+  }));
+}
+
 interface MongoDocumentResult {
   documents: unknown[];
   total: number;
@@ -646,12 +661,12 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
 
 export async function listTables(config: ConnectionConfig, schema?: string): Promise<TableInfo[]> {
   if (config.db_type === "mongodb") {
-    const collections = await bridgeDataRequest<string[]>("/data/mongo/list-collections", {
+    const collections = await bridgeDataRequest<CollectionListEntry[]>("/data/mongo/list-collections", {
       connection_name: config.name,
       database: config.database || "",
       schema: schema || "",
     });
-    return collections.map((name) => ({ name, type: "COLLECTION" }));
+    return collectionListToTableInfos(collections);
   }
   if (config.db_type === "sqlite" || config.db_type === "rqlite") {
     const result = await query(config, `SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name`);

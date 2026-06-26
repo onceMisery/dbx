@@ -68,19 +68,104 @@ fn should_show_main_window_after_setup() -> bool {
 
 fn native_window_decorations_override(target_os: &str) -> Option<bool> {
     match target_os {
-        "windows" => Some(false),
-        "linux" => Some(true),
+        "windows" | "linux" => Some(false),
         _ => None,
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_webkit_rendering_workarounds() -> &'static [(&'static str, &'static str)] {
+    &[
+        // WebKitGTK's DMABUF renderer can produce a blank AppImage window or
+        // Wayland protocol errors on Fedora/Wayland/NVIDIA systems.
+        ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+        // Tauri's Linux graphics guidance recommends this for Wayland explicit
+        // sync issues that can prevent WebKitGTK from creating a usable surface.
+        ("__NV_DISABLE_EXPLICIT_SYNC", "1"),
+    ]
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_system_gtk3_immodules_cache_path() -> Option<&'static str> {
+    [
+        "/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache",
+        "/usr/lib/aarch64-linux-gnu/gtk-3.0/3.0.0/immodules.cache",
+        "/usr/lib64/gtk-3.0/3.0.0/immodules.cache",
+        "/usr/lib/gtk-3.0/3.0.0/immodules.cache",
+    ]
+    .iter()
+    .copied()
+    .find(|path| std::path::Path::new(path).is_file())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_appimage_wayland_backend_override(
+    appimage: Option<&std::ffi::OsStr>,
+    wayland_display: Option<&std::ffi::OsStr>,
+    gdk_backend: Option<&std::ffi::OsStr>,
+) -> Option<&'static str> {
+    if appimage.is_some() && wayland_display.is_some() && gdk_backend.is_none() {
+        // AppImage uses the host GTK/WebKitGTK stack. Prefer XWayland for the
+        // affected Wayland/EGL path, but keep Wayland and other compiled
+        // backends as fallbacks for systems without XWayland.
+        Some("x11,wayland,*")
+    } else {
+        None
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_appimage_system_gtk_immodules_cache(
+    appimage: Option<&std::ffi::OsStr>,
+    appdir: Option<&std::ffi::OsStr>,
+    gtk_im_module: Option<&std::ffi::OsStr>,
+    gtk_im_module_file: Option<&std::ffi::OsStr>,
+    system_cache_path: Option<&'static str>,
+) -> Option<&'static str> {
+    let system_cache_path = system_cache_path?;
+    if appimage.is_none() || gtk_im_module.is_none() {
+        return None;
+    }
+
+    let Some(gtk_im_module_file) = gtk_im_module_file else {
+        return Some(system_cache_path);
+    };
+    let Some(appdir) = appdir else {
+        return None;
+    };
+
+    if std::path::Path::new(gtk_im_module_file).starts_with(std::path::Path::new(appdir)) {
+        Some(system_cache_path)
+    } else {
+        None
     }
 }
 
 #[cfg(target_os = "linux")]
 fn apply_linux_webkit_rendering_workarounds() {
-    const DISABLE_DMABUF_RENDERER: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
-    if std::env::var_os(DISABLE_DMABUF_RENDERER).is_none() {
-        // WebKitGTK's DMABUF renderer can produce a blank AppImage window on
-        // Fedora/Wayland/NVIDIA systems. This must be set before WebKit starts.
-        std::env::set_var(DISABLE_DMABUF_RENDERER, "1");
+    for (key, value) in linux_webkit_rendering_workarounds() {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+    if let Some(gdk_backend) = linux_appimage_wayland_backend_override(
+        std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("GDK_BACKEND").as_deref(),
+    ) {
+        std::env::set_var("GDK_BACKEND", gdk_backend);
+    }
+    if let Some(gtk_im_module_file) = linux_appimage_system_gtk_immodules_cache(
+        std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("APPDIR").as_deref(),
+        std::env::var_os("GTK_IM_MODULE").as_deref(),
+        std::env::var_os("GTK_IM_MODULE_FILE").as_deref(),
+        linux_system_gtk3_immodules_cache_path(),
+    ) {
+        // linuxdeploy-plugin-gtk points GTK_IM_MODULE_FILE at the bundled
+        // cache. That hides host IM modules such as fcitx5/ibus, so prefer the
+        // host GTK cache when the user has configured a GTK input method.
+        std::env::set_var("GTK_IM_MODULE_FILE", gtk_im_module_file);
     }
 }
 
@@ -202,9 +287,13 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        native_window_decorations_override, should_hide_window_on_close, should_setup_desktop_tray,
-        should_show_main_window_after_setup,
+        linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
+        linux_webkit_rendering_workarounds, native_window_decorations_override, should_hide_window_on_close,
+        should_setup_desktop_tray, should_show_main_window_after_setup,
     };
+    use std::ffi::OsStr;
+
+    const TEST_GTK3_IMMODULES_CACHE: &str = "/usr/lib/test/gtk-3.0/3.0.0/immodules.cache";
 
     #[test]
     fn hides_window_on_close_for_windows_and_macos() {
@@ -234,8 +323,110 @@ mod tests {
     #[test]
     fn overrides_native_window_decorations_for_desktop_platforms() {
         assert_eq!(native_window_decorations_override("windows"), Some(false));
-        assert_eq!(native_window_decorations_override("linux"), Some(true));
+        assert_eq!(native_window_decorations_override("linux"), Some(false));
         assert_eq!(native_window_decorations_override("macos"), None);
+    }
+
+    #[test]
+    fn applies_linux_webkit_rendering_workarounds_before_webkit_starts() {
+        assert_eq!(
+            linux_webkit_rendering_workarounds(),
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1"), ("__NV_DISABLE_EXPLICIT_SYNC", "1")]
+        );
+    }
+
+    #[test]
+    fn prefers_x11_for_appimage_wayland_when_backend_is_not_user_configured() {
+        assert_eq!(
+            linux_appimage_wayland_backend_override(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("wayland-0")),
+                None
+            ),
+            Some("x11,wayland,*")
+        );
+        assert_eq!(
+            linux_appimage_wayland_backend_override(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("wayland-0")),
+                Some(OsStr::new("wayland"))
+            ),
+            None
+        );
+        assert_eq!(linux_appimage_wayland_backend_override(Some(OsStr::new("/tmp/DBX.AppImage")), None, None), None);
+        assert_eq!(linux_appimage_wayland_backend_override(None, Some(OsStr::new("wayland-0")), None), None);
+    }
+
+    #[test]
+    fn prefers_system_gtk_immodules_cache_for_appimage_input_methods() {
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("fcitx5")),
+                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            Some(TEST_GTK3_IMMODULES_CACHE)
+        );
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("ibus")),
+                None,
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            Some(TEST_GTK3_IMMODULES_CACHE)
+        );
+    }
+
+    #[test]
+    fn preserves_external_gtk_immodules_cache_overrides() {
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("fcitx5")),
+                Some(OsStr::new("/opt/custom/immodules.cache")),
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn skips_system_gtk_immodules_cache_without_required_context() {
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                None,
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("fcitx5")),
+                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            None
+        );
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                None,
+                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
+                Some(TEST_GTK3_IMMODULES_CACHE),
+            ),
+            None
+        );
+        assert_eq!(
+            linux_appimage_system_gtk_immodules_cache(
+                Some(OsStr::new("/tmp/DBX.AppImage")),
+                Some(OsStr::new("/tmp/.mount_DBX123")),
+                Some(OsStr::new("fcitx5")),
+                Some(OsStr::new("/tmp/.mount_DBX123/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules.cache")),
+                None,
+            ),
+            None
+        );
     }
 }
 
