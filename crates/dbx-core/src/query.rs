@@ -74,7 +74,7 @@ impl DbOperationBudget {
 
     /// 使用全局默认值（无连接配置时）。
     pub fn with_defaults() -> Self {
-        let default_infra = crate::db::connection_timeout();
+        let default_infra = db::connection_timeout();
         Self {
             checkout_timeout: default_infra,
             connect_timeout: default_infra,
@@ -729,6 +729,10 @@ fn is_agent_rpc_timeout_error(lower: &str) -> bool {
     lower.starts_with("agent rpc call timed out ")
 }
 
+fn is_schema_reset_cleanup_error(lower: &str) -> bool {
+    lower.contains("schema.reset cleanup failed")
+}
+
 fn should_discard_agent_pool_after_error(err: &str) -> bool {
     let lower = err.to_lowercase();
     is_dbx_query_timeout_error(&lower)
@@ -744,6 +748,7 @@ pub fn pool_error_action(db_type: Option<DatabaseType>, err: &str) -> PoolErrorA
     let lower = err.to_lowercase();
     if db::sqlserver::is_driver_panic_error(err)
         || (is_dbx_query_timeout_error(&lower) && should_discard_pool_after_query_timeout(db_type))
+        || is_schema_reset_cleanup_error(&lower)
         || (db_type.is_some_and(|db_type| database_capabilities::is_agent_type(&db_type))
             && should_discard_agent_pool_after_error(err)
             && !is_connection_error(err))
@@ -2370,7 +2375,7 @@ mod tests {
     #[test]
     fn db_operation_budget_with_defaults() {
         let budget = DbOperationBudget::with_defaults();
-        assert_eq!(budget.checkout_timeout, crate::db::connection_timeout());
+        assert_eq!(budget.checkout_timeout, db::connection_timeout());
         assert_eq!(budget.query_timeout, Some(QUERY_TIMEOUT));
     }
 
@@ -2456,6 +2461,15 @@ mod tests {
         assert_eq!(pool_error_action(Some(DatabaseType::Oracle), err), PoolErrorAction::Discard);
         assert_eq!(pool_error_action(Some(DatabaseType::Sqlite), err), PoolErrorAction::Keep);
         assert_eq!(pool_error_action(Some(DatabaseType::DuckDb), err), PoolErrorAction::Keep);
+    }
+
+    #[test]
+    fn pool_error_action_discards_schema_reset_cleanup_without_retry() {
+        let err = "PostgreSQL schema.reset cleanup failed: PostgreSQL schema.reset timed out after 3 seconds";
+
+        assert_eq!(pool_error_action(Some(DatabaseType::Postgres), err), PoolErrorAction::Discard);
+        assert_eq!(pool_error_action(Some(DatabaseType::OpenGauss), err), PoolErrorAction::Discard);
+        assert!(should_discard_pool_after_error(Some(DatabaseType::Postgres), err));
     }
 
     #[test]

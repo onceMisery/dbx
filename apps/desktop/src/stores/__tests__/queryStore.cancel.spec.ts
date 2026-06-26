@@ -1,5 +1,5 @@
 import { createPinia, setActivePinia } from "pinia";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 function installLocalStorage() {
   const data = new Map<string, string>();
@@ -17,6 +17,10 @@ describe("queryStore cancel timeout recovery", () => {
     vi.unstubAllGlobals();
     installLocalStorage();
     setActivePinia(createPinia());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("clears cancelling state when cancelQuery does not return", async () => {

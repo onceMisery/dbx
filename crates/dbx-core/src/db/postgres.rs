@@ -719,7 +719,7 @@ pub async fn stream_query_rows(
     cancelled: &AtomicBool,
     mut on_row: impl FnMut(&[serde_json::Value]) -> Result<(), String>,
 ) -> Result<u64, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     match stream_query_rows_on_client(&client, sql, max_rows, cancelled, &mut on_row).await {
         Ok(rows) => Ok(rows),
         Err(error) if should_retry_postgres_text_query_message(&error.to_ascii_lowercase()) => {
@@ -1204,7 +1204,7 @@ fn validate_postgres_ssl_paths(url: &str) -> Result<(), String> {
 }
 
 pub async fn list_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT datname FROM pg_database \
@@ -1233,7 +1233,7 @@ pub async fn list_tables_filtered(
     let filter_pattern = like_contains_pattern(filter.unwrap_or("").trim());
     let limit_param = limit.and_then(|value| i64::try_from(value).ok());
     let offset_param = offset.and_then(|value| i64::try_from(value).ok()).unwrap_or(0);
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client.prepare_cached(postgres_tables_sql()).await.map_err(|e| e.to_string())?;
     let rows = client
         .query(&stmt, &[&schema, &filter_pattern, &limit_param, &offset_param])
@@ -1264,7 +1264,7 @@ pub async fn completion_assistant_search(
         request.object_kinds.clone()
     };
     let pattern = postgres_completion_like_pattern(&request.mask, request.match_mode.as_ref());
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let mut candidates = Vec::new();
 
     if kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::Schema)) {
@@ -1447,7 +1447,7 @@ fn postgres_completion_like_pattern(value: &str, mode: Option<&CompletionAssista
 
 pub async fn get_table_comment(pool: &Pool, schema: &str, table: &str) -> Result<Option<String>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client.prepare_cached(postgres_table_comment_sql()).await.map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[&schema, &table]).await.map_err(|e| e.to_string())?;
     Ok(rows.first().and_then(|row| row.try_get::<_, Option<String>>(0).ok().flatten()).filter(|s| !s.is_empty()))
@@ -1576,7 +1576,7 @@ fn list_objects_sql(include_timestamps: bool) -> &'static str {
 }
 
 pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client.prepare_cached(list_objects_sql(true)).await.map_err(|e| e.to_string())?;
     let rows = match client.query(&stmt, &[&schema]).await {
         Ok(rows) => rows,
@@ -1603,7 +1603,7 @@ pub async fn list_objects(pool: &Pool, schema: &str) -> Result<Vec<ObjectInfo>, 
 
 pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<ObjectStatistics>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT c.relname, \
@@ -1633,7 +1633,7 @@ pub async fn list_schemas(pool: &Pool) -> Result<Vec<String>, String> {
 }
 
 pub async fn list_schema_infos(pool: &Pool) -> Result<Vec<SchemaInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT n.nspname AS schema_name, d.description AS schema_comment \
@@ -1780,7 +1780,7 @@ async fn get_columns_with_sql(
 
 pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     match get_columns_with_sql(&client, POSTGRES_COLUMNS_SQL, schema, table).await {
         Ok(columns) => Ok(columns),
         Err(primary_error) => match get_columns_with_sql(&client, POSTGRES_COLUMNS_COMPAT_SQL, schema, table).await {
@@ -1827,10 +1827,10 @@ pub async fn execute_query_with_max_rows(
     let row_limit = query_result_row_limit(max_rows);
 
     if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "WITH", "TABLE"]) {
-        let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+        let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
         execute_select_query(&client, sql, start, row_limit).await
     } else {
-        let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+        let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
         let affected = client.execute(sql, &[]).await.map_err(pg_error_to_string)?;
         clear_postgres_caches_after_ddl(pool, Some(&client), sql);
 
@@ -1881,7 +1881,7 @@ pub async fn execute_query_with_schema_and_max_rows(
 ) -> Result<QueryResult, String> {
     let start = Instant::now();
     let checkout_start = Instant::now();
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     log::info!(
         "[postgres][execute_with_schema:pool:done] elapsed_ms={} total_ms={} schema={}",
         checkout_start.elapsed().as_millis(),
@@ -1900,7 +1900,7 @@ pub async fn execute_query_with_schema_and_max_rows(
     execute_postgres_infra_statement(
         &client,
         &format!("SET search_path TO {}", pg_quote_ident(schema)),
-        crate::db::connection_timeout(),
+        super::connection_timeout(),
         "schema.set",
     )
     .await?;
@@ -1922,30 +1922,8 @@ pub async fn execute_query_with_schema_and_max_rows(
         result.is_ok()
     );
 
-    // Always reset search_path so the connection is clean when returned to the pool
-    let reset_start = Instant::now();
-    match execute_postgres_infra_statement(
-        &client,
-        "RESET search_path",
-        crate::db::connection_timeout(),
-        "schema.reset",
-    )
-    .await
-    {
-        Ok(_) => log::info!(
-            "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
-            reset_start.elapsed().as_millis(),
-            start.elapsed().as_millis()
-        ),
-        Err(err) => log::warn!(
-            "[postgres][execute_with_schema:reset-search-path:error] elapsed_ms={} total_ms={} error={}",
-            reset_start.elapsed().as_millis(),
-            start.elapsed().as_millis(),
-            err
-        ),
-    }
-
-    result
+    let reset_result = reset_postgres_search_path(&client, super::connection_timeout(), start).await;
+    merge_postgres_query_and_reset_result(result, reset_result)
 }
 
 pub async fn execute_query_with_schema_and_max_rows_and_cancel(
@@ -2018,22 +1996,51 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
         result.is_ok()
     );
 
-    let reset_start = Instant::now();
-    match execute_postgres_infra_statement(&client, "RESET search_path", budget.cleanup_timeout, "schema.reset").await {
-        Ok(_) => log::info!(
-            "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
-            reset_start.elapsed().as_millis(),
-            start.elapsed().as_millis()
-        ),
-        Err(err) => log::warn!(
-            "[postgres][execute_with_schema:reset-search-path:error] elapsed_ms={} total_ms={} error={}",
-            reset_start.elapsed().as_millis(),
-            start.elapsed().as_millis(),
-            err
-        ),
-    }
+    let reset_result = reset_postgres_search_path(&client, budget.cleanup_timeout, start).await;
+    merge_postgres_query_and_reset_result(result, reset_result)
+}
 
-    result
+async fn reset_postgres_search_path(
+    client: &deadpool_postgres::Client,
+    timeout_duration: Duration,
+    start: Instant,
+) -> Result<(), String> {
+    let reset_start = Instant::now();
+    match execute_postgres_infra_statement(client, "RESET search_path", timeout_duration, "schema.reset").await {
+        Ok(_) => {
+            log::info!(
+                "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
+                reset_start.elapsed().as_millis(),
+                start.elapsed().as_millis()
+            );
+            Ok(())
+        }
+        Err(err) => {
+            log::warn!(
+                "[postgres][execute_with_schema:reset-search-path:error] elapsed_ms={} total_ms={} error={}",
+                reset_start.elapsed().as_millis(),
+                start.elapsed().as_millis(),
+                err
+            );
+            Err(postgres_schema_reset_cleanup_error(err))
+        }
+    }
+}
+
+fn merge_postgres_query_and_reset_result(
+    query_result: Result<QueryResult, String>,
+    reset_result: Result<(), String>,
+) -> Result<QueryResult, String> {
+    match (query_result, reset_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(query_err), Ok(())) => Err(query_err),
+        (Ok(_), Err(reset_err)) => Err(reset_err),
+        (Err(query_err), Err(reset_err)) => Err(format!("{query_err}; {reset_err}")),
+    }
+}
+
+fn postgres_schema_reset_cleanup_error(err: String) -> String {
+    format!("PostgreSQL schema.reset cleanup failed: {err}")
 }
 
 async fn execute_postgres_infra_statement(
@@ -2323,7 +2330,7 @@ async fn list_indexes_with_sql(
 }
 
 pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     match list_indexes_with_sql(&client, POSTGRES_INDEXES_SQL, schema, table).await {
         Ok(indexes) => Ok(indexes),
         Err(primary_error) => match list_indexes_with_sql(&client, POSTGRES_INDEXES_COMPAT_SQL, schema, table).await {
@@ -2343,7 +2350,7 @@ pub async fn list_indexes(pool: &Pool, schema: &str, table: &str) -> Result<Vec<
 }
 
 pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT fk.constraint_name, fk.column_name, \
@@ -2384,7 +2391,7 @@ pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result
 }
 
 pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec<TriggerInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT trigger_name, event_manipulation, action_timing \
@@ -2408,7 +2415,7 @@ pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec
 }
 
 pub async fn list_functions(pool: &Pool, schema: &str) -> Result<Vec<FunctionInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     // Use pg_proc + pg_get_functiondef() instead of information_schema.routines
     // for reliable function definition retrieval (information_schema.routines.routine_definition
     // is NULL for non-SQL functions like plpgsql)
@@ -2450,7 +2457,7 @@ pub async fn list_functions(pool: &Pool, schema: &str) -> Result<Vec<FunctionInf
 }
 
 pub async fn list_sequences(pool: &Pool, schema: &str, with_last_values: bool) -> Result<Vec<SequenceInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     // Use pg_class + pg_sequence + pg_namespace instead of pg_sequences view
     // for better compatibility and permission handling
     let stmt = client
@@ -2510,7 +2517,7 @@ pub async fn list_sequences(pool: &Pool, schema: &str, with_last_values: bool) -
 }
 
 pub async fn list_rules(pool: &Pool, schema: &str) -> Result<Vec<RuleInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client
         .prepare_cached(
             "SELECT schemaname, tablename, rulename, definition \
@@ -2533,7 +2540,7 @@ pub async fn list_rules(pool: &Pool, schema: &str) -> Result<Vec<RuleInfo>, Stri
 }
 
 pub async fn list_owners(pool: &Pool, schema: &str) -> Result<Vec<OwnerInfo>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stmt = client.prepare_cached(POSTGRES_OWNERS_SQL).await.map_err(|e| e.to_string())?;
     let rows = client.query(&stmt, &[&schema]).await.map_err(|e| e.to_string())?;
 
@@ -2557,14 +2564,14 @@ pub async fn execute_batch(pool: &Pool, statements: &[String]) -> Result<(), Str
     if combined.is_empty() {
         return Ok(());
     }
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     client.batch_execute(&combined).await.map_err(pg_error_to_string)?;
     clear_postgres_caches_after_ddl(pool, Some(&client), &combined);
     Ok(())
 }
 
 pub async fn terminate_current_user_database_backends(pool: &Pool, database: &str) -> Result<u64, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     client
         .execute(
             "SELECT pg_terminate_backend(pid) \
@@ -2600,7 +2607,7 @@ fn invalidates_postgres_statement_cache(sql: &str) -> bool {
 /// `COPY table (col1, col2) TO STDOUT (FORMAT CSV, HEADER)`.
 /// Returns the raw COPY output bytes.
 pub async fn copy_out(pool: &Pool, sql: &str) -> Result<Vec<u8>, String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let stream = client.copy_out(sql).await.map_err(pg_error_to_string)?;
     tokio::pin!(stream);
     let mut result = Vec::new();
@@ -2614,7 +2621,7 @@ pub async fn copy_out(pool: &Pool, sql: &str) -> Result<Vec<u8>, String> {
 /// `COPY table (col1, col2) FROM STDIN (FORMAT CSV)`.
 /// `data` is the raw input in the format specified by the COPY command.
 pub async fn copy_in(pool: &Pool, sql: &str, data: &[u8]) -> Result<(), String> {
-    let client = checkout_postgres_client(pool, None, crate::db::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let sink = client.copy_in::<str, bytes::Bytes>(sql).await.map_err(pg_error_to_string)?;
     let mut sink = Box::pin(sink);
     sink.as_mut().send(bytes::Bytes::copy_from_slice(data)).await.map_err(pg_error_to_string)?;

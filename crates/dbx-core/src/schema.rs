@@ -3057,7 +3057,7 @@ async fn mysql_object_source(
 ) -> Result<String, String> {
     use mysql_async::prelude::*;
     let sql = mysql_object_source_sql(name, kind);
-    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
+    let mut conn = db::mysql::get_conn_with_timeout(pool, db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     let row = rows.first().ok_or("Object source not found")?;
@@ -3420,7 +3420,7 @@ mod ddl_tests {
 pub async fn mysql_ddl(pool: &db::mysql::MySqlPool, table: &str) -> Result<String, String> {
     use mysql_async::prelude::*;
     let sql = format!("SHOW CREATE TABLE `{}`", table.replace('`', "``"));
-    let mut conn = crate::db::mysql::get_conn_with_timeout(pool, crate::db::connection_timeout()).await?;
+    let mut conn = db::mysql::get_conn_with_timeout(pool, db::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     let row = rows.first().ok_or("DDL not found")?;

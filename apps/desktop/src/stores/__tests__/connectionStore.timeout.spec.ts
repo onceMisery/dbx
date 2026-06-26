@@ -1,5 +1,5 @@
 import { createPinia, setActivePinia } from "pinia";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig, TreeNode } from "@/types/database";
 
 function installLocalStorage() {
@@ -33,6 +33,10 @@ describe("connectionStore timeout recovery", () => {
     vi.unstubAllGlobals();
     installLocalStorage();
     setActivePinia(createPinia());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("times out connected health checks and falls back to reconnect", async () => {
