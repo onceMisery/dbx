@@ -852,7 +852,7 @@ pub struct PostgresSslFiles {
     pub sslrootcert: Option<String>,
 }
 
-/// TLS 上下文信息，用于 cancel 时重建 TLS connector。
+/// TLS context info, used to reconstruct the TLS connector when cancelling a query.
 #[derive(Debug, Clone)]
 pub struct PostgresCancelContext {
     pub ssl_files: PostgresSslFiles,
@@ -861,8 +861,8 @@ pub struct PostgresCancelContext {
     pub ssl_mode: SslMode,
 }
 
-/// 从连接 URL 构建 TLS cancel 上下文。
-/// 返回 None 表示 URL 解析失败或 sslmode=disable（无需 TLS cancel）。
+/// Build a TLS cancel context from the connection URL.
+/// Returns None if URL parsing fails or sslmode=disable (no TLS cancel needed).
 pub fn build_postgres_cancel_context(url: &str) -> Option<PostgresCancelContext> {
     let postgres_url = postgres_connection_url(url).ok()?;
     let pg_config = tokio_postgres::Config::from_str(&postgres_url.url).ok()?;
@@ -877,11 +877,11 @@ pub fn build_postgres_cancel_context(url: &str) -> Option<PostgresCancelContext>
     })
 }
 
-/// 从 cancel context 重建 TLS connector，用于 TLS 连接取消。
+/// Reconstruct a TLS connector from the cancel context, used for TLS connection cancellation.
 fn make_rustls_connect_from_context(
     ctx: &PostgresCancelContext,
 ) -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
-    // 构建一个最小 pg_config 仅用于 ssl_mode 判断
+    // Build a minimal pg_config solely for ssl_mode determination
     let mut pg_config = tokio_postgres::Config::new();
     pg_config.ssl_mode(ctx.ssl_mode);
     let tls_config = postgres_tls_config(&pg_config, &ctx.ssl_files, ctx.accepts_invalid_certs, ctx.verifies_hostname)?;
@@ -896,8 +896,8 @@ struct PostgresConnectionUrl {
     verifies_hostname: bool,
 }
 
-/// 注入 TCP keepalive 参数到 PostgreSQL URL（仅在用户未显式指定时）。
-/// 默认参数缩短半开连接检测时间，适合桌面/VPN/NAT 环境。
+/// Inject TCP keepalive parameters into the PostgreSQL URL (only when the user has not explicitly specified them).
+/// Default parameters shorten half-open connection detection time, suitable for desktop/VPN/NAT environments.
 fn inject_postgres_keepalive_params(url: &str) -> String {
     let (base, fragment) = url.split_once('#').map_or((url, ""), |(base, fragment)| (base, fragment));
     let query = base.split('?').nth(1);
@@ -905,7 +905,7 @@ fn inject_postgres_keepalive_params(url: &str) -> String {
         .map(|q| q.split('&').any(|p| p.split('=').next().is_some_and(|k| k.eq_ignore_ascii_case("keepalives"))))
         .unwrap_or(false);
     if has_keepalives {
-        return url.to_string(); // 用户已显式配置
+        return url.to_string(); // User has explicitly configured keepalive
     }
     let separator = if base.contains('?') { "&" } else { "?" };
     let injected =
@@ -2133,9 +2133,9 @@ where
     }
 }
 
-/// 带 timeout 和 cancel token 的 PostgreSQL pool checkout。
-/// checkout 阶段卡住时，cancel token 可提前终止等待。
-/// timeout 错误消息包含 "checkout timed out"，确保 is_connection_error 能正确分类。
+/// PostgreSQL pool checkout with timeout and cancel token support.
+/// When the checkout phase is stuck, the cancel token can terminate the wait early.
+/// The timeout error message includes "checkout timed out" to ensure is_connection_error can classify it correctly.
 pub async fn checkout_postgres_client(
     pool: &Pool,
     cancel_token: Option<&CancellationToken>,
@@ -2212,8 +2212,7 @@ async fn cancel_postgres_query(
                 }
             },
             Err(err) => {
-                log::warn!("Failed to build TLS connector for cancel: {err}");
-                return;
+                log::warn!("Failed to build TLS connector for cancel: {err}; falling back to NoTls cancel");
             }
         }
     }
