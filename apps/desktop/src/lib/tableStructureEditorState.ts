@@ -268,6 +268,7 @@ export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
     "interval day to second",
   ],
   questdb: ["boolean", "ipv4", "byte", "short", "char", "int", "float", "symbol", "varchar", "string", "long", "date", "timestamp", "timestamp_ns", "double", "uuid", "binary", "long256", "geohash", "array", "interval", "decimal"],
+  xugu: ["BOOLEAN", "INTEGER", "SMALLINT", "BIGINT", "FLOAT", "NUMERIC", "CHAR", "VARCHAR", "CLOB", "DATE", "TIME", "TIMESTAMP", "BINARY", "VARBINARY", "BLOB", "XML", "BOOL", "INT", "SHORT", "LONGINT", "LONG", "REAL", "DECIMAL", "TEXT", "NCHAR", "NVARCHAR", "NVARCHAR2"],
 };
 
 const DATA_TYPE_OPTION_ALIASES: Partial<Record<DatabaseType, string>> = {

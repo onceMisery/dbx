@@ -569,6 +569,10 @@ export async function getColumns(connectionId: string, database: string, schema:
   return invoke("get_columns", { connectionId, database, schema, table });
 }
 
+export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
+  return invoke("list_data_types", { connectionId, database });
+}
+
 export async function executeQuery(
   connectionId: string,
   database: string,
@@ -1607,7 +1611,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
         unlisten = await listen<TransferProgress>("transfer-progress", (event) => {
           if (event.payload.transferId !== request.transferId) return;
           onProgress(event.payload);
-          if (event.payload.status === "done" || event.payload.status === "cancelled") {
+          if (event.payload.status === "done" || event.payload.status === "error" || event.payload.status === "cancelled") {
             unlisten?.();
             resolve();
           }

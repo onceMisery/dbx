@@ -56,6 +56,7 @@ const historyStore = useHistoryStore();
 const settingsStore = useSettingsStore();
 const { toast } = useToast();
 const rootRef = ref<HTMLElement>();
+const dynamicDataTypeOptionsCache = new Map<string, string[]>();
 
 const sqlHighlighter = ref<SqlHighlighter>();
 onMounted(async () => {
@@ -310,7 +311,7 @@ const structureDensityStyle = computed(() => {
     "--structure-line-height": String(metric.lineHeight),
   };
 });
-const structureControlClass = "h-[var(--structure-control-height)] min-w-0 px-[var(--structure-control-px)] py-0 text-[length:var(--structure-font-size)]";
+const structureControlClass = "h-[var(--structure-control-height)] min-w-0 rounded-none px-[var(--structure-control-px)] py-0 text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25";
 const structureMonoControlClass = `${structureControlClass} font-mono`;
 const structureToolbarButtonClass = "h-[var(--structure-control-height)] gap-1 px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]";
 const structureIconButtonClass = "h-[var(--structure-control-height)] w-[var(--structure-control-height)]";
@@ -454,7 +455,8 @@ const structureCapabilities = computed(() => getTableStructureCapabilities(datab
 const tableMetadataCapabilities = computed(() => getTableMetadataCapabilities(databaseType.value));
 const structureDialect = computed(() => structureCapabilities.value.dialect);
 const isTableCommentDisabled = computed(() => !structureCapabilities.value.comment);
-const dataTypeOptions = computed(() => getDataTypeOptions(databaseType.value));
+const dynamicDataTypeOptions = ref<string[]>([]);
+const dataTypeOptions = computed(() => mergeDataTypeOptions(dynamicDataTypeOptions.value, getDataTypeOptions(databaseType.value)));
 const columnEditorControls = computed(() => getColumnEditorControls(databaseType.value));
 
 const indexTypesByDb: Record<string, string[]> = {
@@ -587,6 +589,7 @@ function isManticoreJsonColumn(column: EditableStructureColumn): boolean {
 
 let sqlPreviewRequestId = 0;
 let structureLoadRequestId = 0;
+let dataTypeOptionsRequestId = 0;
 let sqlPreviewDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 let deferredSqlPreviewRefresh = false;
 let keydownListenerRegistered = false;
@@ -610,6 +613,57 @@ function clearSqlPreviewState() {
   sqlPreviewLoading.value = false;
   pendingStatements.value = [];
   warnings.value = [];
+}
+
+function dataTypeOptionsCacheKey(connectionId: string, database: string) {
+  return `${connectionId}\u0000${database}`;
+}
+
+function mergeDataTypeOptions(primary: readonly string[], fallback: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const option of [...primary, ...fallback]) {
+    const trimmed = option.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+async function loadDynamicDataTypeOptions() {
+  const requestId = ++dataTypeOptionsRequestId;
+  const connectionId = props.connectionId;
+  const database = props.database;
+  if (!connectionId || !database) {
+    dynamicDataTypeOptions.value = [];
+    return;
+  }
+  const cacheKey = dataTypeOptionsCacheKey(connectionId, database);
+  const cached = dynamicDataTypeOptionsCache.get(cacheKey);
+  if (cached) {
+    dynamicDataTypeOptions.value = cached;
+    return;
+  }
+  dynamicDataTypeOptions.value = [];
+  try {
+    await store.ensureConnected(connectionId);
+    const options = await api.listDataTypes(connectionId, database);
+    if (requestId !== dataTypeOptionsRequestId) return;
+    const normalized = mergeDataTypeOptions(options, []);
+    if (normalized.length > 0) {
+      dynamicDataTypeOptionsCache.set(cacheKey, normalized);
+      dynamicDataTypeOptions.value = normalized;
+    } else {
+      dynamicDataTypeOptions.value = [];
+    }
+  } catch {
+    if (requestId === dataTypeOptionsRequestId) {
+      dynamicDataTypeOptions.value = [];
+    }
+  }
 }
 
 function scheduleSqlPreviewRefresh() {
@@ -1222,11 +1276,13 @@ function unregisterStructureEditorShortcuts() {
 onMounted(() => {
   resetState();
   registerStructureEditorShortcuts();
+  void loadDynamicDataTypeOptions();
   void loadStructure();
 });
 
 onActivated(() => {
   registerStructureEditorShortcuts();
+  void loadDynamicDataTypeOptions();
   if (!isCreateMode.value) void loadStructure(true);
 });
 onDeactivated(unregisterStructureEditorShortcuts);
@@ -1253,6 +1309,10 @@ watch(tableMetadataCapabilities, (capabilities) => {
     (activeTab.value === "triggers" && capabilities.triggers) ||
     (activeTab.value === "ddl" && capabilities.ddl && !isCreateMode.value);
   if (!supported) activeTab.value = firstStructureMetadataTab(capabilities);
+});
+
+watch([() => props.connectionId, () => props.database, databaseType], () => {
+  void loadDynamicDataTypeOptions();
 });
 
 watch(
@@ -1340,7 +1400,7 @@ watch(activeTab, (tab) => {
                 <div ref="structureDensityMenuRef" class="relative">
                   <button
                     type="button"
-                    class="flex h-[var(--structure-control-height)] min-w-[76px] items-center justify-between rounded-md border bg-background px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/40"
+                    class="flex h-[var(--structure-control-height)] min-w-[76px] items-center justify-between rounded-md border bg-background px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] outline-none hover:bg-muted focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25"
                     :aria-label="t('structureEditor.density')"
                     :aria-expanded="structureDensityMenuOpen"
                     aria-haspopup="listbox"
@@ -1500,7 +1560,7 @@ watch(activeTab, (tab) => {
                           </div>
                           <textarea
                             v-model="column.comment"
-                            class="min-h-36 w-full resize-y rounded-md border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50"
+                            class="min-h-36 w-full resize-y rounded-none border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50"
                             :placeholder="t('structureEditor.commentPlaceholder')"
                             :disabled="isColumnCommentDisabled(column)"
                           />
@@ -1562,7 +1622,7 @@ watch(activeTab, (tab) => {
                             }
                           "
                         >
-                          <SelectTrigger class="h-[var(--structure-control-height)] w-28 rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                          <SelectTrigger class="h-[var(--structure-control-height)] w-28 rounded-none px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
@@ -1722,7 +1782,7 @@ watch(activeTab, (tab) => {
                   </td>
                   <td :class="structureCellClass">
                     <Select v-if="indexTypeOptions.length > 0" :model-value="index.indexType || 'BTREE'" :disabled="!canEditIndexDraft(index)" @update:model-value="(v: any) => (index.indexType = String(v ?? ''))">
-                      <SelectTrigger class="h-[var(--structure-control-height)] w-full rounded-md px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)]">
+                      <SelectTrigger class="h-[var(--structure-control-height)] w-full rounded-none px-[var(--structure-control-px)] font-mono text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -1801,7 +1861,7 @@ watch(activeTab, (tab) => {
                 </div>
                 <div class="mt-1.5 grid grid-cols-[minmax(110px,0.5fr)_minmax(110px,0.5fr)_1fr] gap-1.5">
                   <Select :model-value="fk.onDelete || '__default'" :disabled="!canEditForeignKeyDraft(fk)" @update:model-value="(v: any) => (fk.onDelete = String(v === '__default' ? '' : (v ?? '')))">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-none px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                       <SelectValue :placeholder="t('structureEditor.onDelete')" />
                     </SelectTrigger>
                     <SelectContent>
@@ -1809,7 +1869,7 @@ watch(activeTab, (tab) => {
                     </SelectContent>
                   </Select>
                   <Select :model-value="fk.onUpdate || '__default'" :disabled="!canEditForeignKeyDraft(fk)" @update:model-value="(v: any) => (fk.onUpdate = String(v === '__default' ? '' : (v ?? '')))">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-none px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                       <SelectValue :placeholder="t('structureEditor.onUpdate')" />
                     </SelectTrigger>
                     <SelectContent>
@@ -1835,7 +1895,7 @@ watch(activeTab, (tab) => {
                 <div class="grid grid-cols-[minmax(140px,1fr)_110px_110px_auto] gap-1.5">
                   <Input v-model="trigger.name" :class="structureControlClass" :placeholder="t('structureEditor.triggerName')" :disabled="!canEditTriggerDraft(trigger)" />
                   <Select v-model="trigger.timing" :disabled="!canEditTriggerDraft(trigger)">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-none px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -1843,7 +1903,7 @@ watch(activeTab, (tab) => {
                     </SelectContent>
                   </Select>
                   <Select v-model="trigger.event" :disabled="!canEditTriggerDraft(trigger)">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-md px-[var(--structure-control-px)] text-[length:var(--structure-font-size)]">
+                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-none px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -1863,7 +1923,7 @@ watch(activeTab, (tab) => {
                 </div>
                 <textarea
                   v-model="trigger.statement"
-                  class="mt-1.5 min-h-28 w-full resize-y rounded-md border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] font-mono text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50"
+                  class="mt-1.5 min-h-28 w-full resize-y rounded-none border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] font-mono text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50"
                   :placeholder="t('structureEditor.triggerStatement')"
                   :disabled="!canEditTriggerDraft(trigger)"
                 />

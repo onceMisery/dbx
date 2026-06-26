@@ -10,8 +10,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUSTFLAGS: -C debuginfo=line-tables-only
+
 jobs:
   frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -43,6 +48,8 @@ jobs:
         run: pnpm publish:dry-run
 
   rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -79,6 +86,8 @@ jobs:
         run: cargo test --workspace --locked
 
   jdbc:
+    needs: changes
+    if: needs.changes.outputs.jdbc == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -107,31 +116,39 @@ jobs:
   changes:
     runs-on: ubuntu-22.04
     outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      rust: ${{ steps.filter.outputs.rust }}
+      jdbc: ${{ steps.filter.outputs.jdbc }}
       agents: ${{ steps.filter.outputs.agents }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Detect agent changes
+      - name: Detect changed areas
+        uses: dorny/paths-filter@v3
         id: filter
-        shell: bash
-        env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          if [ -z "$BASE_SHA" ] || echo "$BASE_SHA" | grep -Eq '^0+$' || ! git rev-parse --verify "$BASE_SHA^{commit}" >/dev/null 2>&1; then
-            if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-              BASE_SHA="HEAD^"
-            else
-              BASE_SHA="$(git hash-object -t tree /dev/null)"
-            fi
-          fi
-
-          if git diff --name-only "$BASE_SHA" HEAD -- agents/ | grep -q .; then
-            echo "agents=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "agents=false" >> "$GITHUB_OUTPUT"
-          fi
+        with:
+          filters: |
+            frontend:
+              - 'apps/desktop/**'
+              - 'packages/**'
+              - 'pnpm-lock.yaml'
+              - 'package.json'
+              - '.oxfmtrc.json'
+              - 'scripts/run-check.mjs'
+              - '.github/workflows/ci.yml'
+            rust:
+              - 'crates/**'
+              - 'src-tauri/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+            jdbc:
+              - 'plugins/jdbc/**'
+            agents:
+              - 'agents/**'
 
   agents:
     needs: changes

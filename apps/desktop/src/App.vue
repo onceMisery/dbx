@@ -29,6 +29,7 @@ import { useDataGridActions } from "@/composables/useDataGridActions";
 import { useTauriEvents } from "@/composables/useTauriEvents";
 import { useCloseActionPrompt } from "@/composables/useCloseActionPrompt";
 import { useVisibilityChange } from "@/composables/useVisibilityChange";
+import { useWebDavAutoUpload } from "@/composables/useWebDavAutoUpload";
 import "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/api";
@@ -216,7 +217,7 @@ function promptActiveDatabaseSelection() {
   toast(t("editor.selectDatabaseRequired"), 2500);
 }
 
-const { dangerSql, pendingDangerSql, showDangerDialog, suppressDangerConfirm, tryExecute, doExecute, cancelActiveExecution, tryExplain, onDangerConfirm, explainMode } = useSqlExecution({
+const { dangerSql, pendingDangerSql, showDangerDialog, suppressDangerConfirm, tryExecute, doExecute, cancelActiveExecution, tryExplain, onDangerConfirm, showSqlParameterDialog, sqlParameterSourceSql, sqlParameterNames, onSqlParametersConfirm, explainMode } = useSqlExecution({
   activeTab,
   activeConnection,
   executableSql,
@@ -243,6 +244,7 @@ const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
 });
 const { showCloseActionPrompt, chooseQuit, chooseMinimize, setupCloseActionPromptListener, cleanupCloseActionPromptListener } = useCloseActionPrompt();
 useVisibilityChange();
+useWebDavAutoUpload();
 
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
@@ -1629,11 +1631,16 @@ onUnmounted(() => {
           :show-danger-dialog="showDangerDialog"
           :danger-sql="dangerSql"
           :suppress-danger-confirm="suppressDangerConfirm"
+          :show-sql-parameter-dialog="showSqlParameterDialog"
+          :sql-parameter-source-sql="sqlParameterSourceSql"
+          :sql-parameter-names="sqlParameterNames"
           @update:show-connection-dialog="setConnectionDialogOpen"
           @update:show-settings-dialog="showSettingsDialog = $event"
           @update:show-danger-dialog="showDangerDialog = $event"
           @update:suppress-danger-confirm="suppressDangerConfirm = $event"
+          @update:show-sql-parameter-dialog="showSqlParameterDialog = $event"
           @danger-confirm="onDangerConfirm"
+          @sql-parameters-confirm="onSqlParametersConfirm"
           @connect-started="(name: string) => toast(t('connection.connecting', { name }), 30000)"
           @connect-succeeded="(name: string) => toast(t('connection.connectSuccess', { name }), 2000)"
           @connect-failed="

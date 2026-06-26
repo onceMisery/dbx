@@ -1,6 +1,6 @@
 name: "❓ Question / 问题咨询"
 description: Usage questions, configuration issues, or feedback you're not sure is a bug. / 使用疑问、配置问题或不确定是否为 bug 的反馈。
-title: "[❓ Question] "
+title: "[Question] "
 labels: ["question"]
 body:
   - type: input

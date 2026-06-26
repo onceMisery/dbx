@@ -24,7 +24,7 @@ import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import * as api from "@/lib/api";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "@/lib/connectionUrl";
-import type { ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
+import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connectionPresentation";
 import { h2ConnectionModeForConfig, h2FileJdbcUrl, h2FilePathFromJdbcUrl, type H2ConnectionMode } from "@/lib/h2Connection";
 import { firstZooKeeperEndpoint, normalizeZooKeeperConnectString } from "@/lib/zookeeperConnection";
@@ -1464,6 +1464,12 @@ async function testConnection() {
 
 function applyConnectionUrlToForm(input: string): boolean {
   try {
+    const draft = parseConnectionDeepLink(input);
+    if (draft) {
+      applyConnectionDraftToForm({ ...draft, oneTime: undefined });
+      return true;
+    }
+
     const parsed = parseConnectionUrl(input, selectedType.value);
     form.value = applyParsedConnectionUrl(form.value, parsed);
     selectedType.value = parsed.driverProfile;
@@ -2146,8 +2152,7 @@ function submitOneTimePrefill(draft: ConnectionDeepLinkDraft) {
   void nextTick(() => save());
 }
 
-function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
-  resetForm();
+function applyConnectionDraftToForm(draft: ConnectionDeepLinkDraft) {
   applyProfile(draft.driverProfile);
   form.value = {
     ...form.value,
@@ -2183,6 +2188,11 @@ function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
   dialogStep.value = "config";
   configTab.value = "connection";
   resetTestState();
+}
+
+function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
+  resetForm();
+  applyConnectionDraftToForm(draft);
   submitOneTimePrefill(draft);
 }
 
@@ -3510,7 +3520,9 @@ function openExternalUrl(url: string) {
                                 ? 'OAuthType=0;OAuthServiceAcctEmail=svc@project.iam.gserviceaccount.com;OAuthPvtKeyPath=/path/key.json'
                                 : form.db_type === 'informix'
                                   ? 'CLIENT_LOCALE=en_US.utf8;DB_LOCALE=en_US.utf8'
-                                  : 'sslmode=disable'
+                                  : form.db_type === 'influxdb'
+                                    ? 'epoch=ms'
+                                    : 'sslmode=disable'
                       "
                     />
                   </div>

@@ -35,6 +35,10 @@ public interface DatabaseAgent {
         return result;
     }
 
+    default List<String> listDataTypes() {
+        return Collections.emptyList();
+    }
+
     default CompletionAssistantResponse completionAssistantSearch(CompletionAssistantRequest request) {
         throw new UnsupportedOperationException("Completion assistant search is not supported by this agent");
     }
@@ -145,6 +149,14 @@ public interface DatabaseAgent {
             throw new IllegalStateException("Not connected");
         }
         return TransactionExecutor.executeUpdateStatements(conn, statements, schema, this::setSchemaSQL);
+    }
+
+    default QueryResult executeBatch(List<String> statements, String schema) {
+        Connection conn = getConnection();
+        if (conn == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        return BatchExecutor.executeBatchStatements(conn, statements, schema, this::setSchemaSQL);
     }
 
     default String setSchemaSQL(String schema) {

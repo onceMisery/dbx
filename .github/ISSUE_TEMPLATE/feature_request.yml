@@ -1,6 +1,6 @@
 name: "💡 Feature Request / 功能建议"
 description: Propose a new feature, interaction improvement, or enhancement. / 提议新功能、交互改进或现有功能增强。
-title: "[💡 Feature] "
+title: "[Feature] "
 labels: ["enhancement"]
 body:
   - type: markdown

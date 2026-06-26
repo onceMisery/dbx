@@ -65,6 +65,7 @@ import { SHORTCUT_DEFINITIONS, findShortcutConflict, normalizeShortcutSettings, 
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebarTableNameDisplay";
 import { normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sqlFormatterConfig";
 import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES } from "@/lib/tableColumnTemplates";
+import { buildMcpCodexConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpVsCodeConfig, type McpEnvEntry } from "@/lib/mcpConfigTemplates";
 import { combineDataTypeForDatabase, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/tableStructureEditorState";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
 import { uuid } from "@/lib/utils";
@@ -77,6 +78,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { currentLocale, setLocale, type Locale } from "@/i18n";
 import { LOCALE_OPTIONS } from "@/lib/localeOptions";
+import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdavAutoUploadConfig";
 
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
@@ -1051,19 +1053,22 @@ async function exportDebugLogs() {
 }
 
 // ---------- MCP Server ----------
+type McpConfigTab = "claude" | "cursor" | "trae" | "vscode" | "windsurf" | "codex" | "opencode";
+type McpCopyKind = "install" | `${McpConfigTab}-config`;
+
 const mcpStatus = ref<McpServerStatus | null>(null);
 const mcpStatusLoading = ref(false);
 const mcpStatusError = ref("");
-const mcpCopied = ref<"" | "install" | "claude-config" | "codex-config" | "opencode-config">("");
-const mcpConfigTab = ref<"claude" | "codex" | "opencode">("claude");
+const mcpCopied = ref<"" | McpCopyKind>("");
+const mcpConfigTab = ref<McpConfigTab>("claude");
 const mcpReadonlyMode = ref(false);
 const mcpAllowDangerous = ref(false);
 const mcpInstalling = ref(false);
 const mcpInstallMessage = ref("");
 const mcpInstallError = ref(false);
 
-const mcpEnvEntries = computed(() => {
-  const entries: Array<[string, string]> = [];
+const mcpEnvEntries = computed<McpEnvEntry[]>(() => {
+  const entries: McpEnvEntry[] = [];
   if (mcpReadonlyMode.value) {
     entries.push(["DBX_MCP_ALLOW_WRITES", "0"]);
   }
@@ -1073,48 +1078,13 @@ const mcpEnvEntries = computed(() => {
   return entries;
 });
 
-const mcpClaudeRecommendedConfig = computed(() => {
-  const config: Record<string, unknown> = {
-    mcpServers: {
-      dbx: {
-        command: "dbx-mcp-server",
-      } as Record<string, unknown>,
-    },
-  };
-  if (mcpEnvEntries.value.length > 0) {
-    const env = Object.fromEntries(mcpEnvEntries.value);
-    ((config.mcpServers as Record<string, any>).dbx as Record<string, unknown>).env = env;
-  }
-  return JSON.stringify(config, null, 2);
-});
+const mcpJsonRecommendedConfig = computed(() => buildMcpJsonConfig(mcpEnvEntries.value));
 
-const mcpCodexRecommendedConfig = computed(() => {
-  const lines = ["[mcp_servers.dbx]", 'command = "dbx-mcp-server"'];
-  if (mcpEnvEntries.value.length > 0) {
-    lines.push("");
-    lines.push("[mcp_servers.dbx.env]");
-    for (const [key, value] of mcpEnvEntries.value) {
-      lines.push(`${key} = "${value}"`);
-    }
-  }
-  return lines.join("\n");
-});
+const mcpVsCodeRecommendedConfig = computed(() => buildMcpVsCodeConfig(mcpEnvEntries.value));
 
-const mcpOpenCodeRecommendedConfig = computed(() => {
-  const config: Record<string, unknown> = {
-    mcp: {
-      dbx: {
-        type: "local",
-        command: ["dbx-mcp-server"],
-      } as Record<string, unknown>,
-    },
-  };
-  if (mcpEnvEntries.value.length > 0) {
-    const env = Object.fromEntries(mcpEnvEntries.value);
-    ((config.mcp as Record<string, unknown>).dbx as Record<string, unknown>).environment = env;
-  }
-  return JSON.stringify(config, null, 2);
-});
+const mcpCodexRecommendedConfig = computed(() => buildMcpCodexConfig(mcpEnvEntries.value));
+
+const mcpOpenCodeRecommendedConfig = computed(() => buildMcpOpenCodeConfig(mcpEnvEntries.value));
 
 const mcpStatusTone = computed<"ok" | "warning" | "muted">(() => {
   if (!mcpStatus.value) return "muted";
@@ -1153,7 +1123,7 @@ async function refreshMcpStatus() {
   }
 }
 
-async function copyMcpText(kind: "install" | "claude-config" | "codex-config" | "opencode-config", value: string) {
+async function copyMcpText(kind: McpCopyKind, value: string) {
   mcpCopied.value = kind;
   try {
     await copyToClipboard(value);
@@ -1196,15 +1166,14 @@ const webdavUsername = ref(localStorage.getItem("dbx-webdav-username") || "");
 const webdavPassword = ref("");
 const webdavRememberPassword = ref(localStorage.getItem("dbx-webdav-remember-password") === "true");
 const webdavHasSavedPassword = ref(false);
-const webdavRemotePath = ref(localStorage.getItem("dbx-webdav-remote-path") || "DBX/sync/snapshot.json");
+const webdavRemotePath = ref(localStorage.getItem("dbx-webdav-remote-path") || DEFAULT_WEB_DAV_REMOTE_PATH);
 const webdavSyncSecrets = ref(false);
 const webdavSecretsPassphrase = ref("");
 const webdavAutoUploadEnabled = ref(localStorage.getItem("dbx-webdav-auto-upload-enabled") === "true");
-const webdavAutoUploadIntervalMinutes = ref(Number(localStorage.getItem("dbx-webdav-auto-upload-interval-minutes") || "30"));
+const webdavAutoUploadIntervalMinutes = ref(Number(localStorage.getItem("dbx-webdav-auto-upload-interval-minutes") || String(DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES)));
 const webdavBusy = ref<"" | "test" | "upload" | "download">("");
 const webdavMessage = ref("");
 const webdavError = ref(false);
-let webdavAutoUploadTimer: ReturnType<typeof window.setInterval> | undefined;
 
 const webdavReady = computed(() => !!webdavEndpoint.value.trim() && !webdavBusy.value && (!webdavSyncSecrets.value || !!webdavSecretsPassphrase.value.trim()));
 
@@ -1213,7 +1182,7 @@ function currentWebDavConfig(): WebDavConfig {
     endpoint: webdavEndpoint.value.trim(),
     username: webdavUsername.value.trim() || undefined,
     password: webdavPassword.value || undefined,
-    remotePath: webdavRemotePath.value.trim() || "DBX/sync/snapshot.json",
+    remotePath: webdavRemotePath.value.trim() || DEFAULT_WEB_DAV_REMOTE_PATH,
   };
 }
 
@@ -1223,11 +1192,11 @@ function currentWebDavAccountConfig(): WebDavConfig {
 }
 
 function rememberWebDavFields() {
-  localStorage.setItem("dbx-webdav-endpoint", webdavEndpoint.value.trim());
-  localStorage.setItem("dbx-webdav-username", webdavUsername.value.trim());
-  localStorage.setItem("dbx-webdav-remote-path", webdavRemotePath.value.trim() || "DBX/sync/snapshot.json");
-  localStorage.setItem("dbx-webdav-auto-upload-enabled", String(webdavAutoUploadEnabled.value));
-  localStorage.setItem("dbx-webdav-auto-upload-interval-minutes", String(normalizedWebDavAutoUploadInterval()));
+  writeWebDavAutoUploadFields(currentWebDavConfig(), {
+    enabled: webdavAutoUploadEnabled.value,
+    intervalMinutes: webdavAutoUploadIntervalMinutes.value,
+  });
+  window.dispatchEvent(new Event("dbx:webdav-auto-upload-config-changed"));
 }
 
 function setWebDavResult(message: string, error = false) {
@@ -1290,43 +1259,6 @@ async function uploadWebDavSnapshot() {
     const summary = await webdavSyncUpload(currentWebDavConfig(), settingsStore.editorSettings, webdavSyncSecrets.value ? webdavSecretsPassphrase.value : undefined);
     return t("settings.syncUploadSuccess", { bytes: summary.bytes, path: summary.remotePath });
   });
-}
-
-function normalizedWebDavAutoUploadInterval() {
-  const value = Number(webdavAutoUploadIntervalMinutes.value);
-  if (!Number.isFinite(value)) return 30;
-  return Math.max(1, Math.min(1440, Math.round(value)));
-}
-
-function scheduleWebDavAutoUpload() {
-  if (webdavAutoUploadTimer) {
-    window.clearInterval(webdavAutoUploadTimer);
-    webdavAutoUploadTimer = undefined;
-  }
-  if (!webdavAutoUploadEnabled.value) return;
-
-  const intervalMinutes = normalizedWebDavAutoUploadInterval();
-  webdavAutoUploadIntervalMinutes.value = intervalMinutes;
-  webdavAutoUploadTimer = window.setInterval(() => {
-    void runWebDavAutoUpload();
-  }, intervalMinutes * 60_000);
-}
-
-async function runWebDavAutoUpload() {
-  if (!webdavEndpoint.value.trim() || webdavBusy.value) return;
-  webdavBusy.value = "upload";
-  webdavMessage.value = "";
-  webdavError.value = false;
-  try {
-    rememberWebDavFields();
-    await applyWebDavPasswordPreference();
-    const summary = await webdavSyncUpload(currentWebDavConfig(), settingsStore.editorSettings, webdavSyncSecrets.value ? webdavSecretsPassphrase.value : undefined);
-    setWebDavResult(t("settings.syncAutoUploadSuccess", { bytes: summary.bytes, path: summary.remotePath }));
-  } catch (e: any) {
-    setWebDavResult(e?.message || String(e), true);
-  } finally {
-    webdavBusy.value = "";
-  }
 }
 
 async function downloadWebDavSnapshot() {
@@ -1408,8 +1340,8 @@ watch(webdavRememberPassword, (val) => {
   localStorage.setItem("dbx-webdav-remember-password", String(val));
 });
 watch([webdavAutoUploadEnabled, webdavAutoUploadIntervalMinutes], () => {
+  webdavAutoUploadIntervalMinutes.value = normalizedWebDavAutoUploadInterval(webdavAutoUploadIntervalMinutes.value);
   rememberWebDavFields();
-  scheduleWebDavAutoUpload();
 });
 
 watch(activeSettingsTab, (tab) => {
@@ -1423,17 +1355,12 @@ watch(activeSettingsTab, (tab) => {
 
 onMounted(() => {
   void refreshWebDavPasswordStatus();
-  scheduleWebDavAutoUpload();
   checkLayoutDescTruncation();
   checkIconThemeDescTruncation();
   initTruncationObservers();
 });
 
 onUnmounted(() => {
-  if (webdavAutoUploadTimer) {
-    window.clearInterval(webdavAutoUploadTimer);
-    webdavAutoUploadTimer = undefined;
-  }
   cleanupTableColumnTemplatePointerDrag();
   cleanupTruncationObservers();
 });
@@ -3267,19 +3194,83 @@ watch(
               <div class="space-y-2">
                 <Label>{{ t("settings.mcpConfig") }}</Label>
                 <Tabs v-model="mcpConfigTab" class="space-y-3">
-                  <TabsList>
+                  <TabsList class="max-w-full overflow-x-auto">
                     <TabsTrigger value="claude">Claude Code</TabsTrigger>
+                    <TabsTrigger value="cursor">Cursor</TabsTrigger>
+                    <TabsTrigger value="trae">TRAE</TabsTrigger>
+                    <TabsTrigger value="vscode">VS Code</TabsTrigger>
+                    <TabsTrigger value="windsurf">Windsurf</TabsTrigger>
                     <TabsTrigger value="codex">Codex</TabsTrigger>
                     <TabsTrigger value="opencode">OpenCode</TabsTrigger>
                   </TabsList>
 
                   <TabsContent value="claude" class="m-0">
                     <div class="relative rounded-md border bg-background p-3">
-                      <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpClaudeRecommendedConfig }}</code></pre>
-                      <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('claude-config', mcpClaudeRecommendedConfig)">
+                      <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                      <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('claude-config', mcpJsonRecommendedConfig)">
                         <CheckCircle2 v-if="mcpCopied === 'claude-config'" class="h-3.5 w-3.5 text-green-500" />
                         <Copy v-else class="h-3.5 w-3.5" />
                       </Button>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="cursor" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpCursorConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('cursor-config', mcpJsonRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'cursor-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="trae" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpTraeConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('trae-config', mcpJsonRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'trae-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="vscode" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpVsCodeConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpVsCodeRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('vscode-config', mcpVsCodeRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'vscode-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="windsurf" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpWindsurfConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('windsurf-config', mcpJsonRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'windsurf-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
                     </div>
                   </TabsContent>
 

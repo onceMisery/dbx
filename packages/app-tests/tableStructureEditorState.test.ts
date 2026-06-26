@@ -1,6 +1,21 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { applyManticoreDdlColumnExtras, buildStructureTargetLabel, canEditManticoreColumnProperties, combineDataTypeForDatabase, createColumnDrafts, createIndexDrafts, generateIndexName, generateUniqueIndexName, getColumnEditorControls, getDataTypeOptions, isProtectedManticoreIdColumn, normalizeDataTypeParams, parseExtraToColumnExtra, toColumnNames } from "../../apps/desktop/src/lib/tableStructureEditorState.ts";
+import {
+  applyManticoreDdlColumnExtras,
+  buildStructureTargetLabel,
+  canEditManticoreColumnProperties,
+  combineDataTypeForDatabase,
+  createColumnDrafts,
+  createIndexDrafts,
+  generateIndexName,
+  generateUniqueIndexName,
+  getColumnEditorControls,
+  getDataTypeOptions,
+  isProtectedManticoreIdColumn,
+  normalizeDataTypeParams,
+  parseExtraToColumnExtra,
+  toColumnNames,
+} from "../../apps/desktop/src/lib/tableStructureEditorState.ts";
 import type { ColumnInfo, IndexInfo } from "../../apps/desktop/src/types/database.ts";
 
 const columns: ColumnInfo[] = [
@@ -221,6 +236,14 @@ test("returns data type options for compatible table structure editors", () => {
   assert.deepEqual(getDataTypeOptions("doris"), getDataTypeOptions("mysql"));
   assert.equal(getDataTypeOptions("dameng").includes("varchar2"), true);
   assert.equal(getDataTypeOptions("sqlserver").includes("nvarchar"), true);
+});
+
+test("returns Xugu data type options", () => {
+  const options = getDataTypeOptions("xugu");
+  assert.equal(options.includes("INTEGER"), true);
+  assert.equal(options.includes("VARCHAR"), true);
+  assert.equal(options.includes("NUMERIC"), true);
+  assert.equal(options.includes("INT"), true);
 });
 
 test("returns Manticore Search data type options", () => {

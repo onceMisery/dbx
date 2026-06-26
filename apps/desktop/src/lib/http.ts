@@ -527,6 +527,10 @@ export async function getColumns(connectionId: string, database: string, schema:
   return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table })}`);
 }
 
+export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
+  return get(`/api/schema/data-types?${qs({ connection_id: connectionId, database })}`);
+}
+
 export async function listIndexes(connectionId: string, database: string, schema: string, table: string): Promise<IndexInfo[]> {
   return get(`/api/schema/indexes?${qs({ connection_id: connectionId, database, schema, table })}`);
 }
@@ -1143,7 +1147,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
     es.onmessage = (e) => {
       const progress: TransferProgress = JSON.parse(e.data);
       onProgress(progress);
-      if (progress.status === "done" || progress.status === "cancelled") {
+      if (progress.status === "done" || progress.status === "error" || progress.status === "cancelled") {
         es.close();
         resolve();
       }

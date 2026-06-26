@@ -1915,7 +1915,7 @@ pub async fn execute_query_with_schema_and_max_rows(
     let set_schema_start = Instant::now();
     execute_postgres_infra_statement(
         &client,
-        &format!("SET search_path TO {}", pg_quote_ident(schema)),
+        &format!("SET search_path TO {}, public", pg_quote_ident(schema)),
         super::connection_timeout(),
         "schema.set",
     )
@@ -1980,7 +1980,7 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
     let set_schema_start = Instant::now();
     execute_postgres_infra_statement(
         &client,
-        &format!("SET search_path TO {}", pg_quote_ident(schema)),
+        &format!("SET search_path TO {}, public", pg_quote_ident(schema)),
         budget.recycle_timeout,
         "schema.set",
     )
