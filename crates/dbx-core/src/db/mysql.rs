@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::models::connection::DatabaseType;
 use crate::sql::starts_with_executable_sql_keyword;
@@ -2009,10 +2010,25 @@ fn skip_mysql_quoted(sql: &str, start: usize, quote: u8) -> usize {
 /// Get a connection from the pool with a health check. If the connection is dead
 /// (e.g. after app was backgrounded), it tries again with a fresh connection.
 pub async fn get_conn_with_health_check(pool: &MySqlPool) -> Result<mysql_async::Conn, String> {
+    get_conn_with_health_check_with_timeout(pool, super::connection_timeout()).await
+}
+
+pub async fn get_conn_with_health_check_with_timeout(
+    pool: &MySqlPool,
+    timeout: Duration,
+) -> Result<mysql_async::Conn, String> {
+    get_conn_with_health_check_with_cancel(pool, timeout, timeout, None).await
+}
+
+pub async fn get_conn_with_health_check_with_cancel(
+    pool: &MySqlPool,
+    timeout: Duration,
+    cleanup_timeout: Duration,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<mysql_async::Conn, String> {
     let start = Instant::now();
-    let timeout = super::connection_timeout();
-    let mut conn = get_conn_with_timeout(pool, timeout).await?;
-    match ping_conn_with_timeout(&mut conn, timeout).await {
+    let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token).await?;
+    match ping_conn_with_timeout_and_cancel(&mut conn, timeout, cancel_token).await {
         Ok(()) => {
             log::debug!(
                 "[db:health.check:done] elapsed_ms={} timeout_ms={}",
@@ -2021,6 +2037,10 @@ pub async fn get_conn_with_health_check(pool: &MySqlPool) -> Result<mysql_async:
             );
             Ok(conn)
         }
+        Err(err) if err == crate::query::QUERY_CANCELED => {
+            let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
+            Err(err)
+        }
         Err(err) => {
             log::warn!(
                 "[db:health.check:error] elapsed_ms={} timeout_ms={} error={}; retrying",
@@ -2028,9 +2048,14 @@ pub async fn get_conn_with_health_check(pool: &MySqlPool) -> Result<mysql_async:
                 timeout.as_millis(),
                 err
             );
-            let _ = tokio::time::timeout(timeout, conn.disconnect()).await;
-            let mut conn = get_conn_with_timeout(pool, timeout).await?;
-            ping_conn_with_timeout(&mut conn, timeout).await?;
+            let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
+            let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token).await?;
+            if let Err(err) = ping_conn_with_timeout_and_cancel(&mut conn, timeout, cancel_token).await {
+                if err == crate::query::QUERY_CANCELED {
+                    let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
+                }
+                return Err(err);
+            }
             log::info!(
                 "[db:health.check:recovered] elapsed_ms={} timeout_ms={}",
                 start.elapsed().as_millis(),
@@ -2041,6 +2066,30 @@ pub async fn get_conn_with_health_check(pool: &MySqlPool) -> Result<mysql_async:
     }
 }
 
+async fn get_conn_with_timeout_and_cancel(
+    pool: &MySqlPool,
+    timeout: Duration,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<mysql_async::Conn, String> {
+    let get_future = async {
+        tokio::time::timeout(timeout, pool.get_conn())
+            .await
+            .map_err(|_| "MySQL get connection timed out".to_string())?
+            .map_err(|e| e.to_string())
+    };
+
+    match cancel_token {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(crate::query::canceled_error()),
+                result = get_future => result,
+            }
+        }
+        None => get_future.await,
+    }
+}
+
 pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<mysql_async::Conn, String> {
     tokio::time::timeout(timeout, pool.get_conn())
         .await
@@ -2048,11 +2097,28 @@ pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Resul
         .map_err(|e| e.to_string())
 }
 
-async fn ping_conn_with_timeout(conn: &mut mysql_async::Conn, timeout: Duration) -> Result<(), String> {
-    tokio::time::timeout(timeout, conn.ping())
-        .await
-        .map_err(|_| "MySQL ping timed out".to_string())?
-        .map_err(|e| e.to_string())
+async fn ping_conn_with_timeout_and_cancel(
+    conn: &mut mysql_async::Conn,
+    timeout: Duration,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<(), String> {
+    let ping_future = async {
+        tokio::time::timeout(timeout, conn.ping())
+            .await
+            .map_err(|_| "MySQL ping timed out".to_string())?
+            .map_err(|e| e.to_string())
+    };
+
+    match cancel_token {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(crate::query::canceled_error()),
+                result = ping_future => result,
+            }
+        }
+        None => ping_future.await,
+    }
 }
 
 async fn execute_result_set_with_text_protocol_on_conn(

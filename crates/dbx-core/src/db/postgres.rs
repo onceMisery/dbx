@@ -2059,7 +2059,7 @@ fn postgres_schema_reset_cleanup_error(err: String) -> String {
     format!("PostgreSQL schema.reset cleanup failed: {err}")
 }
 
-async fn execute_postgres_infra_statement(
+pub(crate) async fn execute_postgres_infra_statement(
     client: &deadpool_postgres::Client,
     sql: &str,
     timeout_duration: Duration,
@@ -2069,6 +2069,19 @@ async fn execute_postgres_infra_statement(
         .await
         .map_err(|_| format!("PostgreSQL {stage} timed out after {} seconds", timeout_duration.as_secs()))?
         .map_err(pg_error_to_string)
+}
+
+pub(crate) async fn wait_postgres_operation<T, F>(
+    pg_cancel_token: tokio_postgres::CancelToken,
+    cancel_context: Option<PostgresCancelContext>,
+    timeout_duration: Option<Duration>,
+    cancel_timeout: Duration,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    wait_postgres_query(pg_cancel_token, cancel_context, None, timeout_duration, cancel_timeout, future).await
 }
 
 async fn wait_postgres_query<T, F>(

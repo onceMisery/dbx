@@ -33,7 +33,7 @@ pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
 pub const PRESTOSQL_JDBC_DRIVER_CLASS: &str = "io.prestosql.jdbc.PrestoDriver";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
-const POOL_CLOSE_TIMEOUT_SECS: u64 = 5;
+const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
 
 #[cfg(feature = "duckdb-bundled")]
 mod duckdb_types {
@@ -427,9 +427,10 @@ impl AppState {
         self.stop_keepalive_task(&pool_key).await;
         self.pool_activity.write().await.insert(pool_key.clone(), PoolActivity::now());
         self.start_keepalive_task(&pool_key, &pool, config).await;
+        let previous_key = pool_key.clone();
         let previous = self.connections.write().await.insert(pool_key, pool);
         if let Some(pool) = previous {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(previous_key, pool).await;
         }
     }
 
@@ -468,7 +469,7 @@ impl AppState {
         config: &ConnectionConfig,
     ) -> Result<(), String> {
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, Some(attempt)).await {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key, pool).await;
             return Err(err);
         }
         self.insert_connection_pool(pool_key, pool, config).await;
@@ -1027,7 +1028,7 @@ impl AppState {
         };
 
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, connection_attempt).await {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.clone(), pool).await;
             return Err(err);
         }
         self.insert_connection_pool(pool_key.clone(), pool, &db_config).await;
@@ -1341,7 +1342,7 @@ impl AppState {
         self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -1373,7 +1374,7 @@ impl AppState {
             self.postgres_cancel_contexts.write().await.remove(&pool_key);
             let removed = self.connections.write().await.remove(&pool_key);
             if let Some(pool) = removed {
-                close_pool_kind(pool).await;
+                close_pool_kind_with_timeout(pool_key.clone(), pool).await;
             }
         }
         self.get_or_create_pool_for_session(connection_id, database, client_session_id).await
@@ -1403,7 +1404,7 @@ impl AppState {
         self.postgres_cancel_contexts.write().await.remove(&pool_key);
         let removed = self.connections.write().await.remove(&pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key, pool).await;
             Ok(true)
         } else {
             Ok(false)
@@ -1416,7 +1417,7 @@ impl AppState {
         self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -1454,13 +1455,13 @@ impl AppState {
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
             if let Some(pool) = conns.remove(&key) {
-                removed.push(pool);
+                removed.push((key, pool));
             }
         }
         drop(conns);
         let closed = !removed.is_empty();
-        for pool in removed {
-            close_pool_kind(pool).await;
+        for (key, pool) in removed {
+            close_pool_kind_with_timeout(key, pool).await;
         }
         Ok(closed)
     }
@@ -1748,11 +1749,14 @@ impl AppState {
                 }
             }
             let mut conns = self.connections.write().await;
+            let mut removed = Vec::with_capacity(dead_keys.len());
             for key in &dead_keys {
                 if let Some(pool) = conns.remove(key) {
-                    close_pool_kind(pool).await;
+                    removed.push((key.clone(), pool));
                 }
             }
+            drop(conns);
+            close_removed_pools(removed).await;
         }
 
         // Re-establish SSH tunnels that have died
