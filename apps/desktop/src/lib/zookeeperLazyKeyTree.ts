@@ -83,6 +83,37 @@ export function replaceLazyKvChildren(state: LazyKvKeyTreeState, parentKey: stri
   rebuildLazyNodeIndex(state);
 }
 
+export function replaceLazyKvFocusedRoot(state: LazyKvKeyTreeState, root: KvKeySummary, keys: KvKeySummary[], continuation: string | null | undefined) {
+  const previous = new Map(state.nodeByKey);
+  const focusedPath = normalizeZooKeeperPath(root.key);
+  const childNodes = keys.map((key) => lazyNodeFromSummary(key, previous.get(key.key)));
+  const chain = focusedPathChain(focusedPath);
+  let rootNode: LazyKvKeyTreeNode | null = null;
+  let parentNode: LazyKvKeyTreeNode | null = null;
+
+  for (const path of chain) {
+    const node = lazyNodeFromSummary(path === focusedPath ? { ...root, key: focusedPath } : { key: path, numChildren: 1 }, previous.get(path));
+    node.hasChildren = true;
+    node.loaded = true;
+    node.continuation = null;
+    node.children = [];
+
+    if (parentNode) parentNode.children = [node];
+    else rootNode = node;
+    parentNode = node;
+  }
+
+  if (parentNode) {
+    parentNode.children = childNodes;
+    parentNode.hasChildren = parentNode.hasChildren || childNodes.length > 0 || !!continuation;
+    parentNode.continuation = continuation || null;
+  }
+
+  state.roots = rootNode ? [rootNode] : [];
+  state.rootContinuation = null;
+  rebuildLazyNodeIndex(state);
+}
+
 export function flattenLazyKvKeyTree(state: LazyKvKeyTreeState, expandedIds: ReadonlySet<string>): LazyKvKeyTreeRow[] {
   const rows = flattenLazyNodes(state.roots, expandedIds, 0);
   if (state.rootContinuation) {
@@ -144,4 +175,13 @@ function rebuildLazyNodeIndex(state: LazyKvKeyTreeState) {
 
 function keySegments(key: string): string[] {
   return key.split("/").filter(Boolean);
+}
+
+function focusedPathChain(path: string): string[] {
+  const segments = keySegments(path);
+  const chain: string[] = [];
+  for (let index = 0; index < segments.length; index++) {
+    chain.push(`/${segments.slice(0, index + 1).join("/")}`);
+  }
+  return chain;
 }

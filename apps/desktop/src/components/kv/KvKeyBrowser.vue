@@ -14,7 +14,7 @@ import type { KvCreateMode, KvGetResponse, KvKeySummary, KvListPrefixOptions, Kv
 import { buildKvKeyTree, flattenVisibleKvKeyTree, preserveKvExpandedGroupIds, type KvKeyTreeNode } from "@/lib/kvKeyTree";
 import { refreshedKvSelectionKey } from "@/lib/kvRefreshSelection";
 import { formatZooKeeperMetadataRows, formatZooKeeperSummaryBadges, prettyPrintJsonText } from "@/lib/kvValueDisplay";
-import { createLazyKvKeyTreeState, flattenLazyKvKeyTree, lazyExpandedKeyFromId, normalizeZooKeeperPath, parentZooKeeperPath, replaceLazyKvChildren, resetLazyKvKeyTree, type LazyKvKeyTreeNode, type LazyKvKeyTreeRow } from "@/lib/zookeeperLazyKeyTree";
+import { createLazyKvKeyTreeState, flattenLazyKvKeyTree, lazyExpandedKeyFromId, normalizeZooKeeperPath, parentZooKeeperPath, replaceLazyKvChildren, replaceLazyKvFocusedRoot, resetLazyKvKeyTree, type LazyKvKeyTreeNode, type LazyKvKeyTreeRow } from "@/lib/zookeeperLazyKeyTree";
 import { useToast } from "@/composables/useToast";
 
 interface KvKeyBrowserLabels {
@@ -200,10 +200,20 @@ async function loadLazyRoot(reset = true, options: LoadKeysOptions = {}) {
     const rootPath = normalizeZooKeeperPath(prefix.value);
     resetLazyKvKeyTree(lazyTreeState, rootPath);
     const result = await props.api.listPrefix(props.connectionId, rootPath, pageSize, null, { recursive: false });
-    replaceLazyKvChildren(lazyTreeState, null, result.keys, result.continuation);
+    if (rootPath === "/") {
+      replaceLazyKvChildren(lazyTreeState, null, result.keys, result.continuation);
+    } else {
+      const rootSummary = await loadLazyRootSummary(rootPath, result.keys, result.continuation);
+      if (rootSummary) {
+        replaceLazyKvFocusedRoot(lazyTreeState, rootSummary, result.keys, result.continuation);
+      } else {
+        replaceLazyKvChildren(lazyTreeState, null, result.keys, result.continuation);
+      }
+    }
 
     if (options.preserveSelection) {
       await restoreLazyExpandedBranches(previousExpanded);
+      expandFocusedRoot(rootPath);
       if (keyToRestore && lazyTreeState.nodeByKey.has(keyToRestore)) {
         await loadSelectedKey(keyToRestore);
       } else {
@@ -211,11 +221,41 @@ async function loadLazyRoot(reset = true, options: LoadKeysOptions = {}) {
         selectedValue.value = null;
       }
     } else {
-      expandedGroupIds.value = new Set();
+      expandedGroupIds.value = focusedRootExpansion(rootPath);
     }
   } finally {
     loading.value = false;
   }
+}
+
+async function loadLazyRootSummary(rootPath: string, children: KvKeySummary[], continuation?: string | null): Promise<KvKeySummary | null> {
+  try {
+    const rootValue = await props.api.get(props.connectionId, rootPath);
+    if (rootValue.found) return { key: rootValue.key || rootPath, ...(rootValue.metadata ?? {}) };
+    if (children.length === 0 && !continuation) return null;
+  } catch {
+    if (children.length === 0 && !continuation) return null;
+  }
+  return { key: rootPath, numChildren: children.length + (continuation ? 1 : 0) };
+}
+
+function focusedRootExpansion(rootPath: string): Set<string> {
+  const normalized = normalizeZooKeeperPath(rootPath);
+  if (normalized === "/") return new Set();
+  return new Set(
+    focusedPathKeys(normalized)
+      .filter((key) => lazyTreeState.nodeByKey.has(key))
+      .map((key) => `lazy:${key}`),
+  );
+}
+
+function expandFocusedRoot(rootPath: string) {
+  expandedGroupIds.value = new Set([...expandedGroupIds.value, ...focusedRootExpansion(rootPath)]);
+}
+
+function focusedPathKeys(rootPath: string): string[] {
+  const segments = normalizeZooKeeperPath(rootPath).split("/").filter(Boolean);
+  return segments.map((_, index) => `/${segments.slice(0, index + 1).join("/")}`);
 }
 
 async function restoreLazyExpandedBranches(previousExpanded: ReadonlySet<string>) {
@@ -268,8 +308,13 @@ async function loadMoreLazyChildren(parentKey: string | null) {
 async function refreshLazyParent(parentPath: string) {
   const normalizedParent = normalizeZooKeeperPath(parentPath);
   if (normalizedParent === lazyTreeState.rootPath) {
-    const result = await props.api.listPrefix(props.connectionId, lazyTreeState.rootPath, pageSize, null, { recursive: false });
-    replaceLazyKvChildren(lazyTreeState, null, result.keys, result.continuation);
+    if (lazyTreeState.rootPath === "/") {
+      const result = await props.api.listPrefix(props.connectionId, lazyTreeState.rootPath, pageSize, null, { recursive: false });
+      replaceLazyKvChildren(lazyTreeState, null, result.keys, result.continuation);
+    } else {
+      await loadLazyChildren(lazyTreeState.rootPath, true);
+      expandFocusedRoot(lazyTreeState.rootPath);
+    }
     return;
   }
 
