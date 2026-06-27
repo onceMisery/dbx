@@ -1346,6 +1346,10 @@ export interface KvListPrefixResponse {
   revision?: number | null;
 }
 
+export interface KvListPrefixOptions {
+  recursive?: boolean | null;
+}
+
 export interface KvGetResponse {
   found: boolean;
   key?: string | null;
@@ -1391,8 +1395,8 @@ export async function etcdDelete(connectionId: string, key: string): Promise<KvD
 }
 
 // --- ZooKeeper ---
-export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null): Promise<KvListPrefixResponse> {
-  return invoke("zookeeper_list_prefix", { connectionId, prefix, limit, continuation });
+export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null, options?: KvListPrefixOptions | null): Promise<KvListPrefixResponse> {
+  return invoke("zookeeper_list_prefix", { connectionId, prefix, limit, continuation, recursive: options?.recursive ?? null });
 }
 
 export async function zookeeperGet(connectionId: string, key: string): Promise<KvGetResponse> {
