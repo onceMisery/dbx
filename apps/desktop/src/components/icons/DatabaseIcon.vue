@@ -84,6 +84,7 @@ const assetIcons: Record<string, string> = {
   chromadb: "chromadb",
   mq: "pulsar",
   pulsar: "pulsar",
+  kafka: "kafka",
   nacos: "nacos.png",
   iris: "iris.png",
   influxdb: "influxdb",

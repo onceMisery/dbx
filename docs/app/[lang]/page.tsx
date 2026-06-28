@@ -125,6 +125,7 @@ const databaseSupport = [
   { name: "Etcd", icon: "/icons/database/etcd.svg", tone: "#419eda" },
   { name: "ZooKeeper", icon: "/icons/database/zookeeper.svg", tone: "#3b82f6" },
   { name: "Pulsar", icon: "/icons/database/pulsar.svg", tone: "#188fff" },
+  { name: "Kafka", icon: "/icons/database/kafka.svg", tone: "#231F20" },
   { name: "Nacos", icon: "/icons/database/nacos.png", tone: "#2f80ed" },
   { name: "IRIS", icon: "/icons/database/iris.png", tone: "#0085ca" },
   { name: "JDBC", icon: "/icons/database/jdbc.svg", tone: "#6ea8ff" },
