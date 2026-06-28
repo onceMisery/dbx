@@ -762,7 +762,8 @@ public final class KafkaAgent {
             filters.add(AclBindingFilter.ANY);
         }
 
-        int deleted = admin.deleteAcls(filters).values().get(timeout, TimeUnit.MILLISECONDS).size();
+        admin.deleteAcls(filters).all().get(timeout, TimeUnit.MILLISECONDS);
+        int deleted = filters.size();
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("ok", true);
         result.put("deleted", deleted);
