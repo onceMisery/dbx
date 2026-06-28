@@ -927,6 +927,8 @@ pub fn run() {
             commands::mq_cmd::mq_get_backlog,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_raw_request,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_send_message,
             commands::history::save_history,
             commands::history::load_history,
             commands::history::clear_history,

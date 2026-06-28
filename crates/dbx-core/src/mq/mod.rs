@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
 
+use crate::db::agent_driver::AgentLaunchSpec;
 use crate::models::connection::ConnectionConfig;
+use crate::mq::adapters::kafka::KafkaAdmin;
 use crate::mq::adapters::pulsar::PulsarAdmin;
 use crate::mq::config::MqAdminConfig;
 use crate::mq::port::MessageQueueAdmin;
@@ -55,13 +57,14 @@ impl MqAdminRegistry {
     /// connection's `external_config` if not already present.
     pub async fn get_or_build(&self, cfg: &ConnectionConfig) -> Result<Arc<dyn MessageQueueAdmin>, String> {
         let mqc = MqAdminConfig::from_connection(cfg)?;
-        self.get_or_build_config(&cfg.id, mqc).await
+        self.get_or_build_config(&cfg.id, mqc, None).await
     }
 
     pub async fn get_or_build_config(
         &self,
         connection_id: &str,
         mqc: MqAdminConfig,
+        kafka_launch: Option<AgentLaunchSpec>,
     ) -> Result<Arc<dyn MessageQueueAdmin>, String> {
         // Fast path: return the cached adapter.
         if let Some(adapter) = self.instances.read().await.get(connection_id) {
@@ -81,7 +84,7 @@ impl MqAdminRegistry {
             return Ok(adapter.clone());
         }
 
-        let adapter = build_adapter(mqc).await?;
+        let adapter = build_adapter(mqc, kafka_launch).await?;
         self.instances.write().await.insert(connection_id.to_string(), adapter.clone());
         Ok(adapter)
     }
@@ -96,21 +99,33 @@ impl MqAdminRegistry {
     /// where we don't want to retain state.
     pub async fn build_transient(&self, cfg: &ConnectionConfig) -> Result<Arc<dyn MessageQueueAdmin>, String> {
         let mqc = MqAdminConfig::from_connection(cfg)?;
-        self.build_transient_config(mqc).await
+        self.build_transient_config(mqc, None).await
     }
 
-    pub async fn build_transient_config(&self, mqc: MqAdminConfig) -> Result<Arc<dyn MessageQueueAdmin>, String> {
-        build_adapter(mqc).await
+    pub async fn build_transient_config(
+        &self,
+        mqc: MqAdminConfig,
+        kafka_launch: Option<AgentLaunchSpec>,
+    ) -> Result<Arc<dyn MessageQueueAdmin>, String> {
+        build_adapter(mqc, kafka_launch).await
     }
 }
 
-async fn build_adapter(mqc: MqAdminConfig) -> Result<Arc<dyn MessageQueueAdmin>, String> {
+async fn build_adapter(
+    mqc: MqAdminConfig,
+    kafka_launch: Option<AgentLaunchSpec>,
+) -> Result<Arc<dyn MessageQueueAdmin>, String> {
     match mqc.system_kind {
         MqSystemKindInternal::Pulsar => {
             let adapter = PulsarAdmin::new(mqc).await?;
             Ok(Arc::new(adapter))
         }
-        MqSystemKindInternal::Kafka => Err("Kafka admin is not yet implemented".to_string()),
+        MqSystemKindInternal::Kafka => {
+            let launch = kafka_launch
+                .ok_or("Kafka adapter requires an agent launch spec. The Kafka agent driver is not installed or not configured.")?;
+            let adapter = KafkaAdmin::new(mqc, launch).await?;
+            Ok(Arc::new(adapter))
+        }
         MqSystemKindInternal::RocketMq => Err("RocketMQ admin is not yet implemented".to_string()),
     }
 }

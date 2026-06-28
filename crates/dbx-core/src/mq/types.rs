@@ -49,6 +49,9 @@ pub struct MqCapabilities {
     pub supports_geo_replication: bool,
     pub supports_token_management: bool,
     pub supports_raw_admin_api: bool,
+    /// Whether the adapter supports producing messages to topics.
+    #[serde(default)]
+    pub supports_send_message: bool,
 }
 
 impl Default for MqCapabilities {
@@ -71,6 +74,7 @@ impl Default for MqCapabilities {
             supports_geo_replication: false,
             supports_token_management: false,
             supports_raw_admin_api: false,
+            supports_send_message: false,
         }
     }
 }
@@ -561,4 +565,49 @@ pub struct MqRawResponse {
     /// Set when the response body was not valid JSON; carries the raw text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Send message (produce)
+// ---------------------------------------------------------------------------
+
+/// Request to produce a message to a topic.
+///
+/// The payload is always base64-encoded so binary messages are preserved.
+/// An optional `payload_text` field provides a UTF-8 preview for the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageRequest {
+    /// Target topic name.
+    pub topic: String,
+    /// Optional message key (used for partitioning in Kafka).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Message payload encoded as base64.
+    pub payload_base64: String,
+    /// Optional UTF-8 text preview of the payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_text: Option<String>,
+    /// Optional message headers.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional target partition (Kafka). When `None`, the key-based partitioner
+    /// is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<i32>,
+}
+
+/// Result of a successful message production.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageResponse {
+    /// Topic the message was written to.
+    pub topic: String,
+    /// Partition the message was written to.
+    pub partition: i32,
+    /// Offset of the produced message.
+    pub offset: i64,
+    /// Broker-assigned timestamp, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }

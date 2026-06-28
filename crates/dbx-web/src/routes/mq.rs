@@ -709,3 +709,21 @@ pub async fn raw_request(
         dbx_core::mq::service::mq_raw_request_core(&state.app, &req.connection_id, req.req).await.map_err(AppError)?;
     Ok(Json(result))
 }
+
+// ---- Message production ----
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SendMessageReq {
+    connection_id: String,
+    req: dbx_core::mq::SendMessageRequest,
+}
+
+pub async fn send_message(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<SendMessageReq>,
+) -> Result<Json<dbx_core::mq::SendMessageResponse>, AppError> {
+    let result =
+        dbx_core::mq::service::mq_send_message_core(&state.app, &req.connection_id, req.req).await.map_err(AppError)?;
+    Ok(Json(result))
+}

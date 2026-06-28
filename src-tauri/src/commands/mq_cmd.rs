@@ -446,3 +446,14 @@ pub async fn mq_raw_request(
     }
     dbx_core::mq::service::mq_raw_request_core(&state, &connection_id, req).await
 }
+
+// ---- Message production ----
+
+#[tauri::command]
+pub async fn mq_send_message(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    req: dbx_core::mq::SendMessageRequest,
+) -> Result<dbx_core::mq::SendMessageResponse, String> {
+    dbx_core::mq::service::mq_send_message_core(&state, &connection_id, req).await
+}

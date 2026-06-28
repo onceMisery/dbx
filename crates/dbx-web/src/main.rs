@@ -75,6 +75,7 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
         .route("/mq/tokens/list", post(routes::mq::list_token_records))
         .route("/mq/monitoring/backlog", post(routes::mq::get_backlog))
         .route("/mq/raw", post(routes::mq::raw_request))
+        .route("/mq/send-message", post(routes::mq::send_message))
 }
 
 #[cfg(not(feature = "mq-admin"))]

@@ -74,4 +74,12 @@ pub trait MessageQueueAdmin: Send + Sync {
     /// Escape hatch: proxy an arbitrary admin REST call. Covers any endpoint the
     /// typed methods do not.
     async fn raw_request(&self, req: MqRawRequest) -> Result<MqRawResponse, String>;
+
+    // ---- Message production ----
+
+    /// Produce a message to a topic. Adapters that do not support message
+    /// production (e.g. admin-only systems) return an error by default.
+    async fn send_message(&self, _req: SendMessageRequest) -> Result<SendMessageResponse, String> {
+        Err("Message production is not supported by this MQ system".to_string())
+    }
 }

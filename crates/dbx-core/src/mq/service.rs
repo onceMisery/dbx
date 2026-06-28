@@ -6,6 +6,7 @@
 //! Mirrors the pattern used by `agent_kv::*_core`.
 
 use crate::connection::AppState;
+use crate::db::agent_driver::AgentLaunchSpec;
 use crate::mq::config::MqAdminConfig;
 use crate::mq::token::sign_pulsar_token;
 use crate::mq::types::*;
@@ -19,7 +20,8 @@ const MAX_PEEK_MESSAGES: u32 = 100;
 pub async fn mq_test_connection_core(state: &AppState, conn_id: &str) -> Result<MqClusterInfo, String> {
     let cfg = state.configs.read().await.get(conn_id).cloned().ok_or("Connection not found")?;
     let mqc = state.mq_admin_config_for_connection(conn_id, &cfg).await?;
-    let adapter = state.mq_registry.build_transient_config(mqc).await?;
+    let kafka_launch = resolve_kafka_launch_spec(&mqc, state);
+    let adapter = state.mq_registry.build_transient_config(mqc, kafka_launch).await?;
     adapter.test_connection().await
 }
 
@@ -456,6 +458,19 @@ pub async fn mq_raw_request_core(state: &AppState, conn_id: &str, req: MqRawRequ
     adapter.raw_request(req).await
 }
 
+// ---- Message production ----
+
+/// Produce a message to a topic through the MQ adapter.
+pub async fn mq_send_message_core(
+    state: &AppState,
+    conn_id: &str,
+    req: SendMessageRequest,
+) -> Result<SendMessageResponse, String> {
+    ensure_connection_writable(state, conn_id, "Send message").await?;
+    let adapter = get_adapter(state, conn_id).await?;
+    adapter.send_message(req).await
+}
+
 // ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
@@ -466,7 +481,29 @@ async fn get_adapter(
 ) -> Result<std::sync::Arc<dyn crate::mq::port::MessageQueueAdmin>, String> {
     let cfg = state.configs.read().await.get(conn_id).cloned().ok_or("Connection not found")?;
     let mqc = state.mq_admin_config_for_connection(conn_id, &cfg).await?;
-    state.mq_registry.get_or_build_config(conn_id, mqc).await
+    let kafka_launch = resolve_kafka_launch_spec(&mqc, state);
+    state.mq_registry.get_or_build_config(conn_id, mqc, kafka_launch).await
+}
+
+/// Resolve the Kafka agent launch spec if the config targets Kafka.
+/// Returns `None` for non-Kafka systems so the registry skips agent resolution.
+pub fn resolve_kafka_launch_spec(mqc: &MqAdminConfig, state: &AppState) -> Option<AgentLaunchSpec> {
+    if mqc.system_kind != MqSystemKind::Kafka {
+        return None;
+    }
+    let agent_state = state.agent_manager.load_state();
+    let jre_key = agent_state
+        .installed_drivers
+        .get("kafka")
+        .map(|driver| driver.jre.as_str())
+        .unwrap_or(crate::agent_manager::DEFAULT_JRE_KEY);
+    match state.agent_manager.resolve_agent_launch_spec(&agent_state, "kafka", jre_key) {
+        Ok(launch) => Some(launch),
+        Err(err) => {
+            log::warn!("Failed to resolve Kafka agent launch spec: {err}");
+            None
+        }
+    }
 }
 
 async fn ensure_connection_writable(state: &AppState, conn_id: &str, operation: &str) -> Result<(), String> {

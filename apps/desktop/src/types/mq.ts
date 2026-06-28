@@ -20,6 +20,7 @@ export interface MqCapabilities {
   supportsGeoReplication: boolean;
   supportsTokenManagement: boolean;
   supportsRawAdminApi: boolean;
+  supportsSendMessage?: boolean;
 }
 
 export interface MqClusterInfo {
@@ -248,4 +249,21 @@ export interface MqRawResponse {
   status: number;
   body: unknown;
   text?: string;
+}
+
+// Send message (produce)
+export interface SendMessageRequest {
+  topic: string;
+  key?: string;
+  payloadBase64: string;
+  payloadText?: string;
+  headers: Record<string, string>;
+  partition?: number;
+}
+
+export interface SendMessageResponse {
+  topic: string;
+  partition: number;
+  offset: number;
+  timestamp?: string;
 }
