@@ -12,7 +12,7 @@ KOTLIN_FILE_SUFFIXES = (".kt", ".kts")
 KOTLIN_SCAN_EXCLUDED_PARTS = {".git", ".gradle", "build"}
 DEFAULT_AGENT_JRE_KEY = "21"
 LEGACY_ORACLE_JRE_KEY = "8"
-NON_JDBC_AGENT_MODULES = {"mongodb", "etcd", "zookeeper"}
+NON_JDBC_AGENT_MODULES = {"mongodb", "etcd", "zookeeper", "kafka"}
 NATIVE_ONLY_AGENT_MODULES = {"xugu"}
 JDBC_ARCHITECTURE_ALLOWLIST = {
     "access": "custom Access metadata and URL behavior pending migration",

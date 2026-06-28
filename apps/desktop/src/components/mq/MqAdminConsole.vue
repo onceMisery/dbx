@@ -34,8 +34,12 @@ const capabilities = ref<MqClusterInfo["capabilities"]>();
 const clusterInfo = ref<MqClusterInfo>();
 const loading = ref(false);
 const error = ref<string>();
+const KAFKA_CONTEXT = "_kafka";
 
 // Computed
+const isKafkaCluster = computed(() => clusterInfo.value?.systemKind === "kafka");
+const effectiveTenant = computed(() => (isKafkaCluster.value ? selectedTenant.value || KAFKA_CONTEXT : selectedTenant.value));
+const effectiveNamespace = computed(() => (isKafkaCluster.value ? selectedNamespace.value || KAFKA_CONTEXT : selectedNamespace.value));
 const canManageTenants = computed(() => capabilities.value?.supportsTenants ?? true);
 const canManageNamespaces = computed(() => capabilities.value?.supportsNamespaces ?? true);
 const canManagePartitionedTopics = computed(() => capabilities.value?.supportsPartitionedTopics ?? true);
@@ -209,13 +213,13 @@ onMounted(() => {
     <div class="mq-content">
       <TenantsPanel v-if="activeTab === 'tenants'" :connection-id="connectionId" :supports-tenants="canManageTenants" :read-only="readOnly" :cluster-options="clusterOptions" @tenant-selected="handleTenantSelected" />
       <NamespacesPanel v-else-if="activeTab === 'namespaces'" :connection-id="connectionId" :tenant="selectedTenant" :supports-namespaces="canManageNamespaces" :read-only="readOnly" @namespace-selected="handleNamespaceSelected" @namespace-roles-selected="handleNamespaceRolesSelected" />
-      <TopicsPanel v-else-if="activeTab === 'topics'" :connection-id="connectionId" :tenant="selectedTenant" :namespace="selectedNamespace" :read-only="readOnly" :supports-partitioned-topics="canManagePartitionedTopics" @topic-selected="handleTopicSelected" />
+      <TopicsPanel v-else-if="activeTab === 'topics'" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" :supports-partitioned-topics="canManagePartitionedTopics" @topic-selected="handleTopicSelected" />
       <SubscriptionsPanel
         v-else-if="activeTab === 'subscriptions' && canManageSubscriptions"
         :connection-id="connectionId"
         :topic="selectedTopic"
-        :tenant="selectedTenant"
-        :namespace="selectedNamespace"
+        :tenant="effectiveTenant"
+        :namespace="effectiveNamespace"
         :read-only="readOnly"
         :supports-create-subscription="canCreateSubscription"
         :supports-reset-cursor="canResetCursor"
@@ -225,20 +229,20 @@ onMounted(() => {
         :supports-expire-messages="canExpireMessages"
         @subscription-selected="handleSubscriptionSelected"
       />
-      <MonitoringPanel v-else-if="activeTab === 'monitoring'" :connection-id="connectionId" :topic="selectedTopic" :tenant="selectedTenant" :namespace="selectedNamespace" />
-      <ProducerConsumerPanel v-else-if="activeTab === 'clients'" :connection-id="connectionId" :topic="selectedTopic" :tenant="selectedTenant" :namespace="selectedNamespace" :read-only="readOnly" :selected-subscription="selectedSubscriptionName" />
+      <MonitoringPanel v-else-if="activeTab === 'monitoring'" :connection-id="connectionId" :topic="selectedTopic" :tenant="effectiveTenant" :namespace="effectiveNamespace" />
+      <ProducerConsumerPanel v-else-if="activeTab === 'clients'" :connection-id="connectionId" :topic="selectedTopic" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" :selected-subscription="selectedSubscriptionName" />
       <PoliciesPanel
         v-else-if="activeTab === 'policies' && canManagePolicies"
         :connection-id="connectionId"
         :topic="selectedTopic"
-        :tenant="selectedTenant"
-        :namespace="selectedNamespace"
+        :tenant="effectiveTenant"
+        :namespace="effectiveNamespace"
         :read-only="readOnly"
         :supports-rate-limits="canManageRateLimits"
         :supports-backlog-quota="canManageBacklogQuota"
         :supports-retention="canManageRetention"
       />
-      <PermissionsPanel v-else-if="activeTab === 'permissions' && canManagePermissions" :connection-id="connectionId" :topic="selectedTopic" :tenant="selectedTenant" :namespace="selectedNamespace" :read-only="readOnly" />
+      <PermissionsPanel v-else-if="activeTab === 'permissions' && canManagePermissions" :connection-id="connectionId" :topic="selectedTopic" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" />
       <RawApiPanel v-else-if="activeTab === 'raw' && canUseRawApi" :connection-id="connectionId" :tenant="selectedTenant" :namespace="selectedNamespace" :topic="selectedTopic" :read-only="readOnly" />
     </div>
   </div>

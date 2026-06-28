@@ -31,6 +31,8 @@ import type {
   PeekedMessage,
   MqRawRequest,
   MqRawResponse,
+  SendMessageRequest,
+  SendMessageResponse,
 } from "@/types/mq";
 
 // Connectivity
@@ -201,4 +203,8 @@ export async function mqGetBacklog(connectionId: string, topic: TopicRef, sub?: 
 // Raw request
 export async function mqRawRequest(connectionId: string, req: MqRawRequest): Promise<MqRawResponse> {
   return invoke("mq_raw_request", { connectionId, req });
+}
+
+export async function mqSendMessage(connectionId: string, req: SendMessageRequest): Promise<SendMessageResponse> {
+  return invoke("mq_send_message", { connectionId, req });
 }

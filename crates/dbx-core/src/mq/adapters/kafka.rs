@@ -16,6 +16,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
 use crate::db::agent_driver::{AgentDriverClient, AgentLaunchSpec};
+use crate::mq::auth::MqAuth;
 use crate::mq::config::MqAdminConfig;
 use crate::mq::port::MessageQueueAdmin;
 use crate::mq::types::*;
@@ -233,38 +234,29 @@ impl MessageQueueAdmin for KafkaAdmin {
         let result: serde_json::Value = self.call("mq_list_consumer_groups", serde_json::json!({})).await?;
         let groups = result.get("groups").and_then(|v| v.as_array()).cloned().unwrap_or_default();
 
-        // For each group, check if it has subscriptions to this topic
+        // For each group, check both active assignments and committed offsets.
         let mut subs = Vec::new();
         for group in groups {
             let group_id = group.get("groupId").and_then(|v| v.as_str()).unwrap_or_default();
-            match self
+            let desc = match self
                 .call::<serde_json::Value>("mq_describe_consumer_group", serde_json::json!({ "groupId": group_id }))
                 .await
             {
-                Ok(desc) => {
-                    let members = desc.get("members").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                    let has_topic = members.iter().any(|m| {
-                        m.get("assignments")
-                            .and_then(|v| v.as_array())
-                            .map(|assignments| {
-                                assignments
-                                    .iter()
-                                    .any(|a| a.get("topic").and_then(|v| v.as_str()) == Some(&topic.topic))
-                            })
-                            .unwrap_or(false)
-                    });
-                    if has_topic {
-                        subs.push(SubscriptionInfo {
-                            name: group_id.to_string(),
-                            sub_type: "consumer-group".to_string(),
-                            msg_backlog: 0,
-                            msg_rate_out: 0.0,
-                            msg_throughput_out: 0.0,
-                            consumers: Vec::new(),
-                        });
-                    }
-                }
-                Err(_) => {} // Skip groups we can't describe
+                Ok(desc) => desc,
+                Err(_) => continue, // Skip groups we can't describe
+            };
+            let lag = self
+                .call::<serde_json::Value>(
+                    "mq_get_consumer_lag",
+                    serde_json::json!({
+                        "groupId": group_id,
+                        "topic": topic.topic,
+                    }),
+                )
+                .await
+                .ok();
+            if let Some(sub) = kafka_subscription_for_topic(group_id, &topic.topic, &desc, lag.as_ref()) {
+                subs.push(sub);
             }
         }
         Ok(subs)
@@ -283,20 +275,8 @@ impl MessageQueueAdmin for KafkaAdmin {
     }
 
     async fn reset_cursor(&self, topic: &TopicRef, sub: &str, pos: ResetPosition) -> Result<(), String> {
-        let position = match pos {
-            ResetPosition::Earliest => "earliest",
-            ResetPosition::Latest => "latest",
-            _ => "latest",
-        };
-        self.call_ok(
-            "mq_reset_consumer_group_offsets",
-            serde_json::json!({
-                "groupId": sub,
-                "topic": topic.topic,
-                "position": position,
-            }),
-        )
-        .await
+        let params = reset_cursor_params(topic, sub, pos)?;
+        self.call_ok("mq_reset_consumer_group_offsets", params).await
     }
 
     async fn clear_backlog(&self, topic: &TopicRef, sub: &str) -> Result<(), String> {
@@ -574,15 +554,258 @@ fn bootstrap_servers(cfg: &MqAdminConfig) -> String {
     cfg.extra.get("bootstrapServers").and_then(|v| v.as_str()).unwrap_or("").to_string()
 }
 
+fn extra_str<'a>(extra: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    extra.get(key).and_then(|v| v.as_str()).filter(|v| !v.trim().is_empty())
+}
+
 /// Build the connection params JSON from MqAdminConfig for the Java agent.
 fn build_connection_params(cfg: &MqAdminConfig) -> serde_json::Value {
     let extra = &cfg.extra;
+    let basic_auth = match &cfg.auth {
+        MqAuth::Basic { username, password } => Some((username.as_str(), password.as_str())),
+        _ => None,
+    };
+    let sasl_username =
+        extra_str(extra, "saslUsername").or_else(|| basic_auth.map(|(username, _)| username)).unwrap_or("");
+    let sasl_password =
+        extra_str(extra, "saslPassword").or_else(|| basic_auth.map(|(_, password)| password)).unwrap_or("");
+    let sasl_mechanism = extra_str(extra, "saslMechanism").unwrap_or(if basic_auth.is_some() { "PLAIN" } else { "" });
+    let security_protocol =
+        extra_str(extra, "securityProtocol").unwrap_or(if !sasl_mechanism.is_empty() { "SASL_PLAINTEXT" } else { "" });
+    let properties =
+        extra.get("properties").filter(|value| value.is_object()).cloned().unwrap_or_else(|| serde_json::json!({}));
+
     serde_json::json!({
         "bootstrap_servers": bootstrap_servers(cfg),
-        "security_protocol": extra.get("securityProtocol").and_then(|v| v.as_str()).unwrap_or(""),
-        "sasl_mechanism": extra.get("saslMechanism").and_then(|v| v.as_str()).unwrap_or(""),
-        "sasl_username": extra.get("saslUsername").and_then(|v| v.as_str()).unwrap_or(""),
-        "sasl_password": extra.get("saslPassword").and_then(|v| v.as_str()).unwrap_or(""),
+        "security_protocol": security_protocol,
+        "sasl_mechanism": sasl_mechanism,
+        "sasl_username": sasl_username,
+        "sasl_password": sasl_password,
         "tls_skip_verify": cfg.tls_skip_verify,
+        "tls": {
+            "skip_verify": cfg.tls_skip_verify,
+        },
+        "properties": properties,
     })
+}
+
+fn reset_cursor_params(topic: &TopicRef, sub: &str, pos: ResetPosition) -> Result<serde_json::Value, String> {
+    match pos {
+        ResetPosition::Earliest => Ok(serde_json::json!({
+            "groupId": sub,
+            "topic": topic.topic,
+            "position": "earliest",
+        })),
+        ResetPosition::Latest => Ok(serde_json::json!({
+            "groupId": sub,
+            "topic": topic.topic,
+            "position": "latest",
+        })),
+        ResetPosition::Timestamp { timestamp_ms } => Ok(serde_json::json!({
+            "groupId": sub,
+            "topic": topic.topic,
+            "position": "timestamp",
+            "timestampMs": timestamp_ms,
+        })),
+        ResetPosition::MessageId { .. } => Err("Kafka does not support cursor reset by Pulsar message id".to_string()),
+    }
+}
+
+fn kafka_subscription_for_topic(
+    group_id: &str,
+    topic: &str,
+    desc: &serde_json::Value,
+    lag: Option<&serde_json::Value>,
+) -> Option<SubscriptionInfo> {
+    let has_active_assignment = desc
+        .get("members")
+        .and_then(|v| v.as_array())
+        .map(|members| {
+            members.iter().any(|member| {
+                member
+                    .get("assignments")
+                    .and_then(|v| v.as_array())
+                    .map(|assignments| {
+                        assignments.iter().any(|a| a.get("topic").and_then(|v| v.as_str()) == Some(topic))
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    let has_committed_offsets = lag
+        .and_then(|v| v.get("partitions"))
+        .and_then(|v| v.as_array())
+        .map(|partitions| !partitions.is_empty())
+        .unwrap_or(false);
+
+    if !has_active_assignment && !has_committed_offsets {
+        return None;
+    }
+
+    Some(SubscriptionInfo {
+        name: group_id.to_string(),
+        sub_type: "consumer-group".to_string(),
+        msg_backlog: lag.and_then(|v| v.get("totalLag")).and_then(|v| v.as_i64()).unwrap_or(0),
+        msg_rate_out: 0.0,
+        msg_throughput_out: 0.0,
+        consumers: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mq::auth::MqAuth;
+    use crate::mq::types::MqSystemKind;
+
+    fn kafka_config(extra: serde_json::Value, auth: MqAuth, tls_skip_verify: bool) -> MqAdminConfig {
+        MqAdminConfig {
+            system_kind: MqSystemKind::Kafka,
+            admin_url: String::new(),
+            auth,
+            tls_skip_verify,
+            pinned_version: None,
+            token_signing: None,
+            connect_override: None,
+            extra,
+        }
+    }
+
+    #[test]
+    fn connection_params_map_basic_auth_to_kafka_sasl_without_plaintext_password_extra() {
+        let cfg = kafka_config(
+            serde_json::json!({
+                "bootstrapServers": "localhost:9092"
+            }),
+            MqAuth::Basic { username: "alice".to_string(), password: "secret".to_string() },
+            false,
+        );
+
+        let params = build_connection_params(&cfg);
+
+        assert_eq!(params.get("bootstrap_servers").and_then(|v| v.as_str()), Some("localhost:9092"));
+        assert_eq!(params.get("security_protocol").and_then(|v| v.as_str()), Some("SASL_PLAINTEXT"));
+        assert_eq!(params.get("sasl_mechanism").and_then(|v| v.as_str()), Some("PLAIN"));
+        assert_eq!(params.get("sasl_username").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(params.get("sasl_password").and_then(|v| v.as_str()), Some("secret"));
+    }
+
+    #[test]
+    fn connection_params_preserve_kafka_security_extra_and_nested_tls() {
+        let cfg = kafka_config(
+            serde_json::json!({
+                "bootstrapServers": "broker:9093",
+                "securityProtocol": "SASL_SSL",
+                "saslMechanism": "SCRAM-SHA-512",
+                "properties": {
+                    "client.id": "dbx"
+                }
+            }),
+            MqAuth::Basic { username: "bob".to_string(), password: "pw".to_string() },
+            true,
+        );
+
+        let params = build_connection_params(&cfg);
+
+        assert_eq!(params.get("security_protocol").and_then(|v| v.as_str()), Some("SASL_SSL"));
+        assert_eq!(params.get("sasl_mechanism").and_then(|v| v.as_str()), Some("SCRAM-SHA-512"));
+        assert_eq!(params.pointer("/tls/skip_verify").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(params.pointer("/properties/client.id").and_then(|v| v.as_str()), Some("dbx"));
+    }
+
+    #[test]
+    fn reset_cursor_params_preserve_timestamp_position() {
+        let topic = TopicRef {
+            tenant: "_kafka".to_string(),
+            namespace: "_kafka".to_string(),
+            topic: "events".to_string(),
+            persistent: true,
+            partitioned: None,
+        };
+
+        let params = reset_cursor_params(&topic, "group-a", ResetPosition::Timestamp { timestamp_ms: 1710000000000 })
+            .expect("timestamp reset should be supported");
+
+        assert_eq!(params.get("groupId").and_then(|v| v.as_str()), Some("group-a"));
+        assert_eq!(params.get("topic").and_then(|v| v.as_str()), Some("events"));
+        assert_eq!(params.get("position").and_then(|v| v.as_str()), Some("timestamp"));
+        assert_eq!(params.get("timestampMs").and_then(|v| v.as_i64()), Some(1710000000000));
+    }
+
+    #[test]
+    fn reset_cursor_params_reject_message_id_position() {
+        let topic = TopicRef {
+            tenant: "_kafka".to_string(),
+            namespace: "_kafka".to_string(),
+            topic: "events".to_string(),
+            persistent: true,
+            partitioned: None,
+        };
+
+        let err = reset_cursor_params(&topic, "group-a", ResetPosition::MessageId { ledger_id: 1, entry_id: 2 })
+            .expect_err("Kafka should not accept Pulsar message ids");
+
+        assert!(err.contains("message id"));
+    }
+
+    #[test]
+    fn kafka_subscription_for_topic_includes_offline_group_with_committed_offsets() {
+        let desc = serde_json::json!({
+            "groupId": "orders-service",
+            "members": []
+        });
+        let lag = serde_json::json!({
+            "totalLag": 7,
+            "partitions": [
+                { "partition": 0, "currentOffset": 3, "endOffset": 10, "lag": 7 }
+            ]
+        });
+
+        let sub = kafka_subscription_for_topic("orders-service", "orders", &desc, Some(&lag))
+            .expect("committed offsets should make an inactive group visible");
+
+        assert_eq!(sub.name, "orders-service");
+        assert_eq!(sub.sub_type, "consumer-group");
+        assert_eq!(sub.msg_backlog, 7);
+    }
+
+    #[test]
+    fn kafka_subscription_for_topic_includes_active_assignment_without_committed_offsets() {
+        let desc = serde_json::json!({
+            "groupId": "live-service",
+            "members": [{
+                "assignments": [
+                    { "topic": "events", "partition": 0 }
+                ]
+            }]
+        });
+        let lag = serde_json::json!({
+            "totalLag": 0,
+            "partitions": []
+        });
+
+        let sub = kafka_subscription_for_topic("live-service", "events", &desc, Some(&lag))
+            .expect("active assignments should make the group visible");
+
+        assert_eq!(sub.name, "live-service");
+        assert_eq!(sub.msg_backlog, 0);
+    }
+
+    #[test]
+    fn kafka_subscription_for_topic_ignores_unrelated_group() {
+        let desc = serde_json::json!({
+            "groupId": "billing-service",
+            "members": [{
+                "assignments": [
+                    { "topic": "billing", "partition": 0 }
+                ]
+            }]
+        });
+        let lag = serde_json::json!({
+            "totalLag": 0,
+            "partitions": []
+        });
+
+        assert!(kafka_subscription_for_topic("billing-service", "orders", &desc, Some(&lag)).is_none());
+    }
 }

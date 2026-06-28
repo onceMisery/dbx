@@ -30,6 +30,8 @@ import type {
   PeekedMessage,
   MqRawRequest,
   MqRawResponse,
+  SendMessageRequest,
+  SendMessageResponse,
 } from "@/types/mq";
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -203,4 +205,8 @@ export async function mqGetBacklog(connectionId: string, topic: TopicRef, sub?: 
 
 export async function mqRawRequest(connectionId: string, req: MqRawRequest): Promise<MqRawResponse> {
   return post("/api/mq/raw", { connectionId, req });
+}
+
+export async function mqSendMessage(connectionId: string, req: SendMessageRequest): Promise<SendMessageResponse> {
+  return post("/api/mq/send-message", { connectionId, req });
 }

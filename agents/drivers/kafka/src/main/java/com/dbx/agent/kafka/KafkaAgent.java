@@ -40,6 +40,7 @@ public final class KafkaAgent {
 
     private static AdminClient adminClient;
     private static KafkaProducer<String, byte[]> producer;
+    private static volatile boolean shutdownRequested;
 
     private KafkaAgent() {}
 
@@ -56,8 +57,12 @@ public final class KafkaAgent {
         while (true) {
             String line = reader.readLine();
             if (line == null) break;
-            System.out.println(handleRequest(line));
+            String response = handleRequest(line);
+            System.out.println(response);
             System.out.flush();
+            if (shutdownRequested) {
+                System.exit(0);
+            }
         }
     }
 
@@ -94,7 +99,7 @@ public final class KafkaAgent {
             case "connect" -> connect(params);
             case "test_connection" -> testConnection(params);
             case "disconnect" -> { closeClients(); yield Collections.singletonMap("ok", true); }
-            case "shutdown" -> { closeClients(); System.exit(0); yield Collections.singletonMap("ok", true); }
+            case "shutdown" -> { closeClients(); shutdownRequested = true; yield Collections.singletonMap("ok", true); }
             // Topic management
             case "mq_list_topics" -> listTopics(params);
             case "mq_create_topic" -> createTopic(params);
@@ -133,16 +138,21 @@ public final class KafkaAgent {
     private static Object connect(JsonObject params) throws Exception {
         JsonObject conn = connectionObject(params);
         AdminClient nextAdmin = buildAdminClient(conn);
+        KafkaProducer<String, byte[]> nextProducer = null;
         try {
             // Verify connectivity
             nextAdmin.describeCluster().clusterId().get(
                 intOrDefault(conn, "request_timeout_ms", DEFAULT_REQUEST_TIMEOUT_MS), TimeUnit.MILLISECONDS);
+            nextProducer = buildProducer(conn);
             closeClients();
             adminClient = nextAdmin;
-            producer = buildProducer(conn);
+            producer = nextProducer;
             return Collections.singletonMap("ok", true);
         } catch (Exception e) {
             nextAdmin.close(Duration.ofSeconds(5));
+            if (nextProducer != null) {
+                nextProducer.close(Duration.ofSeconds(5));
+            }
             throw e;
         }
     }
@@ -194,8 +204,7 @@ public final class KafkaAgent {
             intOrDefault(conn, "request_timeout_ms", DEFAULT_REQUEST_TIMEOUT_MS));
         props.put(AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG,
             intOrDefault(conn, "request_timeout_ms", DEFAULT_REQUEST_TIMEOUT_MS));
-        applySecurityProperties(conn, props);
-        applyExtraProperties(conn, props);
+        applyConnectionProperties(conn, props);
         return AdminClient.create(props);
     }
 
@@ -207,8 +216,7 @@ public final class KafkaAgent {
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
             "org.apache.kafka.common.serialization.ByteArraySerializer");
         props.put(ProducerConfig.ACKS_CONFIG, "all");
-        applySecurityProperties(conn, props);
-        applyExtraProperties(conn, props);
+        applyConnectionProperties(conn, props);
         return new KafkaProducer<>(props);
     }
 
@@ -223,7 +231,7 @@ public final class KafkaAgent {
         return servers;
     }
 
-    private static void applySecurityProperties(JsonObject conn, Properties props) {
+    static void applySecurityProperties(JsonObject conn, Properties props) {
         String securityProtocol = stringOrEmpty(conn, "security_protocol");
         if (securityProtocol.isBlank()) {
             securityProtocol = stringOrEmpty(conn, "securityProtocol");
@@ -255,17 +263,21 @@ public final class KafkaAgent {
                 default -> null;
             };
             if (jaasTemplate != null) {
-                props.put("sasl.jaas.config", String.format(jaasTemplate, saslUsername, saslPassword));
+                props.put("sasl.jaas.config", String.format(jaasTemplate, jaasValue(saslUsername), jaasValue(saslPassword)));
             }
         }
 
-        // TLS properties
         JsonObject tls = conn.has("tls") && conn.get("tls").isJsonObject()
             ? conn.getAsJsonObject("tls") : null;
+        boolean skipVerify = boolOrDefault(conn, "tls_skip_verify", false)
+            || boolOrDefault(conn, "tlsSkipVerify", false)
+            || (tls != null && boolOrDefault(tls, "skip_verify", false));
+        if (skipVerify) {
+            props.put("ssl.endpoint.identification.algorithm", "");
+        }
+
+        // TLS properties
         if (tls != null) {
-            if (boolOrDefault(tls, "skip_verify", false)) {
-                props.put("ssl.endpoint.identification.algorithm", "");
-            }
             String truststorePath = stringOrEmpty(tls, "truststore_path");
             if (!truststorePath.isBlank()) {
                 props.put("ssl.truststore.location", truststorePath);
@@ -283,6 +295,15 @@ public final class KafkaAgent {
                 }
             }
         }
+    }
+
+    static void applyConnectionProperties(JsonObject conn, Properties props) {
+        applySecurityProperties(conn, props);
+        applyExtraProperties(conn, props);
+    }
+
+    static String jaasValue(String value) {
+        return value.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     @SuppressWarnings("unchecked")
@@ -557,28 +578,61 @@ public final class KafkaAgent {
             offsets.put(new TopicPartition(topic, partition), new OffsetAndMetadata(offset));
         }
 
-        // If no explicit offsets, check for a "position" parameter (earliest/latest)
+        // If no explicit offsets, check for a "position" parameter.
         if (offsets.isEmpty()) {
             String position = stringOrDefault(params, "position", "latest");
+            Long timestampMs = params.has("timestampMs") && !params.get("timestampMs").isJsonNull()
+                ? params.get("timestampMs").getAsLong() : null;
             TopicDescription desc = admin.describeTopics(Collections.singletonList(topic))
                 .allTopicNames().get(timeout, TimeUnit.MILLISECONDS).get(topic);
 
             Map<TopicPartition, OffsetSpec> specMap = new HashMap<>();
             for (TopicPartitionInfo pi : desc.partitions()) {
                 TopicPartition tp = new TopicPartition(topic, pi.partition());
-                specMap.put(tp, "earliest".equalsIgnoreCase(position)
-                    ? OffsetSpec.earliest() : OffsetSpec.latest());
+                specMap.put(tp, offsetSpecForPosition(position, timestampMs));
             }
             Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> resolved =
                 admin.listOffsets(specMap).all().get(timeout, TimeUnit.MILLISECONDS);
+            List<TopicPartition> unresolvedTimestampPartitions = new ArrayList<>();
             for (Map.Entry<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> entry : resolved.entrySet()) {
-                offsets.put(entry.getKey(), new OffsetAndMetadata(entry.getValue().offset()));
+                long offset = entry.getValue().offset();
+                if (offset >= 0) {
+                    offsets.put(entry.getKey(), new OffsetAndMetadata(offset));
+                } else {
+                    unresolvedTimestampPartitions.add(entry.getKey());
+                }
+            }
+            if (!unresolvedTimestampPartitions.isEmpty()) {
+                Map<TopicPartition, OffsetSpec> latestSpecs = new HashMap<>();
+                for (TopicPartition tp : unresolvedTimestampPartitions) {
+                    latestSpecs.put(tp, OffsetSpec.latest());
+                }
+                Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> latest =
+                    admin.listOffsets(latestSpecs).all().get(timeout, TimeUnit.MILLISECONDS);
+                for (Map.Entry<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> entry : latest.entrySet()) {
+                    offsets.put(entry.getKey(), new OffsetAndMetadata(entry.getValue().offset()));
+                }
             }
         }
 
         admin.alterConsumerGroupOffsets(groupId, offsets)
             .all().get(timeout, TimeUnit.MILLISECONDS);
         return Collections.singletonMap("ok", true);
+    }
+
+    static OffsetSpec offsetSpecForPosition(String position, Long timestampMs) {
+        String normalized = position == null ? "latest" : position.trim().toLowerCase(Locale.ROOT);
+        return switch (normalized) {
+            case "earliest" -> OffsetSpec.earliest();
+            case "latest", "" -> OffsetSpec.latest();
+            case "timestamp" -> {
+                if (timestampMs == null) {
+                    throw new IllegalArgumentException("timestampMs is required when position is timestamp");
+                }
+                yield OffsetSpec.forTimestamp(timestampMs);
+            }
+            default -> throw new IllegalArgumentException("Unsupported reset position: " + position);
+        };
     }
 
     // -----------------------------------------------------------------------
@@ -601,7 +655,7 @@ public final class KafkaAgent {
             ? params.getAsJsonObject("connection") : null;
         if (conn != null) {
             props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers(conn));
-            applySecurityProperties(conn, props);
+            applyConnectionProperties(conn, props);
         }
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "dbx-peek-" + UUID.randomUUID());
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
@@ -762,12 +816,16 @@ public final class KafkaAgent {
             filters.add(AclBindingFilter.ANY);
         }
 
-        admin.deleteAcls(filters).all().get(timeout, TimeUnit.MILLISECONDS);
-        int deleted = filters.size();
+        Collection<AclBinding> deletedBindings = admin.deleteAcls(filters).all().get(timeout, TimeUnit.MILLISECONDS);
+        int deleted = deletedAclCount(deletedBindings);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("ok", true);
         result.put("deleted", deleted);
         return result;
+    }
+
+    static int deletedAclCount(Collection<AclBinding> deletedBindings) {
+        return deletedBindings == null ? 0 : deletedBindings.size();
     }
 
     private static AclBindingFilter buildAclFilter(JsonObject params) {

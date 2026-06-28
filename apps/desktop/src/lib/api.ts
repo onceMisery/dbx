@@ -360,6 +360,7 @@ export const mqIssueToken = forward("mqIssueToken");
 export const mqListTokenRecords = forward("mqListTokenRecords");
 export const mqGetBacklog = forward("mqGetBacklog");
 export const mqRawRequest = forward("mqRawRequest");
+export const mqSendMessage = forward("mqSendMessage");
 
 // MongoDB
 export const mongoListDatabases = forward("mongoListDatabases");

@@ -9,6 +9,10 @@ import validate_agents
 import validate_agent_jars
 
 
+def normalize_problem_paths(problems):
+    return [problem.replace("\\", "/") for problem in problems]
+
+
 class ValidateAgentsTest(unittest.TestCase):
     def test_versions_must_match_included_agent_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,7 +70,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            problems = validate_agents.validate_source_patterns(root)
+            problems = normalize_problem_paths(validate_agents.validate_source_patterns(root))
 
             self.assertEqual(
                 [
@@ -116,7 +120,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            problems = validate_agents.validate_jdbc_architecture(root, {"example"})
+            problems = normalize_problem_paths(validate_agents.validate_jdbc_architecture(root, {"example"}))
 
             self.assertEqual(
                 [
@@ -155,6 +159,34 @@ class ValidateAgentsTest(unittest.TestCase):
 
             self.assertEqual([], validate_agents.validate_jdbc_architecture(root, {"oracle"}))
 
+    def test_jdbc_architecture_skips_kafka_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            module = root / "drivers/kafka"
+            source = module / "src/main/java/com/dbx/agent/kafka/KafkaAgent.java"
+            source.parent.mkdir(parents=True)
+            (module / "build.gradle").write_text(
+                textwrap.dedent(
+                    """
+                    tasks.named('shadowJar') {
+                        manifest {
+                            attributes(
+                                'Agent-Label': 'Apache Kafka',
+                                'Main-Class': 'com.dbx.agent.kafka.KafkaAgent'
+                            )
+                        }
+                    }
+                    """
+                ),
+                encoding="utf-8",
+            )
+            source.write_text(
+                "package com.dbx.agent.kafka; public final class KafkaAgent {}\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], validate_agents.validate_jdbc_architecture(root, {"kafka"}))
+
     def test_authoring_template_must_use_shared_foundation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -181,7 +213,7 @@ class ValidateAgentsTest(unittest.TestCase):
                     "docs/examples/jdbc-agent-template/src/main/java/com/dbx/agent/template/TemplateAgent.java: template must use shared JDBC foundation",
                     "docs/examples/jdbc-agent-template/src/main/java/com/dbx/agent/template/TemplateAgent.java: template contains copied JDBC connection creation",
                 ],
-                validate_agents.validate_authoring_template(root),
+                normalize_problem_paths(validate_agents.validate_authoring_template(root)),
             )
 
     def test_manifest_validation_requires_registry_fields(self):
@@ -216,7 +248,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            problems = validate_agents.validate_manifest_fields(root, {"h2"})
+            problems = normalize_problem_paths(validate_agents.validate_manifest_fields(root, {"h2"}))
 
             self.assertEqual(
                 ["h2/build.gradle: missing Main-Class manifest attribute"],
@@ -248,7 +280,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            problems = validate_agents.validate_manifest_fields(root, {"h2"})
+            problems = normalize_problem_paths(validate_agents.validate_manifest_fields(root, {"h2"}))
 
             self.assertEqual(
                 ["h2/build.gradle: Main-Class source not found: h2/src/main/java/com/dbx/agent/h2/H2Agent.java"],
@@ -306,7 +338,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("", encoding="utf-8")
 
-            problems = validate_agents.validate_no_kotlin_residue(root)
+            problems = normalize_problem_paths(validate_agents.validate_no_kotlin_residue(root))
 
             self.assertEqual(
                 [
@@ -408,7 +440,7 @@ class ValidateAgentsTest(unittest.TestCase):
 
             self.assertEqual(
                 ["h2/build/libs/dbx-agent-h2.jar: Main-Class class not found: com/dbx/agent/h2/H2Agent.class"],
-                validate_agent_jars.validate_agent_jars(root),
+                normalize_problem_paths(validate_agent_jars.validate_agent_jars(root)),
             )
 
             with zipfile.ZipFile(jar, "a") as archive:
