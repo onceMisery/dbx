@@ -42,6 +42,16 @@ interface PartitionStatsRow {
   raw: Record<string, unknown>;
 }
 
+interface KafkaPartitionStatsRow {
+  partition: number;
+  beginOffset: number;
+  endOffset: number;
+  messageCount: number;
+  leader: number;
+  replicas: number[];
+  isr: number[];
+}
+
 const props = defineProps<Props>();
 
 const stats = ref<TopicStats>();
@@ -57,6 +67,29 @@ const history = ref<MetricPoint[]>([]);
 const MAX_HISTORY_POINTS = 60;
 
 const partitionRows = computed(() => extractPartitionRows(stats.value?.raw));
+const kafkaPartitionRows = computed(() => extractKafkaPartitionRows(stats.value?.raw));
+const isKafkaStats = computed(() => isKafkaStatsPayload(stats.value?.raw));
+const kafkaOverview = computed(() => {
+  const raw = objectRecord(stats.value?.raw);
+  const rows = kafkaPartitionRows.value;
+  const totalMessages = numberField(raw.totalMessages) ?? rows.reduce((sum, row) => sum + row.messageCount, 0);
+  const totalBeginOffset = rows.reduce((sum, row) => sum + row.beginOffset, 0);
+  const totalEndOffset = rows.reduce((sum, row) => sum + row.endOffset, 0);
+  const underReplicatedPartitions = rows.filter((row) => row.replicas.length > 0 && row.isr.length < row.replicas.length).length;
+  const offlinePartitions = rows.filter((row) => row.leader < 0).length;
+  const healthyPartitions = rows.filter((row) => row.leader >= 0 && (row.replicas.length === 0 || row.isr.length === row.replicas.length)).length;
+  return {
+    partitionCount: numberField(raw.partitions) ?? rows.length,
+    replicationFactor: numberField(raw.replicationFactor) ?? Math.max(0, ...rows.map((row) => row.replicas.length)),
+    totalMessages,
+    totalBeginOffset,
+    totalEndOffset,
+    leaderCount: new Set(rows.map((row) => row.leader).filter((leader) => leader >= 0)).size,
+    underReplicatedPartitions,
+    offlinePartitions,
+    healthyPartitions,
+  };
+});
 const selectedPartition = computed(() => partitionRows.value.find((row) => row.name === selectedPartitionName.value) ?? partitionRows.value[0]);
 const selectedPartitionPublishers = computed(() => arrayObjects(selectedPartition.value?.raw.publishers));
 const selectedPartitionSubscriptions = computed(() => {
@@ -136,7 +169,16 @@ async function loadStats(options: { skipWhenHidden?: boolean } = {}) {
   loading.value = true;
   error.value = undefined;
   try {
-    const [statsData, backlogData] = await Promise.all([mqGetTopicStats(props.connectionId, topicRef), mqGetBacklog(props.connectionId, topicRef, undefined)]);
+    const statsData = await mqGetTopicStats(props.connectionId, topicRef);
+
+    if (isKafkaStatsPayload(statsData.raw)) {
+      stats.value = statsData;
+      backlog.value = undefined;
+      appendHistoryPoint(statsData);
+      return;
+    }
+
+    const backlogData = await mqGetBacklog(props.connectionId, topicRef, undefined);
     stats.value = statsData;
     backlog.value = backlogData;
     appendHistoryPoint(statsData, backlogData);
@@ -151,13 +193,13 @@ function refreshNow() {
   void loadStats();
 }
 
-function appendHistoryPoint(statsData: TopicStats, backlogData: BacklogStats) {
+function appendHistoryPoint(statsData: TopicStats, backlogData?: BacklogStats) {
   const point: MetricPoint = {
     time: new Date().toLocaleTimeString(),
     msgRateIn: statsData.msgRateIn,
     msgRateOut: statsData.msgRateOut,
     backlogSize: statsData.backlogSize,
-    msgBacklog: backlogData.msgBacklog,
+    msgBacklog: backlogData?.msgBacklog ?? 0,
     consumerLagMs: extractConsumerLagMs(statsData.raw),
   };
   history.value = [...history.value.slice(-(MAX_HISTORY_POINTS - 1)), point];
@@ -202,6 +244,25 @@ function extractPartitionRows(raw: unknown): PartitionStatsRow[] {
   });
 }
 
+function extractKafkaPartitionRows(raw: unknown): KafkaPartitionStatsRow[] {
+  return arrayObjects(objectRecord(raw).partitionStats)
+    .map((body) => ({
+      partition: numberField(body.partition) ?? 0,
+      beginOffset: numberField(body.beginOffset) ?? 0,
+      endOffset: numberField(body.endOffset) ?? 0,
+      messageCount: numberField(body.messageCount) ?? 0,
+      leader: numberField(body.leader) ?? -1,
+      replicas: numberArrayField(body.replicas),
+      isr: numberArrayField(body.isr),
+    }))
+    .sort((a, b) => a.partition - b.partition);
+}
+
+function isKafkaStatsPayload(raw: unknown): boolean {
+  const root = objectRecord(raw);
+  return Array.isArray(root.partitionStats) || (numberField(root.partitions) !== undefined && numberField(root.replicationFactor) !== undefined && numberField(root.totalMessages) !== undefined);
+}
+
 function partitionBacklogMessages(body: Record<string, unknown>): number {
   const direct = numberField(body.msgBacklog);
   if (direct !== undefined) return direct;
@@ -225,6 +286,10 @@ function arrayObjects(value: unknown): Record<string, unknown>[] {
 
 function numberField(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function numberArrayField(value: unknown): number[] {
+  return Array.isArray(value) ? value.map(numberField).filter((item): item is number => item !== undefined) : [];
 }
 
 function stringField(value: unknown): string {
@@ -336,6 +401,111 @@ onUnmounted(() => {
     <div v-else-if="error" class="panel-error">{{ error }}</div>
 
     <div v-else-if="loading && !stats" class="panel-loading">加载中...</div>
+
+    <div v-else-if="stats && isKafkaStats" class="stats-container">
+      <div class="stats-section">
+        <h4>Kafka Topic 概览</h4>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-icon">P</div>
+            <div class="stat-content">
+              <div class="stat-label">分区数</div>
+              <div class="stat-value">{{ kafkaOverview.partitionCount }}</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">RF</div>
+            <div class="stat-content">
+              <div class="stat-label">副本因子</div>
+              <div class="stat-value">{{ kafkaOverview.replicationFactor }}</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">#</div>
+            <div class="stat-content">
+              <div class="stat-label">消息数</div>
+              <div class="stat-value">{{ formatNumber(kafkaOverview.totalMessages) }}</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">LEO</div>
+            <div class="stat-content">
+              <div class="stat-label">Log end offset</div>
+              <div class="stat-value">{{ formatNumber(kafkaOverview.totalEndOffset) }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="stats-section">
+        <h4>Offset 与副本状态</h4>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-icon">BO</div>
+            <div class="stat-content">
+              <div class="stat-label">起始 offset</div>
+              <div class="stat-value">{{ formatNumber(kafkaOverview.totalBeginOffset) }}</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">L</div>
+            <div class="stat-content">
+              <div class="stat-label">Leader 数</div>
+              <div class="stat-value">{{ kafkaOverview.leaderCount }}</div>
+            </div>
+          </div>
+          <div class="stat-card" :class="{ warning: kafkaOverview.underReplicatedPartitions > 0 }">
+            <div class="stat-icon">ISR</div>
+            <div class="stat-content">
+              <div class="stat-label">ISR 健康分区</div>
+              <div class="stat-value">{{ kafkaOverview.healthyPartitions }} / {{ kafkaOverview.partitionCount }}</div>
+            </div>
+          </div>
+          <div class="stat-card" :class="{ warning: kafkaOverview.offlinePartitions > 0 }">
+            <div class="stat-icon">!</div>
+            <div class="stat-content">
+              <div class="stat-label">无 leader 分区</div>
+              <div class="stat-value">{{ kafkaOverview.offlinePartitions }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="stats-section">
+        <h4>Kafka 分区明细</h4>
+        <div v-if="kafkaPartitionRows.length" class="partition-layout">
+          <div class="partition-table-wrap">
+            <table class="partition-table">
+              <thead>
+                <tr>
+                  <th>分区</th>
+                  <th>起始 offset</th>
+                  <th>Log end offset</th>
+                  <th>消息数</th>
+                  <th>Leader</th>
+                  <th>Replicas</th>
+                  <th>ISR</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="partition in kafkaPartitionRows" :key="partition.partition" :class="{ warning: partition.leader < 0 || (partition.replicas.length > 0 && partition.isr.length < partition.replicas.length) }">
+                  <td>{{ partition.partition }}</td>
+                  <td>{{ formatNumber(partition.beginOffset) }}</td>
+                  <td>{{ formatNumber(partition.endOffset) }}</td>
+                  <td>{{ formatNumber(partition.messageCount) }}</td>
+                  <td>{{ partition.leader >= 0 ? partition.leader : "-" }}</td>
+                  <td>{{ partition.replicas.join(", ") || "-" }}</td>
+                  <td>{{ partition.isr.join(", ") || "-" }}</td>
+                  <td>{{ partition.leader < 0 ? "无 leader" : partition.isr.length < partition.replicas.length ? "ISR 不完整" : "正常" }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div v-else class="empty-state compact">当前 Kafka 响应未返回分区指标</div>
+      </div>
+    </div>
 
     <div v-else-if="stats" class="stats-container">
       <!-- Overview Section -->
@@ -801,6 +971,10 @@ onUnmounted(() => {
 .partition-table tbody tr:hover,
 .partition-table tbody tr.selected {
   background: var(--color-hover);
+}
+
+.partition-table tbody tr.warning {
+  background: var(--color-warning-alpha);
 }
 
 .partition-detail {
