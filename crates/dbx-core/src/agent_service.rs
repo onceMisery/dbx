@@ -255,17 +255,32 @@ pub fn jre_needs_install(am: &AgentManager, registry: &AgentRegistry, jre_key: &
 
 pub fn local_agent_jar_candidates(db_type: &str) -> Vec<PathBuf> {
     let jar_name = format!("dbx-agent-{db_type}.jar");
-    let monorepo_driver =
-        PathBuf::from("agents").join("drivers").join(db_type).join("build").join("libs").join(&jar_name);
-    let monorepo_legacy = PathBuf::from("agents").join(db_type).join("build").join("libs").join(&jar_name);
-    let relative_driver =
-        PathBuf::from("..").join("dbx-agents").join("drivers").join(db_type).join("build").join("libs").join(&jar_name);
-    let nested_driver =
-        PathBuf::from("dbx-agents").join("drivers").join(db_type).join("build").join("libs").join(&jar_name);
-    let relative_legacy =
-        PathBuf::from("..").join("dbx-agents").join(db_type).join("build").join("libs").join(&jar_name);
-    let nested_legacy = PathBuf::from("dbx-agents").join(db_type).join("build").join("libs").join(&jar_name);
-    vec![monorepo_driver, monorepo_legacy, relative_driver, nested_driver, relative_legacy, nested_legacy]
+    let mut candidates = Vec::new();
+
+    for agents_dir in local_agents_dir_candidates() {
+        candidates.push(agent_driver_jar_path(&agents_dir, db_type, &jar_name));
+        candidates.push(agent_legacy_jar_path(&agents_dir, db_type, &jar_name));
+    }
+
+    candidates
+}
+
+fn local_agents_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("agents"), PathBuf::from("..").join("agents")];
+    if let Some(workspace_root) = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().and_then(|path| path.parent()) {
+        candidates.push(workspace_root.join("agents"));
+    }
+    candidates.push(PathBuf::from("..").join("dbx-agents"));
+    candidates.push(PathBuf::from("dbx-agents"));
+    candidates
+}
+
+fn agent_driver_jar_path(agents_dir: &Path, db_type: &str, jar_name: &str) -> PathBuf {
+    agents_dir.join("drivers").join(db_type).join("build").join("libs").join(jar_name)
+}
+
+fn agent_legacy_jar_path(agents_dir: &Path, db_type: &str, jar_name: &str) -> PathBuf {
+    agents_dir.join(db_type).join("build").join("libs").join(jar_name)
 }
 
 pub fn find_local_agent_jar(db_type: &str) -> Option<PathBuf> {

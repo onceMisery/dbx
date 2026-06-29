@@ -233,6 +233,9 @@ fn local_agent_jar_candidates_include_monorepo_and_legacy_build_output() {
     let candidates = local_agent_jar_candidates("tdengine");
 
     assert!(candidates.iter().any(|path| path.ends_with("agents/drivers/tdengine/build/libs/dbx-agent-tdengine.jar")));
+    assert!(candidates
+        .iter()
+        .any(|path| path.ends_with("../agents/drivers/tdengine/build/libs/dbx-agent-tdengine.jar")));
     assert!(candidates.iter().any(|path| path.ends_with("dbx-agents/tdengine/build/libs/dbx-agent-tdengine.jar")));
 }
 
