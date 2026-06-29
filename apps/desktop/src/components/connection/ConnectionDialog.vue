@@ -572,6 +572,7 @@ const driverProfiles: Record<
   etcd: { type: "etcd", port: 2379, user: "", label: "etcd", icon: "etcd" },
   zookeeper: { type: "zookeeper", port: 2181, user: "", label: "Apache ZooKeeper", icon: "zookeeper" },
   mq: { type: "mq", port: 8080, user: "", label: "Apache Pulsar", icon: "pulsar", host: "127.0.0.1" },
+  kafka: { type: "mq", port: 9092, user: "", label: "Apache Kafka", icon: "kafka", host: "127.0.0.1" },
   nacos: { type: "nacos", port: 8848, user: "nacos", label: "Nacos", icon: "nacos", host: "127.0.0.1" },
   iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
   influxdb: { type: "influxdb", port: 8086, user: "", label: "InfluxDB", icon: "InfluxDB" },
@@ -599,6 +600,8 @@ function profileForConfig(config: ConnectionConfig) {
     if (config.driver_profile === "oceanbase-oracle") return "oceanbase";
     return config.driver_profile;
   }
+  if (config.db_type === "mq" && (config.external_config as MqAdminConfig | undefined)?.systemKind === "kafka") return "kafka";
+  if (config.db_type === "mq") return "mq";
   if (config.db_type === "dameng") return "dm";
   if (config.db_type === "oceanbase-oracle") return "oceanbase";
   return config.db_type;
@@ -643,6 +646,16 @@ function resetMqFields(config?: Partial<MqAdminConfig>) {
   const tokenSigning = config?.tokenSigning;
   mqTokenSigningMode.value = tokenSigning?.algorithm === "hs256" || tokenSigning?.algorithm === "rs256" ? tokenSigning.algorithm : "none";
   mqTokenSigningKey.value = tokenSigning?.key || "";
+}
+
+function defaultMqFieldsForProfile(profile: string): Partial<MqAdminConfig> | undefined {
+  if (profile !== "kafka") return undefined;
+  return {
+    systemKind: "kafka",
+    adminUrl: "",
+    auth: { kind: "none" },
+    extra: { bootstrapServers: "127.0.0.1:9092" },
+  };
 }
 
 function hydrateMqFields(value: unknown) {
@@ -1030,7 +1043,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       applyPrestoSqlBuiltinDriverPathsIfAvailable();
     }
     if (profile.type === "mq") {
-      resetMqFields();
+      resetMqFields(defaultMqFieldsForProfile(val));
       form.value.database = undefined;
       form.value.connection_string = undefined;
     }
@@ -1298,6 +1311,7 @@ const iconTypeMap: Record<string, string> = {
   etcd: "etcd",
   zookeeper: "zookeeper",
   mq: "mq",
+  kafka: "kafka",
   nacos: "nacos",
   dm: "dm",
   h2: "h2",
@@ -1385,6 +1399,7 @@ const dbOptions: DbOption[] = [
   { value: "etcd", label: "etcd" },
   { value: "zookeeper", label: "Apache ZooKeeper" },
   { value: "mq", label: "Apache Pulsar" },
+  { value: "kafka", label: "Apache Kafka" },
   { value: "nacos", label: "Nacos" },
   { value: "influxdb", label: "InfluxDB" },
   { value: "iris", label: "IRIS" },

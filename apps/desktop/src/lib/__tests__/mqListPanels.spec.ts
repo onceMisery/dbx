@@ -76,6 +76,11 @@ describe("MQ list panels", () => {
     expect(source).not.toContain('{ value: "", label: "Auto" }');
     expect(source).toContain('config.driver_profile = mqConfig.systemKind === "kafka" ? "kafka" : "pulsar"');
     expect(source).toContain('config.driver_label = mqConfig.systemKind === "kafka" ? "Apache Kafka" : "Apache Pulsar"');
+    expect(source).toContain('kafka: { type: "mq"');
+    expect(source).toContain('{ value: "kafka", label: "Apache Kafka" }');
+    expect(source).toContain('kafka: "kafka"');
+    expect(source).toContain('config.db_type === "mq" && (config.external_config as MqAdminConfig | undefined)?.systemKind === "kafka"');
+    expect(source).toContain("resetMqFields(defaultMqFieldsForProfile(val))");
   });
 
   it("mq api wrappers expose send message on tauri web and lazy api layers", () => {
