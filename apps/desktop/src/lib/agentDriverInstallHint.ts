@@ -9,11 +9,13 @@ export interface AgentDriverInstallState {
 function agentDriverInstallKey(dbType: DatabaseType | undefined, driverProfile?: string): string | undefined {
   if (dbType === "oracle") return "oracle";
   if (dbType === "mongodb") return "mongodb";
+  if (dbType === "mq") return driverProfile === "kafka" ? "kafka" : undefined;
   return driverProfile && driverProfile !== dbType ? driverProfile : dbType;
 }
 
 export function showAgentDriverInstallHint(dbType: DatabaseType | undefined, drivers: readonly AgentDriverInstallState[], driverProfile?: string): boolean {
   if (!supportsDriverManagement(dbType)) return false;
   const driverKey = agentDriverInstallKey(dbType, driverProfile);
+  if (!driverKey) return false;
   return drivers.find((driver) => driver.db_type === driverKey)?.installed !== true;
 }

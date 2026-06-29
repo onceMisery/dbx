@@ -1646,6 +1646,13 @@
       "metadataConnectionScoped": false,
       "skipTcpProbe": true,
       "defaultPort": 8080,
+      "driverProfiles": [
+        {
+          "profile": "kafka",
+          "label": "Apache Kafka",
+          "agentKey": "kafka"
+        }
+      ],
       "supportLevel": "connect",
       "capabilities": {
         "queryExecution": false,
@@ -1663,7 +1670,7 @@
         "fieldLineage": false,
         "sqlExplain": false,
         "userAdmin": false,
-        "driverManagement": false
+        "driverManagement": true
       }
     },
     {
