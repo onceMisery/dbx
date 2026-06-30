@@ -11,8 +11,7 @@ use mysql_async::Row as MysqlRow;
 use crate::agent_connection::{
     agent_connect_params, h2_file_path_from_jdbc_url, is_h2_file_connection, mongo_legacy_error_with_auth_hint,
     mongo_uses_legacy_driver, oracle_alternate_connect_config_labels, oracle_alternate_connect_configs,
-    oracle_auth_fallback_profiles, oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
-    should_retry_oracle_with_10g_driver, trino_like_jdbc_connection_string,
+    oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver, trino_like_jdbc_connection_string,
 };
 use crate::agent_manager::{JavaRuntimeMode, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
@@ -54,6 +53,19 @@ pub enum MysqlMode {
     Normal,
     Bare,
     OceanBaseOracle,
+}
+
+fn is_oceanbase_mysql_config(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::Mysql
+        && config.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("oceanbase"))
+}
+
+fn oceanbase_mysql_setup_queries(config: &ConnectionConfig) -> Vec<String> {
+    if !is_oceanbase_mysql_config(config) || config.query_timeout_secs == 0 {
+        return Vec::new();
+    }
+    let timeout_us = config.query_timeout_secs.saturating_mul(1_000_000);
+    vec![format!("SET ob_query_timeout = {timeout_us}")]
 }
 
 pub enum PoolKind {
@@ -218,8 +230,16 @@ pub async fn connect_mysql_metadata_pool(
 ) -> Result<(db::mysql::MySqlPool, MysqlMode), String> {
     let url = connection_url_for_endpoint(db_config, host, port);
     let idle_timeout_secs = Some(db_config.idle_timeout_secs);
+    let extra_setup_queries = oceanbase_mysql_setup_queries(db_config);
     if db_config.needs_bare_mysql() {
-        return match db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections).await {
+        return match db::mysql::connect_bare_with_pool_limit_and_setup(
+            &url,
+            connect_timeout,
+            max_connections,
+            &extra_setup_queries,
+        )
+        .await
+        {
             Ok(pool) => Ok((pool, MysqlMode::Bare)),
             Err(err) => {
                 let fallback_url = mysql_metadata_fallback_url(config, db_config, host, port);
@@ -227,9 +247,14 @@ pub async fn connect_mysql_metadata_pool(
                     log::info!(
                         "MySQL metadata connection without a default database failed ({err}); retrying with configured default database."
                     );
-                    db::mysql::connect_bare_with_pool_limit(&fallback_url, connect_timeout, max_connections)
-                        .await
-                        .map(|pool| (pool, MysqlMode::Bare))
+                    db::mysql::connect_bare_with_pool_limit_and_setup(
+                        &fallback_url,
+                        connect_timeout,
+                        max_connections,
+                        &extra_setup_queries,
+                    )
+                    .await
+                    .map(|pool| (pool, MysqlMode::Bare))
                 } else {
                     Err(err)
                 }
@@ -237,12 +262,13 @@ pub async fn connect_mysql_metadata_pool(
         };
     }
 
-    match db::mysql::connect_with_ca_cert_pool_limit_and_idle(
+    match db::mysql::connect_with_ca_cert_pool_limit_idle_and_setup(
         &url,
         Some(&db_config.ca_cert_path),
         connect_timeout,
         max_connections,
         idle_timeout_secs,
+        &extra_setup_queries,
     )
     .await
     {
@@ -256,12 +282,13 @@ pub async fn connect_mysql_metadata_pool(
                 log::info!(
                     "MySQL metadata connection without a default database failed ({err}); retrying with configured default database."
                 );
-                let pool = db::mysql::connect_with_ca_cert_pool_limit_and_idle(
+                let pool = db::mysql::connect_with_ca_cert_pool_limit_idle_and_setup(
                     &fallback_url,
                     Some(&config.ca_cert_path),
                     connect_timeout,
                     max_connections,
                     idle_timeout_secs,
+                    &extra_setup_queries,
                 )
                 .await?;
                 let mode = detect_ob_oracle_mode(config, &pool).await;
@@ -281,19 +308,38 @@ pub async fn connect_bare_metadata_pool(
     max_connections: usize,
 ) -> Result<db::mysql::MySqlPool, String> {
     let url = connection_url_for_endpoint(db_config, host, port);
+    let extra_setup_queries = oceanbase_mysql_setup_queries(db_config);
     if db_config.effective_database().is_none() {
-        return db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections).await;
+        return db::mysql::connect_bare_with_pool_limit_and_setup(
+            &url,
+            connect_timeout,
+            max_connections,
+            &extra_setup_queries,
+        )
+        .await;
     }
 
     let mut unscoped_config = db_config.clone();
     unscoped_config.database = None;
     let unscoped_url = connection_url_for_endpoint(&unscoped_config, host, port);
     if unscoped_url == url {
-        return db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections).await;
+        return db::mysql::connect_bare_with_pool_limit_and_setup(
+            &url,
+            connect_timeout,
+            max_connections,
+            &extra_setup_queries,
+        )
+        .await;
     }
 
-    let preferred = db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections);
-    let unscoped = db::mysql::connect_bare_with_pool_limit(&unscoped_url, connect_timeout, max_connections);
+    let preferred =
+        db::mysql::connect_bare_with_pool_limit_and_setup(&url, connect_timeout, max_connections, &extra_setup_queries);
+    let unscoped = db::mysql::connect_bare_with_pool_limit_and_setup(
+        &unscoped_url,
+        connect_timeout,
+        max_connections,
+        &extra_setup_queries,
+    );
     tokio::pin!(preferred);
     tokio::pin!(unscoped);
 
@@ -899,7 +945,7 @@ impl AppState {
                 let connect_result = client
                     .call_method_with_timeout::<serde_json::Value>(
                         AgentMethod::Connect,
-                        connect_params.clone(),
+                        connect_params,
                         Some(agent_connect_timeout(&db_config)),
                     )
                     .await;
@@ -947,45 +993,6 @@ impl AppState {
                                 fallback_errors.join("\n")
                             ));
                         }
-                    } else if should_retry_oracle_with_10g_driver(&db_config, &err) {
-                        log::warn!(
-                            "Oracle connect failed with profile {:?}: {}. Retrying with legacy Oracle profiles.",
-                            db_config.driver_profile,
-                            err
-                        );
-                        let mut fallback_errors = Vec::new();
-                        let mut connected_client = None;
-                        for profile in oracle_auth_fallback_profiles(&db_config, &err) {
-                            match self.agent_manager.spawn(&db_config.db_type, Some(profile)).await {
-                                Ok(mut fallback_client) => {
-                                    match fallback_client
-                                        .call_method_with_timeout::<serde_json::Value>(
-                                            AgentMethod::Connect,
-                                            connect_params.clone(),
-                                            Some(agent_connect_timeout(&db_config)),
-                                        )
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            connected_client = Some(fallback_client);
-                                            break;
-                                        }
-                                        Err(fallback_err) => {
-                                            fallback_errors.push(format!("{profile}: {fallback_err}"));
-                                        }
-                                    }
-                                }
-                                Err(fallback_err) => {
-                                    fallback_errors.push(format!("{profile}: {fallback_err}"));
-                                }
-                            }
-                        }
-                        client = connected_client.ok_or_else(|| {
-                            format!(
-                                "{err}\n\nFallback with legacy Oracle drivers failed: {}",
-                                fallback_errors.join("\n")
-                            )
-                        })?;
                     } else {
                         return Err(oracle_error_with_driver_hint(&db_config, &err));
                     }
@@ -2393,13 +2400,13 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
 mod tests {
     use super::{
         agent_connect_timeout, connection_remote_endpoint, connection_url_for_endpoint, database_connection_config,
-        metadata_connection_config, mysql_metadata_fallback_url, prestosql_jdbc_config_for_endpoint,
-        redacted_connection_url_for_endpoint, uses_bare_mysql_pool, uses_tcp_probe, validate_h2_database_path,
-        AppState, PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
+        metadata_connection_config, mysql_metadata_fallback_url, oceanbase_mysql_setup_queries,
+        prestosql_jdbc_config_for_endpoint, redacted_connection_url_for_endpoint, uses_bare_mysql_pool, uses_tcp_probe,
+        validate_h2_database_path, AppState, PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
-        oracle_alternate_connect_config, should_retry_mongo_with_legacy_driver, should_retry_oracle_with_10g_driver,
+        oracle_alternate_connect_config, should_retry_mongo_with_legacy_driver,
     };
     use crate::agent_manager::{AgentState, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY};
     use crate::database_capabilities;
@@ -2598,6 +2605,32 @@ mod tests {
     }
 
     #[test]
+    fn oceanbase_mysql_setup_queries_follow_query_timeout() {
+        let mut config = mysql_config(Some("dbx"));
+        config.driver_profile = Some("oceanbase".to_string());
+        config.query_timeout_secs = 30;
+
+        assert_eq!(oceanbase_mysql_setup_queries(&config), vec!["SET ob_query_timeout = 30000000"]);
+    }
+
+    #[test]
+    fn oceanbase_mysql_setup_queries_skip_disabled_timeout() {
+        let mut config = mysql_config(Some("dbx"));
+        config.driver_profile = Some("oceanbase".to_string());
+        config.query_timeout_secs = 0;
+
+        assert!(oceanbase_mysql_setup_queries(&config).is_empty());
+    }
+
+    #[test]
+    fn oceanbase_mysql_setup_queries_do_not_apply_to_plain_mysql() {
+        let mut config = mysql_config(Some("dbx"));
+        config.query_timeout_secs = 30;
+
+        assert!(oceanbase_mysql_setup_queries(&config).is_empty());
+    }
+
+    #[test]
     fn mongo_legacy_retry_covers_old_server_handshake_eof() {
         let err = r#"MongoDB connection failed: Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: db.example.com:27017, Type: Unknown, Error: Kind: I/O error: unexpected end of file } ] }"#;
 
@@ -2694,33 +2727,6 @@ mod tests {
     }
 
     #[test]
-    fn oracle_retry_guard_only_triggers_for_non_10g_listener_errors() {
-        let mut config = mysql_config(Some("ORCL"));
-        config.db_type = DatabaseType::Oracle;
-        config.driver_profile = Some("oracle".to_string());
-
-        assert!(!should_retry_oracle_with_10g_driver(
-            &config,
-            "Agent RPC error (-1): ORA-28040: No matching authentication protocol"
-        ));
-        assert!(!should_retry_oracle_with_10g_driver(&config, "Agent RPC error (-1): ORA-12541: TNS:no listener"));
-        assert!(!should_retry_oracle_with_10g_driver(&config, "host xxx port 1521 中没有监听程序"));
-
-        config.driver_profile = Some("oracle-10g".to_string());
-        assert!(!should_retry_oracle_with_10g_driver(&config, "Agent RPC error (-1): ORA-12541: TNS:no listener"));
-        assert!(!should_retry_oracle_with_10g_driver(
-            &config,
-            "Agent RPC error (-1): ORA-28040: No matching authentication protocol"
-        ));
-
-        config.driver_profile = Some("oracle".to_string());
-        assert!(!should_retry_oracle_with_10g_driver(
-            &config,
-            "Agent RPC error (-1): ORA-01017: invalid username/password"
-        ));
-    }
-
-    #[test]
     fn oracle_listener_errors_can_retry_with_alternate_connect_descriptor() {
         let mut config = mysql_config(Some("ORCL"));
         config.db_type = DatabaseType::Oracle;
@@ -2748,15 +2754,12 @@ mod tests {
     }
 
     #[test]
-    fn oracle_alternate_descriptor_retry_skips_non_listener_errors_and_10g_profiles() {
+    fn oracle_alternate_descriptor_retry_skips_non_listener_errors() {
         let mut config = mysql_config(Some("ORCL"));
         config.db_type = DatabaseType::Oracle;
         config.driver_profile = Some("oracle".to_string());
 
         assert!(oracle_alternate_connect_config(&config, "ORA-01017: invalid username/password").is_none());
-
-        config.driver_profile = Some("oracle-10g".to_string());
-        assert!(oracle_alternate_connect_config(&config, "ORA-12514: listener does not know service").is_none());
     }
 
     #[test]
@@ -3375,6 +3378,7 @@ mod tests {
     async fn duckdb_client_session_reuses_base_pool_to_avoid_file_locks() {
         let (state, dir) = test_app_state().await;
         let db_path = dir.join("session.duckdb");
+        duckdb::Connection::open(&db_path).unwrap();
         let mut config = mysql_config(None);
         config.id = "duckdb-conn".to_string();
         config.name = "DuckDB".to_string();

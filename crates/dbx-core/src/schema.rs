@@ -816,6 +816,25 @@ pub async fn list_tables_core(
     .await
 }
 
+/// List vector database collections, returning structured info (name, id, dimension).
+/// Only works for PoolKind::VectorDb connections; returns an error for other types.
+pub async fn list_vector_collections_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+) -> Result<Vec<db::vector_driver::CollectionInfo>, String> {
+    let pool_key =
+        state.get_or_create_pool(connection_id, if database.is_empty() { None } else { Some(database) }).await?;
+    let client = {
+        let connections = state.connections.read().await;
+        match connections.get(&pool_key) {
+            Some(PoolKind::VectorDb(client)) => client.clone(),
+            _ => return Err("Not a vector database connection".to_string()),
+        }
+    };
+    db::vector_driver::list_collections_with_db(&client, database).await
+}
+
 pub async fn get_table_comment_core(
     state: &AppState,
     connection_id: &str,
@@ -1221,6 +1240,7 @@ async fn external_driver_presto_like_objects(
             name: table.name,
             object_type: table.table_type,
             schema: Some(schema.to_string()),
+            signature: None,
             comment: table.comment,
             created_at: None,
             updated_at: None,
@@ -2104,6 +2124,7 @@ async fn list_objects_once(
                         name: table.name,
                         object_type: table.table_type,
                         schema: None,
+                        signature: None,
                         comment: table.comment,
                         created_at: None,
                         updated_at: None,
@@ -2207,6 +2228,7 @@ async fn list_objects_once(
                     name: table.name,
                     object_type: table.table_type,
                     schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
+                    signature: None,
                     comment: table.comment,
                     created_at: None,
                     updated_at: None,
@@ -3062,6 +3084,18 @@ fn postgres_object_source_sql_without_relispopulated(schema: &str, name: &str, k
     postgres_object_source_sql_inner(schema, name, kind, false)
 }
 
+fn postgres_function_object_source_sql_without_prokind(schema: &str, name: &str) -> String {
+    format!(
+        "SELECT pg_get_functiondef(p.oid) \
+         FROM pg_proc p \
+         JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = {} AND p.proname = {} AND NOT p.proisagg AND NOT p.proiswindow \
+         ORDER BY p.oid LIMIT 1",
+        sql_string(schema),
+        sql_string(name)
+    )
+}
+
 fn postgres_object_source_sql_inner(
     schema: &str,
     name: &str,
@@ -3378,6 +3412,7 @@ async fn oracle_agent_list_objects(
                 name,
                 object_type,
                 schema,
+                signature: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -3427,6 +3462,16 @@ async fn postgres_object_source(
                 .and_then(first_string_cell)
                 .map_err(|fallback_err| format!("{primary_err}; relispopulated fallback failed: {fallback_err}"))
         }
+        Err(primary_err)
+            if postgres_missing_prokind_error(&primary_err)
+                && matches!(object_type, db::ObjectSourceKind::Function) =>
+        {
+            let fallback_sql = postgres_function_object_source_sql_without_prokind(schema, name);
+            db::postgres::execute_query(pool, &fallback_sql)
+                .await
+                .and_then(first_string_cell)
+                .map_err(|fallback_err| format!("{primary_err}; prokind fallback failed: {fallback_err}"))
+        }
         Err(primary_err) if matches!(object_type, db::ObjectSourceKind::View) => {
             let fallback_sql = postgres_view_source_fallback_sql(schema, name);
             db::postgres::execute_query(pool, &fallback_sql)
@@ -3436,6 +3481,14 @@ async fn postgres_object_source(
         }
         Err(err) => Err(err),
     }
+}
+
+fn postgres_missing_prokind_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("does not exist")
+        && (lower.contains("column p.prokind")
+            || lower.contains("column \"p\".\"prokind\"")
+            || lower.contains("column \"prokind\""))
 }
 
 fn postgres_missing_relispopulated_error(err: &str) -> bool {
@@ -3489,6 +3542,16 @@ mod object_source_tests {
     }
 
     #[test]
+    fn builds_postgres_function_source_sql_without_prokind_for_legacy_catalogs() {
+        let sql = postgres_function_object_source_sql_without_prokind("public", "recalc_score");
+
+        assert_eq!(
+            sql,
+            "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND NOT p.proisagg AND NOT p.proiswindow ORDER BY p.oid LIMIT 1"
+        );
+    }
+
+    #[test]
     fn keeps_legacy_materialized_viewdef_when_it_already_contains_create_statement() {
         let sql = postgres_object_source_sql("public", "active_users", &ObjectSourceKind::MaterializedView);
 
@@ -3506,6 +3569,13 @@ mod object_source_tests {
     fn detects_legacy_postgres_relispopulated_errors() {
         assert!(postgres_missing_relispopulated_error("ERROR: column c.relispopulated does not exist"));
         assert!(!postgres_missing_relispopulated_error("ERROR: relation public.relispopulated does not exist"));
+    }
+
+    #[test]
+    fn detects_legacy_postgres_prokind_errors() {
+        assert!(postgres_missing_prokind_error("ERROR: column p.prokind does not exist"));
+        assert!(postgres_missing_prokind_error("ERROR: column \"p\".\"prokind\" does not exist"));
+        assert!(!postgres_missing_prokind_error("ERROR: relation public.prokind does not exist"));
     }
 
     #[test]
@@ -3595,6 +3665,47 @@ mod ddl_tests {
         let ddl = render_postgres_table_ddl("public", "users", &[id], &[], &[]);
 
         assert!(ddl.contains("\"id\" integer generated by default as identity NOT NULL"), "ddl: {ddl}");
+    }
+
+    #[test]
+    fn postgres_table_ddl_keeps_composite_foreign_key_together() {
+        let columns = vec![column("a", "integer"), column("b", "integer"), column("c", "integer")];
+        let foreign_keys = vec![
+            db::ForeignKeyInfo {
+                name: "aaa_1".to_string(),
+                column: "a".to_string(),
+                ref_schema: Some("public".to_string()),
+                ref_table: "aaa_2".to_string(),
+                ref_column: "a".to_string(),
+                on_update: None,
+                on_delete: None,
+            },
+            db::ForeignKeyInfo {
+                name: "aaa_1".to_string(),
+                column: "b".to_string(),
+                ref_schema: Some("public".to_string()),
+                ref_table: "aaa_2".to_string(),
+                ref_column: "b".to_string(),
+                on_update: None,
+                on_delete: None,
+            },
+            db::ForeignKeyInfo {
+                name: "aaa_1".to_string(),
+                column: "c".to_string(),
+                ref_schema: Some("public".to_string()),
+                ref_table: "aaa_2".to_string(),
+                ref_column: "c".to_string(),
+                on_update: None,
+                on_delete: None,
+            },
+        ];
+
+        let ddl = render_postgres_table_ddl("public", "aaa_1", &columns, &[], &foreign_keys);
+
+        assert!(ddl.contains(
+            "CONSTRAINT \"aaa_1\" FOREIGN KEY (\"a\", \"b\", \"c\") REFERENCES \"aaa_2\"(\"a\", \"b\", \"c\")"
+        ));
+        assert_eq!(ddl.matches("CONSTRAINT \"aaa_1\" FOREIGN KEY").count(), 1);
     }
 
     #[test]
@@ -3714,13 +3825,18 @@ pub fn render_postgres_table_ddl(
     if !pks.is_empty() {
         ddl.push_str(&format!(",\n  PRIMARY KEY ({})", pks.iter().map(|k| pg_ident(k)).collect::<Vec<_>>().join(", ")));
     }
-    for fk in fkeys {
+    for fk_group in group_foreign_keys_by_name(fkeys) {
+        let Some(first_fk) = fk_group.first() else {
+            continue;
+        };
+        let columns = fk_group.iter().map(|fk| pg_ident(&fk.column)).collect::<Vec<_>>().join(", ");
+        let ref_columns = fk_group.iter().map(|fk| pg_ident(&fk.ref_column)).collect::<Vec<_>>().join(", ");
         ddl.push_str(&format!(
             ",\n  CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({})",
-            pg_ident(&fk.name),
-            pg_ident(&fk.column),
-            pg_ident(&fk.ref_table),
-            pg_ident(&fk.ref_column)
+            pg_ident(&first_fk.name),
+            columns,
+            pg_ident(&first_fk.ref_table),
+            ref_columns
         ));
     }
     ddl.push_str("\n);\n");
@@ -3763,6 +3879,18 @@ pub fn render_postgres_table_ddl(
         }
     }
     ddl
+}
+
+fn group_foreign_keys_by_name(fkeys: &[db::ForeignKeyInfo]) -> Vec<Vec<&db::ForeignKeyInfo>> {
+    let mut groups: Vec<Vec<&db::ForeignKeyInfo>> = Vec::new();
+    for fk in fkeys {
+        if let Some(group) = groups.iter_mut().find(|group| group.first().is_some_and(|first| first.name == fk.name)) {
+            group.push(fk);
+        } else {
+            groups.push(vec![fk]);
+        }
+    }
+    groups
 }
 
 pub async fn build_sqlserver_ddl(

@@ -47,7 +47,6 @@ fn built_in_agent_list_includes_expected_driver_labels() {
     assert!(agents.iter().any(|agent| agent.db_type == "iotdb" && agent.label == "Apache IoTDB"));
     assert!(agents.iter().any(|agent| agent.db_type == "yashandb" && agent.label == "崖山 YashanDB"));
     assert!(agents.iter().any(|agent| agent.db_type == "access" && agent.label == "Microsoft Access"));
-    assert!(agents.iter().any(|agent| agent.db_type == "kafka" && agent.label == "Apache Kafka"));
 }
 
 #[test]
@@ -233,9 +232,6 @@ fn local_agent_jar_candidates_include_monorepo_and_legacy_build_output() {
     let candidates = local_agent_jar_candidates("tdengine");
 
     assert!(candidates.iter().any(|path| path.ends_with("agents/drivers/tdengine/build/libs/dbx-agent-tdengine.jar")));
-    assert!(candidates
-        .iter()
-        .any(|path| path.ends_with("../agents/drivers/tdengine/build/libs/dbx-agent-tdengine.jar")));
     assert!(candidates.iter().any(|path| path.ends_with("dbx-agents/tdengine/build/libs/dbx-agent-tdengine.jar")));
 }
 

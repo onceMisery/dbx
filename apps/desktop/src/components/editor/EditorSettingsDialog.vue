@@ -80,6 +80,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { currentLocale, setLocale, type Locale } from "@/i18n";
 import { LOCALE_OPTIONS } from "@/lib/localeOptions";
 import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdavAutoUploadConfig";
+import { apiUrl } from "@/lib/webPath";
 
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
@@ -1386,7 +1387,7 @@ async function changePassword() {
   changingPassword.value = true;
   passwordMessage.value = "";
   try {
-    const res = await fetch("/api/auth/change-password", {
+    const res = await fetch(apiUrl("/api/auth/change-password"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ old_password: oldPassword.value, new_password: newPassword.value }),

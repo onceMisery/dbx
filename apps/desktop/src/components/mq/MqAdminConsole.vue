@@ -3,6 +3,7 @@ import { formatError } from "@/lib/errorUtils";
 import { ref, computed, onMounted, watch } from "vue";
 import type { MqClusterInfo, TopicInfo } from "@/types/mq";
 import { mqTestConnection } from "@/lib/api";
+import { useConnectionStore } from "@/stores/connectionStore";
 import { mqClusterOptionsFromExtra } from "@/lib/mqTenantForm";
 import TenantsPanel from "./TenantsPanel.vue";
 import NamespacesPanel from "./NamespacesPanel.vue";
@@ -26,6 +27,7 @@ interface Props {
 }
 
 const props = defineProps<Props>();
+const connectionStore = useConnectionStore();
 
 // State
 const activeTab = ref<MqTab>(props.initialTab || (props.initialTenant ? "namespaces" : "tenants"));
@@ -184,7 +186,12 @@ watch(
 );
 
 // Lifecycle
-onMounted(() => {
+onMounted(async () => {
+  try {
+    await connectionStore.ensureConnected(props.connectionId);
+  } catch (e) {
+    console.warn("[DBX] ensureConnected failed for", props.connectionId, e);
+  }
   loadClusterInfo();
 });
 </script>

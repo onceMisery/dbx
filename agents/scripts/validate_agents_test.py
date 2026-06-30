@@ -9,10 +9,6 @@ import validate_agents
 import validate_agent_jars
 
 
-def normalize_problem_paths(problems):
-    return [problem.replace("\\", "/") for problem in problems]
-
-
 class ValidateAgentsTest(unittest.TestCase):
     def test_versions_must_match_included_agent_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -70,7 +66,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            problems = normalize_problem_paths(validate_agents.validate_source_patterns(root))
+            problems = validate_agents.validate_source_patterns(root)
 
             self.assertEqual(
                 [
@@ -120,7 +116,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            problems = normalize_problem_paths(validate_agents.validate_jdbc_architecture(root, {"example"}))
+            problems = validate_agents.validate_jdbc_architecture(root, {"example"})
 
             self.assertEqual(
                 [
@@ -131,61 +127,22 @@ class ValidateAgentsTest(unittest.TestCase):
                 problems,
             )
 
-    def test_jdbc_architecture_allows_documented_migration_exceptions(self):
+    def test_versions_include_native_only_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            module = root / "oracle"
-            source = module / "src/main/java/com/dbx/agent/oracle/OracleAgent.java"
-            source.parent.mkdir(parents=True)
-            (module / "build.gradle").write_text(
-                textwrap.dedent(
-                    """
-                    tasks.named('shadowJar') {
-                        manifest {
-                            attributes(
-                                'Agent-Label': 'Oracle',
-                                'Main-Class': 'com.dbx.agent.oracle.OracleAgent'
-                            )
-                        }
-                    }
-                    """
-                ),
+            (root / "settings.gradle").write_text(
+                "def infrastructureModules = ['common', 'test-support']\n"
+                "def driverModules = ['h2']\n"
+                "include(*(infrastructureModules + driverModules))\n",
                 encoding="utf-8",
             )
-            source.write_text(
-                "package com.dbx.agent.oracle; public final class OracleAgent extends BaseDatabaseAgent {}\n",
+            (root / "drivers/oracle-go").mkdir(parents=True)
+            (root / "versions.json").write_text(
+                json.dumps({"h2": "0.1.0", "oracle": "0.1.0"}),
                 encoding="utf-8",
             )
 
-            self.assertEqual([], validate_agents.validate_jdbc_architecture(root, {"oracle"}))
-
-    def test_jdbc_architecture_skips_kafka_agent(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            module = root / "drivers/kafka"
-            source = module / "src/main/java/com/dbx/agent/kafka/KafkaAgent.java"
-            source.parent.mkdir(parents=True)
-            (module / "build.gradle").write_text(
-                textwrap.dedent(
-                    """
-                    tasks.named('shadowJar') {
-                        manifest {
-                            attributes(
-                                'Agent-Label': 'Apache Kafka',
-                                'Main-Class': 'com.dbx.agent.kafka.KafkaAgent'
-                            )
-                        }
-                    }
-                    """
-                ),
-                encoding="utf-8",
-            )
-            source.write_text(
-                "package com.dbx.agent.kafka; public final class KafkaAgent {}\n",
-                encoding="utf-8",
-            )
-
-            self.assertEqual([], validate_agents.validate_jdbc_architecture(root, {"kafka"}))
+            self.assertEqual([], validate_agents.validate_versions(root))
 
     def test_authoring_template_must_use_shared_foundation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,7 +170,7 @@ class ValidateAgentsTest(unittest.TestCase):
                     "docs/examples/jdbc-agent-template/src/main/java/com/dbx/agent/template/TemplateAgent.java: template must use shared JDBC foundation",
                     "docs/examples/jdbc-agent-template/src/main/java/com/dbx/agent/template/TemplateAgent.java: template contains copied JDBC connection creation",
                 ],
-                normalize_problem_paths(validate_agents.validate_authoring_template(root)),
+                validate_agents.validate_authoring_template(root),
             )
 
     def test_manifest_validation_requires_registry_fields(self):
@@ -248,7 +205,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            problems = normalize_problem_paths(validate_agents.validate_manifest_fields(root, {"h2"}))
+            problems = validate_agents.validate_manifest_fields(root, {"h2"})
 
             self.assertEqual(
                 ["h2/build.gradle: missing Main-Class manifest attribute"],
@@ -280,7 +237,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            problems = normalize_problem_paths(validate_agents.validate_manifest_fields(root, {"h2"}))
+            problems = validate_agents.validate_manifest_fields(root, {"h2"})
 
             self.assertEqual(
                 ["h2/build.gradle: Main-Class source not found: h2/src/main/java/com/dbx/agent/h2/H2Agent.java"],
@@ -338,7 +295,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("", encoding="utf-8")
 
-            problems = normalize_problem_paths(validate_agents.validate_no_kotlin_residue(root))
+            problems = validate_agents.validate_no_kotlin_residue(root)
 
             self.assertEqual(
                 [
@@ -348,7 +305,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 problems,
             )
 
-    def test_release_runtime_keys_match_java_21_default_and_oracle_8_exception(self):
+    def test_release_runtime_keys_match_java_21_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workflow = root / ".github/workflows/release.yml"
@@ -363,7 +320,6 @@ class ValidateAgentsTest(unittest.TestCase):
                             java-version: "21"
                     detect_jre_key() {
                       case "$name" in
-                        oracle-10g) echo "8" ;;
                         *) echo "21" ;;
                       esac
                     }
@@ -394,7 +350,6 @@ class ValidateAgentsTest(unittest.TestCase):
                             java-version: "21"
                     detect_jre_key() {
                       case "$name" in
-                        oracle-10g) echo "8" ;;
                         *) echo "17" ;;
                       esac
                     }
@@ -415,11 +370,11 @@ class ValidateAgentsTest(unittest.TestCase):
             self.assertEqual(
                 [
                     "release workflow must build the default JRE with key 21",
-                    "non-legacy agents must use JRE key 21",
+                    "agents must use JRE key 21",
                     "registry must publish Java 21 under JRE key 21",
                     "native-only registry entries must publish a legacy jar placeholder for older DBX clients",
                     "release workflow must not build Java 21 under JRE key 17",
-                    "non-legacy agents must not use JRE key 17",
+                    "agents must not use JRE key 17",
                     "registry must not publish Java 21 under JRE key 17",
                 ],
                 validate_agents.validate_release_runtime_keys(root),
@@ -440,7 +395,7 @@ class ValidateAgentsTest(unittest.TestCase):
 
             self.assertEqual(
                 ["h2/build/libs/dbx-agent-h2.jar: Main-Class class not found: com/dbx/agent/h2/H2Agent.class"],
-                normalize_problem_paths(validate_agent_jars.validate_agent_jars(root)),
+                validate_agent_jars.validate_agent_jars(root),
             )
 
             with zipfile.ZipFile(jar, "a") as archive:

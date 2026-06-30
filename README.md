@@ -219,6 +219,17 @@ volumes:
 
 Open `http://localhost:4224` in your browser. Multi-arch images (amd64 / arm64) are available.
 
+To publish DBX under a reverse-proxy context path such as `/dbx`, set the
+runtime base path and proxy the same prefix to the container:
+
+```yaml
+environment:
+  - DBX_PUBLIC_BASE_PATH=/dbx
+```
+
+When building the frontend yourself with an absolute asset base, set
+`VITE_DBX_BASE_PATH=/dbx/` before `pnpm build`.
+
 ## Getting Started
 
 ### Prerequisites

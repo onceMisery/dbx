@@ -58,9 +58,12 @@ import {
   isResetZoomShortcut,
   isRefreshDataShortcut,
   isSaveShortcut,
+  isSwitchToNextTabShortcut,
+  isSwitchToPreviousTabShortcut,
   isToggleSidebarShortcut,
   isZoomInShortcut,
   isZoomOutShortcut,
+  switchToTabIndexFromShortcut,
 } from "@/lib/keyboardShortcuts";
 import { isPreviewTab } from "@/lib/tabPresentation";
 import { supportsSqlFileExecution } from "@/lib/databaseCapabilities";
@@ -68,6 +71,7 @@ import { classifyAiSqlExecution } from "@/lib/aiSqlExecutionPolicy";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/agentDriverUpdateBadge";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
+import { apiUrl, webPath } from "@/lib/webPath";
 import { rankSavedSqlHistory } from "@/lib/savedSqlHistory";
 import { isSchemaAware, isSingleDatabase, usesTreeSchemaMode } from "@/lib/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
@@ -1160,10 +1164,37 @@ async function handleQuickOpenSelect(item: any) {
   }
 }
 
+function dispatchBeforeTabSwitch(tabId: string) {
+  if (tabId === queryStore.activeTabId) return;
+  window.dispatchEvent(new CustomEvent("dbx:before-tab-switch", { detail: { tabId, fromTabId: queryStore.activeTabId } }));
+}
+
+function activateQueryTab(tabId: string): boolean {
+  if (!queryStore.tabs.some((tab) => tab.id === tabId)) return false;
+  dispatchBeforeTabSwitch(tabId);
+  queryStore.activeTabId = tabId;
+  driverStoreActive.value = false;
+  return true;
+}
+
+function activateTabByIndex(index: number): boolean {
+  const tab = queryStore.tabs[index];
+  return tab ? activateQueryTab(tab.id) : false;
+}
+
+function activateAdjacentTab(direction: -1 | 1): boolean {
+  const count = queryStore.tabs.length;
+  if (count < 2) return false;
+  const currentIndex = queryStore.tabs.findIndex((tab) => tab.id === queryStore.activeTabId);
+  const nextIndex = currentIndex < 0 ? (direction > 0 ? 0 : count - 1) : (currentIndex + direction + count) % count;
+  return activateTabByIndex(nextIndex);
+}
+
 function handleKeydown(e: KeyboardEvent) {
   if (e.defaultPrevented) return;
 
   const shortcuts = settingsStore.editorSettings.shortcuts;
+  const switchTabIndex = switchToTabIndexFromShortcut(e, shortcuts);
 
   if (isOpenSettingsShortcut(e, shortcuts)) {
     e.preventDefault();
@@ -1201,6 +1232,27 @@ function handleKeydown(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     setSidebarOpen(!sidebarOpen.value);
+    return;
+  }
+  if (switchTabIndex != null) {
+    if (activateTabByIndex(switchTabIndex)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    return;
+  }
+  if (isSwitchToPreviousTabShortcut(e, shortcuts)) {
+    if (activateAdjacentTab(-1)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    return;
+  }
+  if (isSwitchToNextTabShortcut(e, shortcuts)) {
+    if (activateAdjacentTab(1)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     return;
   }
   if (isCloseTabShortcut(e, shortcuts)) {
@@ -1263,7 +1315,7 @@ function onLoginSuccess() {
   authenticated.value = true;
   setupRequired.value = false;
   needsAuth.value = true;
-  window.history.replaceState(null, "", "/");
+  window.history.replaceState(null, "", webPath("/"));
   initApp();
 }
 
@@ -1386,7 +1438,7 @@ onMounted(async () => {
   );
   if (!isDesktop) {
     try {
-      const res = await fetch("/api/auth/check");
+      const res = await fetch(apiUrl("/api/auth/check"));
       const data = await res.json();
       needsAuth.value = data.required;
       authenticated.value = data.authenticated;
@@ -1395,7 +1447,7 @@ onMounted(async () => {
       /* server unreachable */
     }
     if (needsAuth.value && !authenticated.value) {
-      history.replaceState(null, "", "/login");
+      history.replaceState(null, "", webPath("/login"));
     }
     if (!setupRequired.value && (!needsAuth.value || authenticated.value)) initApp();
     api

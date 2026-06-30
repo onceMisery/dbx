@@ -598,7 +598,11 @@ fn sqlserver_cell_to_json(cell: &ColumnData<'static>) -> serde_json::Value {
         return serde_json::Value::String(v.to_string());
     }
     if let Ok(Some(v)) = <chrono::NaiveDateTime as FromSql>::from_sql(cell) {
-        return serde_json::Value::String(v.to_string());
+        let value = match cell {
+            ColumnData::DateTime(_) => crate::sqlserver_temporal::format_sqlserver_datetime_display(&v),
+            _ => v.to_string(),
+        };
+        return serde_json::Value::String(value);
     }
     if let Ok(Some(v)) = <chrono::NaiveDate as FromSql>::from_sql(cell) {
         return serde_json::Value::String(v.to_string());
@@ -1197,6 +1201,7 @@ pub async fn list_objects(client: &mut SqlServerClient, schema: &str) -> Result<
             name: row.get::<&str, _>(0).unwrap_or("").to_string(),
             object_type: row.get::<&str, _>(1).unwrap_or("TABLE").to_string(),
             schema: Some(schema.to_string()),
+            signature: None,
             comment: row.get::<&str, _>(4).filter(|s: &&str| !s.is_empty()).map(|s: &str| s.to_string()),
             created_at: row.get::<chrono::NaiveDateTime, _>(2).map(|value| value.to_string()),
             updated_at: row.get::<chrono::NaiveDateTime, _>(3).map(|value| value.to_string()),
@@ -2123,6 +2128,13 @@ mod tests {
         let cell: ColumnData<'static> = datetime.into_sql();
 
         assert_eq!(sqlserver_cell_to_json(&cell), serde_json::json!("2026-05-13 09:08:07.123"));
+    }
+
+    #[test]
+    fn sqlserver_datetime_cells_display_millisecond_precision() {
+        let cell = ColumnData::DateTime(Some(tiberius::time::DateTime::new(46_200, 11_001_869)));
+
+        assert_eq!(sqlserver_cell_to_json(&cell), serde_json::json!("2026-06-29 10:11:12.897"));
     }
 
     #[test]

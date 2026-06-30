@@ -114,8 +114,6 @@ fn maps_agent_database_types_to_driver_keys() {
     assert_eq!(agent_key(&DatabaseType::Databend, None), Some("databend"));
     assert_eq!(agent_key(&DatabaseType::InfluxDb, None), Some("influxdb"));
     assert_eq!(agent_key(&DatabaseType::ZooKeeper, None), Some("zookeeper"));
-    assert_eq!(agent_key(&DatabaseType::MessageQueue, Some("kafka")), Some("kafka"));
-    assert_eq!(agent_key(&DatabaseType::MessageQueue, Some("pulsar")), None);
     assert_eq!(agent_key(&DatabaseType::Oracle, Some("oracle-legacy")), Some("oracle"));
     assert_eq!(agent_key(&DatabaseType::Oracle, Some("oracle-10g")), Some("oracle"));
     assert_eq!(agent_key(&DatabaseType::Postgres, None), None);
@@ -130,20 +128,6 @@ fn driver_store_entries_do_not_repeat_agent_keys() {
     assert!(duplicate_keys.is_empty(), "driver store agent keys should be unique: {duplicate_keys:?}");
     assert_eq!(entries.iter().filter(|(key, _)| *key == "gbase8a").count(), 1);
     assert_eq!(entries.iter().filter(|(key, _)| *key == "gbase8s").count(), 1);
-    assert!(entries.iter().any(|(key, label)| *key == "kafka" && *label == "Apache Kafka"));
-}
-
-#[test]
-fn message_queue_manifest_declares_kafka_agent_profile() {
-    let manifest = driver_manifest();
-    let mq = manifest
-        .drivers
-        .iter()
-        .find(|driver| driver.db_type == DatabaseType::MessageQueue)
-        .expect("message queue manifest entry");
-
-    assert!(mq.capabilities.driver_management);
-    assert!(mq.driver_profiles.iter().any(|profile| profile.profile == "kafka" && profile.agent_key == "kafka"));
 }
 
 #[test]

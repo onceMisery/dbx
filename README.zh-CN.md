@@ -218,6 +218,15 @@ volumes:
   dbx-data:
 ```
 
+如需通过 nginx 等反向代理发布到 `/dbx` 这类子路径下，设置运行时上下文路径，并将同一前缀代理到容器：
+
+```yaml
+environment:
+  - DBX_PUBLIC_BASE_PATH=/dbx
+```
+
+如果自行从源码构建前端并希望使用绝对资源路径，可在 `pnpm build` 前设置 `VITE_DBX_BASE_PATH=/dbx/`。
+
 浏览器访问 `http://localhost:4224`。支持 amd64 / arm64 双架构镜像。
 
 ## 快速开始

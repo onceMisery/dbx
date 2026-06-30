@@ -494,30 +494,38 @@ async function toggle() {
         await connectionStore.loadDatabases(node.connectionId);
       }
     } else if (node.type === "redis-db" && node.connectionId && node.database) {
+      await connectionStore.ensureConnected(node.connectionId);
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "Redis"}:db${node.database}`;
       queryStore.createTab(node.connectionId, node.database, tabTitle, "redis");
     } else if (node.type === "mq-tenant" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
       queryStore.openMqAdmin(node.connectionId, { tenant: node.mqTenant || node.label, initialTab: node.mqInitialTab });
     } else if (node.type === "nacos-namespace" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
       queryStore.openNacosAdmin(node.connectionId, { namespace: node.nacosNamespace || "", namespaceName: node.nacosNamespaceName || node.label });
     } else if (node.type === "etcd-root" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "etcd"}:keys`;
       queryStore.createTab(node.connectionId, "", tabTitle, "etcd");
       refreshActiveKvBrowserAfterOpen("etcd", node.connectionId);
     } else if (node.type === "zookeeper-root" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "ZooKeeper"}:keys`;
       queryStore.createTab(node.connectionId, "", tabTitle, "zookeeper");
       refreshActiveKvBrowserAfterOpen("zookeeper", node.connectionId);
     } else if (node.type === "user-admin" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
       queryStore.openUserAdmin(node.connectionId);
     } else if (node.type === "mongo-db" && node.connectionId && node.database) {
       await connectionStore.loadMongoCollections(node.connectionId, node.database);
     } else if (node.type === "mongo-collection" && node.connectionId && node.database) {
       await connectionStore.loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id);
     } else if (node.type === "elasticsearch-index" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
       const tab = queryStore.createTab(node.connectionId, node.database || "default", node.label, "mongo");
       queryStore.updateSql(tab, node.label);
     } else if (node.type === "vector-collection" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
       const collectionRef = node.id.includes("__vector_collection:") ? node.id.split("__vector_collection:").pop() || node.label : node.label;
       const tab = queryStore.createTab(node.connectionId, node.database || "default", node.label, "vector");
       queryStore.updateSql(tab, collectionRef);
@@ -3460,6 +3468,14 @@ function copyStructureAsSubmenu(): ContextMenuItem {
   };
 }
 
+function moreActionsSubmenu(children: ContextMenuItem[]): ContextMenuItem {
+  return {
+    label: t("common.more"),
+    icon: ListTree,
+    children,
+  };
+}
+
 function savedSqlHistoryScopeForNode(node: TreeNode): SavedSqlHistoryScope | null {
   if (!node.connectionId) return null;
   if (node.type === "connection") {
@@ -3604,6 +3620,13 @@ function treeItemMenuItems(): ContextMenuItem[] {
         icon: ListFilter,
       });
     }
+    if (canConfigureVisibleSchemas.value) {
+      items.push({
+        label: t("visibleSchemas.title"),
+        action: openVisibleSchemasDialog,
+        icon: ListFilter,
+      });
+    }
     items.push({ label: t("contextMenu.editConnection"), action: editConnection, icon: Pencil });
     if (revealConnectionFilePath.value) {
       items.push({
@@ -3657,6 +3680,10 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   // 4. Database / Schema
   if (node.type === "database" || node.type === "schema") {
+    if (canCloseDatabaseConnection.value) {
+      items.push({ label: t("contextMenu.closeDatabaseConnection"), action: closeDatabaseConnection, icon: Unplug });
+      items.push({ label: "", separator: true });
+    }
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     items.push({ label: "", separator: true });
     if (canOpenObjectBrowser.value) {
@@ -3708,21 +3735,22 @@ function treeItemMenuItems(): ContextMenuItem[] {
     items.push({ label: t("diff.title"), action: openSchemaDiff, icon: ArrowRightLeft });
     items.push({ label: t("dataCompare.title"), action: openDataCompare, icon: ArrowRightLeft });
     items.push({ label: t("contextMenu.exportDatabase"), action: openDatabaseExport, icon: Upload });
-    if (canCloseDatabaseConnection.value) {
-      items.push({ label: "", separator: true });
-      items.push({ label: t("contextMenu.closeDatabaseConnection"), action: closeDatabaseConnection, icon: Unplug });
-    }
-    if (canDropDatabase.value || canDropSchema.value) {
-      items.push({ label: "", separator: true });
-    }
+    const destructiveActions: ContextMenuItem[] = [];
     if (canDropDatabase.value) {
-      items.push({
+      destructiveActions.push({
         label: t("contextMenu.dropDatabase"),
         action: dropDatabase,
         icon: Trash2,
         shortcut: shortcutDelete,
         variant: "destructive" as const,
       });
+    }
+    if (destructiveActions.length > 0) {
+      items.push({ label: "", separator: true });
+      items.push(moreActionsSubmenu(destructiveActions));
+    }
+    if (canDropSchema.value) {
+      items.push({ label: "", separator: true });
     }
     if (canDropSchema.value) {
       items.push({
@@ -3760,7 +3788,17 @@ function treeItemMenuItems(): ContextMenuItem[] {
     }
     if (canDropMongoDatabase.value) {
       items.push({ label: "", separator: true });
-      items.push({ label: t("contextMenu.dropDatabase"), action: dropDatabase, icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
+      items.push(
+        moreActionsSubmenu([
+          {
+            label: t("contextMenu.dropDatabase"),
+            action: dropDatabase,
+            icon: Trash2,
+            shortcut: shortcutDelete,
+            variant: "destructive" as const,
+          },
+        ]),
+      );
     }
     return items;
   }
@@ -3803,6 +3841,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
 
   // 6. Table / View / Materialized View
   if (node.type === "table" || node.type === "view" || node.type === "materialized_view") {
+    const destructiveActions: ContextMenuItem[] = [];
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     items.push({ label: "", separator: true });
     items.push({ label: t("contextMenu.viewData"), action: openData, icon: TableProperties });
@@ -3833,7 +3872,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
       });
     }
     if (node.type === "view" || node.type === "materialized_view") {
-      items.push({
+      destructiveActions.push({
         label: deleteMenuLabel(t("contextMenu.dropView")),
         action: deleteMenuAction(requestDropObject),
         icon: Trash2,
@@ -3876,28 +3915,31 @@ function treeItemMenuItems(): ContextMenuItem[] {
     if (isTableNotView.value) {
       items.push({ label: "", separator: true });
       items.push({ label: t("contextMenu.duplicateStructure"), action: duplicateStructure, icon: CopyPlus });
-      items.push({ label: "", separator: true });
       if (supportsTruncate.value) {
-        items.push({
+        destructiveActions.push({
           label: t("contextMenu.truncateTable"),
           action: truncateTable,
           icon: Scissors,
           variant: "destructive" as const,
         });
       }
-      items.push({
+      destructiveActions.push({
         label: t("contextMenu.emptyTable"),
         action: emptyTable,
         icon: Eraser,
         variant: "destructive" as const,
       });
-      items.push({
+      destructiveActions.push({
         label: deleteMenuLabel(t("contextMenu.dropTable")),
         action: deleteMenuAction(dropTable),
         icon: Trash2,
         shortcut: shortcutDelete,
         variant: "destructive" as const,
       });
+    }
+    if (destructiveActions.length > 0) {
+      items.push({ label: "", separator: true });
+      items.push(moreActionsSubmenu(destructiveActions));
     }
     items.push({ label: "", separator: true });
     items.push({
