@@ -1531,18 +1531,36 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureConnected(connectionId);
       if (useCachedChildren(node, options)) return;
 
-      const tenants = await withMetadataLoadTimeout(connectionId, api.mqListTenants(connectionId), "message queue tenants");
-      const tenantNames = sortSidebarNames(tenants.map((tenant) => tenant.name).filter((name) => !!name.trim()));
-      setChildren(
-        node,
-        tenantNames.map((tenant) => ({
-          id: schemaCacheKey(connectionId, "mq-tenant", tenant),
-          label: tenant,
-          type: "mq-tenant" as const,
-          connectionId,
-          mqTenant: tenant,
-        })),
-      );
+      const config = getConfig(connectionId);
+      const isKafka = config?.driver_profile === "kafka";
+
+      if (isKafka) {
+        // Kafka has no tenant/namespace concept. Create a synthetic child
+        // that opens the MQ admin console directly when clicked.
+        setChildren(node, [
+          {
+            id: schemaCacheKey(connectionId, "mq-tenant", "_kafka"),
+            label: "Topics",
+            type: "mq-tenant" as const,
+            connectionId,
+            mqTenant: "_kafka",
+            mqInitialTab: "topics",
+          },
+        ]);
+      } else {
+        const tenants = await withMetadataLoadTimeout(connectionId, api.mqListTenants(connectionId), "message queue tenants");
+        const tenantNames = sortSidebarNames(tenants.map((tenant) => tenant.name).filter((name) => !!name.trim()));
+        setChildren(
+          node,
+          tenantNames.map((tenant) => ({
+            id: schemaCacheKey(connectionId, "mq-tenant", tenant),
+            label: tenant,
+            type: "mq-tenant" as const,
+            connectionId,
+            mqTenant: tenant,
+          })),
+        );
+      }
       node.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e);

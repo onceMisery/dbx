@@ -433,6 +433,14 @@ pub async fn mq_get_backlog(
     dbx_core::mq::service::mq_get_backlog_core(&state, &connection_id, topic, sub).await
 }
 
+#[tauri::command]
+pub async fn mq_get_cluster_info(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<dbx_core::mq::ClusterInfo, String> {
+    dbx_core::mq::service::mq_get_cluster_info_core(&state, &connection_id).await
+}
+
 // ---- Raw request (escape hatch) ----
 
 #[tauri::command]

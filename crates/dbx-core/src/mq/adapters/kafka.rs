@@ -102,12 +102,20 @@ impl MessageQueueAdmin for KafkaAdmin {
         let cluster_id = result.get("clusterId").and_then(|v| v.as_str()).map(String::from);
         let brokers = result.get("brokers").cloned().unwrap_or(serde_json::json!([]));
 
+        // When the broker has no authorizer configured, disable permissions in the UI
+        // so the frontend hides the tab instead of showing raw errors.
+        let acl_enabled = result.get("aclEnabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let mut caps = KAFKA_CAPABILITIES;
+        if !acl_enabled {
+            caps.supports_permissions = false;
+        }
+
         Ok(MqClusterInfo {
             system_kind: MqSystemKind::Kafka,
             server_version: None,
             resolved_profile: "kafka-agent".to_string(),
             version_detection: "agent".to_string(),
-            capabilities: KAFKA_CAPABILITIES,
+            capabilities: caps,
             extra: serde_json::json!({
                 "clusterId": cluster_id,
                 "brokers": brokers,
@@ -337,8 +345,21 @@ impl MessageQueueAdmin for KafkaAdmin {
 
     // ---- Producers / consumers ----
 
-    async fn list_producers(&self, _topic: &TopicRef) -> Result<Vec<ProducerInfo>, String> {
-        Err("Kafka does not expose active producers via AdminClient".to_string())
+    async fn list_producers(&self, topic: &TopicRef) -> Result<Vec<ProducerInfo>, String> {
+        let result: serde_json::Value =
+            self.call("mq_list_producers", serde_json::json!({ "topic": topic.topic })).await?;
+        let producers = result.get("producers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        Ok(producers
+            .into_iter()
+            .map(|p| ProducerInfo {
+                producer_id: p.get("producerId").and_then(|v| v.as_i64()).unwrap_or(0),
+                producer_name: p.get("producerName").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                msg_rate_in: p.get("msgRateIn").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                msg_throughput_in: p.get("msgThroughputIn").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                address: p.get("address").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                client_version: p.get("clientVersion").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            })
+            .collect())
     }
 
     async fn list_consumers(&self, _topic: &TopicRef, sub: &str) -> Result<Vec<ConsumerInfo>, String> {
@@ -516,6 +537,39 @@ impl MessageQueueAdmin for KafkaAdmin {
 
         let total_lag = result.get("totalLag").and_then(|v| v.as_i64()).unwrap_or(0);
         Ok(BacklogStats { msg_backlog: total_lag, backlog_size: 0 })
+    }
+
+    async fn get_cluster_info(&self) -> Result<ClusterInfo, String> {
+        let result: serde_json::Value = self.call("mq_describe_cluster", serde_json::json!({})).await?;
+
+        let cluster_id = result.get("clusterId").and_then(|v| v.as_str()).map(String::from);
+        let broker_count = result.get("nodeCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+        let controller = result.get("controller").filter(|v| !v.is_null());
+        let controller_id = controller.and_then(|v| v.get("id")).and_then(|v| v.as_i64()).map(|v| v as i32);
+        let controller_host = controller.and_then(|v| v.get("host")).and_then(|v| v.as_str()).map(|host| {
+            let port = controller.and_then(|v| v.get("port")).and_then(|v| v.as_i64()).unwrap_or(0);
+            format!("{}:{}", host, port)
+        });
+
+        let brokers = result
+            .get("brokers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|node| {
+                        Some(BrokerNode {
+                            id: node.get("id")?.as_i64()? as i32,
+                            host: node.get("host")?.as_str()?.to_string(),
+                            port: node.get("port")?.as_i64()? as i32,
+                            rack: node.get("rack").and_then(|v| v.as_str()).map(String::from),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(ClusterInfo { cluster_id, broker_count, controller_id, controller_host, brokers, raw: result })
     }
 
     // ---- Raw request (not supported for Kafka) ----

@@ -532,6 +532,7 @@ export interface TreeNode {
   linkedCatalog?: string;
   linkedSchema?: string;
   mqTenant?: string;
+  mqInitialTab?: "topics";
   nacosNamespace?: string;
   nacosNamespaceName?: string;
   schema?: string;
@@ -613,6 +614,7 @@ export interface QueryTab {
   explainExecutionId?: string;
   mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users";
   mqTenant?: string;
+  mqInitialTab?: "topics";
   nacosNamespace?: string;
   nacosNamespaceName?: string;
   structureTableName?: string;

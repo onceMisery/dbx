@@ -926,6 +926,8 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_get_backlog,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_cluster_info,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_raw_request,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_send_message,

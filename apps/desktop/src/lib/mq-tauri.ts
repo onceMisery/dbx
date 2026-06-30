@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   MqClusterInfo,
+  ClusterInfo,
   TenantInfo,
   TenantConfig,
   NamespaceRef,
@@ -198,6 +199,10 @@ export async function mqListTokenRecords(connectionId: string, subject?: string)
 // Monitoring
 export async function mqGetBacklog(connectionId: string, topic: TopicRef, sub?: string): Promise<BacklogStats> {
   return invoke("mq_get_backlog", { connectionId, topic, sub });
+}
+
+export async function mqGetClusterInfo(connectionId: string): Promise<ClusterInfo> {
+  return invoke("mq_get_cluster_info", { connectionId });
 }
 
 // Raw request

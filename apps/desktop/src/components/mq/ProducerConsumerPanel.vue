@@ -2,7 +2,7 @@
 import { formatError } from "@/lib/errorUtils";
 import { computed, ref, watch } from "vue";
 import type { ConsumerInfo, ProducerInfo, SubscriptionInfo, TopicInfo, TopicRef, TopicStats } from "@/types/mq";
-import { mqGetTopicStats, mqListSubscriptions, mqUnloadTopic } from "@/lib/api";
+import { mqGetTopicStats, mqListConsumers, mqListProducers, mqListSubscriptions, mqUnloadTopic } from "@/lib/api";
 
 interface Props {
   connectionId: string;
@@ -27,6 +27,16 @@ interface PartitionClientRow {
   subscriptions: SubscriptionInfo[];
 }
 
+interface KafkaPartitionRow {
+  partition: number;
+  beginOffset: number;
+  endOffset: number;
+  messageCount: number;
+  leader: number;
+  replicas: number[];
+  isr: number[];
+}
+
 const producers = ref<ProducerInfo[]>([]);
 const subscriptions = ref<SubscriptionInfo[]>([]);
 const stats = ref<TopicStats>();
@@ -48,6 +58,8 @@ const topicRef = computed<TopicRef | null>(() => {
 });
 
 const partitionRows = computed(() => extractPartitionClientRows(stats.value?.raw));
+const kafkaPartitionRows = computed(() => extractKafkaPartitionRows(stats.value?.raw));
+const isKafkaStats = computed(() => kafkaPartitionRows.value.length > 0);
 const selectedPartition = computed(() => {
   if (!partitionRows.value.length) return undefined;
   return partitionRows.value.find((row) => row.name === selectedPartitionName.value) ?? partitionRows.value[0];
@@ -78,11 +90,15 @@ async function loadRuntimeClients() {
   try {
     const statsData = await mqGetTopicStats(props.connectionId, current);
     stats.value = statsData;
-    producers.value = extractProducersFromStats(statsData.raw);
+    const parsedProducers = extractProducersFromStats(statsData.raw);
+    producers.value = parsedProducers.length ? parsedProducers : await mqListProducers(props.connectionId, current);
     const parsedSubscriptions = extractSubscriptionsFromStats(statsData.raw);
     const partitionSubscriptions = mergeSubscriptionOptions([], extractPartitionClientRows(statsData.raw));
     subscriptions.value = parsedSubscriptions.length || partitionSubscriptions.length ? mergeSubscriptionOptions(parsedSubscriptions, extractPartitionClientRows(statsData.raw)) : await mqListSubscriptions(props.connectionId, current);
     syncSelectedSubscription();
+    if (selectedSubscription.value && !subscriptions.value.some((sub) => sub.name === selectedSubscription.value && sub.consumers.length > 0)) {
+      await loadSelectedSubscriptionConsumers();
+    }
     syncSelectedPartition();
   } catch (e: unknown) {
     error.value = formatError(e) || String(e);
@@ -119,6 +135,14 @@ function formatBytes(value: number): string {
   return `${(value / 1024 ** index).toFixed(2)} ${units[index]}`;
 }
 
+function formatOptionalRate(value: number): string {
+  return isKafkaStats.value ? "-" : formatRate(value);
+}
+
+function formatOptionalBytes(value: number): string {
+  return isKafkaStats.value ? "-" : formatBytes(value);
+}
+
 function syncSelectedSubscription() {
   const options = subscriptionOptions.value;
   if (props.selectedSubscription && options.some((sub) => sub.name === props.selectedSubscription)) {
@@ -151,6 +175,13 @@ function syncSelectedSubscriptionForPartition() {
   selectedSubscription.value = (active ?? partition.subscriptions[0])?.name ?? selectedSubscription.value;
 }
 
+async function loadSelectedSubscriptionConsumers() {
+  const current = topicRef.value;
+  if (!current || !selectedSubscription.value) return;
+  const consumers = await mqListConsumers(props.connectionId, current, selectedSubscription.value);
+  subscriptions.value = subscriptions.value.map((sub) => (sub.name === selectedSubscription.value ? { ...sub, consumers } : sub));
+}
+
 function extractProducersFromStats(raw: unknown): ProducerInfo[] {
   const root = objectRecord(raw);
   const producers = arrayObjects(root.publishers).map(parseProducer);
@@ -181,6 +212,20 @@ function extractPartitionClientRows(raw: unknown): PartitionClientRow[] {
       subscriptions: partitionSubscriptions,
     };
   });
+}
+
+function extractKafkaPartitionRows(raw: unknown): KafkaPartitionRow[] {
+  return arrayObjects(objectRecord(raw).partitionStats)
+    .map((body) => ({
+      partition: numberField(body.partition) ?? 0,
+      beginOffset: numberField(body.beginOffset) ?? 0,
+      endOffset: numberField(body.endOffset) ?? 0,
+      messageCount: numberField(body.messageCount) ?? 0,
+      leader: numberField(body.leader) ?? -1,
+      replicas: numberArrayField(body.replicas),
+      isr: numberArrayField(body.isr),
+    }))
+    .sort((a, b) => a.partition - b.partition);
 }
 
 function mergeSubscriptionOptions(base: SubscriptionInfo[], partitions: PartitionClientRow[]): SubscriptionInfo[] {
@@ -263,6 +308,10 @@ function numberField(value: unknown): number | undefined {
   return undefined;
 }
 
+function numberArrayField(value: unknown): number[] {
+  return Array.isArray(value) ? value.map(numberField).filter((item): item is number => item !== undefined) : [];
+}
+
 function stringField(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
@@ -277,6 +326,9 @@ watch(
 
 watch(selectedSubscription, () => {
   syncSelectedPartition();
+  void loadSelectedSubscriptionConsumers().catch((e: unknown) => {
+    error.value = formatError(e) || String(e);
+  });
 });
 
 watch(selectedPartitionName, () => {
@@ -311,7 +363,38 @@ watch(
     <div v-else-if="error" class="panel-error">{{ error }}</div>
 
     <div v-else class="runtime-content">
-      <section v-if="partitionRows.length" class="runtime-section">
+      <section v-if="isKafkaStats" class="runtime-section">
+        <div class="section-heading">
+          <h4>Kafka 分区状态</h4>
+          <span>{{ kafkaPartitionRows.length }} 个分区</span>
+        </div>
+        <table class="runtime-table partition-table">
+          <thead>
+            <tr>
+              <th>分区</th>
+              <th>起始 offset</th>
+              <th>最新 offset</th>
+              <th>消息数</th>
+              <th>Leader</th>
+              <th>Replicas</th>
+              <th>ISR</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="partition in kafkaPartitionRows" :key="partition.partition">
+              <td>{{ partition.partition }}</td>
+              <td>{{ partition.beginOffset }}</td>
+              <td>{{ partition.endOffset }}</td>
+              <td>{{ partition.messageCount }}</td>
+              <td>{{ partition.leader }}</td>
+              <td>{{ partition.replicas.join(", ") || "-" }}</td>
+              <td>{{ partition.isr.join(", ") || "-" }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section v-else-if="partitionRows.length" class="runtime-section">
         <div class="section-heading">
           <h4>分区客户端</h4>
           <span>{{ partitionRows.length }} 个分区</span>
@@ -366,8 +449,8 @@ watch(
               <td>{{ producer.producerId }}</td>
               <td>{{ producer.address || "-" }}</td>
               <td>{{ producer.clientVersion || "-" }}</td>
-              <td>{{ formatRate(producer.msgRateIn) }}</td>
-              <td>{{ formatBytes(producer.msgThroughputIn) }}</td>
+              <td>{{ formatOptionalRate(producer.msgRateIn) }}</td>
+              <td>{{ formatOptionalBytes(producer.msgThroughputIn) }}</td>
             </tr>
           </tbody>
         </table>
@@ -379,7 +462,7 @@ watch(
           <div class="subscription-selector">
             <span v-if="selectedPartition" class="scope-chip">{{ selectedScopeLabel }}</span>
             <span>{{ displayedConsumers.length }}</span>
-            <select v-if="partitionRows.length" v-model="selectedPartitionName" :disabled="loading">
+            <select v-if="!isKafkaStats && partitionRows.length" v-model="selectedPartitionName" :disabled="loading">
               <option v-for="partition in partitionRows" :key="partition.name" :value="partition.name">{{ partition.shortName }}</option>
             </select>
             <select v-model="selectedSubscription" :disabled="loading || !subscriptionOptions.length">
@@ -407,8 +490,8 @@ watch(
               <td>{{ consumer.consumerName || "-" }}</td>
               <td>{{ consumer.address || "-" }}</td>
               <td>{{ consumer.clientVersion || "-" }}</td>
-              <td>{{ formatRate(consumer.msgRateOut) }}</td>
-              <td>{{ formatBytes(consumer.msgThroughputOut) }}</td>
+              <td>{{ formatOptionalRate(consumer.msgRateOut) }}</td>
+              <td>{{ formatOptionalBytes(consumer.msgThroughputOut) }}</td>
               <td>{{ consumer.availablePermits }}</td>
             </tr>
           </tbody>

@@ -324,6 +324,29 @@ pub struct TopicStats {
 // Subscription / consumers / producers
 // ---------------------------------------------------------------------------
 
+/// Cluster-level information for the Broker monitoring panel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterInfo {
+    pub cluster_id: Option<String>,
+    pub broker_count: u32,
+    pub controller_id: Option<i32>,
+    pub controller_host: Option<String>,
+    pub brokers: Vec<BrokerNode>,
+    /// Free-form extra fields from the adapter.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerNode {
+    pub id: i32,
+    pub host: String,
+    pub port: i32,
+    pub rack: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionInfo {

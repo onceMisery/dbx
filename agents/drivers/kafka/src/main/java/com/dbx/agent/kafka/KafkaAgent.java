@@ -113,6 +113,7 @@ public final class KafkaAgent {
             case "mq_describe_consumer_group" -> describeConsumerGroup(params);
             case "mq_delete_consumer_group" -> deleteConsumerGroup(params);
             case "mq_reset_consumer_group_offsets" -> resetConsumerGroupOffsets(params);
+            case "mq_list_producers" -> listProducers(params);
             // Messages
             case "mq_peek_messages" -> peekMessages(params);
             case "mq_send_message" -> sendMessage(params);
@@ -167,10 +168,28 @@ public final class KafkaAgent {
             Node controller = cluster.controller().get(timeout, TimeUnit.MILLISECONDS);
             Collection<Node> brokers = cluster.nodes().get(timeout, TimeUnit.MILLISECONDS);
 
+            // Probe ACL support: try a describe operation and catch security errors.
+            boolean aclEnabled = true;
+            try {
+                probe.describeAcls(AclBindingFilter.ANY)
+                    .values().get(timeout, TimeUnit.MILLISECONDS);
+            } catch (Exception aclEx) {
+                Throwable cause = aclEx;
+                while (cause != null) {
+                    if (cause.getClass().getSimpleName().contains("SecurityDisabled")
+                        || (cause.getMessage() != null && cause.getMessage().contains("No Authorizer"))) {
+                        aclEnabled = false;
+                        break;
+                    }
+                    cause = cause.getCause();
+                }
+            }
+
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("ok", true);
             result.put("clusterId", clusterId);
             result.put("controller", controller != null ? nodeToMap(controller) : null);
+            result.put("aclEnabled", aclEnabled);
             List<Map<String, Object>> brokerList = new ArrayList<>();
             for (Node node : brokers) {
                 brokerList.add(nodeToMap(node));
@@ -550,6 +569,63 @@ public final class KafkaAgent {
         }
         result.put("members", members);
         return result;
+    }
+
+    private static Object listProducers(JsonObject params) throws Exception {
+        AdminClient admin = requireAdmin();
+        int timeout = requestTimeout(params);
+        String topic = stringOrEmpty(params, "topic");
+
+        TopicDescription desc = admin.describeTopics(Collections.singletonList(topic))
+            .allTopicNames().get(timeout, TimeUnit.MILLISECONDS).get(topic);
+        List<TopicPartition> partitions = desc.partitions().stream()
+            .map(pi -> new TopicPartition(topic, pi.partition()))
+            .collect(Collectors.toList());
+
+        DescribeProducersResult described = admin.describeProducers(
+            partitions,
+            new DescribeProducersOptions().timeoutMs(timeout));
+
+        Map<Long, Map<String, Object>> byProducer = new LinkedHashMap<>();
+        for (TopicPartition tp : partitions) {
+            DescribeProducersResult.PartitionProducerState state =
+                described.partitionResult(tp).get(timeout, TimeUnit.MILLISECONDS);
+            for (ProducerState producerState : state.activeProducers()) {
+                long producerId = producerState.producerId();
+                Map<String, Object> producer = byProducer.computeIfAbsent(producerId, id -> {
+                    Map<String, Object> p = new LinkedHashMap<>();
+                    p.put("producerId", id);
+                    p.put("producerName", "producer-" + id);
+                    p.put("msgRateIn", 0.0);
+                    p.put("msgThroughputIn", 0.0);
+                    p.put("clientVersion", "Kafka producer");
+                    p.put("partitions", new ArrayList<Integer>());
+                    p.put("lastTimestamp", producerState.lastTimestamp());
+                    return p;
+                });
+                @SuppressWarnings("unchecked")
+                List<Integer> producerPartitions = (List<Integer>) producer.get("partitions");
+                producerPartitions.add(tp.partition());
+                long currentLastTimestamp = (long) producer.get("lastTimestamp");
+                if (producerState.lastTimestamp() > currentLastTimestamp) {
+                    producer.put("lastTimestamp", producerState.lastTimestamp());
+                }
+            }
+        }
+
+        for (Map<String, Object> producer : byProducer.values()) {
+            @SuppressWarnings("unchecked")
+            List<Integer> producerPartitions = (List<Integer>) producer.get("partitions");
+            producerPartitions.sort(Integer::compareTo);
+            producer.put(
+                "address",
+                producerPartitions.size() == 1
+                    ? "partition " + producerPartitions.get(0)
+                    : "partitions " + producerPartitions.stream().map(String::valueOf).collect(Collectors.joining(", "))
+            );
+        }
+
+        return Collections.singletonMap("producers", new ArrayList<>(byProducer.values()));
     }
 
     private static Object deleteConsumerGroup(JsonObject params) throws Exception {

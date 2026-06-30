@@ -190,6 +190,22 @@ export interface BacklogStats {
   backlogSize: number;
 }
 
+export interface ClusterInfo {
+  clusterId?: string;
+  brokerCount: number;
+  controllerId?: number;
+  controllerHost?: string;
+  brokers: BrokerNode[];
+  raw?: Record<string, unknown>;
+}
+
+export interface BrokerNode {
+  id: number;
+  host: string;
+  port: number;
+  rack?: string;
+}
+
 export interface PeekedMessage {
   position: number;
   messageId?: string;

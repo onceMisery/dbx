@@ -13,19 +13,22 @@ import ProducerConsumerPanel from "./ProducerConsumerPanel.vue";
 import PoliciesPanel from "./PoliciesPanel.vue";
 import PermissionsPanel from "./PermissionsPanel.vue";
 import RawApiPanel from "./RawApiPanel.vue";
+import SendMessagePanel from "./SendMessagePanel.vue";
+import BrokerPanel from "./BrokerPanel.vue";
+
+type MqTab = "tenants" | "namespaces" | "topics" | "subscriptions" | "monitoring" | "clients" | "policies" | "permissions" | "messages" | "raw" | "broker";
 
 interface Props {
   connectionId: string;
   initialTenant?: string;
+  initialTab?: MqTab;
   readOnly?: boolean;
 }
 
 const props = defineProps<Props>();
 
-type MqTab = "tenants" | "namespaces" | "topics" | "subscriptions" | "monitoring" | "clients" | "policies" | "permissions" | "raw";
-
 // State
-const activeTab = ref<MqTab>(props.initialTenant ? "namespaces" : "tenants");
+const activeTab = ref<MqTab>(props.initialTab || (props.initialTenant ? "namespaces" : "tenants"));
 const selectedTenant = ref<string | undefined>(props.initialTenant);
 const selectedNamespace = ref<string>();
 const selectedTopic = ref<TopicInfo>();
@@ -57,6 +60,7 @@ const canManagePolicies = computed(() => {
   return canManageRateLimits.value || canManageBacklogQuota.value || canManageRetention.value;
 });
 const canManagePermissions = computed(() => capabilities.value?.supportsPermissions ?? true);
+const canSendMessage = computed(() => capabilities.value?.supportsSendMessage ?? false);
 const canUseRawApi = computed(() => capabilities.value?.supportsRawAdminApi ?? true);
 const clusterOptions = computed(() => mqClusterOptionsFromExtra(clusterInfo.value?.extra));
 const availableTabs = computed<MqTab[]>(() => {
@@ -64,9 +68,11 @@ const availableTabs = computed<MqTab[]>(() => {
   if (canManageTenants.value) tabs.push("tenants");
   if (canManageNamespaces.value) tabs.push("namespaces");
   tabs.push("topics");
+  if (canSendMessage.value) tabs.push("messages");
   if (canManageSubscriptions.value) tabs.push("subscriptions");
   tabs.push("monitoring");
   tabs.push("clients");
+  tabs.push("broker");
   if (canManagePolicies.value) tabs.push("policies");
   if (canManagePermissions.value) tabs.push("permissions");
   if (canUseRawApi.value) tabs.push("raw");
@@ -170,6 +176,12 @@ watch(
     }
   },
 );
+watch(
+  () => props.initialTab,
+  (tab) => {
+    if (tab) setActiveTab(tab);
+  },
+);
 
 // Lifecycle
 onMounted(() => {
@@ -201,9 +213,11 @@ onMounted(() => {
       <button v-if="canManageTenants" :class="{ active: activeTab === 'tenants' }" @click="setActiveTab('tenants')">租户</button>
       <button v-if="canManageNamespaces" :class="{ active: activeTab === 'namespaces' }" @click="setActiveTab('namespaces')">命名空间</button>
       <button :class="{ active: activeTab === 'topics' }" @click="setActiveTab('topics')">主题</button>
+      <button v-if="canSendMessage" :class="{ active: activeTab === 'messages' }" @click="setActiveTab('messages')">发送消息</button>
       <button v-if="canManageSubscriptions" :class="{ active: activeTab === 'subscriptions' }" @click="setActiveTab('subscriptions')">订阅</button>
       <button :class="{ active: activeTab === 'monitoring' }" @click="setActiveTab('monitoring')">监控</button>
       <button :class="{ active: activeTab === 'clients' }" @click="setActiveTab('clients')">客户端</button>
+      <button :class="{ active: activeTab === 'broker' }" @click="setActiveTab('broker')">Broker</button>
       <button v-if="canManagePolicies" :class="{ active: activeTab === 'policies' }" @click="setActiveTab('policies')">策略</button>
       <button v-if="canManagePermissions" :class="{ active: activeTab === 'permissions' }" @click="setActiveTab('permissions')">权限</button>
       <button v-if="canUseRawApi" :class="{ active: activeTab === 'raw' }" @click="setActiveTab('raw')">Raw API</button>
@@ -214,6 +228,7 @@ onMounted(() => {
       <TenantsPanel v-if="activeTab === 'tenants'" :connection-id="connectionId" :supports-tenants="canManageTenants" :read-only="readOnly" :cluster-options="clusterOptions" @tenant-selected="handleTenantSelected" />
       <NamespacesPanel v-else-if="activeTab === 'namespaces'" :connection-id="connectionId" :tenant="selectedTenant" :supports-namespaces="canManageNamespaces" :read-only="readOnly" @namespace-selected="handleNamespaceSelected" @namespace-roles-selected="handleNamespaceRolesSelected" />
       <TopicsPanel v-else-if="activeTab === 'topics'" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" :supports-partitioned-topics="canManagePartitionedTopics" @topic-selected="handleTopicSelected" />
+      <SendMessagePanel v-else-if="activeTab === 'messages' && canSendMessage" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :topic="selectedTopic" :read-only="readOnly" />
       <SubscriptionsPanel
         v-else-if="activeTab === 'subscriptions' && canManageSubscriptions"
         :connection-id="connectionId"
@@ -231,6 +246,7 @@ onMounted(() => {
       />
       <MonitoringPanel v-else-if="activeTab === 'monitoring'" :connection-id="connectionId" :topic="selectedTopic" :tenant="effectiveTenant" :namespace="effectiveNamespace" />
       <ProducerConsumerPanel v-else-if="activeTab === 'clients'" :connection-id="connectionId" :topic="selectedTopic" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" :selected-subscription="selectedSubscriptionName" />
+      <BrokerPanel v-else-if="activeTab === 'broker'" :connection-id="connectionId" :read-only="readOnly" />
       <PoliciesPanel
         v-else-if="activeTab === 'policies' && canManagePolicies"
         :connection-id="connectionId"

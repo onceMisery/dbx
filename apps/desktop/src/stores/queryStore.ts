@@ -651,10 +651,11 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
-  function openMqAdmin(connectionId: string, target?: { tenant?: string }) {
+  function openMqAdmin(connectionId: string, target?: { tenant?: string; initialTab?: QueryTab["mqInitialTab"] }) {
     const existing = tabs.value.find((tab) => tab.mode === "mq" && tab.connectionId === connectionId);
     if (existing) {
       if (target?.tenant) existing.mqTenant = target.tenant;
+      if (target?.initialTab) existing.mqInitialTab = target.initialTab;
       activeTabId.value = existing.id;
       return existing.id;
     }
@@ -672,6 +673,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "mq",
       mqTenant: target?.tenant,
+      mqInitialTab: target?.initialTab,
     };
     tabs.value.push(tab);
     activeTabId.value = id;
@@ -877,6 +879,7 @@ export const useQueryStore = defineStore("query", () => {
       explainExecutionId: undefined,
       mode: original.mode,
       mqTenant: original.mqTenant,
+      mqInitialTab: original.mqInitialTab,
       nacosNamespace: original.nacosNamespace,
       nacosNamespaceName: original.nacosNamespaceName,
       structureTableName: original.structureTableName,

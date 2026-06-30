@@ -448,6 +448,11 @@ pub async fn mq_get_backlog_core(
     adapter.get_backlog(&topic, sub.as_deref()).await
 }
 
+pub async fn mq_get_cluster_info_core(state: &AppState, conn_id: &str) -> Result<ClusterInfo, String> {
+    let adapter = get_adapter(state, conn_id).await?;
+    adapter.get_cluster_info().await
+}
+
 // ---- Raw request (escape hatch) ----
 
 pub async fn mq_raw_request_core(state: &AppState, conn_id: &str, req: MqRawRequest) -> Result<MqRawResponse, String> {

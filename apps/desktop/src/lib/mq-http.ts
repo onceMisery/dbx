@@ -1,6 +1,7 @@
 // HTTP fetch API for message queue admin (web mode)
 import type {
   MqClusterInfo,
+  ClusterInfo,
   TenantInfo,
   TenantConfig,
   NamespaceRef,
@@ -201,6 +202,10 @@ export async function mqListTokenRecords(connectionId: string, subject?: string)
 
 export async function mqGetBacklog(connectionId: string, topic: TopicRef, sub?: string): Promise<BacklogStats> {
   return post("/api/mq/monitoring/backlog", { connectionId, topic, sub });
+}
+
+export async function mqGetClusterInfo(connectionId: string): Promise<ClusterInfo> {
+  return post("/api/mq/monitoring/cluster-info", { connectionId });
 }
 
 export async function mqRawRequest(connectionId: string, req: MqRawRequest): Promise<MqRawResponse> {
