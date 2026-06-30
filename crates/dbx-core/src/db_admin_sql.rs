@@ -116,6 +116,17 @@ pub struct DuplicateTableStructureSqlOptions {
     pub target_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyTableDataSqlOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_type: Option<DatabaseType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub source_name: String,
+    pub target_name: String,
+}
+
 const MYSQL_COMPATIBLE_PROFILES: &[&str] =
     &["mysql", "mariadb", "tidb", "oceanbase", "doris", "starrocks", "custom_mysql"];
 
@@ -307,6 +318,12 @@ pub fn build_duplicate_table_structure_sql(options: DuplicateTableStructureSqlOp
         return format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 1=0");
     }
     format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 0;")
+}
+
+pub fn build_copy_table_data_sql(options: CopyTableDataSqlOptions) -> String {
+    let source = qualified_name(options.database_type, options.schema.as_deref(), &options.source_name);
+    let target = qualified_name(options.database_type, options.schema.as_deref(), &options.target_name);
+    format!("INSERT INTO {target} SELECT * FROM {source};")
 }
 
 pub fn supports_object_rename(database_type: Option<DatabaseType>, object_type: DatabaseObjectType) -> bool {

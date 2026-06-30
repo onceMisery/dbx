@@ -345,6 +345,11 @@ pub fn build_duplicate_table_structure_sql(
 }
 
 #[tauri::command]
+pub fn build_copy_table_data_sql(options: dbx_core::db_admin_sql::CopyTableDataSqlOptions) -> Result<String, String> {
+    Ok(dbx_core::db_admin_sql::build_copy_table_data_sql(options))
+}
+
+#[tauri::command]
 pub fn build_executable_object_source_statements(
     input: dbx_core::object_source_sql::EditableObjectSourceSqlInput,
 ) -> Result<Vec<String>, String> {

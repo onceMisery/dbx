@@ -176,6 +176,12 @@ pub struct BuildDuplicateTableStructureSqlRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BuildCopyTableDataSqlRequest {
+    pub options: dbx_core::db_admin_sql::CopyTableDataSqlOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildExecutableObjectSourceRequest {
     pub input: dbx_core::object_source_sql::EditableObjectSourceSqlInput,
 }
@@ -620,6 +626,10 @@ pub async fn build_duplicate_table_structure_sql(
     Json(req): Json<BuildDuplicateTableStructureSqlRequest>,
 ) -> Json<String> {
     Json(dbx_core::db_admin_sql::build_duplicate_table_structure_sql(req.options))
+}
+
+pub async fn build_copy_table_data_sql(Json(req): Json<BuildCopyTableDataSqlRequest>) -> Json<String> {
+    Json(dbx_core::db_admin_sql::build_copy_table_data_sql(req.options))
 }
 
 pub async fn build_executable_object_source_statements(

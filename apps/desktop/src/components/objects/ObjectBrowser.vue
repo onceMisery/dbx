@@ -8,6 +8,7 @@ import {
   ArrowUp,
   Braces,
   CheckSquare,
+  Clipboard,
   Code2,
   Copy,
   CopyPlus,
@@ -51,7 +52,7 @@ import { isSchemaAware } from "@/lib/databaseCapabilities";
 import { supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { buildTableSelectSql } from "@/lib/tableSelectSql";
-import { buildDropObjectSql, buildDuplicateTableStructureSql, buildEmptyTableSql, buildTruncateTableSql, type TableAdminSqlOptions } from "@/lib/dbAdminSql";
+import { buildDropObjectSql, buildDuplicateTableStructureSql, buildCopyTableDataSql, buildEmptyTableSql, buildTruncateTableSql, type TableAdminSqlOptions } from "@/lib/dbAdminSql";
 import { useToast } from "@/composables/useToast";
 import { buildExecutableObjectSourceStatements, buildRoutineRenameObjectSourceStatements, objectSourceSaveExecutionMode, supportsSourceBackedRoutineRename } from "@/lib/objectSourceEditor";
 import { buildRenameObjectSql, supportsObjectRename } from "@/lib/objectRenameSql";
@@ -152,6 +153,11 @@ const selectedTableIds = ref<Set<string>>(new Set());
 const expandedPartitionParentIds = ref<Set<string>>(new Set());
 const showBatchDropConfirm = ref(false);
 const batchDropPreviewSql = ref("");
+// Paste table dialog state
+type PasteTableMode = "structure-and-data" | "structure-only" | "data-only";
+const showPasteDialog = ref(false);
+const pasteTableMode = ref<PasteTableMode>("structure-and-data");
+const pasteTableEntries = ref<{ sourceName: string; targetName: string; schema?: string }[]>([]);
 const objectColumnWidths = ref<Record<ObjectBrowserColumnKey, number>>({
   select: 34,
   name: 360,
@@ -964,6 +970,95 @@ async function confirmDuplicateStructure() {
   }
 }
 
+function copySelectedTablesToClipboard() {
+  const selectedRows = selectedTableRows.value;
+  if (selectedRows.length === 0) return;
+  connectionStore.treeClipboard = {
+    kind: "table-copy",
+    tables: selectedRows.map((row) => ({
+      connectionId: props.connection.id,
+      database: props.database,
+      schema: row.schema || selectedSchema.value,
+      tableName: row.name,
+    })),
+  };
+  toast(t("contextMenu.pasteTableClipboardUpdated"), 2000);
+}
+
+function copySingleTableToClipboard(row: ObjectBrowserRow) {
+  connectionStore.treeClipboard = {
+    kind: "table-copy",
+    tables: [
+      {
+        connectionId: props.connection.id,
+        database: props.database,
+        schema: row.schema || selectedSchema.value,
+        tableName: row.name,
+      },
+    ],
+  };
+  toast(t("contextMenu.pasteTableClipboardUpdated"), 2000);
+}
+
+function openPasteTableDialog() {
+  const clipboard = connectionStore.treeClipboard;
+  if (clipboard?.kind !== "table-copy" || clipboard.tables.length === 0) {
+    toast(t("contextMenu.noTableToPaste"), 2000);
+    return;
+  }
+  pasteTableMode.value = "structure-and-data";
+  pasteTableEntries.value = clipboard.tables.map((entry) => ({
+    sourceName: entry.tableName,
+    targetName: `${entry.tableName}_copy`,
+    schema: entry.schema,
+  }));
+  showPasteDialog.value = true;
+}
+
+async function confirmPasteTable() {
+  const entries = pasteTableEntries.value.filter((entry) => entry.targetName.trim());
+  if (entries.length === 0) return;
+  const mode = pasteTableMode.value;
+  showPasteDialog.value = false;
+  let successCount = 0;
+  let failCount = 0;
+  for (const entry of entries) {
+    const targetName = entry.targetName.trim();
+    const schema = entry.schema || selectedSchema.value;
+    try {
+      if (mode === "structure-and-data" || mode === "structure-only") {
+        const structureSql = await buildDuplicateTableStructureSql({
+          databaseType: effectiveDatabaseType.value,
+          schema,
+          sourceName: entry.sourceName,
+          targetName,
+        });
+        await api.executeQuery(props.connection.id, props.database, structureSql, schema);
+      }
+      if (mode === "structure-and-data" || mode === "data-only") {
+        const dataSql = await buildCopyTableDataSql({
+          databaseType: effectiveDatabaseType.value,
+          schema,
+          sourceName: entry.sourceName,
+          targetName,
+        });
+        await api.executeQuery(props.connection.id, props.database, dataSql, schema);
+      }
+      successCount++;
+    } catch (e: any) {
+      failCount++;
+      console.error(`Failed to paste table "${entry.sourceName}" -> "${targetName}":`, e);
+    }
+  }
+  if (failCount === 0) {
+    toast(t("contextMenu.batchPasteSuccess", { count: successCount }), 3000);
+  } else {
+    toast(t("contextMenu.batchPastePartialFail", { success: successCount, failed: failCount }), 5000);
+  }
+  await reload();
+  await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, selectedSchema.value);
+}
+
 function tableAdminSqlOptions(row: ObjectBrowserRow): TableAdminSqlOptions {
   return {
     databaseType: effectiveDatabaseType.value,
@@ -1290,6 +1385,7 @@ function getTableMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     { label: t("contextMenu.exportStructure"), action: () => exportStructure(item), icon: FileCode },
     { label: "", separator: true },
     { label: t("contextMenu.duplicateStructure"), action: () => requestDuplicateStructure(item), icon: CopyPlus },
+    { label: t("contextMenu.copyTable"), action: () => copySingleTableToClipboard(item), icon: Copy },
     { label: "", separator: true },
     ...(supportsTruncateTable.value
       ? [
@@ -1417,6 +1513,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="loadingObjects" @click="reload">
         <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingObjects }" />
       </Button>
+      <Button v-if="connectionStore.treeClipboard?.kind === 'table-copy' && connectionStore.treeClipboard.tables.length > 0" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openPasteTableDialog">
+        <Clipboard class="mr-1.5 h-3.5 w-3.5" />
+        {{ t("objects.pasteTableSelected") }}
+      </Button>
     </div>
     <div v-if="selectedTableCount > 0" class="flex h-9 shrink-0 items-center gap-2 border-b bg-muted/30 px-3 text-xs">
       <div class="min-w-0 flex-1 truncate text-muted-foreground">
@@ -1425,6 +1525,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openBatchDatabaseExport">
         <Download class="mr-1.5 h-3.5 w-3.5" />
         {{ t("objects.exportSelected") }}
+      </Button>
+      <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="copySelectedTablesToClipboard">
+        <Clipboard class="mr-1.5 h-3.5 w-3.5" />
+        {{ t("objects.copyTableSelected") }}
       </Button>
       <Button variant="ghost" size="sm" class="h-7 px-2 text-xs text-destructive" @click="requestBatchDropTables">
         <Trash2 class="mr-1.5 h-3.5 w-3.5" />
@@ -1701,6 +1805,41 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         <Button :disabled="!duplicateTableName.trim()" @click="confirmDuplicateStructure">
           {{ t("dangerDialog.confirm") }}
         </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showPasteDialog">
+    <DialogContent class="sm:max-w-[500px]">
+      <DialogHeader>
+        <DialogTitle>{{ pasteTableEntries.length > 1 ? t("contextMenu.batchPasteTitle") : t("contextMenu.pasteTableConfirmTitle") }}</DialogTitle>
+      </DialogHeader>
+      <div class="space-y-4">
+        <div class="flex gap-2">
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer">
+            <input v-model="pasteTableMode" type="radio" value="structure-and-data" class="accent-primary" />
+            {{ t("contextMenu.pasteOptionStructureAndData") }}
+          </label>
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer">
+            <input v-model="pasteTableMode" type="radio" value="structure-only" class="accent-primary" />
+            {{ t("contextMenu.pasteOptionStructureOnly") }}
+          </label>
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer">
+            <input v-model="pasteTableMode" type="radio" value="data-only" class="accent-primary" />
+            {{ t("contextMenu.pasteOptionDataOnly") }}
+          </label>
+        </div>
+        <div class="space-y-2 max-h-64 overflow-y-auto">
+          <div v-for="(entry, idx) in pasteTableEntries" :key="idx" class="flex items-center gap-2">
+            <span class="text-sm text-muted-foreground truncate min-w-0 flex-shrink basis-1/3" :title="entry.sourceName">{{ entry.sourceName }}</span>
+            <span class="text-xs text-muted-foreground flex-shrink-0">&rarr;</span>
+            <Input v-model="entry.targetName" class="flex-1 h-8 text-sm" :placeholder="t('contextMenu.duplicateNamePlaceholder')" />
+          </div>
+        </div>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" @click="showPasteDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="pasteTableEntries.every((e) => !e.targetName.trim())" @click="confirmPasteTable">{{ t("dangerDialog.confirm") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

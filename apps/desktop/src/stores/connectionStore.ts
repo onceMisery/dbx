@@ -127,12 +127,16 @@ function ensureSqlServerLinkedRootNode(connectionId: string, children: TreeNode[
 // Temporary storage for DataGrip import payload (used to read Keychain passwords after import)
 let pendingDataGripPayload: { format: "datagrip-import"; dataSources: string; dataSourcesLocal?: string } | null = null;
 
-interface TreeClipboardTableStructure {
-  kind: "table-structure";
+interface TreeClipboardTableEntry {
   connectionId: string;
   database: string;
   schema?: string;
   tableName: string;
+}
+
+export interface TreeClipboard {
+  kind: "table-copy";
+  tables: TreeClipboardTableEntry[];
 }
 
 interface LoadTreeOptions {
@@ -160,7 +164,7 @@ export const useConnectionStore = defineStore("connection", () => {
   const selectedTreeNodeId = ref<string | null>(null);
   const selectedTreeNodeIds = ref<string[]>([]);
   const treeSelectionAnchorId = ref<string | null>(null);
-  const treeClipboard = ref<TreeClipboardTableStructure | null>(null);
+  const treeClipboard = ref<TreeClipboard | null>(null);
 
   watch(activeConnectionId, (id) => {
     if (id) localStorage.setItem(ACTIVE_CONNECTION_STORAGE_KEY, id);
