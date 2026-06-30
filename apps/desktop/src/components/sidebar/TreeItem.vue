@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, onBeforeUnmount, inject } from "vue";
+import { ref, computed, nextTick, watch, onMounted, onBeforeUnmount, inject } from "vue";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
@@ -761,6 +761,12 @@ function requestPasteTreeClipboard(): boolean {
   }));
   showPasteDialog.value = true;
   return true;
+}
+
+function onSidebarRequestPasteTable(event: Event) {
+  const nodeId = (event as CustomEvent<{ nodeId?: string }>).detail?.nodeId;
+  if (nodeId !== props.node.id) return;
+  requestPasteTreeClipboard();
 }
 
 function requestRefreshSelectedNode(): boolean {
@@ -3528,7 +3534,14 @@ function onRowMouseDown(event: MouseEvent) {
   }
 }
 
-onBeforeUnmount(() => finishTableReferenceDrag());
+onMounted(() => {
+  window.addEventListener("dbx:sidebar-request-paste-table", onSidebarRequestPasteTable);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("dbx:sidebar-request-paste-table", onSidebarRequestPasteTable);
+  finishTableReferenceDrag();
+});
 
 // ---- CustomContextMenu ----
 

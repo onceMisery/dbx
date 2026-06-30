@@ -785,6 +785,15 @@ mod tests {
         );
         assert_eq!(
             build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                schema: Some("public".to_string()),
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+            }),
+            "CREATE TABLE \"public\".\"users_copy\" (LIKE \"public\".\"users\" INCLUDING ALL);"
+        );
+        assert_eq!(
+            build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
                 database_type: Some(DatabaseType::Kwdb),
                 schema: Some("public".to_string()),
                 source_name: "users".to_string(),
@@ -827,6 +836,37 @@ mod tests {
                 target_name: "users_copy".to_string(),
             }),
             "CREATE TABLE `users_copy` (LIKE `users`);"
+        );
+    }
+
+    #[test]
+    fn builds_copy_table_data_sql() {
+        assert_eq!(
+            build_copy_table_data_sql(CopyTableDataSqlOptions {
+                database_type: Some(DatabaseType::Mysql),
+                schema: None,
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+            }),
+            "INSERT INTO `users_copy` SELECT * FROM `users`;"
+        );
+        assert_eq!(
+            build_copy_table_data_sql(CopyTableDataSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                schema: Some("public".to_string()),
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+            }),
+            "INSERT INTO \"public\".\"users_copy\" SELECT * FROM \"public\".\"users\";"
+        );
+        assert_eq!(
+            build_copy_table_data_sql(CopyTableDataSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                schema: Some("dbo".to_string()),
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+            }),
+            "INSERT INTO [dbo].[users_copy] SELECT * FROM [dbo].[users];"
         );
     }
 

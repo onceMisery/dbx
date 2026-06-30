@@ -59,7 +59,7 @@ import { buildRenameObjectSql, supportsObjectRename } from "@/lib/objectRenameSq
 import { buildViewDdl } from "@/lib/viewDdl";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { generateDatabaseExportId } from "@/lib/databaseExport";
-import { copyToClipboard } from "@/lib/clipboard";
+import { copyToClipboard, eventTargetAllowsAppClipboardShortcut } from "@/lib/clipboard";
 import { formatSqlInsert } from "@/lib/exportFormats";
 import { buildSingleDdlExportFileContent } from "@/lib/ddlExport";
 import { fetchTableDataForExport } from "@/lib/tableDataExport";
@@ -985,6 +985,11 @@ function copySelectedTablesToClipboard() {
   toast(t("contextMenu.pasteTableClipboardUpdated"), 2000);
 }
 
+function canPasteTableClipboard(): boolean {
+  const clipboard = connectionStore.treeClipboard;
+  return clipboard?.kind === "table-copy" && clipboard.tables.length > 0;
+}
+
 function copySingleTableToClipboard(row: ObjectBrowserRow) {
   connectionStore.treeClipboard = {
     kind: "table-copy",
@@ -1002,7 +1007,7 @@ function copySingleTableToClipboard(row: ObjectBrowserRow) {
 
 function openPasteTableDialog() {
   const clipboard = connectionStore.treeClipboard;
-  if (clipboard?.kind !== "table-copy" || clipboard.tables.length === 0) {
+  if (!canPasteTableClipboard() || !clipboard) {
     toast(t("contextMenu.noTableToPaste"), 2000);
     return;
   }
@@ -1013,6 +1018,23 @@ function openPasteTableDialog() {
     schema: entry.schema,
   }));
   showPasteDialog.value = true;
+}
+
+function onObjectBrowserKeydown(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
+  if (eventTargetAllowsAppClipboardShortcut(event, "c")) {
+    if (selectedTableCount.value === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    copySelectedTablesToClipboard();
+    return;
+  }
+  if (eventTargetAllowsAppClipboardShortcut(event, "v")) {
+    if (!canPasteTableClipboard()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openPasteTableDialog();
+  }
 }
 
 async function confirmPasteTable() {
@@ -1474,7 +1496,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 </script>
 
 <template>
-  <div ref="rootRef" class="flex h-full min-h-0 flex-col bg-background">
+  <div ref="rootRef" data-object-browser-root class="flex h-full min-h-0 flex-col bg-background outline-none" tabindex="0" @keydown="onObjectBrowserKeydown">
     <div class="flex h-10 shrink-0 items-center gap-2 border-b px-3">
       <div class="flex min-w-0 flex-1 items-center gap-2">
         <Table2 class="h-4 w-4 text-muted-foreground" />
