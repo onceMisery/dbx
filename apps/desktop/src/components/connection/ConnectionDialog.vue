@@ -118,6 +118,8 @@ const agentInstallDriverKey = ref("");
 const agentInstallLabel = ref("");
 const agentInstallProgress = ref<DriverInstallProgress | null>(null);
 const agentInstallError = ref("");
+const showConnectionErrorDialog = ref(false);
+const connectionErrorDetail = ref("");
 const editingId = ref<string | null>(null);
 const showVisibleDatabasesDialog = ref(false);
 const isLoadingVisibleDatabases = ref(false);
@@ -906,6 +908,11 @@ function failAgentDriverInstall(error: unknown) {
   agentInstallRunning.value = false;
   agentInstallError.value = errorMessage(error);
   showAgentInstallDialog.value = true;
+}
+
+function showConnectionError(message: string) {
+  connectionErrorDetail.value = translateBackendError(t, message);
+  showConnectionErrorDialog.value = true;
 }
 
 function setAgentInstallDialogOpen(value: boolean) {
@@ -1822,6 +1829,9 @@ async function testConnection() {
       configTab.value = "advanced";
     }
     testResult.value = fallbackMessage ? { ok: true, message: fallbackMessage } : { ok: false, message };
+    if (!fallbackMessage) {
+      showConnectionError(message);
+    }
   } finally {
     if (runId === testRunId) {
       isTesting.value = false;
@@ -2404,6 +2414,8 @@ function resetTestState() {
   testRunId += 1;
   isTesting.value = false;
   testResult.value = null;
+  showConnectionErrorDialog.value = false;
+  connectionErrorDetail.value = "";
 }
 
 function resetVisibleDatabaseDraftState() {
@@ -2598,6 +2610,16 @@ async function copyAgentInstallError() {
   if (!agentInstallError.value) return;
   try {
     await copyToClipboard(agentInstallError.value);
+    toast(t("grid.copied"));
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function copyConnectionErrorDetail() {
+  if (!connectionErrorDetail.value) return;
+  try {
+    await copyToClipboard(connectionErrorDetail.value);
     toast(t("grid.copied"));
   } catch (e: any) {
     toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
@@ -2892,7 +2914,9 @@ async function save() {
     }
     open.value = false;
   } catch (e: any) {
-    testResult.value = { ok: false, message: mongodbAuthFailureHint(String(e?.message || e)) };
+    const message = mongodbAuthFailureHint(String(e?.message || e));
+    testResult.value = { ok: false, message };
+    showConnectionError(message);
   } finally {
     isSaving.value = false;
   }
@@ -4729,6 +4753,27 @@ function openExternalUrl(url: string) {
         <Button :disabled="!canCloseAgentInstallDialog" @click="showAgentInstallDialog = false">
           {{ agentInstallError ? "关闭" : "安装中..." }}
         </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showConnectionErrorDialog">
+    <DialogContent class="sm:max-w-[560px]">
+      <DialogHeader>
+        <DialogTitle>连接失败</DialogTitle>
+      </DialogHeader>
+
+      <div class="space-y-2">
+        <div class="text-sm text-muted-foreground">完整错误信息</div>
+        <pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/30 p-3 text-xs leading-5 text-destructive">{{ connectionErrorDetail }}</pre>
+      </div>
+
+      <DialogFooter class="gap-2">
+        <Button variant="outline" @click="copyConnectionErrorDetail">
+          <Copy class="mr-1.5 h-3.5 w-3.5" />
+          复制错误
+        </Button>
+        <Button @click="showConnectionErrorDialog = false">关闭</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

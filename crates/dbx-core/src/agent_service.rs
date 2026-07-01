@@ -299,6 +299,10 @@ pub fn install_local_agent(am: &AgentManager, db_type: &str, source: PathBuf) ->
     let parent = jar_path.parent().ok_or_else(|| format!("Invalid driver path: {}", jar_path.display()))?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     std::fs::copy(&source, &jar_path).map_err(|e| format!("Failed to copy local agent jar: {e}"))?;
+    if !am.is_driver_jar_valid(db_type) {
+        std::fs::remove_file(&jar_path).ok();
+        return Err(format!("Local agent jar is invalid or corrupt: {}", source.display()));
+    }
 
     let mut local_state = am.load_state();
     local_state.installed_drivers.insert(
@@ -644,6 +648,10 @@ async fn install_agent_driver_from_registry(
         total_drivers,
     )
     .await?;
+    if jar_artifact.is_some() && !am.is_driver_jar_valid(db_type) {
+        std::fs::remove_file(&target_path).ok();
+        return Err(format!("Downloaded driver jar is invalid or corrupt: {}", target_path.display()));
+    }
     if native_artifact.is_some() {
         mark_executable(&target_path)?;
         std::fs::remove_file(am.driver_jar_path(db_type)).ok();
