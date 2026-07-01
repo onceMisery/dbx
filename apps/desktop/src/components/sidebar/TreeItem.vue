@@ -109,7 +109,7 @@ import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionObjectT
 import { hexToRgba } from "@/lib/color";
 import { focusSidebarRenameInput } from "@/lib/sidebarRenameFocus";
 import { hasTreeNodeDatabaseContext } from "@/lib/treeNodeContext";
-import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, type PasteTableMode, type TableClipboardContext } from "@/lib/tableClipboard";
+import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, tableDataCopyColumnOptions, type PasteTableMode, type TableClipboardContext } from "@/lib/tableClipboard";
 import { sidebarDisplayTableName } from "@/lib/sidebarTableNameDisplay";
 import { selectedTreeNodesInVisibleOrder as orderSelectedTreeNodes, treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebarTreeSelection";
 import { selectedConnectionDeleteTargets } from "@/lib/sidebarConnectionSelection";
@@ -2596,11 +2596,17 @@ async function confirmPasteTable() {
         await api.executeQuery(entry.connectionId, entry.database, structureSql, entry.schema);
       }
       if (copyData) {
+        const sourceColumns = await api.getColumns(entry.connectionId, entry.database, entry.schema || "", entry.sourceName);
+        const dataCopyColumnOptions = tableDataCopyColumnOptions(databaseType, sourceColumns);
+        if (dataCopyColumnOptions.columns.length === 0) {
+          throw new Error("No writable columns available for table data copy.");
+        }
         const dataSql = await buildCopyTableDataSql({
           databaseType,
           schema: entry.schema,
           sourceName: entry.sourceName,
           targetName,
+          ...dataCopyColumnOptions,
         });
         await api.executeQuery(entry.connectionId, entry.database, dataSql, entry.schema);
       }

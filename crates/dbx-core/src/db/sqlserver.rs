@@ -1417,7 +1417,11 @@ fn sqlserver_columns_sql(schema: &str, table: &str) -> String {
            ELSE CONVERT(INT, c.max_length) \
          END AS CHARACTER_MAXIMUM_LENGTH, \
          CONVERT(INT, c.scale) AS DATETIME_PRECISION, \
-         CASE WHEN ic.column_id IS NOT NULL THEN 'identity(' + CONVERT(VARCHAR(38), ic.seed_value) + ',' + CONVERT(VARCHAR(38), ic.increment_value) + ')' ELSE NULL END AS COLUMN_EXTRA, \
+         CASE \
+           WHEN c.is_computed = 1 THEN 'computed' \
+           WHEN ic.column_id IS NOT NULL THEN 'identity(' + CONVERT(VARCHAR(38), ic.seed_value) + ',' + CONVERT(VARCHAR(38), ic.increment_value) + ')' \
+           ELSE NULL \
+         END AS COLUMN_EXTRA, \
          ep.value AS COLUMN_COMMENT \
          FROM sys.objects o \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
@@ -1963,6 +1967,7 @@ mod tests {
         assert!(sql.contains("ep.major_id = c.object_id"));
         assert!(sql.contains("ep.minor_id = c.column_id"));
         assert!(sql.contains("MS_Description"));
+        assert!(sql.contains("c.is_computed = 1 THEN 'computed'"));
     }
 
     #[test]

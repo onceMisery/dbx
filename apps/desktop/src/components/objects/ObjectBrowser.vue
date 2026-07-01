@@ -60,7 +60,7 @@ import { buildViewDdl } from "@/lib/viewDdl";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { generateDatabaseExportId } from "@/lib/databaseExport";
 import { copyToClipboard, eventTargetAllowsAppClipboardShortcut } from "@/lib/clipboard";
-import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, type PasteTableMode, type TableClipboardContext } from "@/lib/tableClipboard";
+import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, tableDataCopyColumnOptions, type PasteTableMode, type TableClipboardContext } from "@/lib/tableClipboard";
 import { formatSqlInsert } from "@/lib/exportFormats";
 import { buildSingleDdlExportFileContent } from "@/lib/ddlExport";
 import { fetchTableDataForExport } from "@/lib/tableDataExport";
@@ -1068,11 +1068,17 @@ async function confirmPasteTable() {
         await api.executeQuery(props.connection.id, props.database, structureSql, schema);
       }
       if (copyData) {
+        const sourceColumns = await api.getColumns(props.connection.id, props.database, schema || "", entry.sourceName);
+        const dataCopyColumnOptions = tableDataCopyColumnOptions(effectiveDatabaseType.value, sourceColumns);
+        if (dataCopyColumnOptions.columns.length === 0) {
+          throw new Error("No writable columns available for table data copy.");
+        }
         const dataSql = await buildCopyTableDataSql({
           databaseType: effectiveDatabaseType.value,
           schema,
           sourceName: entry.sourceName,
           targetName,
+          ...dataCopyColumnOptions,
         });
         await api.executeQuery(props.connection.id, props.database, dataSql, schema);
       }

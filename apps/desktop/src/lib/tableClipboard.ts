@@ -1,4 +1,4 @@
-import type { DatabaseType } from "@/types/database";
+import type { ColumnInfo, DatabaseType } from "@/types/database";
 
 export type PasteTableMode = "structure-and-data" | "structure-only" | "data-only";
 
@@ -8,7 +8,11 @@ export interface TableClipboardContext {
   schema?: string | null;
 }
 
-const UNSAFE_WHOLE_ROW_COPY_DATABASES = new Set<DatabaseType>(["mysql", "postgres", "sqlserver"]);
+export interface TableDataCopyColumnOptions {
+  columns: string[];
+  postgresOverridingSystemValue: boolean;
+  sqlserverIdentityInsert: boolean;
+}
 
 function normalizeSchema(schema: string | null | undefined): string {
   return schema?.trim() ?? "";
@@ -23,7 +27,7 @@ export function tableClipboardMatchesTarget(entries: TableClipboardContext[], ta
 }
 
 export function supportsWholeRowTableDataCopy(databaseType: DatabaseType | undefined): boolean {
-  return !!databaseType && !UNSAFE_WHOLE_ROW_COPY_DATABASES.has(databaseType);
+  return !!databaseType;
 }
 
 export function defaultPasteTableMode(databaseType: DatabaseType | undefined): PasteTableMode {
@@ -32,4 +36,31 @@ export function defaultPasteTableMode(databaseType: DatabaseType | undefined): P
 
 export function pasteTableModeCopiesData(mode: PasteTableMode): boolean {
   return mode === "structure-and-data" || mode === "data-only";
+}
+
+export function tableDataCopyColumnOptions(databaseType: DatabaseType | undefined, columns: ColumnInfo[]): TableDataCopyColumnOptions {
+  const writableColumns = columns.filter((column) => isWritableTableDataCopyColumn(databaseType, column));
+  return {
+    columns: writableColumns.map((column) => column.name),
+    postgresOverridingSystemValue: databaseType === "postgres" && writableColumns.some(isIdentityColumn),
+    sqlserverIdentityInsert: databaseType === "sqlserver" && writableColumns.some(isIdentityColumn),
+  };
+}
+
+function isWritableTableDataCopyColumn(databaseType: DatabaseType | undefined, column: ColumnInfo): boolean {
+  const extra = (column.extra ?? "").toLowerCase();
+  if (databaseType === "mysql") {
+    return !extra.includes("generated");
+  }
+  if (databaseType === "postgres") {
+    return !extra.includes("generated always as (");
+  }
+  if (databaseType === "sqlserver") {
+    return !extra.includes("computed");
+  }
+  return !extra.includes("computed") && !(extra.includes("generated") && !extra.includes("identity"));
+}
+
+function isIdentityColumn(column: ColumnInfo): boolean {
+  return (column.extra ?? "").toLowerCase().includes("identity");
 }
