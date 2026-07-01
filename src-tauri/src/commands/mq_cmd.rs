@@ -253,8 +253,9 @@ pub async fn mq_peek_messages(
     topic: dbx_core::mq::TopicRef,
     sub: String,
     count: u32,
+    options: Option<dbx_core::mq::PeekMessagesOptions>,
 ) -> Result<Vec<dbx_core::mq::PeekedMessage>, String> {
-    dbx_core::mq::service::mq_peek_messages_core(&state, &connection_id, topic, sub, count).await
+    dbx_core::mq::service::mq_peek_messages_core(&state, &connection_id, topic, sub, count, options).await
 }
 
 #[tauri::command]

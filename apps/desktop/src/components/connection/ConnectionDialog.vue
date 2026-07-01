@@ -32,7 +32,7 @@ import { isLocalFileTypeDb } from "@/lib/connectionFile";
 import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedVersion } from "@/lib/mqPinnedVersionOptions";
 import { mongodbAuthFailureHint, mongoUrlParam, setMongoUrlParam } from "@/lib/mongoConnectionOptions";
 import { copyToClipboard } from "@/lib/clipboard";
-import { appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
+import { agentDriverInstallKey, appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
 import { prestoSqlBuiltinDriverPaths } from "@/lib/prestoSqlBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
@@ -866,6 +866,33 @@ function errorMessage(error: unknown): string {
 function connectionErrorWithDriverUpdateHint(config: ConnectionConfig, message: string): string {
   if (!hasAgentDriverUpdate(config.db_type, agentDrivers.value, config.driver_profile)) return message;
   return appendAgentDriverUpdateHint(message, t("connection.agentDriverUpdateConnectionHint"));
+}
+
+function installedAgentDriver(drivers: readonly AgentDriverInstallState[], key: string): AgentDriverInstallState | undefined {
+  return drivers.find((driver) => driver.db_type === key);
+}
+
+async function refreshLocalAgentDrivers(): Promise<AgentDriverInstallState[]> {
+  const drivers = await api.listInstalledAgentsLocal();
+  agentDrivers.value = drivers;
+  return drivers;
+}
+
+async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Promise<void> {
+  const driverKey = agentDriverInstallKey(config.db_type, config.driver_profile);
+  if (!driverKey) return;
+
+  let drivers = agentDrivers.value.length ? agentDrivers.value : await refreshLocalAgentDrivers();
+  if (!showAgentDriverInstallHint(config.db_type, drivers, config.driver_profile)) return;
+  if (installedAgentDriver(drivers, driverKey)?.installed === true) return;
+
+  drivers = await refreshLocalAgentDrivers();
+  if (installedAgentDriver(drivers, driverKey)?.installed === true) return;
+
+  const label = config.driver_label || driverKey;
+  testResult.value = { ok: true, message: `Installing ${label} driver...` };
+  await api.installAgent(driverKey);
+  await refreshLocalAgentDrivers();
 }
 
 function isSqlServerLegacyUnencryptedMode(params: string | undefined): boolean {
@@ -1706,6 +1733,7 @@ async function testConnection() {
   testResult.value = null;
   const config = connectionConfigForSubmit(editingId.value || uuid());
   try {
+    await ensureRequiredAgentDriverInstalled(config);
     const msg = await testConnectionWithTimeout(config, runId);
     if (runId !== testRunId) return;
     if (config.db_type === "mongodb" && /legacy driver/i.test(msg)) {
@@ -2755,10 +2783,12 @@ async function save() {
   try {
     if (editingId.value) {
       const updated = connectionConfigForSubmit(editingId.value);
+      await ensureRequiredAgentDriverInstalled(updated);
       await store.updateConnection(updated);
       store.stopEditing();
     } else {
       const config = connectionConfigForSubmit(uuid());
+      await ensureRequiredAgentDriverInstalled(config);
       await store.addConnection(config);
       if (config.db_type === "jdbc") {
         open.value = false;

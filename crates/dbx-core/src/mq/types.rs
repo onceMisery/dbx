@@ -439,6 +439,17 @@ pub struct PeekedMessage {
     pub payload_text: Option<String>,
 }
 
+/// Optional hints for reading messages. Pulsar ignores these today; Kafka uses
+/// them to select a partition and starting offset for a non-committing peek.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeekMessagesOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Policy scope (rate limits / quotas / permissions)
 // ---------------------------------------------------------------------------

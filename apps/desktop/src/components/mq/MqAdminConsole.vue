@@ -220,7 +220,7 @@ onMounted(async () => {
       <button v-if="canManageTenants" :class="{ active: activeTab === 'tenants' }" @click="setActiveTab('tenants')">租户</button>
       <button v-if="canManageNamespaces" :class="{ active: activeTab === 'namespaces' }" @click="setActiveTab('namespaces')">命名空间</button>
       <button :class="{ active: activeTab === 'topics' }" @click="setActiveTab('topics')">主题</button>
-      <button v-if="canSendMessage" :class="{ active: activeTab === 'messages' }" @click="setActiveTab('messages')">发送消息</button>
+      <button v-if="canSendMessage" :class="{ active: activeTab === 'messages' }" @click="setActiveTab('messages')">消息</button>
       <button v-if="canManageSubscriptions" :class="{ active: activeTab === 'subscriptions' }" @click="setActiveTab('subscriptions')">订阅</button>
       <button :class="{ active: activeTab === 'monitoring' }" @click="setActiveTab('monitoring')">监控</button>
       <button :class="{ active: activeTab === 'clients' }" @click="setActiveTab('clients')">客户端</button>
@@ -235,7 +235,7 @@ onMounted(async () => {
       <TenantsPanel v-if="activeTab === 'tenants'" :connection-id="connectionId" :supports-tenants="canManageTenants" :read-only="readOnly" :cluster-options="clusterOptions" @tenant-selected="handleTenantSelected" />
       <NamespacesPanel v-else-if="activeTab === 'namespaces'" :connection-id="connectionId" :tenant="selectedTenant" :supports-namespaces="canManageNamespaces" :read-only="readOnly" @namespace-selected="handleNamespaceSelected" @namespace-roles-selected="handleNamespaceRolesSelected" />
       <TopicsPanel v-else-if="activeTab === 'topics'" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" :supports-partitioned-topics="canManagePartitionedTopics" @topic-selected="handleTopicSelected" />
-      <SendMessagePanel v-else-if="activeTab === 'messages' && canSendMessage" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :topic="selectedTopic" :read-only="readOnly" />
+      <SendMessagePanel v-else-if="activeTab === 'messages' && canSendMessage" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :topic="selectedTopic" :read-only="readOnly" :is-kafka-cluster="isKafkaCluster" :supports-peek-messages="canPeekMessages" />
       <SubscriptionsPanel
         v-else-if="activeTab === 'subscriptions' && canManageSubscriptions"
         :connection-id="connectionId"

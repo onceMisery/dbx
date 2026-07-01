@@ -218,6 +218,11 @@ export interface PeekedMessage {
   payloadText?: string;
 }
 
+export interface PeekMessagesOptions {
+  partition?: number;
+  offset?: number;
+}
+
 // Policy scope
 export type PolicyScope = { level: "namespace"; tenant: string; namespace: string } | { level: "topic"; tenant: string; namespace: string; topic: string; persistent: boolean };
 

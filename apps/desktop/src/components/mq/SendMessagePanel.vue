@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
-import type { TopicInfo, SendMessageRequest, SendMessageResponse } from "@/types/mq";
-import { mqSendMessage, mqListTopics } from "@/lib/api";
+import type { PeekedMessage, TopicInfo, TopicRef, SendMessageRequest, SendMessageResponse } from "@/types/mq";
+import { mqSendMessage, mqListTopics, mqPeekMessages } from "@/lib/api";
 import { formatError } from "@/lib/errorUtils";
 
 interface Props {
@@ -10,6 +10,8 @@ interface Props {
   namespace?: string;
   topic?: TopicInfo;
   readOnly?: boolean;
+  isKafkaCluster?: boolean;
+  supportsPeekMessages?: boolean;
 }
 
 const props = defineProps<Props>();
@@ -24,6 +26,12 @@ const success = ref<SendMessageResponse>();
 const availableTopics = ref<TopicInfo[]>([]);
 const topicsLoading = ref(false);
 const headersExpanded = ref(false);
+const peekLoading = ref(false);
+const peekError = ref<string>();
+const peekMessages = ref<PeekedMessage[]>([]);
+const peekPartition = ref(0);
+const peekOffset = ref(0);
+const peekCount = ref(20);
 
 let successTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -36,6 +44,21 @@ const topicOptions = computed(() => {
     partitions: t.partitions,
   }));
 });
+
+const selectedTopicRef = computed<TopicRef | null>(() => {
+  const topic = topicName.value.trim();
+  if (!topic || !props.tenant || !props.namespace) return null;
+  const selected = availableTopics.value.find((item) => item.shortName === topic);
+  return {
+    tenant: props.tenant,
+    namespace: props.namespace,
+    topic,
+    persistent: selected?.persistent ?? true,
+    partitioned: selected?.partitioned,
+  };
+});
+
+const canBrowseMessages = computed(() => props.isKafkaCluster === true && props.supportsPeekMessages !== false);
 
 function clearSuccessLater() {
   if (successTimer) clearTimeout(successTimer);
@@ -119,6 +142,11 @@ async function sendMessage() {
       headers,
     };
     success.value = await mqSendMessage(props.connectionId, req);
+    if (canBrowseMessages.value) {
+      peekPartition.value = success.value.partition;
+      peekOffset.value = success.value.offset;
+      void loadMessages();
+    }
     messageValue.value = "";
     messageKey.value = "";
     clearSuccessLater();
@@ -127,6 +155,40 @@ async function sendMessage() {
   } finally {
     loading.value = false;
   }
+}
+
+async function loadMessages() {
+  const topic = selectedTopicRef.value;
+  if (!topic) {
+    peekError.value = "Select a topic before loading messages";
+    return;
+  }
+  peekLoading.value = true;
+  peekError.value = undefined;
+  try {
+    const count = Math.max(1, Math.min(100, Number(peekCount.value) || 20));
+    const partition = Math.max(0, Number(peekPartition.value) || 0);
+    const offset = Math.max(0, Number(peekOffset.value) || 0);
+    peekCount.value = count;
+    peekPartition.value = partition;
+    peekOffset.value = offset;
+    peekMessages.value = await mqPeekMessages(props.connectionId, topic, "__dbx_kafka_viewer__", count, { partition, offset });
+  } catch (e: unknown) {
+    peekError.value = formatError(e);
+  } finally {
+    peekLoading.value = false;
+  }
+}
+
+function messagePayload(message: PeekedMessage): string {
+  return message.payloadText ?? message.payloadBase64;
+}
+
+function formatMessageTimestamp(value?: string): string {
+  if (!value) return "-";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return value;
+  return new Date(numeric).toLocaleString();
 }
 
 function formatJson() {
@@ -154,6 +216,11 @@ watch(
   },
   { immediate: true },
 );
+
+watch(topicName, () => {
+  peekError.value = undefined;
+  peekMessages.value = [];
+});
 
 watch(
   () => props.topic,
@@ -233,6 +300,48 @@ watch(
           {{ loading ? "发送中..." : "发送消息" }}
         </button>
       </div>
+
+      <section v-if="canBrowseMessages" class="message-browser">
+        <div class="message-browser-header">
+          <h4>消息列表</h4>
+          <button type="button" class="btn-sm" :disabled="peekLoading || !selectedTopicRef" @click="loadMessages">
+            {{ peekLoading ? "加载中..." : "加载消息" }}
+          </button>
+        </div>
+
+        <div class="peek-controls">
+          <label>
+            <span>分区</span>
+            <input v-model.number="peekPartition" type="number" min="0" :disabled="peekLoading" />
+          </label>
+          <label>
+            <span>Offset</span>
+            <input v-model.number="peekOffset" type="number" min="0" :disabled="peekLoading" />
+          </label>
+          <label>
+            <span>数量</span>
+            <input v-model.number="peekCount" type="number" min="1" max="100" :disabled="peekLoading" />
+          </label>
+        </div>
+
+        <div v-if="peekError" class="panel-error">{{ peekError }}</div>
+        <div v-else-if="peekLoading" class="message-empty">消息加载中...</div>
+        <div v-else-if="!peekMessages.length" class="message-empty">暂无消息</div>
+        <div v-else class="message-list">
+          <article v-for="message in peekMessages" :key="message.messageId || message.position" class="message-row">
+            <div class="message-meta">
+              <span>#{{ message.position }}</span>
+              <span>offset {{ message.messageId || "-" }}</span>
+              <span v-if="message.key">key {{ message.key }}</span>
+              <span>{{ formatMessageTimestamp(message.publishTime) }}</span>
+            </div>
+            <pre class="message-payload">{{ messagePayload(message) }}</pre>
+            <div v-if="Object.keys(message.headers || {}).length" class="message-headers">
+              <span v-for="(value, key) in message.headers" :key="key">{{ key }}: {{ value }}</span>
+            </div>
+          </article>
+        </div>
+      </section>
     </div>
   </div>
 </template>
@@ -406,7 +515,8 @@ watch(
   }
 }
 
-input[type="text"] {
+input[type="text"],
+input[type="number"] {
   padding: 7px 10px;
   border: 1px solid var(--color-border);
   border-radius: 6px;
@@ -416,7 +526,8 @@ input[type="text"] {
   box-sizing: border-box;
 }
 
-input[type="text"]:focus {
+input[type="text"]:focus,
+input[type="number"]:focus {
   outline: none;
   border-color: var(--color-primary);
   box-shadow: 0 0 0 2px var(--color-primary-alpha);
@@ -520,6 +631,124 @@ input[type="text"]:focus {
 
 .btn-primary:hover:not(:disabled) {
   opacity: 0.9;
+}
+
+.message-browser {
+  margin-top: 4px;
+  padding: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-background-secondary);
+}
+
+.message-browser-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.message-browser-header h4 {
+  margin: 0;
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.peek-controls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.peek-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.peek-controls input {
+  width: 100%;
+}
+
+.message-empty {
+  padding: 18px;
+  border: 1px dashed var(--color-border);
+  border-radius: 6px;
+  color: var(--color-text-tertiary);
+  text-align: center;
+  font-size: 13px;
+}
+
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.message-row {
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-background);
+}
+
+.message-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+}
+
+.message-meta span:first-child {
+  color: var(--color-primary);
+  font-weight: 700;
+}
+
+.message-payload {
+  margin: 8px 0 0;
+  padding: 10px;
+  max-height: 160px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--color-background-tertiary, var(--color-background-secondary));
+  color: var(--color-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message-headers {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.message-headers span {
+  padding: 2px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-text-secondary);
+  background: var(--color-background-secondary);
+  font-size: 12px;
+}
+
+@media (max-width: 720px) {
+  .peek-controls {
+    grid-template-columns: 1fr;
+  }
 }
 
 button:disabled,

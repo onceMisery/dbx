@@ -173,6 +173,8 @@ pub(crate) struct PeekMessagesReq {
     topic: dbx_core::mq::TopicRef,
     sub: String,
     count: u32,
+    #[serde(default)]
+    options: Option<dbx_core::mq::PeekMessagesOptions>,
 }
 
 #[derive(serde::Deserialize)]
@@ -521,10 +523,16 @@ pub async fn peek_messages(
     State(state): State<Arc<WebState>>,
     Json(req): Json<PeekMessagesReq>,
 ) -> Result<Json<Vec<dbx_core::mq::PeekedMessage>>, AppError> {
-    let result =
-        dbx_core::mq::service::mq_peek_messages_core(&state.app, &req.connection_id, req.topic, req.sub, req.count)
-            .await
-            .map_err(AppError)?;
+    let result = dbx_core::mq::service::mq_peek_messages_core(
+        &state.app,
+        &req.connection_id,
+        req.topic,
+        req.sub,
+        req.count,
+        req.options,
+    )
+    .await
+    .map_err(AppError)?;
     Ok(Json(result))
 }
 

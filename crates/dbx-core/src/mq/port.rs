@@ -46,7 +46,13 @@ pub trait MessageQueueAdmin: Send + Sync {
     async fn skip_messages(&self, topic: &TopicRef, sub: &str, count: SkipCount) -> Result<(), String>;
     async fn reset_cursor(&self, topic: &TopicRef, sub: &str, pos: ResetPosition) -> Result<(), String>;
     async fn clear_backlog(&self, topic: &TopicRef, sub: &str) -> Result<(), String>;
-    async fn peek_messages(&self, topic: &TopicRef, sub: &str, count: u32) -> Result<Vec<PeekedMessage>, String>;
+    async fn peek_messages(
+        &self,
+        topic: &TopicRef,
+        sub: &str,
+        count: u32,
+        options: PeekMessagesOptions,
+    ) -> Result<Vec<PeekedMessage>, String>;
     async fn expire_messages(&self, topic: &TopicRef, sub: &str, expire_seconds: i64) -> Result<(), String>;
 
     // ---- Producers / consumers (runtime, read from stats) ----

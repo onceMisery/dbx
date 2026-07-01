@@ -502,6 +502,51 @@ async fn install_agent_driver_with_batch(
     }
 }
 
+async fn ensure_jre_from_registry(
+    am: &AgentManager,
+    registry: &AgentRegistry,
+    jre_key: &str,
+    db_type: &str,
+    progress: &impl Fn(AgentProgressEvent),
+    current: Option<u32>,
+    total_drivers: Option<u32>,
+) -> Result<(), String> {
+    let jre_info = registry.resolve_jre(jre_key).ok_or_else(|| format!("No JRE definition for version: {jre_key}"))?;
+    let platform = AgentManager::current_platform();
+    let platform_jre = jre_info
+        .platforms
+        .get(platform)
+        .ok_or_else(|| format!("No JRE {jre_key} available for platform: {platform}"))?;
+    let jre_archive = am.base_dir().join("jre-download.tar.gz");
+    progress(AgentProgressEvent::transfer("jre", 0, platform_jre.size).with_batch(
+        Some(db_type),
+        current,
+        total_drivers,
+    ));
+    download_with_progress(
+        am,
+        progress,
+        "jre",
+        &platform_jre.url,
+        &r2_path_with_cache_buster(&github_url_to_r2_path(&platform_jre.url, "jre"), &jre_info.version),
+        &jre_archive,
+        platform_jre.size,
+        Some(CacheIdentity::Jre { key: jre_key, version: &jre_info.version }),
+        Some(db_type),
+        current,
+        total_drivers,
+    )
+    .await?;
+    progress(AgentProgressEvent::transfer("jre-extract", 0, 0).with_batch(Some(db_type), current, total_drivers));
+    let jre_dir = am.jre_dir(jre_key);
+    // Stop daemons first (Windows ERROR_ACCESS_DENIED, Issue #1100).
+    am.stop_daemons().await;
+    replace_old_jre_dir(am, &jre_dir)?;
+    extract_tar_gz(&jre_archive, &jre_dir)?;
+    std::fs::remove_file(&jre_archive).ok();
+    Ok(())
+}
+
 async fn install_agent_driver_from_registry(
     am: &AgentManager,
     registry: &AgentRegistry,
@@ -512,7 +557,16 @@ async fn install_agent_driver_from_registry(
 ) -> Result<(), String> {
     let Some(driver) = agent_registry_driver(registry, db_type) else {
         if let Some(local_jar) = find_local_agent_jar(db_type) {
+            let jre_key = DEFAULT_JRE_KEY;
+            if jre_needs_install(am, registry, jre_key) {
+                ensure_jre_from_registry(am, registry, jre_key, db_type, progress, current, total_drivers).await?;
+            }
             install_local_agent(am, db_type, local_jar)?;
+            if let Some(jre_info) = registry.resolve_jre(jre_key) {
+                let mut local_state = am.load_state();
+                local_state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone());
+                am.save_state(&local_state)?;
+            }
             am.stop_daemon_by_key(db_type).await;
             progress(AgentProgressEvent::step("done"));
             return Ok(());
@@ -526,40 +580,7 @@ async fn install_agent_driver_from_registry(
     let needs_jre = requires_java_runtime && jre_needs_install(am, registry, jre_key);
 
     if needs_jre {
-        let jre_info =
-            registry.resolve_jre(jre_key).ok_or_else(|| format!("No JRE definition for version: {jre_key}"))?;
-        let platform = AgentManager::current_platform();
-        let platform_jre = jre_info
-            .platforms
-            .get(platform)
-            .ok_or_else(|| format!("No JRE {jre_key} available for platform: {platform}"))?;
-        let jre_archive = am.base_dir().join("jre-download.tar.gz");
-        progress(AgentProgressEvent::transfer("jre", 0, platform_jre.size).with_batch(
-            Some(db_type),
-            current,
-            total_drivers,
-        ));
-        download_with_progress(
-            am,
-            progress,
-            "jre",
-            &platform_jre.url,
-            &r2_path_with_cache_buster(&github_url_to_r2_path(&platform_jre.url, "jre"), &jre_info.version),
-            &jre_archive,
-            platform_jre.size,
-            Some(CacheIdentity::Jre { key: jre_key, version: &jre_info.version }),
-            Some(db_type),
-            current,
-            total_drivers,
-        )
-        .await?;
-        progress(AgentProgressEvent::transfer("jre-extract", 0, 0).with_batch(Some(db_type), current, total_drivers));
-        let jre_dir = am.jre_dir(jre_key);
-        // Stop daemons first (Windows ERROR_ACCESS_DENIED, Issue #1100).
-        am.stop_daemons().await;
-        replace_old_jre_dir(am, &jre_dir)?;
-        extract_tar_gz(&jre_archive, &jre_dir)?;
-        std::fs::remove_file(&jre_archive).ok();
+        ensure_jre_from_registry(am, registry, jre_key, db_type, progress, current, total_drivers).await?;
     }
 
     let (artifact, target_path) = if let Some(native) = native_artifact {

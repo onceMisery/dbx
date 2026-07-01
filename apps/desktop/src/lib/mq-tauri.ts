@@ -30,6 +30,7 @@ import type {
   MqIssuedToken,
   BacklogStats,
   PeekedMessage,
+  PeekMessagesOptions,
   MqRawRequest,
   MqRawResponse,
   SendMessageRequest,
@@ -129,8 +130,8 @@ export async function mqClearBacklog(connectionId: string, topic: TopicRef, sub:
   return invoke("mq_clear_backlog", { connectionId, topic, sub });
 }
 
-export async function mqPeekMessages(connectionId: string, topic: TopicRef, sub: string, count: number): Promise<PeekedMessage[]> {
-  return invoke("mq_peek_messages", { connectionId, topic, sub, count });
+export async function mqPeekMessages(connectionId: string, topic: TopicRef, sub: string, count: number, options?: PeekMessagesOptions): Promise<PeekedMessage[]> {
+  return invoke("mq_peek_messages", { connectionId, topic, sub, count, options });
 }
 
 export async function mqExpireMessages(connectionId: string, topic: TopicRef, sub: string, expireSeconds: number): Promise<void> {

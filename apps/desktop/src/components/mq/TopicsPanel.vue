@@ -377,6 +377,7 @@ watch(includeNonPersistent, () => {
 .topics-table {
   flex: 1;
   overflow: auto;
+  background: var(--color-background);
 }
 
 table {
@@ -392,12 +393,17 @@ thead {
 }
 
 th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   padding: 10px 12px;
   text-align: left;
   font-weight: 600;
   font-size: 13px;
   color: var(--color-text-secondary);
+  background: var(--color-background-secondary);
   border-bottom: 1px solid var(--color-border);
+  box-shadow: 0 1px 0 var(--color-border);
 }
 
 tbody tr {

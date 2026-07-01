@@ -237,6 +237,7 @@ pub async fn mq_peek_messages_core(
     topic: TopicRef,
     sub: String,
     count: u32,
+    options: Option<PeekMessagesOptions>,
 ) -> Result<Vec<PeekedMessage>, String> {
     if count == 0 {
         return Ok(Vec::new());
@@ -245,7 +246,7 @@ pub async fn mq_peek_messages_core(
         return Err(format!("Peek message count must be between 1 and {MAX_PEEK_MESSAGES}"));
     }
     let adapter = get_adapter(state, conn_id).await?;
-    adapter.peek_messages(&topic, &sub, count).await
+    adapter.peek_messages(&topic, &sub, count, options.unwrap_or_default()).await
 }
 
 pub async fn mq_expire_messages_core(
@@ -666,6 +667,7 @@ mod tests {
             },
             "sub-a".to_string(),
             101,
+            None,
         )
         .await
         .expect_err("peek count above the service limit should fail");

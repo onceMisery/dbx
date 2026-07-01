@@ -87,7 +87,7 @@ public final class KafkaAgent {
         } catch (Exception e) {
             JsonObject error = new JsonObject();
             error.addProperty("code", -1);
-            error.addProperty("message", e.getMessage() == null ? "Unknown error" : e.getMessage());
+            error.addProperty("message", normalizeErrorMessage(e));
             response.add("error", error);
         }
         return GSON.toJson(response);
@@ -255,9 +255,10 @@ public final class KafkaAgent {
         if (securityProtocol.isBlank()) {
             securityProtocol = stringOrEmpty(conn, "securityProtocol");
         }
-        if (!securityProtocol.isBlank()) {
-            props.put("security.protocol", securityProtocol);
+        if (securityProtocol.isBlank()) {
+            securityProtocol = "PLAINTEXT";
         }
+        props.put("security.protocol", securityProtocol);
 
         String saslMechanism = stringOrEmpty(conn, "sasl_mechanism");
         if (saslMechanism.isBlank()) {
@@ -576,56 +577,63 @@ public final class KafkaAgent {
         int timeout = requestTimeout(params);
         String topic = stringOrEmpty(params, "topic");
 
-        TopicDescription desc = admin.describeTopics(Collections.singletonList(topic))
-            .allTopicNames().get(timeout, TimeUnit.MILLISECONDS).get(topic);
-        List<TopicPartition> partitions = desc.partitions().stream()
-            .map(pi -> new TopicPartition(topic, pi.partition()))
-            .collect(Collectors.toList());
+        try {
+            TopicDescription desc = admin.describeTopics(Collections.singletonList(topic))
+                .allTopicNames().get(timeout, TimeUnit.MILLISECONDS).get(topic);
+            List<TopicPartition> partitions = desc.partitions().stream()
+                .map(pi -> new TopicPartition(topic, pi.partition()))
+                .collect(Collectors.toList());
 
-        DescribeProducersResult described = admin.describeProducers(
-            partitions,
-            new DescribeProducersOptions().timeoutMs(timeout));
+            DescribeProducersResult described = admin.describeProducers(
+                partitions,
+                new DescribeProducersOptions().timeoutMs(timeout));
 
-        Map<Long, Map<String, Object>> byProducer = new LinkedHashMap<>();
-        for (TopicPartition tp : partitions) {
-            DescribeProducersResult.PartitionProducerState state =
-                described.partitionResult(tp).get(timeout, TimeUnit.MILLISECONDS);
-            for (ProducerState producerState : state.activeProducers()) {
-                long producerId = producerState.producerId();
-                Map<String, Object> producer = byProducer.computeIfAbsent(producerId, id -> {
-                    Map<String, Object> p = new LinkedHashMap<>();
-                    p.put("producerId", id);
-                    p.put("producerName", "producer-" + id);
-                    p.put("msgRateIn", 0.0);
-                    p.put("msgThroughputIn", 0.0);
-                    p.put("clientVersion", "Kafka producer");
-                    p.put("partitions", new ArrayList<Integer>());
-                    p.put("lastTimestamp", producerState.lastTimestamp());
-                    return p;
-                });
-                @SuppressWarnings("unchecked")
-                List<Integer> producerPartitions = (List<Integer>) producer.get("partitions");
-                producerPartitions.add(tp.partition());
-                long currentLastTimestamp = (long) producer.get("lastTimestamp");
-                if (producerState.lastTimestamp() > currentLastTimestamp) {
-                    producer.put("lastTimestamp", producerState.lastTimestamp());
+            Map<Long, Map<String, Object>> byProducer = new LinkedHashMap<>();
+            for (TopicPartition tp : partitions) {
+                DescribeProducersResult.PartitionProducerState state =
+                    described.partitionResult(tp).get(timeout, TimeUnit.MILLISECONDS);
+                for (ProducerState producerState : state.activeProducers()) {
+                    long producerId = producerState.producerId();
+                    Map<String, Object> producer = byProducer.computeIfAbsent(producerId, id -> {
+                        Map<String, Object> p = new LinkedHashMap<>();
+                        p.put("producerId", id);
+                        p.put("producerName", "producer-" + id);
+                        p.put("msgRateIn", 0.0);
+                        p.put("msgThroughputIn", 0.0);
+                        p.put("clientVersion", "Kafka producer");
+                        p.put("partitions", new ArrayList<Integer>());
+                        p.put("lastTimestamp", producerState.lastTimestamp());
+                        return p;
+                    });
+                    @SuppressWarnings("unchecked")
+                    List<Integer> producerPartitions = (List<Integer>) producer.get("partitions");
+                    producerPartitions.add(tp.partition());
+                    long currentLastTimestamp = (long) producer.get("lastTimestamp");
+                    if (producerState.lastTimestamp() > currentLastTimestamp) {
+                        producer.put("lastTimestamp", producerState.lastTimestamp());
+                    }
                 }
             }
-        }
 
-        for (Map<String, Object> producer : byProducer.values()) {
-            @SuppressWarnings("unchecked")
-            List<Integer> producerPartitions = (List<Integer>) producer.get("partitions");
-            producerPartitions.sort(Integer::compareTo);
-            producer.put(
-                "address",
-                producerPartitions.size() == 1
-                    ? "partition " + producerPartitions.get(0)
-                    : "partitions " + producerPartitions.stream().map(String::valueOf).collect(Collectors.joining(", "))
-            );
-        }
+            for (Map<String, Object> producer : byProducer.values()) {
+                @SuppressWarnings("unchecked")
+                List<Integer> producerPartitions = (List<Integer>) producer.get("partitions");
+                producerPartitions.sort(Integer::compareTo);
+                producer.put(
+                    "address",
+                    producerPartitions.size() == 1
+                        ? "partition " + producerPartitions.get(0)
+                        : "partitions " + producerPartitions.stream().map(String::valueOf).collect(Collectors.joining(", "))
+                );
+            }
 
-        return Collections.singletonMap("producers", new ArrayList<>(byProducer.values()));
+            return Collections.singletonMap("producers", new ArrayList<>(byProducer.values()));
+        } catch (Exception e) {
+            if (isUnsupportedVersionError(e)) {
+                return Collections.singletonMap("producers", Collections.emptyList());
+            }
+            throw e;
+        }
     }
 
     private static Object deleteConsumerGroup(JsonObject params) throws Exception {
@@ -1009,6 +1017,60 @@ public final class KafkaAgent {
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    private static String normalizeErrorMessage(Exception e) {
+        String message = e.getMessage() == null || e.getMessage().isBlank()
+            ? e.getClass().getName()
+            : e.getMessage();
+        Throwable root = rootCause(e);
+        if (root != e && root.getMessage() != null && !root.getMessage().isBlank()
+            && !message.contains(root.getMessage())) {
+            message = message + ": " + root.getMessage();
+        }
+        if (isSslHandshakeError(e)) {
+            message = message
+                + ". Hint: SSL handshake failed. Check the Kafka security protocol. "
+                + "Use PLAINTEXT for a PLAINTEXT broker listener, SSL for SSL, "
+                + "SASL_PLAINTEXT for SASL without TLS, or SASL_SSL for SASL with TLS. "
+                + "For older Kafka/JDK TLS setups, also check truststore settings, certificates, "
+                + "hostname verification, and enabled TLS protocol versions.";
+        }
+        return message;
+    }
+
+    private static boolean isSslHandshakeError(Throwable error) {
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            String className = current.getClass().getName();
+            String message = current.getMessage() == null ? "" : current.getMessage().toLowerCase(Locale.ROOT);
+            if (className.contains("SslAuthenticationException")
+                || className.contains("SSLHandshakeException")
+                || message.contains("ssl handshake failed")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isUnsupportedVersionError(Throwable error) {
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            String className = current.getClass().getName();
+            String message = current.getMessage() == null ? "" : current.getMessage().toLowerCase(Locale.ROOT);
+            if (className.contains("UnsupportedVersionException")
+                || message.contains("unsupported version")
+                || message.contains("does not support")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Throwable rootCause(Throwable error) {
+        Throwable current = error;
+        while (current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
+    }
 
     private static AdminClient requireAdmin() {
         if (adminClient == null) {

@@ -300,15 +300,21 @@ impl MessageQueueAdmin for KafkaAdmin {
         .await
     }
 
-    async fn peek_messages(&self, topic: &TopicRef, _sub: &str, count: u32) -> Result<Vec<PeekedMessage>, String> {
+    async fn peek_messages(
+        &self,
+        topic: &TopicRef,
+        _sub: &str,
+        count: u32,
+        options: PeekMessagesOptions,
+    ) -> Result<Vec<PeekedMessage>, String> {
         let conn_params = build_connection_params(&self.config);
         let result: serde_json::Value = self
             .call(
                 "mq_peek_messages",
                 serde_json::json!({
                     "topic": topic.topic,
-                    "partition": 0,
-                    "offset": 0,
+                    "partition": options.partition.unwrap_or(0),
+                    "offset": options.offset.unwrap_or(0),
                     "count": count,
                     "connection": conn_params,
                 }),
@@ -624,8 +630,11 @@ fn build_connection_params(cfg: &MqAdminConfig) -> serde_json::Value {
     let sasl_password =
         extra_str(extra, "saslPassword").or_else(|| basic_auth.map(|(_, password)| password)).unwrap_or("");
     let sasl_mechanism = extra_str(extra, "saslMechanism").unwrap_or(if basic_auth.is_some() { "PLAIN" } else { "" });
-    let security_protocol =
-        extra_str(extra, "securityProtocol").unwrap_or(if !sasl_mechanism.is_empty() { "SASL_PLAINTEXT" } else { "" });
+    let security_protocol = extra_str(extra, "securityProtocol").unwrap_or(if !sasl_mechanism.is_empty() {
+        "SASL_PLAINTEXT"
+    } else {
+        "PLAINTEXT"
+    });
     let properties =
         extra.get("properties").filter(|value| value.is_object()).cloned().unwrap_or_else(|| serde_json::json!({}));
 

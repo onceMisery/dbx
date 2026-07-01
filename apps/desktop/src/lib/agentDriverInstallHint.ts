@@ -7,7 +7,7 @@ export interface AgentDriverInstallState {
   update_available?: boolean;
 }
 
-function agentDriverInstallKey(dbType: DatabaseType | undefined, driverProfile?: string): string | undefined {
+export function agentDriverInstallKey(dbType: DatabaseType | undefined, driverProfile?: string): string | undefined {
   if (dbType === "oracle") return "oracle";
   if (dbType === "mongodb") return "mongodb";
   if (dbType === "dameng") return "dameng";
