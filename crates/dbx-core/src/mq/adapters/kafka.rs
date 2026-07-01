@@ -353,7 +353,14 @@ impl MessageQueueAdmin for KafkaAdmin {
 
     async fn list_producers(&self, topic: &TopicRef) -> Result<Vec<ProducerInfo>, String> {
         let result: serde_json::Value =
-            self.call("mq_list_producers", serde_json::json!({ "topic": topic.topic })).await?;
+            match self.call("mq_list_producers", serde_json::json!({ "topic": topic.topic })).await {
+                Ok(result) => result,
+                Err(err) if is_describe_producers_unsupported(&err) => {
+                    log::info!("Kafka broker does not support DESCRIBE_PRODUCERS; active producers are unavailable");
+                    return Ok(Vec::new());
+                }
+                Err(err) => return Err(err),
+            };
         let producers = result.get("producers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         Ok(producers
             .into_iter()
@@ -616,6 +623,13 @@ fn bootstrap_servers(cfg: &MqAdminConfig) -> String {
 
 fn extra_str<'a>(extra: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     extra.get(key).and_then(|v| v.as_str()).filter(|v| !v.trim().is_empty())
+}
+
+fn is_describe_producers_unsupported(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("unsupportedversionexception")
+        || normalized.contains("describe_producers")
+        || normalized.contains("does not support describe_producers")
 }
 
 /// Build the connection params JSON from MqAdminConfig for the Java agent.
