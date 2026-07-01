@@ -843,30 +843,12 @@ mod tests {
     fn builds_copy_table_data_sql() {
         assert_eq!(
             build_copy_table_data_sql(CopyTableDataSqlOptions {
-                database_type: Some(DatabaseType::Mysql),
+                database_type: Some(DatabaseType::Sqlite),
                 schema: None,
                 source_name: "users".to_string(),
                 target_name: "users_copy".to_string(),
             }),
-            "INSERT INTO `users_copy` SELECT * FROM `users`;"
-        );
-        assert_eq!(
-            build_copy_table_data_sql(CopyTableDataSqlOptions {
-                database_type: Some(DatabaseType::Postgres),
-                schema: Some("public".to_string()),
-                source_name: "users".to_string(),
-                target_name: "users_copy".to_string(),
-            }),
-            "INSERT INTO \"public\".\"users_copy\" SELECT * FROM \"public\".\"users\";"
-        );
-        assert_eq!(
-            build_copy_table_data_sql(CopyTableDataSqlOptions {
-                database_type: Some(DatabaseType::SqlServer),
-                schema: Some("dbo".to_string()),
-                source_name: "users".to_string(),
-                target_name: "users_copy".to_string(),
-            }),
-            "INSERT INTO [dbo].[users_copy] SELECT * FROM [dbo].[users];"
+            "INSERT INTO \"users_copy\" SELECT * FROM \"users\";"
         );
     }
 

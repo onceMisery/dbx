@@ -109,6 +109,7 @@ import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionObjectT
 import { hexToRgba } from "@/lib/color";
 import { focusSidebarRenameInput } from "@/lib/sidebarRenameFocus";
 import { hasTreeNodeDatabaseContext } from "@/lib/treeNodeContext";
+import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, type PasteTableMode, type TableClipboardContext } from "@/lib/tableClipboard";
 import { sidebarDisplayTableName } from "@/lib/sidebarTableNameDisplay";
 import { selectedTreeNodesInVisibleOrder as orderSelectedTreeNodes, treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebarTreeSelection";
 import { selectedConnectionDeleteTargets } from "@/lib/sidebarConnectionSelection";
@@ -748,10 +749,24 @@ function isPasteTreeClipboardShortcut(event: KeyboardEvent): boolean {
   return (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "v";
 }
 
+function pasteTableTargetContext(): TableClipboardContext | null {
+  if (!props.node.connectionId || !props.node.database) return null;
+  return {
+    connectionId: props.node.connectionId,
+    database: props.node.database,
+    schema: props.node.schema,
+  };
+}
+
+function canPasteTreeClipboardToCurrentNode(): boolean {
+  const clipboard = connectionStore.treeClipboard;
+  return clipboard?.kind === "table-copy" && tableClipboardMatchesTarget(clipboard.tables, pasteTableTargetContext());
+}
+
 function requestPasteTreeClipboard(): boolean {
   const clipboard = connectionStore.treeClipboard;
-  if (clipboard?.kind !== "table-copy" || clipboard.tables.length === 0) return false;
-  pasteTableMode.value = "structure-and-data";
+  if (clipboard?.kind !== "table-copy" || !canPasteTreeClipboardToCurrentNode()) return false;
+  pasteTableMode.value = defaultPasteTableMode(currentDatabaseType());
   pasteTableEntries.value = clipboard.tables.map((entry) => ({
     sourceName: entry.tableName,
     targetName: `${entry.tableName}_copy`,
@@ -1472,10 +1487,10 @@ const duplicateTableName = ref("");
 const duplicateStructureSource = ref<DuplicateStructureSource | null>(null);
 
 // Paste table dialog state
-type PasteTableMode = "structure-and-data" | "structure-only" | "data-only";
 const showPasteDialog = ref(false);
 const pasteTableMode = ref<PasteTableMode>("structure-and-data");
 const pasteTableEntries = ref<{ sourceName: string; targetName: string; connectionId: string; database: string; schema?: string }[]>([]);
+const pasteTableDataCopySupported = computed(() => supportsWholeRowTableDataCopy(currentDatabaseType()));
 
 const ddlTarget = ref<TreeNode | null>(null);
 const showDdlDialog = ref(false);
@@ -2561,6 +2576,7 @@ async function confirmPasteTable() {
   const entries = pasteTableEntries.value.filter((entry) => entry.targetName.trim());
   if (entries.length === 0) return;
   const mode = pasteTableMode.value;
+  const copyData = pasteTableModeCopiesData(mode) && pasteTableDataCopySupported.value;
   showPasteDialog.value = false;
   let successCount = 0;
   let failCount = 0;
@@ -2579,7 +2595,7 @@ async function confirmPasteTable() {
         });
         await api.executeQuery(entry.connectionId, entry.database, structureSql, entry.schema);
       }
-      if (mode === "structure-and-data" || mode === "data-only") {
+      if (copyData) {
         const dataSql = await buildCopyTableDataSql({
           databaseType,
           schema: entry.schema,
@@ -2625,11 +2641,11 @@ function copyTableToClipboard() {
 
 function openPasteTableDialog() {
   const clipboard = connectionStore.treeClipboard;
-  if (clipboard?.kind !== "table-copy" || clipboard.tables.length === 0) {
+  if (clipboard?.kind !== "table-copy" || !canPasteTreeClipboardToCurrentNode()) {
     toast(t("contextMenu.noTableToPaste"), 2000);
     return;
   }
-  pasteTableMode.value = "structure-and-data";
+  pasteTableMode.value = defaultPasteTableMode(currentDatabaseType());
   pasteTableEntries.value = clipboard.tables.map((entry) => ({
     sourceName: entry.tableName,
     targetName: `${entry.tableName}_copy`,
@@ -4138,7 +4154,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
     const canLoadAllObjectGroup = node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views";
     if (node.type === "group-tables" && canCreateTable.value) {
       items.push({ label: t("contextMenu.createTable"), action: createTable, icon: Plus });
-      if (connectionStore.treeClipboard?.kind === "table-copy" && connectionStore.treeClipboard.tables.length > 0) {
+      if (canPasteTreeClipboardToCurrentNode()) {
         items.push({ label: t("contextMenu.pasteTable"), action: openPasteTableDialog, icon: Clipboard });
       }
     }
@@ -4437,16 +4453,16 @@ function treeItemMenuItems(): ContextMenuItem[] {
       </DialogHeader>
       <div class="space-y-4">
         <div class="flex gap-2">
-          <label class="flex items-center gap-1.5 text-sm cursor-pointer">
-            <input v-model="pasteTableMode" type="radio" value="structure-and-data" class="accent-primary" />
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer" :class="{ 'opacity-50 cursor-not-allowed': !pasteTableDataCopySupported }">
+            <input v-model="pasteTableMode" type="radio" value="structure-and-data" class="accent-primary" :disabled="!pasteTableDataCopySupported" />
             {{ t("contextMenu.pasteOptionStructureAndData") }}
           </label>
           <label class="flex items-center gap-1.5 text-sm cursor-pointer">
             <input v-model="pasteTableMode" type="radio" value="structure-only" class="accent-primary" />
             {{ t("contextMenu.pasteOptionStructureOnly") }}
           </label>
-          <label class="flex items-center gap-1.5 text-sm cursor-pointer">
-            <input v-model="pasteTableMode" type="radio" value="data-only" class="accent-primary" />
+          <label class="flex items-center gap-1.5 text-sm cursor-pointer" :class="{ 'opacity-50 cursor-not-allowed': !pasteTableDataCopySupported }">
+            <input v-model="pasteTableMode" type="radio" value="data-only" class="accent-primary" :disabled="!pasteTableDataCopySupported" />
             {{ t("contextMenu.pasteOptionDataOnly") }}
           </label>
         </div>
