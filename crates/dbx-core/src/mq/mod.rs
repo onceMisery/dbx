@@ -20,6 +20,7 @@ pub mod types;
 pub(crate) mod util;
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
@@ -44,8 +45,13 @@ pub use crate::mq::types::*;
 /// racing to construct an adapter.
 #[derive(Default)]
 pub struct MqAdminRegistry {
-    instances: RwLock<HashMap<String, Arc<dyn MessageQueueAdmin>>>,
+    instances: RwLock<HashMap<String, CachedMqAdmin>>,
     build_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+struct CachedMqAdmin {
+    fingerprint: u64,
+    adapter: Arc<dyn MessageQueueAdmin>,
 }
 
 impl MqAdminRegistry {
@@ -66,9 +72,13 @@ impl MqAdminRegistry {
         mqc: MqAdminConfig,
         kafka_launch: Option<AgentLaunchSpec>,
     ) -> Result<Arc<dyn MessageQueueAdmin>, String> {
+        let fingerprint = adapter_fingerprint(&mqc, kafka_launch.as_ref());
+
         // Fast path: return the cached adapter.
-        if let Some(adapter) = self.instances.read().await.get(connection_id) {
-            return Ok(adapter.clone());
+        if let Some(entry) = self.instances.read().await.get(connection_id) {
+            if entry.fingerprint == fingerprint {
+                return Ok(entry.adapter.clone());
+            }
         }
 
         // Slow path: acquire a per-connection build lock so only one task
@@ -80,12 +90,17 @@ impl MqAdminRegistry {
         let _guard = lock.lock().await;
 
         // Another task may have built it while we were waiting for the lock.
-        if let Some(adapter) = self.instances.read().await.get(connection_id) {
-            return Ok(adapter.clone());
+        if let Some(entry) = self.instances.read().await.get(connection_id) {
+            if entry.fingerprint == fingerprint {
+                return Ok(entry.adapter.clone());
+            }
         }
 
         let adapter = build_adapter(mqc, kafka_launch).await?;
-        self.instances.write().await.insert(connection_id.to_string(), adapter.clone());
+        self.instances
+            .write()
+            .await
+            .insert(connection_id.to_string(), CachedMqAdmin { fingerprint, adapter: adapter.clone() });
         Ok(adapter)
     }
 
@@ -109,6 +124,13 @@ impl MqAdminRegistry {
     ) -> Result<Arc<dyn MessageQueueAdmin>, String> {
         build_adapter(mqc, kafka_launch).await
     }
+}
+
+fn adapter_fingerprint(mqc: &MqAdminConfig, kafka_launch: Option<&AgentLaunchSpec>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{mqc:?}").hash(&mut hasher);
+    format!("{kafka_launch:?}").hash(&mut hasher);
+    hasher.finish()
 }
 
 async fn build_adapter(

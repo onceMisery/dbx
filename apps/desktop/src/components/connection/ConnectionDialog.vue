@@ -121,6 +121,7 @@ const agentInstallError = ref("");
 const showConnectionErrorDialog = ref(false);
 const connectionErrorDetail = ref("");
 const editingId = ref<string | null>(null);
+const draftTestConnectionId = ref(uuid());
 const showVisibleDatabasesDialog = ref(false);
 const isLoadingVisibleDatabases = ref(false);
 const visibleDatabaseNames = ref<string[]>([]);
@@ -1810,7 +1811,7 @@ async function testConnection() {
   const runId = ++testRunId;
   isTesting.value = true;
   testResult.value = null;
-  const config = connectionConfigForSubmit(editingId.value || uuid());
+  const config = connectionConfigForSubmit(editingId.value || draftTestConnectionId.value);
   try {
     await ensureRequiredAgentDriverInstalled(config);
     const msg = await testConnectionWithTimeout(config, runId);
@@ -2891,9 +2892,10 @@ async function save() {
       await store.updateConnection(updated);
       store.stopEditing();
     } else {
-      const config = connectionConfigForSubmit(uuid());
+      const config = connectionConfigForSubmit(draftTestConnectionId.value);
       await ensureRequiredAgentDriverInstalled(config);
       await store.addConnection(config);
+      draftTestConnectionId.value = uuid();
       if (config.db_type === "jdbc") {
         open.value = false;
         return;

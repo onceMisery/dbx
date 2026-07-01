@@ -1021,8 +1021,17 @@ impl AppState {
                 // connection_id is recognized as valid.
                 let mqc = self.mq_admin_config_for_connection(connection_id, &config).await?;
                 let kafka_launch = crate::mq::service::resolve_kafka_launch_spec(&mqc, self);
-                let adapter = self.mq_registry.build_transient_config(mqc, kafka_launch).await?;
-                adapter.test_connection().await?;
+                let adapter = match self.mq_registry.get_or_build_config(connection_id, mqc, kafka_launch).await {
+                    Ok(adapter) => adapter,
+                    Err(err) => {
+                        self.mq_registry.drop_connection(connection_id).await;
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = adapter.test_connection().await {
+                    self.mq_registry.drop_connection(connection_id).await;
+                    return Err(err);
+                }
                 PoolKind::MessageQueue
             }
             #[cfg(not(feature = "mq-admin"))]
