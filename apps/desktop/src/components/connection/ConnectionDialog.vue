@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { uuid } from "@/lib/utils";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -36,6 +36,7 @@ import { agentDriverInstallKey, appendAgentDriverUpdateHint, hasAgentDriverUpdat
 import { prestoSqlBuiltinDriverPaths } from "@/lib/prestoSqlBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
+import { driverInstallProgressPercent, type DriverInstallProgress } from "@/lib/driverInstallProgressUi";
 import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connectionVisibleDatabases";
 import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForVisiblePicker, isSystemDatabaseName, normalizeVisibleDatabaseSelection, buildDraftVisibleSchemasConnectionId, normalizeVisibleSchemaSelection } from "@/lib/visibleDatabases";
@@ -111,6 +112,12 @@ const store = useConnectionStore();
 const isTesting = ref(false);
 const isSaving = ref(false);
 const testResult = ref<{ ok: boolean; message: string } | null>(null);
+const showAgentInstallDialog = ref(false);
+const agentInstallRunning = ref(false);
+const agentInstallDriverKey = ref("");
+const agentInstallLabel = ref("");
+const agentInstallProgress = ref<DriverInstallProgress | null>(null);
+const agentInstallError = ref("");
 const editingId = ref<string | null>(null);
 const showVisibleDatabasesDialog = ref(false);
 const isLoadingVisibleDatabases = ref(false);
@@ -125,6 +132,7 @@ const visibleSchemaNames = ref<string[]>([]);
 const visibleSchemaInitialSelection = ref<string[]>([]);
 const visibleSchemaError = ref("");
 let testRunId = 0;
+let unlistenAgentInstallProgress: (() => void) | null = null;
 
 function initialConfigTab(): ConfigTab {
   return props.initialTab ?? "connection";
@@ -878,6 +886,51 @@ async function refreshLocalAgentDrivers(): Promise<AgentDriverInstallState[]> {
   return drivers;
 }
 
+function beginAgentDriverInstall(driverKey: string, label: string) {
+  agentInstallDriverKey.value = driverKey;
+  agentInstallLabel.value = label;
+  agentInstallProgress.value = null;
+  agentInstallError.value = "";
+  agentInstallRunning.value = true;
+  showAgentInstallDialog.value = true;
+}
+
+function finishAgentDriverInstall() {
+  agentInstallRunning.value = false;
+  agentInstallProgress.value = null;
+  agentInstallError.value = "";
+  showAgentInstallDialog.value = false;
+}
+
+function failAgentDriverInstall(error: unknown) {
+  agentInstallRunning.value = false;
+  agentInstallError.value = errorMessage(error);
+  showAgentInstallDialog.value = true;
+}
+
+function setAgentInstallDialogOpen(value: boolean) {
+  if (value || canCloseAgentInstallDialog.value) {
+    showAgentInstallDialog.value = value;
+  }
+}
+
+function handleAgentInstallProgress(payload: DriverInstallProgress) {
+  if (!agentInstallRunning.value || !agentInstallDriverKey.value) return;
+  if (payload.db_type && payload.db_type !== agentInstallDriverKey.value) return;
+  if (payload.step === "done" || payload.step === "all-done") {
+    agentInstallProgress.value = null;
+    return;
+  }
+  agentInstallProgress.value = payload;
+}
+
+function formatInstallSize(bytes: number): string {
+  if (!bytes) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Promise<void> {
   const driverKey = agentDriverInstallKey(config.db_type, config.driver_profile);
   if (!driverKey) return;
@@ -891,8 +944,15 @@ async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Pro
 
   const label = config.driver_label || driverKey;
   testResult.value = { ok: true, message: `Installing ${label} driver...` };
-  await api.installAgent(driverKey);
-  await refreshLocalAgentDrivers();
+  beginAgentDriverInstall(driverKey, label);
+  try {
+    await api.installAgent(driverKey);
+    await refreshLocalAgentDrivers();
+    finishAgentDriverInstall();
+  } catch (error) {
+    failAgentDriverInstall(error);
+    throw error;
+  }
 }
 
 function isSqlServerLegacyUnencryptedMode(params: string | undefined): boolean {
@@ -1660,6 +1720,18 @@ const testResultMessage = computed(() => {
   if (!testResult.value) return "";
   return testResult.value.ok ? t("connection.testSuccess") : translateBackendError(t, testResult.value.message);
 });
+const agentInstallPercent = computed(() => driverInstallProgressPercent(agentInstallProgress.value));
+const agentInstallProgressLabel = computed(() => {
+  const progress = agentInstallProgress.value;
+  if (agentInstallError.value) return "安装失败";
+  if (!agentInstallRunning.value) return "等待安装";
+  if (!progress) return "准备安装驱动...";
+  if (progress.step === "jre-extract") return "解压 JRE...";
+  const label = progress.step === "jre" ? "下载 JRE" : progress.step === "driver" ? "下载驱动" : progress.step || "安装驱动";
+  if (!progress.total) return `${label}...`;
+  return `${label} ${formatInstallSize(progress.downloaded ?? 0)} / ${formatInstallSize(progress.total)} (${agentInstallPercent.value ?? 0}%)`;
+});
+const canCloseAgentInstallDialog = computed(() => !agentInstallRunning.value || !!agentInstallError.value);
 const sqlServerLegacyUnencryptedModeEnabled = computed({
   get: () => form.value.db_type === "sqlserver" && isSqlServerLegacyUnencryptedMode(form.value.url_params),
   set: (enabled: boolean) => {
@@ -2522,6 +2594,16 @@ async function copyTestResult() {
   }
 }
 
+async function copyAgentInstallError() {
+  if (!agentInstallError.value) return;
+  try {
+    await copyToClipboard(agentInstallError.value);
+    toast(t("grid.copied"));
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
 function resetForm() {
   editingId.value = null;
   form.value = defaultForm();
@@ -3079,6 +3161,15 @@ function onJdbcDriverSelect(id: any) {
   addJdbcDriverPaths(item.paths);
   jdbcManualClasspathOpen.value = false;
 }
+
+onMounted(async () => {
+  unlistenAgentInstallProgress = await api.listenAgentInstallProgress(handleAgentInstallProgress);
+});
+
+onUnmounted(() => {
+  unlistenAgentInstallProgress?.();
+  unlistenAgentInstallProgress = null;
+});
 
 function openExternalUrl(url: string) {
   if (isTauriRuntime()) {
@@ -4601,6 +4692,44 @@ function openExternalUrl(url: string) {
           </Button>
         </DialogFooter>
       </template>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog :open="showAgentInstallDialog" @update:open="setAgentInstallDialogOpen">
+    <DialogContent class="sm:max-w-[520px]" @interact-outside.prevent @escape-key-down.prevent>
+      <DialogHeader>
+        <DialogTitle>{{ agentInstallError ? "驱动安装失败" : "正在安装驱动" }}</DialogTitle>
+      </DialogHeader>
+
+      <div class="space-y-4">
+        <div class="rounded-lg border bg-muted/20 p-4">
+          <div class="flex items-center justify-between gap-3">
+            <div class="min-w-0">
+              <div class="truncate text-sm font-medium">{{ agentInstallLabel || agentInstallDriverKey }}</div>
+              <div class="mt-1 text-xs text-muted-foreground">{{ agentInstallProgressLabel }}</div>
+            </div>
+            <Loader2 v-if="agentInstallRunning && !agentInstallError" class="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
+          </div>
+          <div v-if="!agentInstallError" class="mt-4 h-2 overflow-hidden rounded-full bg-muted">
+            <div class="h-full rounded-full bg-primary transition-all" :class="{ 'animate-pulse': agentInstallPercent === null }" :style="{ width: `${agentInstallPercent ?? 35}%` }" />
+          </div>
+        </div>
+
+        <div v-if="agentInstallError" class="space-y-2">
+          <div class="text-sm font-medium text-destructive">完整错误</div>
+          <pre class="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/30 p-3 text-xs leading-5 text-destructive">{{ agentInstallError }}</pre>
+        </div>
+      </div>
+
+      <DialogFooter class="gap-2">
+        <Button v-if="agentInstallError" variant="outline" @click="copyAgentInstallError">
+          <Copy class="mr-1.5 h-3.5 w-3.5" />
+          复制错误
+        </Button>
+        <Button :disabled="!canCloseAgentInstallDialog" @click="showAgentInstallDialog = false">
+          {{ agentInstallError ? "关闭" : "安装中..." }}
+        </Button>
+      </DialogFooter>
     </DialogContent>
   </Dialog>
 

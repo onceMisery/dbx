@@ -488,7 +488,25 @@ async fn install_agent_driver_with_batch(
 ) -> Result<(), String> {
     match fetch_registry().await {
         Ok(registry) => {
-            install_agent_driver_from_registry(am, &registry, db_type, progress, current, total_drivers).await
+            match install_agent_driver_from_registry(am, &registry, db_type, progress, current, total_drivers).await {
+                Ok(()) => Ok(()),
+                Err(registry_err) => {
+                    if let Some(local_jar) = find_local_agent_jar(db_type) {
+                        install_local_agent_with_registry_jre(
+                            am,
+                            &registry,
+                            db_type,
+                            local_jar,
+                            progress,
+                            current,
+                            total_drivers,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(registry_err)
+                }
+            }
         }
         Err(registry_err) => {
             if let Some(local_jar) = find_local_agent_jar(db_type) {
@@ -547,6 +565,30 @@ async fn ensure_jre_from_registry(
     Ok(())
 }
 
+async fn install_local_agent_with_registry_jre(
+    am: &AgentManager,
+    registry: &AgentRegistry,
+    db_type: &str,
+    local_jar: PathBuf,
+    progress: &impl Fn(AgentProgressEvent),
+    current: Option<u32>,
+    total_drivers: Option<u32>,
+) -> Result<(), String> {
+    let jre_key = DEFAULT_JRE_KEY;
+    if jre_needs_install(am, registry, jre_key) {
+        ensure_jre_from_registry(am, registry, jre_key, db_type, progress, current, total_drivers).await?;
+    }
+    install_local_agent(am, db_type, local_jar)?;
+    if let Some(jre_info) = registry.resolve_jre(jre_key) {
+        let mut local_state = am.load_state();
+        local_state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone());
+        am.save_state(&local_state)?;
+    }
+    am.stop_daemon_by_key(db_type).await;
+    progress(AgentProgressEvent::step("done"));
+    Ok(())
+}
+
 async fn install_agent_driver_from_registry(
     am: &AgentManager,
     registry: &AgentRegistry,
@@ -557,18 +599,8 @@ async fn install_agent_driver_from_registry(
 ) -> Result<(), String> {
     let Some(driver) = agent_registry_driver(registry, db_type) else {
         if let Some(local_jar) = find_local_agent_jar(db_type) {
-            let jre_key = DEFAULT_JRE_KEY;
-            if jre_needs_install(am, registry, jre_key) {
-                ensure_jre_from_registry(am, registry, jre_key, db_type, progress, current, total_drivers).await?;
-            }
-            install_local_agent(am, db_type, local_jar)?;
-            if let Some(jre_info) = registry.resolve_jre(jre_key) {
-                let mut local_state = am.load_state();
-                local_state.jre_versions.insert(jre_key.to_string(), jre_info.version.clone());
-                am.save_state(&local_state)?;
-            }
-            am.stop_daemon_by_key(db_type).await;
-            progress(AgentProgressEvent::step("done"));
+            install_local_agent_with_registry_jre(am, registry, db_type, local_jar, progress, current, total_drivers)
+                .await?;
             return Ok(());
         }
         return Err(format!("Unknown driver type: {db_type}"));
