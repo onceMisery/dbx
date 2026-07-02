@@ -309,6 +309,7 @@ pub async fn execute_query(
             client_session_id: req.client_session_id,
             timeout_secs: req.timeout_secs,
             execution_id: Some(execution_id),
+            ..Default::default()
         },
     )
     .await
@@ -345,6 +346,7 @@ pub async fn execute_multi(
             client_session_id: req.client_session_id,
             timeout_secs: req.timeout_secs,
             execution_id: Some(execution_id),
+            ..Default::default()
         },
     )
     .await

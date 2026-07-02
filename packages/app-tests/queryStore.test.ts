@@ -101,6 +101,22 @@ test("renames query tab titles", () => {
   assert.equal(tab?.customTitle, true);
 });
 
+test("closing an active data tab restores the previously focused query tab", () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const firstQueryId = store.createTab("conn-1", "db", "query_1", "query");
+  store.createTab("conn-1", "db", "query_2", "query");
+
+  store.activeTabId = firstQueryId;
+  const dataTabId = store.createTab("conn-1", "db", "public.users", "data", "public");
+
+  assert.equal(store.activeTabId, dataTabId);
+
+  store.closeTab(dataTabId);
+
+  assert.equal(store.activeTabId, firstQueryId);
+});
+
 test("linkExternalSqlPath records the local path and detaches saved SQL", () => {
   setActivePinia(createPinia());
   const store = useQueryStore();

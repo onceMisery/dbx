@@ -447,9 +447,12 @@ function clearSidebarSelection() {
 
 async function createNewGroup() {
   const groupId = store.createConnectionGroup(t("connectionGroup.newGroupDefault"));
+  await startRenamingCreatedGroup(groupId);
+}
+
+async function startRenamingCreatedGroup(groupId: string) {
   pendingRenameGroupId.value = groupId;
   store.selectedTreeNodeId = groupId;
-
   if (isFiltering.value) {
     searchQuery.value = "";
     deferredSearchQuery.value = "";
@@ -921,7 +924,16 @@ defineExpose({ focusSearch, createNewGroup });
         flow-mode
       >
         <template #default="{ item }">
-          <TreeItem :node="item.node" :depth="item.depth" :drag-disabled="isFiltering" :pending-rename="pendingRenameGroupId === item.node.id" :highlighted="highlightedNodeId === item.node.id" @search-toggle="onSearchToggle" @rename-started="pendingRenameGroupId = null" />
+          <TreeItem
+            :node="item.node"
+            :depth="item.depth"
+            :drag-disabled="isFiltering"
+            :pending-rename="pendingRenameGroupId === item.node.id"
+            :highlighted="highlightedNodeId === item.node.id"
+            @search-toggle="onSearchToggle"
+            @rename-started="pendingRenameGroupId = null"
+            @group-created="startRenamingCreatedGroup"
+          />
         </template>
       </RecycleScroller>
       <div v-if="stickyNode" class="sticky-database-header pointer-events-auto absolute inset-x-0 top-0 z-[5] border-b border-border/60" :style="stickyHeaderStyle">
@@ -943,6 +955,7 @@ defineExpose({ focusSearch, createNewGroup });
           :highlighted="highlightedNodeId === item.id"
           @search-toggle="onSearchToggle"
           @rename-started="pendingRenameGroupId = null"
+          @group-created="startRenamingCreatedGroup"
         />
       </div>
       <div v-if="hasSidebarVerticalOverflow" ref="sidebarScrollbarTrackRef" class="sidebar-tree-scrollbar" :class="{ 'sidebar-tree-scrollbar--scrolling': isScrollingSidebar, 'sidebar-tree-scrollbar--dragging': isDraggingSidebarScrollbar }" @pointerdown="onSidebarScrollbarTrackPointerDown">

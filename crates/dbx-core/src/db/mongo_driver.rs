@@ -73,6 +73,11 @@ fn normalize_mongo_uri_direct_connection(uri: &str) -> String {
 }
 
 fn is_multi_host_mongo_uri(url: &str) -> bool {
+    if url.get(..14).is_some_and(|scheme| scheme.eq_ignore_ascii_case("mongodb+srv://")) {
+        // SRV URLs expand to a DNS seed list during driver parsing, so forcing
+        // directConnection would be rejected even though the URI shows one host.
+        return true;
+    }
     let rest = match url.strip_prefix("mongodb://").or_else(|| url.strip_prefix("mongodb+srv://")) {
         Some(r) => r,
         None => return false,
@@ -923,6 +928,16 @@ mod tests {
         let normalized = normalize_mongo_uri_direct_connection(uri);
 
         assert_eq!(normalized, "mongodb://host1:27017,host2:27017/admin?authSource=admin#read");
+    }
+
+    #[test]
+    fn srv_uri_removes_direct_connection_true_before_driver_parse() {
+        let uri = "mongodb+srv://read:pass@cluster.example.net/admin?tls=true&directConnection=true&replicaSet=rs0";
+
+        let normalized = normalize_mongo_uri_direct_connection(uri);
+
+        assert_eq!(normalized, "mongodb+srv://read:pass@cluster.example.net/admin?tls=true&replicaSet=rs0");
+        assert!(is_multi_host_mongo_uri(&normalized));
     }
 
     #[test]

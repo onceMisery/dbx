@@ -2194,6 +2194,24 @@ async fn execute_transfer_ddl_on_pool(
     Ok(())
 }
 
+fn transfer_table_already_exists_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("already exists")
+        || lower.contains("there is already")
+        || lower.contains("duplicate_table")
+        || lower.contains("42p07")
+        || error.contains("已经存在")
+        || error.contains("已存在")
+}
+
+fn transfer_create_table_created(result: Result<(), String>, error_prefix: &str) -> Result<bool, String> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) if transfer_table_already_exists_error(&e) => Ok(false),
+        Err(e) => Err(format!("{error_prefix}: {e}")),
+    }
+}
+
 fn transfer_ddl_statements(sql: &str, db_type: &DatabaseType) -> Vec<String> {
     if matches!(db_type, DatabaseType::Postgres) {
         let statements = split_sql_statements(sql);
@@ -3328,42 +3346,55 @@ where
                     sql_target_columns.iter().map(|column| Some(column.data_type.clone())).collect();
 
                 if request.create_table {
-                    let ddl = generate_create_table_ddl(
-                        &sql_target_columns,
-                        &target_table,
-                        &request.source_schema,
+                    let target_table_preexisting = crate::schema::list_tables_core(
+                        state,
+                        &request.target_connection_id,
+                        &request.target_database,
                         &request.target_schema,
-                        target_db_type,
-                        source_db_type,
+                        Some(&target_table),
+                        Some(1),
                         None,
-                    );
-                    let table_exists = match execute_on_pool(state, target_pool_key, &ddl).await {
-                        Ok(_) => true,
-                        Err(e) => {
-                            let err_lower = e.to_lowercase();
-                            if err_lower.contains("already exists") || err_lower.contains("there is already") {
-                                true
-                            } else {
-                                return Err(format!("Failed to create table from MongoDB collection '{table}': {e}"));
-                            }
-                        }
-                    };
-                    if table_exists {
-                        for stmt in generate_comment_ddl(
+                        None,
+                    )
+                    .await
+                    .map(|tables| !tables.is_empty())
+                    .unwrap_or(false);
+                    if !target_table_preexisting {
+                        let ddl = generate_create_table_ddl(
                             &sql_target_columns,
                             &target_table,
+                            &request.source_schema,
                             &request.target_schema,
                             target_db_type,
+                            source_db_type,
                             None,
-                        ) {
-                            if let Err(e) = execute_on_pool(state, target_pool_key, &stmt).await {
-                                log::warn!(
-                                    "[transfer] failed to set MongoDB transfer column comment for {}: {}",
-                                    target_table,
-                                    e
-                                );
+                        );
+                        let target_table_created = transfer_create_table_created(
+                            execute_on_pool(state, target_pool_key, &ddl).await.map(|_| ()),
+                            &format!("Failed to create table from MongoDB collection '{table}'"),
+                        )?;
+                        if target_table_created {
+                            for stmt in generate_comment_ddl(
+                                &sql_target_columns,
+                                &target_table,
+                                &request.target_schema,
+                                target_db_type,
+                                None,
+                            ) {
+                                if let Err(e) = execute_on_pool(state, target_pool_key, &stmt).await {
+                                    log::warn!(
+                                        "[transfer] failed to set MongoDB transfer column comment for {}: {}",
+                                        target_table,
+                                        e
+                                    );
+                                }
                             }
                         }
+                    } else {
+                        log::info!(
+                            "[transfer] target table {} already exists, skipping create-table DDL",
+                            target_table
+                        );
                     }
                 }
 
@@ -3513,7 +3544,7 @@ where
     .next()
     .and_then(|t| t.comment);
 
-    let target_table_preexisting = crate::schema::list_tables_core(
+    let mut target_table_preexisting = crate::schema::list_tables_core(
         state,
         &request.target_connection_id,
         &request.target_database,
@@ -3566,31 +3597,52 @@ where
                 .await
                 .map_err(|e| format!("Failed to ensure schema exists: {e}"))?;
         }
-        let owned_sequences = prepare_postgres_owned_sequences_for_transfer(
-            state,
-            request,
-            table,
-            &target_table,
-            source_pool_key,
-            target_pool_key,
-            pg_compat_transfer,
-            preserves_target_table_name,
-            target_table_preexisting,
-        )
-        .await?;
-        let can_reuse_source_ddl =
-            can_reuse_source_table_ddl(source_db_type, target_db_type, preserves_target_table_name);
-        let ddl = if can_reuse_source_ddl {
-            let source_ddl = crate::schema::get_table_ddl_core(
-                &state,
-                &request.source_connection_id,
-                &request.source_database,
-                &request.source_schema,
+        if target_table_preexisting {
+            log::info!("[transfer] target table {} already exists, skipping create-table DDL", target_table);
+        } else {
+            let owned_sequences = prepare_postgres_owned_sequences_for_transfer(
+                state,
+                request,
                 table,
-                None,
+                &target_table,
+                source_pool_key,
+                target_pool_key,
+                pg_compat_transfer,
+                preserves_target_table_name,
+                target_table_preexisting,
             )
-            .await
-            .unwrap_or_else(|_| {
+            .await?;
+            let can_reuse_source_ddl =
+                can_reuse_source_table_ddl(source_db_type, target_db_type, preserves_target_table_name);
+            let ddl = if can_reuse_source_ddl {
+                let source_ddl = crate::schema::get_table_ddl_core(
+                    &state,
+                    &request.source_connection_id,
+                    &request.source_database,
+                    &request.source_schema,
+                    table,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    generate_create_table_ddl(
+                        &columns,
+                        &target_table,
+                        &request.source_schema,
+                        &request.target_schema,
+                        target_db_type,
+                        source_db_type,
+                        table_comment.as_deref(),
+                    )
+                });
+                rewrite_transfer_source_table_ddl(
+                    &source_ddl,
+                    &request.source_schema,
+                    &request.target_schema,
+                    source_db_type,
+                    target_db_type,
+                )
+            } else {
                 generate_create_table_ddl(
                     &columns,
                     &target_table,
@@ -3600,58 +3652,38 @@ where
                     source_db_type,
                     table_comment.as_deref(),
                 )
-            });
-            rewrite_transfer_source_table_ddl(
-                &source_ddl,
-                &request.source_schema,
-                &request.target_schema,
-                source_db_type,
-                target_db_type,
-            )
-        } else {
-            generate_create_table_ddl(
-                &columns,
-                &target_table,
-                &request.source_schema,
-                &request.target_schema,
-                target_db_type,
-                source_db_type,
-                table_comment.as_deref(),
-            )
-        };
-        log::info!("[transfer] creating target table: {}", ddl.chars().take(200).collect::<String>());
-        let table_exists = match execute_transfer_ddl_on_pool(state, target_pool_key, &ddl, target_db_type).await {
-            Ok(_) => true,
-            Err(e) => {
-                let err_lower = e.to_lowercase();
-                if err_lower.contains("already exists") || err_lower.contains("there is already") {
-                    true
-                } else {
-                    return Err(format!("Failed to create table: {e}"));
+            };
+            log::info!("[transfer] creating target table: {}", ddl.chars().take(200).collect::<String>());
+            let target_table_created = transfer_create_table_created(
+                execute_transfer_ddl_on_pool(state, target_pool_key, &ddl, target_db_type).await,
+                "Failed to create table",
+            )?;
+            if target_table_created {
+                let comment_stmts = generate_comment_ddl(
+                    &columns,
+                    &target_table,
+                    &request.target_schema,
+                    target_db_type,
+                    table_comment.as_deref(),
+                );
+                for stmt in &comment_stmts {
+                    if let Err(e) = execute_on_pool(state, target_pool_key, stmt).await {
+                        log::warn!("[transfer] failed to set column comment for {}: {}", target_table, e);
+                    }
                 }
+                bind_postgres_owned_sequences_for_transfer(
+                    state,
+                    request,
+                    &target_table,
+                    target_pool_key,
+                    &owned_sequences,
+                )
+                .await?;
+            } else {
+                // DDL may report the table already exists even when metadata
+                // lookup missed it (case/schema differences or localized errors).
+                target_table_preexisting = true;
             }
-        };
-        if table_exists {
-            let comment_stmts = generate_comment_ddl(
-                &columns,
-                &target_table,
-                &request.target_schema,
-                target_db_type,
-                table_comment.as_deref(),
-            );
-            for stmt in &comment_stmts {
-                if let Err(e) = execute_on_pool(state, target_pool_key, stmt).await {
-                    log::warn!("[transfer] failed to set column comment for {}: {}", target_table, e);
-                }
-            }
-            bind_postgres_owned_sequences_for_transfer(
-                state,
-                request,
-                &target_table,
-                target_pool_key,
-                &owned_sequences,
-            )
-            .await?;
         }
     }
 
@@ -4534,6 +4566,28 @@ mod tests {
         assert_eq!(
             statements,
             vec!["CREATE TABLE \"public\".\"audit_logs\" (\n  \"id\" integer,\n  \"user_id\" integer\n)".to_string()]
+        );
+    }
+
+    #[test]
+    fn transfer_create_table_result_treats_existing_table_as_preexisting() {
+        assert_eq!(
+            transfer_create_table_created(
+                Err("ERROR: relation \"items\" already exists (SQLSTATE 42P07)".to_string()),
+                "create"
+            )
+            .unwrap(),
+            false
+        );
+        assert_eq!(
+            transfer_create_table_created(Err("错误: 关系 \"items\" 已经存在".to_string()), "create").unwrap(),
+            false
+        );
+        assert_eq!(transfer_create_table_created(Ok(()), "create").unwrap(), true);
+        assert_eq!(
+            transfer_create_table_created(Err("permission denied for schema public".to_string()), "create")
+                .unwrap_err(),
+            "create: permission denied for schema public"
         );
     }
 

@@ -466,13 +466,33 @@ fn responses_token_usage(event: &serde_json::Value) -> Option<TokenUsage> {
     Some(TokenUsage { input_tokens: input as u32, output_tokens: output as u32 })
 }
 
+fn is_openai_api_endpoint(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.eq_ignore_ascii_case("api.openai.com")))
+        .unwrap_or(false)
+}
+
 fn is_openai_api_config(config: &AiConfig) -> bool {
-    matches!(config.provider, AiProvider::Openai) || config.endpoint.to_ascii_lowercase().contains("api.openai.com")
+    // OpenAI provider can be routed through a custom proxy while still requiring OpenAI request semantics.
+    matches!(config.provider, AiProvider::Openai) || is_openai_api_endpoint(&config.endpoint)
 }
 
 fn is_openai_reasoning_model(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
     model.starts_with("gpt-5") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4")
+}
+
+fn uses_openai_max_completion_tokens(config: &AiConfig) -> bool {
+    is_openai_api_config(config) && is_openai_reasoning_model(&config.model)
+}
+
+fn set_chat_completion_token_limit(body: &mut serde_json::Value, config: &AiConfig, max_tokens: u32) {
+    if uses_openai_max_completion_tokens(config) {
+        body["max_completion_tokens"] = json!(max_tokens);
+    } else {
+        body["max_tokens"] = json!(max_tokens);
+    }
 }
 
 /// Kimi K2.5+ models (including K2.7-Code) require fixed sampling parameters:
@@ -497,7 +517,7 @@ fn is_kimi_model(model: &str) -> bool {
 }
 
 pub fn supports_temperature(config: &AiConfig) -> bool {
-    !(is_kimi_model(&config.model) || is_openai_api_config(config) && is_openai_reasoning_model(&config.model))
+    !(is_kimi_model(&config.model) || uses_openai_max_completion_tokens(config))
 }
 
 fn add_temperature_if_supported_for_config(body: &mut serde_json::Value, config: &AiConfig, temperature: Option<f32>) {
@@ -893,8 +913,8 @@ pub async fn call_openai_compatible(client: &reqwest::Client, request: AiComplet
     let mut body_obj = json!({
         "model": request.config.model,
         "messages": messages,
-        "max_tokens": request.max_tokens.unwrap_or(2048),
     });
+    set_chat_completion_token_limit(&mut body_obj, &request.config, request.max_tokens.unwrap_or(2048));
     add_temperature_if_supported(&mut body_obj, &request);
     if !request.config.enable_thinking && !is_kimi_model(&request.config.model) {
         body_obj["extra_body"] = json!({
@@ -1150,12 +1170,13 @@ pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionR
                 })
             } else {
                 let messages = vec![json!({ "role": "user", "content": TEST_PROMPT })];
-                json!({
+                let mut body = json!({
                     "model": &model,
                     "messages": messages,
-                    "max_tokens": 16,
                     "stream": true,
-                })
+                });
+                set_chat_completion_token_limit(&mut body, config, 16);
+                body
             };
             add_temperature_if_supported_for_config(&mut body_obj, config, Some(0.0));
             if config.api_style != AiApiStyle::Responses && !config.enable_thinking && !is_kimi_model(&config.model) {
@@ -1411,9 +1432,9 @@ async fn stream_openai(
     let mut body_obj = json!({
         "model": request.config.model,
         "messages": messages,
-        "max_tokens": request.max_tokens.unwrap_or(2048),
         "stream": true,
     });
+    set_chat_completion_token_limit(&mut body_obj, &request.config, request.max_tokens.unwrap_or(2048));
     add_temperature_if_supported(&mut body_obj, request);
     if !request.config.enable_thinking && !is_kimi_model(&request.config.model) {
         body_obj["extra_body"] = json!({
@@ -1968,12 +1989,12 @@ async fn stream_openai_with_tools(
     let mut body = json!({
         "model": request.config.model,
         "messages": messages,
-        "max_tokens": request.max_tokens.unwrap_or(4096),
         "tools": tool_json,
         "tool_choice": "auto",
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    set_chat_completion_token_limit(&mut body, &request.config, request.max_tokens.unwrap_or(4096));
     add_temperature_if_supported(&mut body, request);
 
     let res = client
@@ -2460,10 +2481,10 @@ mod tests {
         claude_headers, claude_system_prompt, drain_next_stream_line, emit_responses_function_call_item, gemini_text,
         is_kimi_model, openai_response_text, openai_stream_reasoning, openai_stream_text, parse_model_list_response,
         resolve_endpoint, resolve_model_list_endpoint, responses_function_tool, responses_max_output_tokens,
-        responses_stream_text, responses_text, responses_token_usage, stream_data_payload, supports_temperature,
-        temperature_value, uses_anthropic_messages_api, validate_config, AiApiStyle, AiAuthMethod, AiConfig, AiMessage,
-        AiModelInfo, AiProvider, AiReasoningLevel, StreamToolEvent, StreamingToolCallAccumulator, ToolCallRef,
-        AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
+        responses_stream_text, responses_text, responses_token_usage, set_chat_completion_token_limit,
+        stream_data_payload, supports_temperature, temperature_value, uses_anthropic_messages_api, validate_config,
+        AiApiStyle, AiAuthMethod, AiConfig, AiMessage, AiModelInfo, AiProvider, AiReasoningLevel, StreamToolEvent,
+        StreamingToolCallAccumulator, ToolCallRef, AUTHORIZATION, CLAUDE_DEFAULT_SYSTEM, TEST_PROMPT,
     };
 
     /// Reproduce the "Unknown tool:" bug: some OpenAI-compatible providers
@@ -3090,6 +3111,10 @@ mod tests {
         config.model = "gpt-4o".to_string();
         assert!(supports_temperature(&config));
 
+        config.endpoint = "http://localhost:11434/v1".to_string();
+        config.model = "gpt-5-proxy".to_string();
+        assert!(!supports_temperature(&config));
+
         config.provider = AiProvider::OpenaiCompatible;
         config.endpoint = "http://localhost:11434/v1".to_string();
         config.model = "gpt-5-local".to_string();
@@ -3129,6 +3154,71 @@ mod tests {
         config.model = "kimi-k2.4".to_string();
         assert!(supports_temperature(&config));
         assert!(!is_kimi_model(&config.model));
+    }
+
+    #[test]
+    fn uses_max_completion_tokens_for_openai_reasoning_chat_completions() {
+        let mut config = AiConfig {
+            provider: AiProvider::Openai,
+            api_key: "key".to_string(),
+            auth_method: AiAuthMethod::Bearer,
+            endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
+            model: "gpt-5.5".to_string(),
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: true,
+            reasoning_level: AiReasoningLevel::Default,
+            context_window: None,
+            codex_cli_path: None,
+            codex_cli_env: Default::default(),
+        };
+
+        let mut body = serde_json::json!({
+            "model": &config.model,
+            "messages": [{ "role": "user", "content": TEST_PROMPT }],
+            "stream": true,
+        });
+        set_chat_completion_token_limit(&mut body, &config, 1024);
+
+        assert_eq!(body.get("max_completion_tokens"), Some(&serde_json::json!(1024)));
+        assert!(body.get("max_tokens").is_none());
+
+        config.model = "gpt-4o".to_string();
+        let mut body = serde_json::json!({
+            "model": &config.model,
+            "messages": [{ "role": "user", "content": TEST_PROMPT }],
+            "stream": true,
+        });
+        set_chat_completion_token_limit(&mut body, &config, 1024);
+
+        assert_eq!(body.get("max_tokens"), Some(&serde_json::json!(1024)));
+        assert!(body.get("max_completion_tokens").is_none());
+
+        config.endpoint = "http://localhost:11434/v1".to_string();
+        config.model = "gpt-5-proxy".to_string();
+        let mut body = serde_json::json!({
+            "model": &config.model,
+            "messages": [{ "role": "user", "content": TEST_PROMPT }],
+            "stream": true,
+        });
+        set_chat_completion_token_limit(&mut body, &config, 1024);
+
+        assert_eq!(body.get("max_completion_tokens"), Some(&serde_json::json!(1024)));
+        assert!(body.get("max_tokens").is_none());
+
+        config.provider = AiProvider::OpenaiCompatible;
+        config.endpoint = "http://localhost:11434/v1".to_string();
+        config.model = "gpt-5-local".to_string();
+        let mut body = serde_json::json!({
+            "model": &config.model,
+            "messages": [{ "role": "user", "content": TEST_PROMPT }],
+            "stream": true,
+        });
+        set_chat_completion_token_limit(&mut body, &config, 1024);
+
+        assert_eq!(body.get("max_tokens"), Some(&serde_json::json!(1024)));
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]

@@ -657,6 +657,22 @@ export async function executeInTransaction(connectionId: string, database: strin
   return post("/api/query/execute-in-transaction", { connectionId, database, statements, schema });
 }
 
+export async function beginManualTransaction(_connectionId: string, _database: string, _schema?: string): Promise<string> {
+  throw new Error("Manual transaction management is only available in the desktop app.");
+}
+
+export async function executeInManualTransaction(_txnSessionId: string, _sql: string, _database: string, _schema?: string, _maxRows?: number): Promise<QueryResult[]> {
+  throw new Error("Manual transaction management is only available in the desktop app.");
+}
+
+export async function commitManualTransaction(_txnSessionId: string): Promise<QueryResult> {
+  throw new Error("Manual transaction management is only available in the desktop app.");
+}
+
+export async function rollbackManualTransaction(_txnSessionId: string): Promise<QueryResult> {
+  throw new Error("Manual transaction management is only available in the desktop app.");
+}
+
 export async function cancelQuery(executionId: string): Promise<boolean> {
   const result = await post<boolean | { cancelled?: boolean }>("/api/query/cancel", { executionId });
   return typeof result === "boolean" ? result : result.cancelled === true;

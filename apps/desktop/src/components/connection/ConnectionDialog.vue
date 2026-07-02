@@ -3629,7 +3629,7 @@ function openExternalUrl(url: string) {
                   <template v-if="mqAuthKind === 'token'">
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">Token</Label>
-                      <Input v-model="mqToken" type="password" class="col-span-3" />
+                      <PasswordInput v-model="mqToken" class="col-span-3" />
                     </div>
                   </template>
                   <template v-else-if="mqAuthKind === 'basic'">
@@ -3639,7 +3639,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
-                      <Input v-model="mqBasicPassword" type="password" class="col-span-3" />
+                      <PasswordInput v-model="mqBasicPassword" class="col-span-3" />
                     </div>
                     <div v-if="mqSystemKind === 'kafka'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">SASL Mechanism</Label>
@@ -3662,7 +3662,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">Value</Label>
-                      <Input v-model="mqApiKeyValue" type="password" class="col-span-3" />
+                      <PasswordInput v-model="mqApiKeyValue" class="col-span-3" />
                     </div>
                   </template>
                   <template v-else-if="mqAuthKind === 'oauth2'">
@@ -3676,7 +3676,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">Client Secret</Label>
-                      <Input v-model="mqOauthClientSecret" type="password" class="col-span-3" />
+                      <PasswordInput v-model="mqOauthClientSecret" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">Audience</Label>

@@ -1245,9 +1245,18 @@ fn normalize_mongo_uri_query_path(uri: &str) -> String {
 }
 
 fn mongo_uri_has_multiple_seeds(uri: &str) -> bool {
+    if mongo_uri_is_srv(uri) {
+        // The Rust MongoDB driver resolves SRV records into a seed list, so an
+        // SRV URL must not keep directConnection=true even with one hostname.
+        return true;
+    }
     mongo_uri_host_section(uri)
         .map(|hosts| hosts.split(',').filter(|host| !host.trim().is_empty()).count() > 1)
         .unwrap_or(false)
+}
+
+fn mongo_uri_is_srv(uri: &str) -> bool {
+    uri.get(..14).is_some_and(|scheme| scheme.eq_ignore_ascii_case("mongodb+srv://"))
 }
 
 fn mongo_uri_host_section(uri: &str) -> Option<&str> {
@@ -2407,6 +2416,19 @@ mod tests {
         let url = config.connection_url();
 
         assert_eq!(url, "mongodb://read:pass@host1:27017,host2:27017/admin?replicaSet=rs0&authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_srv_connection_string_removes_direct_connection_true() {
+        let mut config = mongodb_config("root", "secret", Some("admin"));
+        config.connection_string = Some(
+            "mongodb+srv://read:pass@cluster.example.net/admin?tls=true&authSource=admin&directConnection=true&replicaSet=rs0"
+                .to_string(),
+        );
+
+        let url = config.connection_url();
+
+        assert_eq!(url, "mongodb+srv://read:pass@cluster.example.net/admin?tls=true&authSource=admin&replicaSet=rs0");
     }
 
     #[test]

@@ -876,15 +876,7 @@ pub async fn get_table_comment_core(
                                 &sql,
                                 Some(database),
                                 Some(schema),
-                                QueryExecutionOptions {
-                                    max_rows: Some(1),
-                                    fetch_size: None,
-                                    page_size: None,
-                                    result_session_id: None,
-                                    client_session_id: None,
-                                    timeout_secs: None,
-                                    execution_id: None,
-                                },
+                                QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
                             ),
                             timeout,
                         )

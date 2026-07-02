@@ -176,6 +176,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "rename-started": [];
+  "group-created": [groupId: string];
   "node-toggled": [node: TreeNode, wasExpanded: boolean];
   "search-toggle": [node: TreeNode];
 }>();
@@ -3522,6 +3523,7 @@ function newConnectionInGroup() {
 function newSubgroup() {
   const groupId = connectionStore.createConnectionGroup(t("connectionGroup.newGroupDefault"), props.node.id);
   connectionStore.selectedTreeNodeId = groupId;
+  emit("group-created", groupId);
 }
 
 function confirmDeleteGroup() {

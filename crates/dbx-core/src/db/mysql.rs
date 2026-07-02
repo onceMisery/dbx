@@ -218,7 +218,7 @@ fn mysql_bytes_to_json(bytes: Vec<u8>, column: &mysql_async::Column) -> serde_js
 /// Map a MySQL column to a user-facing type name for the result-grid header.
 /// Returns the bare lowercase type name (no length/precision/signedness), which
 /// is enough for display; unknown variants fall back to a lowercased debug name.
-fn mysql_column_type_name(ty: ColumnType) -> String {
+pub(crate) fn mysql_column_type_name(ty: ColumnType) -> String {
     use mysql_async::consts::ColumnType::*;
     match ty {
         MYSQL_TYPE_TINY => "tinyint",
@@ -251,7 +251,7 @@ fn mysql_column_type_name(ty: ColumnType) -> String {
     .to_string()
 }
 
-fn mysql_value_to_json(row: &mysql_async::Row, idx: usize) -> serde_json::Value {
+pub(crate) fn mysql_value_to_json(row: &mysql_async::Row, idx: usize) -> serde_json::Value {
     let Some(column) = row.columns_ref().get(idx) else {
         return serde_json::Value::Null;
     };

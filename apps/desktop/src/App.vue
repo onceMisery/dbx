@@ -1622,8 +1622,19 @@ onUnmounted(() => {
                   :block-dangerous-redis-commands="blockDangerousRedisCommands"
                   :sql-keyword-case="settingsStore.editorSettings.sqlFormatter.keywordCase"
                   :database-required-signal="databaseRequiredTabId === activeTab.id ? databaseRequiredSignal : 0"
+                  :auto-commit="activeTab.autoCommit ?? true"
+                  :txn-session-id="activeTab?.txnSessionId"
+                  :txn-auto-rolled-back="activeTab?.txnAutoRolledBack"
                   @update:explain-mode="(m: 'explain' | 'autotrace') => (explainMode = m)"
                   @update:block-dangerous-redis-commands="(v: boolean) => (blockDangerousRedisCommands = v)"
+                  @update:auto-commit="
+                    (v: boolean) => {
+                      if (activeTab) queryStore.setAutoCommit(activeTab.id, v);
+                    }
+                  "
+                  @commit="activeTab && queryStore.commitTransaction(activeTab.id)"
+                  @rollback="activeTab && queryStore.rollbackTransaction(activeTab.id)"
+                  @dismiss-txn-rolled-back="activeTab && (activeTab.txnAutoRolledBack = false)"
                   @execute="requestActiveEditorExecute()"
                   @cancel="cancelActiveExecution()"
                   @explain="tryExplain()"

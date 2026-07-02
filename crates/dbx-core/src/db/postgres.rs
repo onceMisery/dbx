@@ -304,7 +304,7 @@ fn format_pg_timestamptz(value: DateTime<Local>) -> String {
     value.to_rfc3339()
 }
 
-fn pg_value_to_json(row: &Row, idx: usize, type_name: &str) -> serde_json::Value {
+pub(crate) fn pg_value_to_json(row: &Row, idx: usize, type_name: &str) -> serde_json::Value {
     let upper = type_name.to_uppercase();
 
     if upper == "BYTEA" {

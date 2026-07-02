@@ -190,6 +190,7 @@ export const useQueryStore = defineStore("query", () => {
   const restored = loadSavedTabs();
   const tabs = ref<QueryTab[]>(restored.tabs);
   const activeTabId = ref<string | null>(restored.activeTabId);
+  const activeTabHistory = ref<string[]>(restored.activeTabId ? [restored.activeTabId] : []);
   const showCloseConfirm = ref(false);
   const pendingCloseTabId = ref<string | null>(null);
   const pendingBatchCloseTabIds = ref<string[] | null>(null);
@@ -858,6 +859,7 @@ export const useQueryStore = defineStore("query", () => {
     const idx = tabs.value.findIndex((t) => t.id === id);
     if (idx < 0) return;
     clearDataGridPendingSnapshotsForTab(id);
+    if (tabs.value[idx].txnSessionId) void rollbackTransaction(id);
     if (tabs.value[idx].isExecuting) void cancelTabExecution(id);
     if (tabs.value[idx].isExplaining) void cancelTabExplain(id);
     void closeResultSession(tabs.value[idx]);
@@ -866,7 +868,7 @@ export const useQueryStore = defineStore("query", () => {
     clearResultPayload(tabs.value[idx]);
     tabs.value.splice(idx, 1);
     if (activeTabId.value === id) {
-      activeTabId.value = tabs.value[Math.min(idx, tabs.value.length - 1)]?.id ?? null;
+      activeTabId.value = fallbackActiveTabAfterClose(id, idx);
     }
     if (force) resumePendingBatchCloseAfter(id);
   }
@@ -986,6 +988,7 @@ export const useQueryStore = defineStore("query", () => {
       .filter((tab) => closingIds.has(tab.id))
       .forEach((tab) => {
         clearDataGridPendingSnapshotsForTab(tab.id);
+        if (tab.txnSessionId) void rollbackTransaction(tab.id);
         if (tab.isExecuting) void cancelTabExecution(tab.id);
         if (tab.isExplaining) void cancelTabExplain(tab.id);
         void closeResultSession(tab);
@@ -1014,6 +1017,7 @@ export const useQueryStore = defineStore("query", () => {
     tabs.value
       .filter((tab) => predicate(tab))
       .forEach((tab) => {
+        rollbackTabTransaction(tab, { resetAutoCommit: true });
         if (tab.isExecuting) void cancelTabExecution(tab.id);
         if (tab.isExplaining) void cancelTabExplain(tab.id);
         void closeResultSession(tab);
@@ -1034,10 +1038,65 @@ export const useQueryStore = defineStore("query", () => {
     return tabs.value.some((tab) => tab.connectionId === connectionId && tab.database === database);
   }
 
+  function rollbackTabsWhere(predicate: (tab: QueryTab) => boolean, options?: { resetAutoCommit?: boolean }) {
+    tabs.value.filter((tab) => predicate(tab)).forEach((tab) => rollbackTabTransaction(tab, options));
+  }
+
+  function rollbackConnectionTransactions(connectionId: string) {
+    rollbackTabsWhere((tab) => tab.connectionId === connectionId, { resetAutoCommit: true });
+  }
+
+  function rollbackDatabaseTransactions(connectionId: string, database: string) {
+    rollbackTabsWhere((tab) => tab.connectionId === connectionId && tab.database === database, { resetAutoCommit: true });
+  }
+
   function updateSql(id: string, sql: string) {
     const tab = tabs.value.find((t) => t.id === id);
     if (tab) {
       tab.sql = sql;
+    }
+  }
+
+  function setAutoCommit(id: string, autoCommit: boolean) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (tab) {
+      const wasManual = tab.autoCommit === false;
+      tab.autoCommit = autoCommit;
+      if (autoCommit && wasManual) {
+        if (tab.txnSessionId) {
+          void rollbackTransaction(id);
+        } else {
+          tab.txnAutoRolledBack = false;
+        }
+      }
+    }
+  }
+
+  function rollbackTabTransaction(tab: QueryTab, options?: { resetAutoCommit?: boolean }) {
+    if (tab.txnSessionId) void rollbackTransaction(tab.id);
+    if (options?.resetAutoCommit) tab.autoCommit = true;
+    tab.txnAutoRolledBack = false;
+  }
+
+  async function commitTransaction(id: string) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab?.txnSessionId) return;
+    try {
+      await api.commitManualTransaction(tab.txnSessionId);
+    } finally {
+      tab.txnSessionId = undefined;
+      tab.txnAutoRolledBack = false;
+    }
+  }
+
+  async function rollbackTransaction(id: string) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab?.txnSessionId) return;
+    try {
+      await api.rollbackManualTransaction(tab.txnSessionId);
+    } finally {
+      tab.txnSessionId = undefined;
+      tab.txnAutoRolledBack = false;
     }
   }
 
@@ -1153,6 +1212,7 @@ export const useQueryStore = defineStore("query", () => {
   function updateDatabase(id: string, database: string) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab || tab.database === database) return;
+    rollbackTabTransaction(tab);
     void closeResultSession(tab);
     void closeClientConnectionSession(tab);
     tab.database = database;
@@ -1169,6 +1229,7 @@ export const useQueryStore = defineStore("query", () => {
   function updateSchema(id: string, schema: string | undefined) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab || tab.schema === schema) return;
+    rollbackTabTransaction(tab);
     tab.schema = schema;
     if (tab.mode === "objects") tab.objectBrowser = { ...tab.objectBrowser, schema };
   }
@@ -1176,6 +1237,7 @@ export const useQueryStore = defineStore("query", () => {
   function updateConnection(id: string, connectionId: string, database = "") {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab || tab.connectionId === connectionId) return;
+    rollbackTabTransaction(tab, { resetAutoCommit: true });
     void closeResultSession(tab);
     void closeClientConnectionSession(tab);
     tab.connectionId = connectionId;
@@ -1911,32 +1973,44 @@ export const useQueryStore = defineStore("query", () => {
         return;
       }
 
-      console.info("[DBX][executeTabSql:execute-multi:start]", { traceId, elapsed: elapsed() });
-      const clientSessionId = tab.mode === "query" || tab.mode === "data" ? tabClientSessionId(tab) : undefined;
-      const executionOptions = {
-        ...(typeof pageLimit === "number"
-          ? useAgentResultSession
-            ? {
-                fetchSize: pageLimit,
-                pageSize: pageLimit,
-                resultSessionId: options?.pagination?.sessionId,
-              }
-            : { maxRows: pageLimit, fetchSize: pageLimit }
-          : {}),
-        ...(clientSessionId ? { clientSessionId } : {}),
-        timeoutSecs: queryTimeoutSecs,
-      };
       const executionSchema = connectionUsesSchemaExecutionContext(conn) ? tab.schema || tab.database : tab.mode === "data" || connectionUsesDatabaseObjectTreeMode(conn) ? undefined : tab.schema;
-      console.info("[DBX][executeTabSql:execute-multi:invoke]", {
-        traceId,
-        elapsed: elapsed(),
-        executionSchema,
-        optionKeys: Object.keys(executionOptions),
-        clientSession: Boolean(clientSessionId),
-      });
-      const executionPromise = api.executeMulti(tab.connectionId, tab.database, sqlToExecute, executionSchema, executionId, executionOptions);
       const frontendTimeoutSecs = Math.max(queryTimeoutSecs * 2, 60);
       const sourceLabelDatabase = tab.database || conn?.database;
+
+      let executionPromise: Promise<QueryResult[]>;
+      if (tab.autoCommit === false) {
+        if (!tab.txnSessionId) {
+          console.info("[DBX][executeTabSql:begin-manual-txn:start]", { traceId, elapsed: elapsed() });
+          tab.txnSessionId = await api.beginManualTransaction(tab.connectionId, tab.database, executionSchema);
+          console.info("[DBX][executeTabSql:begin-manual-txn:done]", { traceId, txnSessionId: tab.txnSessionId, elapsed: elapsed() });
+        }
+        console.info("[DBX][executeTabSql:execute-in-txn:invoke]", { traceId, txnSessionId: tab.txnSessionId, elapsed: elapsed() });
+        executionPromise = api.executeInManualTransaction(tab.txnSessionId, sqlToExecute, tab.database, executionSchema, pageLimit);
+      } else {
+        console.info("[DBX][executeTabSql:execute-multi:start]", { traceId, elapsed: elapsed() });
+        const clientSessionId = tab.mode === "query" || tab.mode === "data" ? tabClientSessionId(tab) : undefined;
+        const executionOptions = {
+          ...(typeof pageLimit === "number"
+            ? useAgentResultSession
+              ? {
+                  fetchSize: pageLimit,
+                  pageSize: pageLimit,
+                  resultSessionId: options?.pagination?.sessionId,
+                }
+              : { maxRows: pageLimit, fetchSize: pageLimit }
+            : {}),
+          ...(clientSessionId ? { clientSessionId } : {}),
+          timeoutSecs: queryTimeoutSecs,
+        };
+        console.info("[DBX][executeTabSql:execute-multi:invoke]", {
+          traceId,
+          elapsed: elapsed(),
+          executionSchema,
+          optionKeys: Object.keys(executionOptions),
+          clientSession: Boolean(clientSessionId),
+        });
+        executionPromise = api.executeMulti(tab.connectionId, tab.database, sqlToExecute, executionSchema, executionId, executionOptions);
+      }
       const results = annotateQueryResultSources(markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, queryTimeoutSecs === 0 ? 0 : frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }))), queryBaseSql, sourceLabelDatabase, effectiveDbType);
       console.info("[DBX][executeTabSql:execute-multi:done]", {
         traceId,
@@ -2015,6 +2089,15 @@ export const useQueryStore = defineStore("query", () => {
       console.error("[DBX][executeTabSql:error]", { traceId, elapsed: elapsed(), error: e });
       // Sync connection state if the error indicates a lost connection
       useConnectionStore().recordConnectionLostError(tab.connectionId, e);
+      // Handle manual transaction auto-rollback (e.g. deadlock detected by server,
+      // statement error inside a manual transaction, or idle timeout).
+      if (tab.autoCommit === false) {
+        const errMsg: string = e?.message ?? String(e);
+        if (/rolled.?back/i.test(errMsg) || errMsg.includes("已自动回滚")) {
+          tab.txnSessionId = undefined;
+          tab.txnAutoRolledBack = true;
+        }
+      }
       const current = tabs.value.find((t) => t.id === id);
       if (current?.executionId === executionId) {
         current.result = toErrorResult(e);
@@ -2246,9 +2329,28 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
-  watch(activeTabId, (id) => {
-    touchResult(tabs.value.find((tab) => tab.id === id));
-  });
+  function rememberActiveTab(id: string | null) {
+    if (!id || !tabs.value.some((tab) => tab.id === id)) return;
+    activeTabHistory.value = [...activeTabHistory.value.filter((tabId) => tabId !== id), id];
+  }
+
+  function fallbackActiveTabAfterClose(closedId: string, closedIndex: number): string | null {
+    const remainingIds = new Set(tabs.value.map((tab) => tab.id));
+    // Prefer the most recently focused remaining tab. This preserves the
+    // source query tab when a transient table-info/data tab is closed.
+    const history = activeTabHistory.value.filter((tabId) => tabId !== closedId && remainingIds.has(tabId));
+    activeTabHistory.value = history;
+    return [...history].reverse().find((tabId) => remainingIds.has(tabId)) ?? tabs.value[Math.min(closedIndex, tabs.value.length - 1)]?.id ?? null;
+  }
+
+  watch(
+    activeTabId,
+    (id) => {
+      rememberActiveTab(id);
+      touchResult(tabs.value.find((tab) => tab.id === id));
+    },
+    { flush: "sync" },
+  );
 
   function restoreCachedResultPayload(tab: QueryTab, snapshot: Awaited<ReturnType<typeof readTabResultSnapshot>>) {
     if (!snapshot) return false;
@@ -2561,9 +2663,14 @@ export const useQueryStore = defineStore("query", () => {
     releaseConnectionTabs,
     releaseDatabaseTabs,
     isDatabaseOpen,
+    rollbackConnectionTransactions,
+    rollbackDatabaseTransactions,
     updateSql,
     updateEditorViewport,
     updateEditorSelection,
+    setAutoCommit,
+    commitTransaction,
+    rollbackTransaction,
     renameTab,
     openObjectBrowser,
     openUserAdmin,
