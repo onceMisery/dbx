@@ -1039,7 +1039,7 @@ public final class KafkaAgent {
     }
 
     private static boolean isSslHandshakeError(Throwable error) {
-        for (Throwable current = error; current != null; current = current.getCause()) {
+        for (Throwable current : causeChain(error)) {
             String className = current.getClass().getName();
             String message = current.getMessage() == null ? "" : current.getMessage().toLowerCase(Locale.ROOT);
             if (className.contains("SslAuthenticationException")
@@ -1052,12 +1052,11 @@ public final class KafkaAgent {
     }
 
     private static boolean isUnsupportedVersionError(Throwable error) {
-        for (Throwable current = error; current != null; current = current.getCause()) {
+        for (Throwable current : causeChain(error)) {
             String className = current.getClass().getName();
             String message = current.getMessage() == null ? "" : current.getMessage().toLowerCase(Locale.ROOT);
             if (className.contains("UnsupportedVersionException")
-                || message.contains("unsupported version")
-                || message.contains("does not support")) {
+                || message.contains("unsupported version")) {
                 return true;
             }
         }
@@ -1065,11 +1064,26 @@ public final class KafkaAgent {
     }
 
     private static Throwable rootCause(Throwable error) {
-        Throwable current = error;
-        while (current.getCause() != null) {
-            current = current.getCause();
+        Throwable current = null;
+        for (Throwable cause : causeChain(error)) {
+            current = cause;
         }
-        return current;
+        return current == null ? error : current;
+    }
+
+    private static List<Throwable> causeChain(Throwable error) {
+        List<Throwable> chain = new ArrayList<>();
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        Throwable current = error;
+        for (int depth = 0; current != null && depth < 32 && seen.add(current); depth++) {
+            chain.add(current);
+            Throwable next = current.getCause();
+            if (next == current) {
+                break;
+            }
+            current = next;
+        }
+        return chain;
     }
 
     private static AdminClient requireAdmin() {

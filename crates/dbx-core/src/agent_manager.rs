@@ -592,12 +592,12 @@ impl AgentManager {
 
         let jar_path = self.driver_jar_path(driver_key);
         if jar_path.exists() {
+            let java = self.resolve_java_runtime(state, jre_key)?;
             if !is_valid_jar_file(&jar_path) {
                 return Err(format!(
                     "{driver_key} driver jar is invalid or corrupt. Please reinstall it from the Driver Manager."
                 ));
             }
-            let java = self.resolve_java_runtime(state, jre_key)?;
             return Ok(AgentLaunchSpec::java_jar(java, jar_path));
         }
 

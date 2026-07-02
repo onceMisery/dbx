@@ -627,9 +627,8 @@ fn extra_str<'a>(extra: &'a serde_json::Value, key: &str) -> Option<&'a str> {
 
 fn is_describe_producers_unsupported(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
-    normalized.contains("unsupportedversionexception")
-        || normalized.contains("describe_producers")
-        || normalized.contains("does not support describe_producers")
+    (normalized.contains("unsupportedversionexception") && normalized.contains("describe_producers"))
+        || normalized.contains("the node does not support describe_producers")
 }
 
 /// Build the connection params JSON from MqAdminConfig for the Java agent.

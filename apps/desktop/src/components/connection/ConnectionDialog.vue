@@ -958,6 +958,7 @@ async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Pro
     await refreshLocalAgentDrivers();
     finishAgentDriverInstall();
   } catch (error) {
+    testResult.value = { ok: false, message: errorMessage(error) };
     failAgentDriverInstall(error);
     throw error;
   }
@@ -2721,8 +2722,13 @@ watch(
   open,
   (value) => {
     if (!value) {
+      const draftId = editingId.value ? null : draftTestConnectionId.value;
       submittedOneTimePrefillKey.value = null;
       resetForm();
+      if (draftId) {
+        void api.disconnectDb(draftId).catch(() => undefined);
+        draftTestConnectionId.value = uuid();
+      }
       return;
     }
     if (!props.editConfig) {
