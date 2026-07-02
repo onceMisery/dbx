@@ -1228,6 +1228,11 @@ pub fn import_offline_zip(
             mark_executable(&driver_path)?;
             std::fs::remove_file(am.driver_jar_path(db_type)).ok();
         } else {
+            // Offline bundles are user-supplied; reject corrupt JARs before state says the driver is installed.
+            if !am.is_driver_jar_valid(db_type) {
+                std::fs::remove_file(&driver_path).ok();
+                return Err(format!("Offline agent jar is invalid or corrupt: {entry_name}"));
+            }
             std::fs::remove_file(am.driver_native_path(db_type)).ok();
         }
 
