@@ -11,6 +11,7 @@ interface Props {
   namespace?: string;
   readOnly?: boolean;
   selectedSubscription?: string;
+  isKafkaCluster?: boolean;
 }
 
 const props = defineProps<Props>();
@@ -127,7 +128,7 @@ async function loadRuntimeClients() {
 async function unloadTopic() {
   const current = topicRef.value;
   if (!current || props.readOnly || unloading.value) return;
-  if (!confirm("确认 unload 当前 topic？活跃生产者和消费者会重新连接。")) return;
+  if (!confirm("确认卸载当前主题？活跃生产者和消费者会重新连接。")) return;
 
   unloading.value = true;
   error.value = undefined;
@@ -417,8 +418,8 @@ watch(
     <div class="panel-toolbar">
       <h3>生产者 / 消费者</h3>
       <div class="toolbar-actions">
-        <button class="btn-sm danger" :disabled="readOnly || !topic || unloading" @click="unloadTopic">
-          {{ unloading ? "卸载中..." : "Unload topic" }}
+        <button v-if="!isKafkaCluster" class="btn-sm danger" :disabled="readOnly || !topic || unloading" @click="unloadTopic">
+          {{ unloading ? "卸载中..." : "卸载主题" }}
         </button>
         <button class="btn-sm" :disabled="loading || !topic" @click="loadRuntimeClients">
           {{ loading ? "刷新中..." : "刷新" }}

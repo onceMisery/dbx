@@ -70,10 +70,10 @@ const availableTabs = computed<MqTab[]>(() => {
   if (canManageTenants.value) tabs.push("tenants");
   if (canManageNamespaces.value) tabs.push("namespaces");
   tabs.push("topics");
-  if (canSendMessage.value) tabs.push("messages");
   if (canManageSubscriptions.value) tabs.push("subscriptions");
   tabs.push("monitoring");
   tabs.push("clients");
+  if (canSendMessage.value) tabs.push("messages");
   tabs.push("broker");
   if (canManagePolicies.value) tabs.push("policies");
   if (canManagePermissions.value) tabs.push("permissions");
@@ -220,10 +220,10 @@ onMounted(async () => {
       <button v-if="canManageTenants" :class="{ active: activeTab === 'tenants' }" @click="setActiveTab('tenants')">租户</button>
       <button v-if="canManageNamespaces" :class="{ active: activeTab === 'namespaces' }" @click="setActiveTab('namespaces')">命名空间</button>
       <button :class="{ active: activeTab === 'topics' }" @click="setActiveTab('topics')">主题</button>
-      <button v-if="canSendMessage" :class="{ active: activeTab === 'messages' }" @click="setActiveTab('messages')">消息</button>
       <button v-if="canManageSubscriptions" :class="{ active: activeTab === 'subscriptions' }" @click="setActiveTab('subscriptions')">订阅</button>
       <button :class="{ active: activeTab === 'monitoring' }" @click="setActiveTab('monitoring')">监控</button>
       <button :class="{ active: activeTab === 'clients' }" @click="setActiveTab('clients')">客户端</button>
+      <button v-if="canSendMessage" :class="{ active: activeTab === 'messages' }" @click="setActiveTab('messages')">消息</button>
       <button :class="{ active: activeTab === 'broker' }" @click="setActiveTab('broker')">Broker</button>
       <button v-if="canManagePolicies" :class="{ active: activeTab === 'policies' }" @click="setActiveTab('policies')">策略</button>
       <button v-if="canManagePermissions" :class="{ active: activeTab === 'permissions' }" @click="setActiveTab('permissions')">权限</button>
@@ -234,8 +234,7 @@ onMounted(async () => {
     <div class="mq-content">
       <TenantsPanel v-if="activeTab === 'tenants'" :connection-id="connectionId" :supports-tenants="canManageTenants" :read-only="readOnly" :cluster-options="clusterOptions" @tenant-selected="handleTenantSelected" />
       <NamespacesPanel v-else-if="activeTab === 'namespaces'" :connection-id="connectionId" :tenant="selectedTenant" :supports-namespaces="canManageNamespaces" :read-only="readOnly" @namespace-selected="handleNamespaceSelected" @namespace-roles-selected="handleNamespaceRolesSelected" />
-      <TopicsPanel v-else-if="activeTab === 'topics'" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" :supports-partitioned-topics="canManagePartitionedTopics" @topic-selected="handleTopicSelected" />
-      <SendMessagePanel v-else-if="activeTab === 'messages' && canSendMessage" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :topic="selectedTopic" :read-only="readOnly" :is-kafka-cluster="isKafkaCluster" :supports-peek-messages="canPeekMessages" />
+      <TopicsPanel v-else-if="activeTab === 'topics'" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" :supports-partitioned-topics="canManagePartitionedTopics" :is-kafka-cluster="isKafkaCluster" @topic-selected="handleTopicSelected" />
       <SubscriptionsPanel
         v-else-if="activeTab === 'subscriptions' && canManageSubscriptions"
         :connection-id="connectionId"
@@ -252,7 +251,8 @@ onMounted(async () => {
         @subscription-selected="handleSubscriptionSelected"
       />
       <MonitoringPanel v-else-if="activeTab === 'monitoring'" :connection-id="connectionId" :topic="selectedTopic" :tenant="effectiveTenant" :namespace="effectiveNamespace" />
-      <ProducerConsumerPanel v-else-if="activeTab === 'clients'" :connection-id="connectionId" :topic="selectedTopic" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" :selected-subscription="selectedSubscriptionName" />
+      <ProducerConsumerPanel v-else-if="activeTab === 'clients'" :connection-id="connectionId" :topic="selectedTopic" :tenant="effectiveTenant" :namespace="effectiveNamespace" :read-only="readOnly" :selected-subscription="selectedSubscriptionName" :is-kafka-cluster="isKafkaCluster" />
+      <SendMessagePanel v-else-if="activeTab === 'messages' && canSendMessage" :connection-id="connectionId" :tenant="effectiveTenant" :namespace="effectiveNamespace" :topic="selectedTopic" :read-only="readOnly" :is-kafka-cluster="isKafkaCluster" :supports-peek-messages="canPeekMessages" />
       <BrokerPanel v-else-if="activeTab === 'broker'" :connection-id="connectionId" :read-only="readOnly" />
       <PoliciesPanel
         v-else-if="activeTab === 'policies' && canManagePolicies"
@@ -261,6 +261,7 @@ onMounted(async () => {
         :tenant="effectiveTenant"
         :namespace="effectiveNamespace"
         :read-only="readOnly"
+        :is-kafka-cluster="isKafkaCluster"
         :supports-rate-limits="canManageRateLimits"
         :supports-backlog-quota="canManageBacklogQuota"
         :supports-retention="canManageRetention"

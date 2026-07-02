@@ -10,6 +10,7 @@ interface Props {
   namespace?: string;
   readOnly?: boolean;
   supportsPartitionedTopics?: boolean;
+  isKafkaCluster?: boolean;
 }
 
 const props = defineProps<Props>();
@@ -77,7 +78,7 @@ function openCreateDialog() {
   formData.value = {
     topicName: "",
     persistent: true,
-    partitioned: false,
+    partitioned: props.isKafkaCluster ?? false,
     partitions: 4,
   };
   showCreateDialog.value = true;
@@ -205,7 +206,12 @@ watch(includeNonPersistent, () => {
           包含非持久化主题
         </label>
       </div>
-      <button @click="openCreateDialog" :disabled="loading || readOnly || !tenant || !namespace" class="btn-primary">+ 创建主题</button>
+      <div class="toolbar-actions">
+        <button @click="loadTopics" :disabled="loading || !tenant || !namespace" class="btn-secondary">
+          {{ loading ? "刷新中..." : "刷新" }}
+        </button>
+        <button @click="openCreateDialog" :disabled="loading || readOnly || !tenant || !namespace" class="btn-primary">+ 创建主题</button>
+      </div>
     </div>
 
     <div v-if="!tenant || !namespace" class="panel-placeholder">请先选择租户和命名空间</div>
@@ -260,7 +266,7 @@ watch(includeNonPersistent, () => {
           <button @click="showCreateDialog = false" class="btn-close">×</button>
         </div>
         <div class="dialog-body">
-          <div class="form-group">
+          <div v-if="!isKafkaCluster" class="form-group">
             <label>租户 / 命名空间</label>
             <input type="text" :value="`${tenant} / ${namespace}`" disabled />
           </div>
@@ -342,6 +348,12 @@ watch(includeNonPersistent, () => {
   display: flex;
   align-items: center;
   gap: 16px;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .toolbar-left h3 {
