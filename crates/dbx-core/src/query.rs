@@ -1003,7 +1003,8 @@ pub async fn do_execute(
                 DuckDbTaskWait::Finished(result) => {
                     if matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED || is_dbx_query_timeout_error(&err.to_lowercase()))
                     {
-                        state.remove_pool_by_key(pool_key).await;
+                        con.mark_draining();
+                        state.spawn_duckdb_pool_cleanup(pool_key.to_string(), con);
                     }
                     result
                 }
@@ -2955,7 +2956,7 @@ mod tests {
 
     #[cfg(feature = "duckdb-bundled")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn duckdb_cancel_discards_pool() {
+    async fn duckdb_cancel_keeps_pool_draining_until_references_drop() {
         let dir = std::env::temp_dir().join(format!("dbx-query-duckdb-cancel-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
@@ -2964,6 +2965,7 @@ mod tests {
         let con = std::sync::Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(
             duckdb::Connection::open_in_memory().unwrap(),
         ));
+        let extra_reference = con.clone();
         state.connections.write().await.insert(pool_key.to_string(), PoolKind::DuckDb(con));
         state.configs.write().await.insert(pool_key.to_string(), test_connection_config(DatabaseType::DuckDb));
 
@@ -2987,7 +2989,23 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap_err(), QUERY_CANCELED);
-        assert!(!state.connections.read().await.contains_key(pool_key));
+        let still_present = {
+            let conns = state.connections.read().await;
+            matches!(conns.get(pool_key), Some(PoolKind::DuckDb(current)) if current.is_draining())
+        };
+        assert!(still_present);
+
+        drop(extra_reference);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !state.connections.read().await.contains_key(pool_key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("draining DuckDB pool should be removed after references drop");
     }
 
     #[cfg(feature = "duckdb-bundled")]
@@ -3043,6 +3061,7 @@ mod tests {
         state.spawn_duckdb_draining_cleanup(pool_key.to_string(), con.clone(), task);
 
         assert!(state.connections.read().await.contains_key(pool_key));
+        drop(con);
         timeout(Duration::from_secs(5), async {
             loop {
                 if !state.connections.read().await.contains_key(pool_key) {
@@ -3053,7 +3072,45 @@ mod tests {
         })
         .await
         .expect("draining cleanup should remove the DuckDB pool");
-        assert!(!con.is_draining());
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duckdb_cleanup_keeps_draining_pool_while_extra_reference_exists() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-duckdb-cleanup-ref-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let pool_key = "duckdb-1";
+        let con = std::sync::Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(
+            duckdb::Connection::open_in_memory().unwrap(),
+        ));
+        con.mark_draining();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::DuckDb(con.clone()));
+
+        let extra_reference = con.clone();
+        let task = tokio::task::spawn_blocking(|| Ok(empty_query_result(0)));
+        state.spawn_duckdb_draining_cleanup(pool_key.to_string(), con.clone(), task);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let still_present = {
+            let conns = state.connections.read().await;
+            matches!(conns.get(pool_key), Some(PoolKind::DuckDb(current)) if current.is_draining())
+        };
+        assert!(still_present);
+
+        drop(extra_reference);
+        drop(con);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !state.connections.read().await.contains_key(pool_key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("draining cleanup should remove the DuckDB pool after extra refs drop");
     }
 
     #[test]

@@ -1618,6 +1618,36 @@ impl AppState {
     }
 
     #[cfg(feature = "duckdb-bundled")]
+    pub fn spawn_duckdb_pool_cleanup(&self, pool_key: String, con: DuckDbHandle) {
+        let connections = self.connections.clone();
+        let keepalive_tasks = self.keepalive_tasks.clone();
+        let pool_activity = self.pool_activity.clone();
+        let postgres_cancel_contexts = self.postgres_cancel_contexts.clone();
+        tokio::spawn(async move {
+            while Arc::strong_count(&con) > 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            con.clear_draining();
+            if let Some(handle) = keepalive_tasks.write().await.remove(&pool_key) {
+                handle.abort();
+            }
+            pool_activity.write().await.remove(&pool_key);
+            postgres_cancel_contexts.write().await.remove(&pool_key);
+            let removed = {
+                let mut conns = connections.write().await;
+                match conns.get(&pool_key) {
+                    Some(PoolKind::DuckDb(current)) if Arc::ptr_eq(current, &con) => conns.remove(&pool_key),
+                    _ => None,
+                }
+            };
+            if let Some(pool) = removed {
+                drop(con);
+                close_pool_kind_with_timeout(pool_key, pool).await;
+            }
+        });
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
     pub fn spawn_duckdb_draining_cleanup(
         &self,
         pool_key: String,
@@ -1630,6 +1660,9 @@ impl AppState {
         let postgres_cancel_contexts = self.postgres_cancel_contexts.clone();
         tokio::spawn(async move {
             let _ = task.await;
+            while Arc::strong_count(&con) > 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             con.clear_draining();
             if let Some(handle) = keepalive_tasks.write().await.remove(&pool_key) {
                 handle.abort();
