@@ -1627,7 +1627,6 @@ impl AppState {
             while Arc::strong_count(&con) > 2 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            con.clear_draining();
             if let Some(handle) = keepalive_tasks.write().await.remove(&pool_key) {
                 handle.abort();
             }
@@ -1641,6 +1640,9 @@ impl AppState {
                 }
             };
             if let Some(pool) = removed {
+                // Keep the old DuckDB pool marked as draining until it is no longer
+                // visible in the pool map, otherwise a concurrent query could reuse it.
+                con.clear_draining();
                 drop(con);
                 close_pool_kind_with_timeout(pool_key, pool).await;
             }
@@ -1663,7 +1665,6 @@ impl AppState {
             while Arc::strong_count(&con) > 2 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            con.clear_draining();
             if let Some(handle) = keepalive_tasks.write().await.remove(&pool_key) {
                 handle.abort();
             }
@@ -1677,6 +1678,9 @@ impl AppState {
                 }
             };
             if let Some(pool) = removed {
+                // Keep the old DuckDB pool marked as draining until it is no longer
+                // visible in the pool map, otherwise a concurrent query could reuse it.
+                con.clear_draining();
                 drop(con);
                 close_pool_kind_with_timeout(pool_key, pool).await;
             }
