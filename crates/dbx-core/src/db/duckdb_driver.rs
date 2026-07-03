@@ -2,18 +2,20 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
 pub struct DuckDbConnection {
     connection: Mutex<duckdb::Connection>,
     interrupt_handle: Arc<duckdb::InterruptHandle>,
+    draining: AtomicBool,
 }
 
 impl DuckDbConnection {
     pub fn new(connection: duckdb::Connection) -> Self {
         let interrupt_handle = connection.interrupt_handle();
-        Self { connection: Mutex::new(connection), interrupt_handle }
+        Self { connection: Mutex::new(connection), interrupt_handle, draining: AtomicBool::new(false) }
     }
 
     pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, duckdb::Connection>> {
@@ -22,6 +24,18 @@ impl DuckDbConnection {
 
     pub fn interrupt_handle(&self) -> Arc<duckdb::InterruptHandle> {
         self.interrupt_handle.clone()
+    }
+
+    pub fn mark_draining(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    pub fn clear_draining(&self) {
+        self.draining.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
     }
 
     fn into_inner(self) -> std::sync::LockResult<duckdb::Connection> {

@@ -1617,6 +1617,39 @@ impl AppState {
         }
     }
 
+    #[cfg(feature = "duckdb-bundled")]
+    pub fn spawn_duckdb_draining_cleanup(
+        &self,
+        pool_key: String,
+        con: DuckDbHandle,
+        task: JoinHandle<Result<db::QueryResult, String>>,
+    ) {
+        let connections = self.connections.clone();
+        let keepalive_tasks = self.keepalive_tasks.clone();
+        let pool_activity = self.pool_activity.clone();
+        let postgres_cancel_contexts = self.postgres_cancel_contexts.clone();
+        tokio::spawn(async move {
+            let _ = task.await;
+            con.clear_draining();
+            if let Some(handle) = keepalive_tasks.write().await.remove(&pool_key) {
+                handle.abort();
+            }
+            pool_activity.write().await.remove(&pool_key);
+            postgres_cancel_contexts.write().await.remove(&pool_key);
+            let removed = {
+                let mut conns = connections.write().await;
+                match conns.get(&pool_key) {
+                    Some(PoolKind::DuckDb(current)) if Arc::ptr_eq(current, &con) => conns.remove(&pool_key),
+                    _ => None,
+                }
+            };
+            if let Some(pool) = removed {
+                drop(con);
+                close_pool_kind_with_timeout(pool_key, pool).await;
+            }
+        });
+    }
+
     pub async fn close_database_pool(&self, connection_id: &str, database: Option<&str>) -> Result<bool, String> {
         let db_type = {
             let configs = self.configs.read().await;
