@@ -5502,7 +5502,7 @@ mod tests {
         con.execute_batch("CREATE SCHEMA analytics; CREATE TABLE analytics.items(id INTEGER);").unwrap();
 
         let state = AppState::new(storage);
-        let con = Arc::new(std::sync::Mutex::new(con));
+        let con = Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(con));
         state.connections.write().await.insert("duckdb-1".to_string(), PoolKind::DuckDb(con));
         state.configs.write().await.insert("duckdb-1".to_string(), duckdb_test_config("duckdb-1"));
 

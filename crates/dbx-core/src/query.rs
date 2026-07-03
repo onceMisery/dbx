@@ -940,7 +940,7 @@ pub async fn do_execute(
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             let con = con.clone();
-            let interrupt_handle = con.lock().map_err(|e| e.to_string())?.interrupt_handle();
+            let interrupt_handle = con.interrupt_handle();
             if let Some(ref execution_id) = options.execution_id {
                 let cancel_interrupt_handle = interrupt_handle.clone();
                 state.running_queries.register_interrupt(execution_id, move || {
@@ -956,7 +956,12 @@ pub async fn do_execute(
                 let con = con.lock().map_err(|e| e.to_string())?;
                 duckdb_execute_for_database(&con, &attached_names, database.as_deref(), &sql, max_rows)
             });
-            wait_for_duckdb_task_with_interrupt(cancel_token, query_timeout, interrupt_handle, task).await
+            let result = wait_for_duckdb_task_with_interrupt(cancel_token, query_timeout, interrupt_handle, task).await;
+            if matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED || is_dbx_query_timeout_error(&err.to_lowercase()))
+            {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            result
         }
         #[cfg(not(feature = "duckdb-bundled"))]
         PoolKind::DuckDb(_) => {
@@ -2767,6 +2772,7 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
 mod tests {
     use super::*;
     use crate::models::connection::{default_redis_key_separator, ConnectionConfig, DatabaseType};
+    use crate::storage::Storage;
 
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
         ConnectionConfig {
@@ -2877,34 +2883,60 @@ mod tests {
 
     #[cfg(feature = "duckdb-bundled")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn duckdb_timeout_interrupts_running_task_and_releases_connection() {
-        let con = std::sync::Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
-        let interrupt_handle = con.lock().unwrap().interrupt_handle();
+    async fn duckdb_timeout_interrupts_running_task_without_waiting_for_it_to_finish() {
+        let con = std::sync::Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(
+            duckdb::Connection::open_in_memory().unwrap(),
+        ));
+        let interrupt_handle = con.interrupt_handle();
         let running_con = con.clone();
         let task = tokio::task::spawn_blocking(move || {
             let con = running_con.lock().map_err(|e| e.to_string())?;
             duckdb_execute_with_max_rows(&con, "SELECT sum(sin(i::DOUBLE)) FROM range(10000000000) tbl(i)", None)
         });
 
+        let started = std::time::Instant::now();
         let result =
             wait_for_duckdb_task_with_interrupt(None, Some(Duration::from_millis(10)), interrupt_handle, task).await;
 
         assert_eq!(result.unwrap_err(), timeout_error());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
-        let follow_con = con.clone();
-        let follow_up = timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                let con = follow_con.lock().map_err(|e| e.to_string())?;
-                duckdb_execute_with_max_rows(&con, "SELECT 1", None)
-            }),
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duckdb_cancel_discards_pool() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-duckdb-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let pool_key = "duckdb-1";
+        let con = std::sync::Arc::new(crate::db::duckdb_driver::DuckDbConnection::new(
+            duckdb::Connection::open_in_memory().unwrap(),
+        ));
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::DuckDb(con));
+        state.configs.write().await.insert(pool_key.to_string(), test_connection_config(DatabaseType::DuckDb));
+
+        let token = CancellationToken::new();
+        let cancel_token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel_token.cancel();
+        });
+
+        let result = do_execute(
+            &state,
+            pool_key,
+            db::mysql::MySqlQueryDialect::default(),
+            Some("main"),
+            "SELECT sum(sin(i::DOUBLE)) FROM range(10000000000) tbl(i)",
+            None,
+            Some(token),
+            QueryExecutionOptions::default(),
         )
-        .await
-        .expect("DuckDB connection should be released after timeout")
-        .expect("follow-up task should not panic")
-        .expect("follow-up query should succeed");
+        .await;
 
-        assert_eq!(follow_up.rows, vec![vec![serde_json::json!(1)]]);
+        assert_eq!(result.unwrap_err(), QUERY_CANCELED);
+        assert!(!state.connections.read().await.contains_key(pool_key));
     }
 
     #[test]

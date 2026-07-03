@@ -37,7 +37,7 @@ const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
 #[cfg(feature = "duckdb-bundled")]
 mod duckdb_types {
     use std::sync::Arc;
-    pub type DuckDbHandle = Arc<std::sync::Mutex<duckdb::Connection>>;
+    pub type DuckDbHandle = Arc<crate::db::duckdb_driver::DuckDbConnection>;
     pub type ExternalTabularHandle = Arc<crate::external::ExternalPool>;
 }
 #[cfg(not(feature = "duckdb-bundled"))]
