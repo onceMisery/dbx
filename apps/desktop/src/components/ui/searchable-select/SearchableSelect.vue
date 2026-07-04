@@ -6,8 +6,8 @@ import { Button } from "@/components/ui/button";
 import type { ButtonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { filterDatabaseOptions } from "@/lib/databaseOptionSearch";
-import { cn } from "@/lib/utils";
+import { filterDatabaseOptions } from "@/lib/database/databaseOptionSearch";
+import { cn } from "@/lib/common/utils";
 
 const props = withDefaults(
   defineProps<{
@@ -45,6 +45,12 @@ const props = withDefaults(
 const emit = defineEmits<{
   "update:modelValue": [value: string];
   "update:open": [value: boolean];
+}>();
+
+defineSlots<{
+  "trigger-label"?(props: { value: string; label: string; loading: boolean }): any;
+  "option-label"?(props: { option: string; label: string }): any;
+  "custom-option-label"?(props: { value: string }): any;
 }>();
 
 const open = ref(false);

@@ -14,7 +14,7 @@ use crate::path_utils::expand_tilde;
 
 #[derive(Default)]
 pub struct DuckDbWorkerSession {
-    connection: Option<Arc<Mutex<duckdb::Connection>>>,
+    connection: Option<Arc<db::duckdb_driver::DuckDbConnection>>,
     attached_names: Vec<String>,
 }
 
@@ -100,8 +100,7 @@ impl DuckDbWorkerSession {
 
     fn interrupt_handle(&self) -> Result<Arc<duckdb::InterruptHandle>, String> {
         let connection = self.connection.as_ref().ok_or("DuckDB worker is not connected")?.clone();
-        let locked = connection.lock().map_err(|e| e.to_string())?;
-        Ok(locked.interrupt_handle())
+        Ok(connection.interrupt_handle())
     }
 }
 

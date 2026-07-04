@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, onMounted, onBeforeUnmount, inject } from "vue";
+import { ref, computed, nextTick, watch, onMounted, onBeforeUnmount, inject, type Component } from "vue";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
@@ -48,6 +48,7 @@ import {
   ListFilter,
   Package,
   Clipboard,
+  Check,
   UsersRound,
   Lock,
   HardDriveDownload,
@@ -56,8 +57,9 @@ import {
   ListX,
   Info,
   Archive,
+  Square,
 } from "@lucide/vue";
-import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
+import CustomContextMenu from "@/components/ui/CustomContextMenu.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -65,24 +67,25 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { useToast } from "@/composables/useToast";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import type { ColumnInfo, ConnectionConfig, DatabaseType, ObjectSourceKind, TreeNode, TreeNodeType } from "@/types/database";
-import * as api from "@/lib/api";
-import { uuid } from "@/lib/utils";
-import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
-import { canTreeNodePin, canTreeNodeShowExpander, treeItemPaddingLeft, usesFullWidthTreeLabel } from "@/lib/sidebarTreeItemLayout";
-import { buildTableSelectSql } from "@/lib/tableSelectSql";
-import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTemplate, buildTableUpdateTemplate } from "@/lib/tableSqlTemplates";
-import { connectionFilePath, defaultSqliteBackupFileName, isMemorySqlitePath, sqliteBackupSourcePath } from "@/lib/connectionFile";
-import { revealPathInFileManager } from "@/lib/tauri";
-import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/queryEditorTableDrop";
-import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/tableEditing";
-import { tableOpenPageLimit } from "@/lib/tableOpenPageLimit";
-import { supportsDatabaseCreation, supportsDatabaseSearch, supportsFieldLineage, supportsObjectBrowserTreeNode, supportsSchemaDiagram, supportsSqlFileExecution, supportsTableImport, supportsTableTruncate, supportsTableStructureEditing, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
-import { copyNameForTreeNode, isDocumentBrowserTreeNode, objectSourceKindForTreeNode, shouldRunTreeNodeRowAction, sidebarSelectionCopyAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "@/lib/treeNodeClick";
-import { formatSqlInsert } from "@/lib/exportFormats";
-import { joinExportedDdls } from "@/lib/ddlExport";
-import { fetchTableDataForExport } from "@/lib/tableDataExport";
-import { canActivateExistingDataTableTab } from "@/lib/dataTabActivation";
-import { buildCreateDatabaseSql, buildDuckDbAttachDatabaseSql, duckDbAttachedDatabaseNameFromPath, supportsCreateDatabaseCharset, uniqueDuckDbAttachedDatabaseName } from "@/lib/createDatabaseSql";
+import * as api from "@/lib/backend/api";
+import { uuid } from "@/lib/common/utils";
+import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
+import { canTreeNodePin, canTreeNodeShowExpander, treeItemPaddingLeft, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
+import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
+import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTemplate, buildTableUpdateTemplate } from "@/lib/table/tableSqlTemplates";
+import { connectionFilePath, defaultSqliteBackupFileName, isMemorySqlitePath, sqliteBackupSourcePath } from "@/lib/connection/connectionFile";
+import { revealPathInFileManager } from "@/lib/backend/tauri";
+import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
+import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
+import { supportsDatabaseCreation, supportsDatabaseSearch, supportsFieldLineage, supportsObjectBrowserTreeNode, supportsSchemaDiagram, supportsSqlFileExecution, supportsTableImport, supportsTableTruncate, supportsTableStructureEditing, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
+import { copyNameForTreeNode, isDocumentBrowserTreeNode, objectSourceKindForTreeNode, shouldRunTreeNodeRowAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "@/lib/sidebar/treeNodeClick";
+import { isCopySidebarSelectionShortcut, isEditSidebarConnectionShortcut, isPasteSidebarSelectionShortcut } from "@/lib/editor/keyboardShortcuts";
+import { formatSqlInsert } from "@/lib/export/exportFormats";
+import { joinExportedDdls } from "@/lib/export/ddlExport";
+import { fetchTableDataForExport } from "@/lib/table/tableDataExport";
+import { canActivateExistingDataTableTab } from "@/lib/tabs/dataTabActivation";
+import { buildCreateDatabaseSql, buildDuckDbAttachDatabaseSql, duckDbAttachedDatabaseNameFromPath, supportsCreateDatabaseCharset, uniqueDuckDbAttachedDatabaseName } from "@/lib/database/createDatabaseSql";
 import {
   buildCreateSchemaSql,
   buildDropDatabaseSql,
@@ -101,38 +104,38 @@ import {
   type DropObjectSqlOptions,
   type TableChildObjectType,
   type TableAdminSqlOptions,
-} from "@/lib/dbAdminSql";
-import { buildRenameObjectSql, supportsObjectRename, type RenameableObjectType } from "@/lib/objectRenameSql";
-import { buildEditableObjectSource, buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/objectSourceEditor";
-import { buildViewDdl } from "@/lib/viewDdl";
-import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sqlFormatter";
+} from "@/lib/database/dbAdminSql";
+import { buildRenameObjectSql, supportsObjectRename, type RenameableObjectType } from "@/lib/table/objectRenameSql";
+import { buildEditableObjectSource, buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
+import { buildViewDdl } from "@/lib/table/viewDdl";
+import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
 import DdlViewDialog from "@/components/objects/DdlViewDialog.vue";
-import { getTableStructureCapabilities } from "@/lib/tableStructureCapabilities";
-import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/jdbcDialect";
-import { hexToRgba } from "@/lib/color";
-import { focusSidebarRenameInput } from "@/lib/sidebarRenameFocus";
-import { hasTreeNodeDatabaseContext } from "@/lib/treeNodeContext";
-import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, tableDataCopyColumnOptions, type PasteTableMode, type TableClipboardContext } from "@/lib/tableClipboard";
-import { sidebarDisplayTableName } from "@/lib/sidebarTableNameDisplay";
-import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebarLabelTooltip";
-import { selectedTreeNodesInVisibleOrder as orderSelectedTreeNodes, treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebarTreeSelection";
-import { selectedConnectionDeleteTargets, selectedConnectionDuplicateTargets } from "@/lib/sidebarConnectionSelection";
-import { supportsDatabaseUserAdmin } from "@/lib/databaseUserAdmin";
-import { canCloseSidebarDatabaseConnection, isSidebarDatabaseOpened } from "@/lib/sidebarDatabaseOpenState";
-import { sidebarTreeContextKey } from "@/lib/sidebarTreeContext";
+import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
+import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { hexToRgba } from "@/lib/common/color";
+import { focusSidebarRenameInput } from "@/lib/sidebar/sidebarRenameFocus";
+import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
+import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, tableDataCopyColumnOptions, type PasteTableMode, type TableClipboardContext } from "@/lib/table/tableClipboard";
+import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
+import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebar/sidebarLabelTooltip";
+import { selectedTreeNodesInVisibleOrder as orderSelectedTreeNodes, treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebar/sidebarTreeSelection";
+import { connectionPasteTargetGroupId, selectedConnectionClipboardTargets, selectedConnectionDeleteTargets, selectedConnectionDuplicateTargets, selectedConnectionEditTarget } from "@/lib/sidebar/sidebarConnectionSelection";
+import { supportsDatabaseUserAdmin } from "@/lib/database/databaseUserAdmin";
+import { canCloseSidebarDatabaseConnection, isSidebarDatabaseOpened } from "@/lib/sidebar/sidebarDatabaseOpenState";
+import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
 import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { copyToClipboard } from "@/lib/clipboard";
-import { hasEnabledTransportLayers } from "@/lib/connectionTransport";
-import { formatShortcut } from "@/lib/shortcutRegistry";
-import { isWindows } from "@/lib/platform";
-import { rankSavedSqlHistory, type SavedSqlHistoryScope } from "@/lib/savedSqlHistory";
-import { isSqlServerLinkedNode } from "@/lib/sqlServerLinkedServers";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { copyToClipboard } from "@/lib/common/clipboard";
+import { hasEnabledTransportLayers } from "@/lib/backend/connectionTransport";
+import { formatShortcut } from "@/lib/editor/shortcutRegistry";
+import { isWindows } from "@/lib/backend/platform";
+import { rankSavedSqlHistory, type SavedSqlHistoryScope } from "@/lib/savedSql/savedSqlHistory";
+import { isSqlServerLinkedNode } from "@/lib/database/sqlServerLinkedServers";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import ConnectionErrorIndicator from "@/components/connection/ConnectionErrorIndicator.vue";
-import { isSchemaAware } from "@/lib/databaseFeatureSupport";
+import { isSchemaAware } from "@/lib/database/databaseFeatureSupport";
 import VisibleDatabasesDialog from "@/components/sidebar/VisibleDatabasesDialog.vue";
 import SchemaFilterDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -142,7 +145,7 @@ import { Input } from "@/components/ui/input";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { flattenTree } from "@/composables/useFlatTree";
-import { createDatabaseCollationOptionsForCharset, fallbackCreateDatabaseCharsetMetadata, nextCreateDatabaseCollation, normalizeCreateDatabaseCharset, parseCreateDatabaseCharsetMetadata } from "@/lib/createDatabaseCharsetOptions";
+import { createDatabaseCollationOptionsForCharset, fallbackCreateDatabaseCharsetMetadata, nextCreateDatabaseCollation, normalizeCreateDatabaseCharset, parseCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
 
 const { t } = useI18n();
 const labelRef = ref<HTMLElement>();
@@ -150,6 +153,19 @@ const rowRef = ref<HTMLElement>();
 const labelOverflowing = ref(false);
 let labelResizeObserver: ResizeObserver | null = null;
 let labelMeasureFrame = 0;
+
+interface ContextMenuItem {
+  label: string;
+  action?: () => void;
+  disabled?: boolean;
+  separator?: boolean;
+  icon?: Component;
+  iconClass?: string;
+  shortcut?: string;
+  variant?: "default" | "destructive";
+  visible?: boolean;
+  children?: ContextMenuItem[];
+}
 
 function cancelLabelOverflowMeasure() {
   if (!labelMeasureFrame) return;
@@ -715,12 +731,14 @@ function selectedTreeNodesInVisibleOrder(): TreeNode[] {
 }
 
 function selectSingleTreeNode(node: TreeNode) {
+  connectionStore.connectionMultiSelectActive = false;
   connectionStore.selectedTreeNodeId = node.id;
   connectionStore.selectedTreeNodeIds = [node.id];
   connectionStore.treeSelectionAnchorId = node.id;
 }
 
 function toggleTreeNodeSelection(node: TreeNode) {
+  connectionStore.connectionMultiSelectActive = false;
   const ids = new Set(connectionStore.selectedTreeNodeIds);
   if (ids.has(node.id)) ids.delete(node.id);
   else ids.add(node.id);
@@ -730,6 +748,7 @@ function toggleTreeNodeSelection(node: TreeNode) {
 }
 
 function selectTreeNodeRange(node: TreeNode) {
+  connectionStore.connectionMultiSelectActive = false;
   const visible = visibleTreeNodes();
   const anchorId = connectionStore.treeSelectionAnchorId || connectionStore.selectedTreeNodeId || node.id;
   const currentIndex = sidebarTreeContext ? sidebarTreeContext.getVisibleNodeIndex(node.id) : -1;
@@ -749,6 +768,30 @@ function selectTreeNodeRange(node: TreeNode) {
   const rangeIds = treeSelectionRangeIds(visible, node.id, anchorId, connectionStore.selectedTreeNodeId);
   connectionStore.selectedTreeNodeIds = rangeIds;
   connectionStore.selectedTreeNodeId = node.id;
+}
+
+const selectedConnectionIds = computed(() => {
+  const connectionIds = new Set(connectionStore.connections.map((connection) => connection.id));
+  return connectionStore.selectedTreeNodeIds.filter((id) => connectionIds.has(id));
+});
+
+const isConnectionSelectionChecked = computed(() => connectionStore.connectionMultiSelectActive && props.node.type === "connection" && !!props.node.connectionId && selectedConnectionIds.value.includes(props.node.connectionId));
+
+function toggleConnectionMultiSelection(event: MouseEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  if (props.node.type !== "connection" || !props.node.connectionId) return;
+
+  const next = new Set(connectionStore.connectionMultiSelectActive ? selectedConnectionIds.value : []);
+  if (next.has(props.node.connectionId)) next.delete(props.node.connectionId);
+  else next.add(props.node.connectionId);
+
+  const ids = [...next];
+  connectionStore.selectedTreeNodeIds = ids;
+  connectionStore.selectedTreeNodeId = ids.includes(props.node.connectionId) ? props.node.connectionId : (ids[0] ?? null);
+  connectionStore.treeSelectionAnchorId = props.node.connectionId;
+  connectionStore.connectionMultiSelectActive = ids.length > 0;
+  rowRef.value?.focus({ preventScroll: true });
 }
 
 function onClick(event: MouseEvent) {
@@ -800,6 +843,12 @@ function onKeydown(event: KeyboardEvent) {
     event.stopPropagation();
     return;
   }
+  if (isEditConnectionShortcut(event)) {
+    if (!requestEditSelectedConnection()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
   if (!event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && event.key === "F2") {
     if (!requestRenameSelectedNode()) return;
     event.preventDefault();
@@ -818,8 +867,7 @@ function onKeydown(event: KeyboardEvent) {
     event.stopPropagation();
     return;
   }
-  const action = sidebarSelectionCopyAction(event);
-  if (action !== "copy-name") return;
+  if (!isCopyTreeSelectionShortcut(event)) return;
   event.preventDefault();
   event.stopPropagation();
   copySelectedNames();
@@ -830,7 +878,15 @@ function isDeleteTreeNodeShortcut(event: KeyboardEvent): boolean {
 }
 
 function isPasteTreeClipboardShortcut(event: KeyboardEvent): boolean {
-  return (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "v";
+  return isPasteSidebarSelectionShortcut(event, settingsStore.editorSettings.shortcuts);
+}
+
+function isEditConnectionShortcut(event: KeyboardEvent): boolean {
+  return isEditSidebarConnectionShortcut(event, settingsStore.editorSettings.shortcuts);
+}
+
+function isCopyTreeSelectionShortcut(event: KeyboardEvent): boolean {
+  return isCopySidebarSelectionShortcut(event, settingsStore.editorSettings.shortcuts);
 }
 
 function pasteTableTargetContext(): TableClipboardContext | null {
@@ -849,6 +905,16 @@ function canPasteTreeClipboardToCurrentNode(): boolean {
 
 function requestPasteTreeClipboard(): boolean {
   const clipboard = connectionStore.treeClipboard;
+  if (clipboard?.kind === "connection-copy") {
+    const targetGroupId = connectionPasteTargetGroupId(props.node, (connectionId) => connectionStore.groupIdForConnection(connectionId));
+    void connectionStore
+      .pasteConnectionClipboard(targetGroupId)
+      .then((count) => {
+        if (count > 0) toast(count > 1 ? t("connection.duplicatedSelected", { count }) : t("connection.duplicated"), 2000);
+      })
+      .catch((e: any) => toast(t("connection.saveFailed", { message: e?.message || String(e) }), 5000));
+    return true;
+  }
   if (clipboard?.kind !== "table-copy" || !canPasteTreeClipboardToCurrentNode()) return false;
   pasteTableMode.value = defaultPasteTableMode(currentDatabaseType());
   pasteTableEntries.value = clipboard.tables.map((entry) => ({
@@ -885,6 +951,11 @@ function canRefreshTreeNodeShortcut(): boolean {
 function requestRenameSelectedNode(): boolean {
   const selected = selectedTreeNodesInVisibleOrder();
   if (selected.length > 1 && selected.some((node) => node.id === props.node.id)) return false;
+  const editTarget = selectedConnectionEditTarget(props.node, selected);
+  if (editTarget) {
+    connectionStore.startEditing(editTarget.connectionId);
+    return true;
+  }
   if (canRenameObject.value) {
     openRenameObjectDialog();
     return true;
@@ -894,6 +965,13 @@ function requestRenameSelectedNode(): boolean {
     return true;
   }
   return false;
+}
+
+function requestEditSelectedConnection(): boolean {
+  const editTarget = selectedConnectionEditTarget(props.node, selectedTreeNodesInVisibleOrder());
+  if (!editTarget) return false;
+  connectionStore.startEditing(editTarget.connectionId);
+  return true;
 }
 
 function requestDeleteSelectedNode(): boolean {
@@ -1205,7 +1283,7 @@ async function openData() {
 
     const columns = cachedTableMeta?.columns ?? [];
     const primaryKeys = cachedTableMeta?.primaryKeys ?? [];
-    const includeRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys);
+    const includeRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys, tableType);
     const sql = await buildTableSelectSql({
       databaseType: effectiveDbType,
       schema: tableSchema,
@@ -1526,6 +1604,12 @@ async function copyFinalProxyPort() {
 async function copySelectedNames() {
   const selectedNodes = selectedTreeNodesInVisibleOrder();
   const nodes = selectedNodes.length > 1 && selectedNodes.some((node) => node.id === props.node.id) ? selectedNodes : [props.node];
+  const connectionTargets = selectedConnectionClipboardTargets(props.node, nodes);
+  if (connectionTargets.length > 0) {
+    const copiedCount = connectionStore.copyConnectionsToTreeClipboard(connectionTargets.map((node) => node.connectionId));
+    if (copiedCount > 0) toast(t("connection.copied"), 2000);
+    return;
+  }
   updateTreeClipboardForNodes(nodes);
   try {
     await copyToClipboard(nodes.map(copyNameForTreeNode).join("\n"));
@@ -1879,6 +1963,28 @@ function canDropTreeNode(node: TreeNode): boolean {
   return canDropTableChildObjectNode(node);
 }
 
+function droppedTableObjectTypeForNode(node: TreeNode): "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | null {
+  if (node.type === "table") return "TABLE";
+  if (node.type === "view") return "VIEW";
+  if (node.type === "materialized_view") return "MATERIALIZED_VIEW";
+  return null;
+}
+
+function closeDroppedTableObjectTabsForNode(node: TreeNode) {
+  const objectType = droppedTableObjectTypeForNode(node);
+  if (!objectType || !node.connectionId || !node.database) return;
+  const config = connectionStore.getConfig(node.connectionId);
+  const dataTabSchema = connectionObjectTreeNodeSchema(config, node.database, node.schema);
+  queryStore.closeDroppedTableObjectTabs({
+    connectionId: node.connectionId,
+    database: node.database,
+    schema: dataTabSchema,
+    schemaCandidates: [node.schema, dataTabSchema],
+    name: node.label,
+    objectType,
+  });
+}
+
 function selectedBatchDropTargets(): TreeNode[] {
   const selected = selectedTreeNodesInVisibleOrder();
   if (selected.length <= 1 || !selected.some((node) => node.id === props.node.id)) return [];
@@ -2101,6 +2207,7 @@ async function confirmDropObject() {
     await api.executeQuery(node.connectionId, node.database, sql, node.schema);
     const msgKey = node.type === "view" ? "contextMenu.dropViewSuccess" : node.type === "materialized_view" ? "contextMenu.dropViewSuccess" : node.type === "procedure" ? "contextMenu.dropProcedureSuccess" : "contextMenu.dropFunctionSuccess";
     toast(t(msgKey, { name: node.label }), 3000);
+    closeDroppedTableObjectTabsForNode(node);
     if (node.type === "view" || node.type === "materialized_view") {
       connectionStore.removeTreeNode(node.id);
     } else {
@@ -2163,6 +2270,7 @@ async function confirmBatchDrop() {
       const sql = await dropSqlForTreeNode(target);
       if (!sql) continue;
       await api.executeQuery(target.connectionId, target.database, sql, target.schema);
+      closeDroppedTableObjectTabsForNode(target);
       connectionStore.removeTreeNode(target.id);
     }
     toast(t("contextMenu.batchDropSuccess", { count: targets.length }), 3000);
@@ -2306,6 +2414,7 @@ async function confirmDropTable() {
     const sql = dropTablePreviewSql.value || (await buildDropTableSql(tableAdminSqlOptions()));
     await api.executeQuery(node.connectionId, node.database, sql, node.schema);
     toast(t("contextMenu.dropTableSuccess", { name: node.label }), 3000);
+    closeDroppedTableObjectTabsForNode(node);
     connectionStore.removeTreeNode(node.id);
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
@@ -3875,7 +3984,8 @@ onBeforeUnmount(() => {
 
 // ---- CustomContextMenu ----
 
-const shortcutCopyName = computed(() => formatShortcut("Mod+C"));
+const shortcutCopyName = computed(() => formatShortcut(settingsStore.editorSettings.shortcuts.copySidebarSelection));
+const shortcutEditConnection = computed(() => formatShortcut(settingsStore.editorSettings.shortcuts.editSidebarConnection));
 const shortcutRename = "F2";
 const shortcutRefresh = "F5";
 const shortcutDelete = "Delete";
@@ -4066,7 +4176,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
         icon: ListFilter,
       });
     }
-    items.push({ label: t("contextMenu.editConnection"), action: editConnection, icon: Pencil });
+    items.push({ label: t("contextMenu.editConnection"), action: editConnection, icon: Pencil, shortcut: shortcutEditConnection.value });
     if (revealConnectionFilePath.value) {
       items.push({
         label: t("contextMenu.revealDatabaseFile"),
@@ -4529,19 +4639,22 @@ function treeItemMenuItems(): ContextMenuItem[] {
 </script>
 
 <template>
-  <CustomContextMenu :items="treeItemMenuItems()" v-slot="{ onContextMenu }">
-    <div @contextmenu="onTreeItemContextMenu($event, onContextMenu)">
+  <CustomContextMenu :items="treeItemMenuItems()" v-slot="contextMenuSlot">
+    <div @contextmenu="onTreeItemContextMenu($event, contextMenuSlot.onContextMenu)">
       <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0">
         <div
           ref="rowRef"
-          class="group flex items-center gap-1.5 py-1 px-2 cursor-pointer hover:bg-accent relative outline-none"
+          class="group flex items-center gap-1.5 py-1 px-2 cursor-pointer relative outline-none"
           style="contain: layout style"
           :class="[
             rowWidthClass,
             {
+              'group/sidebar-row': true,
               'ring-1 ring-primary/50 bg-primary/5': showDropInside,
               'opacity-50': isDragging,
               'tree-item-connection-tint': connectionColor,
+              'hover:bg-accent': node.type !== 'connection',
+              'hover:bg-secondary/60': node.type === 'connection',
               rounded: !isSelected && !isMultiSelected,
               'tree-item-active rounded-none': connectionColor && (isSelected || isMultiSelected),
               'tree-item-active rounded-md': !connectionColor && (isSelected || isMultiSelected),
@@ -4567,7 +4680,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
             </button>
           </template>
           <span v-else class="w-3.5 h-3.5 shrink-0" />
-          <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="w-3.5 h-3.5 shrink-0" />
+          <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="h-3.5 w-3.5 shrink-0" />
           <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="w-3.5 h-3.5 shrink-0 animate-spin text-primary" />
           <component v-else :is="getIconInfo(node)?.icon || Database" class="w-3.5 h-3.5 shrink-0" :class="nodeIconClass" />
           <input
@@ -4599,6 +4712,18 @@ function treeItemMenuItems(): ContextMenuItem[] {
           <Badge v-if="isConnectionReadonly" variant="secondary" class="h-4 px-1.5 text-[10px] gap-0.5"><Lock class="w-2.5 h-2.5" />{{ t("connection.readOnlyBadge") }}</Badge>
           <ConnectionErrorIndicator v-if="node.type === 'connection'" :connection-id="node.connectionId" trigger-class="h-4 w-4" />
           <Pin v-if="isPinned" class="w-3 h-3 shrink-0 text-primary fill-current" aria-hidden="true" />
+          <button
+            v-if="node.type === 'connection'"
+            type="button"
+            class="ml-auto flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground/55 opacity-0 transition-colors transition-opacity hover:bg-secondary/45 hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:opacity-100"
+            :class="{ 'opacity-100': isConnectionSelectionChecked || connectionStore.connectionMultiSelectActive }"
+            :aria-label="isConnectionSelectionChecked ? t('connectionGroup.deselectConnection') : t('connectionGroup.selectConnection')"
+            @mousedown.stop
+            @click="toggleConnectionMultiSelection"
+          >
+            <Check v-if="isConnectionSelectionChecked" class="h-3 w-3 text-primary" />
+            <Square v-else class="h-3 w-3 stroke-[1.7]" />
+          </button>
         </div>
         <template v-if="detailTooltip" #content>
           <div class="w-max min-w-40 max-w-[min(28rem,calc(100vw-24px))] rounded-md border border-border bg-popover p-2 text-popover-foreground shadow-lg">

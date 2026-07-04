@@ -1,13 +1,13 @@
 import { defineStore } from "pinia";
-import { uuid } from "@/lib/utils";
+import { uuid } from "@/lib/common/utils";
 import { markRaw, ref, watch, computed } from "vue";
 import { useI18n } from "vue-i18n";
 import type { DatabaseType, QueryResult, QueryTab, TableInfoTab } from "@/types/database";
-import { orderPinnedFirst } from "@/lib/pinnedItems";
-import { canCancelQueryExecution } from "@/lib/queryExecutionState";
-import { buildExplainSql, parseExplainResult, parseDamengExplainText } from "@/lib/explainPlan";
-import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQuery, sourceColumnsForResult, type EditableQueryInfo } from "@/lib/sqlAnalysis";
-import { ACTIVE_TAB_STORAGE_KEY, OPEN_TABS_STORAGE_KEY, restoreOpenTabsState, serializeOpenTabs } from "@/lib/openTabsPersistence";
+import { orderPinnedFirst } from "@/lib/app/pinnedItems";
+import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
+import { buildExplainSql, parseExplainResult, parseDamengExplainText } from "@/lib/diagram/explainPlan";
+import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQuery, sourceColumnsForResult, type EditableQueryInfo } from "@/lib/sql/sqlAnalysis";
+import { ACTIVE_TAB_STORAGE_KEY, OPEN_TABS_STORAGE_KEY, restoreOpenTabsState, serializeOpenTabs } from "@/lib/app/openTabsPersistence";
 import {
   evaluateMongoAggregateSafety,
   evaluateMongoWriteSafety,
@@ -22,25 +22,25 @@ import {
   mongoWriteToQueryResult,
   splitMongoCommands,
   type MongoAggregateSafetyOptions,
-} from "@/lib/mongoShellCommand";
-import { redisCommandResultToQueryResult } from "@/lib/redisQueryResult";
-import { nextRedisCommandDb } from "@/lib/redisCommandSession";
-import { isRedisMutatingCommand } from "@/lib/redisCommandTable";
-import { usesAgentCursorForQuery } from "@/lib/databaseDriverManifest";
-import { canUseKeylessRowPredicate, editableRowIdentifierColumns } from "@/lib/tableEditing";
-import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/tableDataExport";
-import { tableMetaForDataTab } from "@/lib/tableDataTabMeta";
-import { tableOpenPageLimit } from "@/lib/tableOpenPageLimit";
-import { quoteTableIdentifier } from "@/lib/tableSelectSql";
-import { connectionUsesDatabaseObjectTreeMode, connectionUsesSchemaExecutionContext, effectiveDatabaseTypeForConnection, metadataSchemaForConnection } from "@/lib/jdbcDialect";
-import { queryTimeoutSecsForConnection } from "@/lib/queryTimeout";
-import { sortDataGridRows, type DataGridSortDirection } from "@/lib/dataGridSort";
-import { normalizeResultPageSize } from "@/lib/paginationPageSize";
-import { splitSqlStatementRanges } from "@/lib/sqlStatementRanges";
+} from "@/lib/mongo/mongoShellCommand";
+import { redisCommandResultToQueryResult } from "@/lib/redis/redisQueryResult";
+import { nextRedisCommandDb } from "@/lib/redis/redisCommandSession";
+import { isRedisMutatingCommand } from "@/lib/redis/redisCommandTable";
+import { usesAgentCursorForQuery } from "@/lib/database/databaseDriverManifest";
+import { canUseKeylessRowPredicate, editableRowIdentifierColumns } from "@/lib/table/tableEditing";
+import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/table/tableDataExport";
+import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
+import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
+import { quoteTableIdentifier } from "@/lib/table/tableSelectSql";
+import { connectionUsesDatabaseObjectTreeMode, connectionUsesSchemaExecutionContext, effectiveDatabaseTypeForConnection, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
+import { frontendQueryTimeoutSecsForSql, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
+import { sortDataGridRows, type DataGridSortDirection } from "@/lib/dataGrid/dataGridSort";
+import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
+import { splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
 import { clearDataGridPendingSnapshotsForTab } from "@/composables/useDataGridEditor";
-import { buildTabResultSnapshot, deleteTabResultSnapshot, readTabResultSnapshot, tabResultCacheKey, writeTabResultSnapshot } from "@/lib/tabResultCache";
-import { decodeQueryResultArchive, encodeQueryResultArchive, type DecodedQueryResultArchive } from "@/lib/queryResultArchive";
-import * as api from "@/lib/api";
+import { buildTabResultSnapshot, deleteTabResultSnapshot, readTabResultSnapshot, tabResultCacheKey, writeTabResultSnapshot } from "@/lib/tabs/tabResultCache";
+import { decodeQueryResultArchive, encodeQueryResultArchive, type DecodedQueryResultArchive } from "@/lib/query/queryResultArchive";
+import * as api from "@/lib/backend/api";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
@@ -49,6 +49,7 @@ import type { SavedSqlFile } from "@/types/database";
 const ORACLE_LIKE_METADATA_TYPES = new Set<string>(["oracle", "dameng", "oceanbase-oracle"]);
 const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export"] as const;
 const CANCEL_QUERY_TIMEOUT_MS = 10_000;
+const CANCEL_ACK_SETTLE_TIMEOUT_MS = 2_000;
 type CloseConfirmContext = "tab" | "batch" | "app";
 
 function cloneTabDraft<T>(value: T): T {
@@ -61,12 +62,32 @@ interface BuildQueryResultExportRequestOptions {
   format: "csv" | "xlsx";
 }
 
+type DroppedTableObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW";
+
+interface DroppedTableObjectTarget {
+  connectionId: string;
+  database: string;
+  schema?: string;
+  schemaCandidates?: Array<string | undefined>;
+  name: string;
+  objectType?: DroppedTableObjectType;
+}
+
 function tabClientSessionId(tab: Pick<QueryTab, "id">, suffix?: (typeof BACKGROUND_CLIENT_SESSION_SUFFIXES)[number]): string {
   return suffix ? `${tab.id}:${suffix}` : tab.id;
 }
 
 function resultRunCacheKey(tabId: string, runId: string): string {
   return `tab:${tabId}:run:${runId}`;
+}
+
+function normalizeOptionalSchema(schema: string | null | undefined): string {
+  return schema?.trim() ?? "";
+}
+
+function droppedTableObjectSchemaCandidates(target: DroppedTableObjectTarget): Set<string> {
+  const schemas = target.schemaCandidates?.length ? target.schemaCandidates : [target.schema];
+  return new Set(schemas.map(normalizeOptionalSchema));
 }
 
 function markQueryResultRowsRaw(result: QueryResult): QueryResult {
@@ -1218,6 +1239,30 @@ export const useQueryStore = defineStore("query", () => {
     closeTabsWhere((tab) => tab.connectionId === connectionId && tab.database === database);
   }
 
+  function tabMatchesDroppedTableObject(tab: QueryTab, target: DroppedTableObjectTarget): boolean {
+    if (tab.connectionId !== target.connectionId || tab.database !== target.database) return false;
+    const targetSchemas = droppedTableObjectSchemaCandidates(target);
+
+    if (tab.mode === "data") {
+      const tableMeta = tableMetaForDataTab(tab);
+      if (!tableMeta || tableMeta.tableName !== target.name) return false;
+      return targetSchemas.has(normalizeOptionalSchema(tableMeta.schema ?? tab.schema));
+    }
+
+    if ((target.objectType ?? "TABLE") === "TABLE" && tab.mode === "structure") {
+      if ((tab.structureTableName || "") !== target.name) return false;
+      return targetSchemas.has(normalizeOptionalSchema(tab.schema));
+    }
+
+    return false;
+  }
+
+  function closeDroppedTableObjectTabs(target: DroppedTableObjectTarget) {
+    // A dropped table-like object makes existing data/structure tabs stale; close
+    // them immediately instead of letting the next refresh fail against a missing object.
+    closeTabsWhere((tab) => tabMatchesDroppedTableObject(tab, target));
+  }
+
   function releaseTabsWhere(predicate: (tab: QueryTab) => boolean) {
     closeTabsWhere((tab) => predicate(tab) && tab.mode !== "query");
     tabs.value
@@ -1538,6 +1583,22 @@ export const useQueryStore = defineStore("query", () => {
     tab.executionId = undefined;
   }
 
+  function clearAcknowledgedCancelIfStillRunning(id: string, executionId: string) {
+    setTimeout(() => {
+      const current = tabs.value.find((t) => t.id === id);
+      if (!current || current.executionId !== executionId || !current.isCancelling) return;
+      current.isExecuting = false;
+      current.isCancelling = false;
+      current.executionId = undefined;
+      current.queryExecutionStartedAt = undefined;
+      current.result = toErrorResult(new Error("Query canceled"));
+      current.results = undefined;
+      current.activeResultIndex = undefined;
+      current.resultSessionId = undefined;
+      touchResult(current);
+    }, CANCEL_ACK_SETTLE_TIMEOUT_MS);
+  }
+
   async function executeCurrentTab() {
     const tab = tabs.value.find((t) => t.id === activeTabId.value);
     if (!tab || !tab.sql.trim()) return;
@@ -1626,10 +1687,12 @@ export const useQueryStore = defineStore("query", () => {
         elapsed: elapsed?.(),
       });
       const indexes = await api.listIndexes(tab.connectionId, tab.database, metadataSchema, metadataTableName).catch(() => []);
-      const primaryKeys = editableRowIdentifierColumns(dbType as DatabaseType, columns, indexes);
+      const tableType = tab.tableMeta?.tableType;
+      const primaryKeys = editableRowIdentifierColumns(dbType as DatabaseType, columns, indexes, tableType);
       const tableMeta = {
         schema: metadataSchema || undefined,
         tableName: metadataTableName,
+        tableType,
         columns,
         primaryKeys,
       };
@@ -2135,7 +2198,7 @@ export const useQueryStore = defineStore("query", () => {
       }
 
       const executionSchema = connectionUsesSchemaExecutionContext(conn) ? tab.schema || tab.database : tab.mode === "data" || connectionUsesDatabaseObjectTreeMode(conn) ? undefined : tab.schema;
-      const frontendTimeoutSecs = Math.max(queryTimeoutSecs * 2, 60);
+      const frontendTimeoutSecs = frontendQueryTimeoutSecsForSql(sqlToExecute, effectiveDbType, queryTimeoutSecs);
       const sourceLabelDatabase = tab.database || conn?.database;
 
       let executionPromise: Promise<QueryResult[]>;
@@ -2174,7 +2237,7 @@ export const useQueryStore = defineStore("query", () => {
         });
         executionPromise = api.executeMulti(tab.connectionId, tab.database, sqlToExecute, executionSchema, executionId, executionOptions);
       }
-      const results = annotateQueryResultSources(markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, queryTimeoutSecs === 0 ? 0 : frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }))), queryBaseSql, sourceLabelDatabase, effectiveDbType);
+      const results = annotateQueryResultSources(markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }))), queryBaseSql, sourceLabelDatabase, effectiveDbType);
       console.info("[DBX][executeTabSql:execute-multi:done]", {
         traceId,
         resultCount: results.length,
@@ -2403,6 +2466,9 @@ export const useQueryStore = defineStore("query", () => {
     tab.isCancelling = true;
     try {
       const canceled = await withCancelQueryTimeout(api.cancelQuery(executionId));
+      if (canceled) {
+        clearAcknowledgedCancelIfStillRunning(id, executionId);
+      }
       if (!canceled) {
         const current = tabs.value.find((t) => t.id === id);
         if (current && current.executionId === executionId) {
@@ -2837,6 +2903,7 @@ export const useQueryStore = defineStore("query", () => {
     duplicateTab,
     closeConnectionTabs,
     closeDatabaseTabs,
+    closeDroppedTableObjectTabs,
     releaseConnectionTabs,
     releaseDatabaseTabs,
     isDatabaseOpen,

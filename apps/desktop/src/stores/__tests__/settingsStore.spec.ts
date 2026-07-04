@@ -50,6 +50,12 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ updateDownloadSource: "atomgit" }).updateDownloadSource).toBe("atomgit");
     expect(normalizeEditorSettings({ updateDownloadSource: "mirror" as any }).updateDownloadSource).toBe("official");
   });
+
+  it("defaults data grid search to row filtering and preserves highlight mode", () => {
+    expect(normalizeEditorSettings({}).dataGridSearchMode).toBe("filter");
+    expect(normalizeEditorSettings({ dataGridSearchMode: "highlight" }).dataGridSearchMode).toBe("highlight");
+    expect(normalizeEditorSettings({ dataGridSearchMode: "invalid" as any }).dataGridSearchMode).toBe("filter");
+  });
 });
 
 describe("normalizeDesktopSettings", () => {
