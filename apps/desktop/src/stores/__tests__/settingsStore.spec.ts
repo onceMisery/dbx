@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeEditorSettings } from "@/stores/settingsStore";
+import { normalizeDesktopSettings, normalizeEditorSettings } from "@/stores/settingsStore";
 
 describe("normalizeEditorSettings", () => {
   it("enables automatic table aliases by default", () => {
@@ -49,5 +49,11 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ updateDownloadSource: "cnb" }).updateDownloadSource).toBe("cnb");
     expect(normalizeEditorSettings({ updateDownloadSource: "atomgit" }).updateDownloadSource).toBe("atomgit");
     expect(normalizeEditorSettings({ updateDownloadSource: "mirror" as any }).updateDownloadSource).toBe("official");
+  });
+});
+
+describe("normalizeDesktopSettings", () => {
+  it("defaults DuckDB worker process isolation to disabled for old settings", () => {
+    expect(normalizeDesktopSettings({}).duckdb_worker_process_isolation).toBe(false);
   });
 });

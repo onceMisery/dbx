@@ -586,6 +586,12 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
             let con = con.lock().map_err(|e| e.to_string())?;
             duckdb_list_databases_with_attached(&con, &duckdb_attached_names)
         }
+        #[cfg(feature = "duckdb-bundled")]
+        PoolKind::DuckDbWorker(client) => {
+            let client = client.clone();
+            drop(connections);
+            client.list_databases().await
+        }
         _ => Ok(vec![]),
     }
 }
@@ -784,6 +790,16 @@ async fn list_schemas_once(
             let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
             let con = con.lock().map_err(|e| e.to_string())?;
             duckdb_list_schemas_with_attached(&con, database, &duckdb_attached_names)
+                .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
+        }
+        #[cfg(feature = "duckdb-bundled")]
+        PoolKind::DuckDbWorker(client) => {
+            let client = client.clone();
+            let database = database.to_string();
+            drop(connections);
+            client
+                .list_schemas(database)
+                .await
                 .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
         }
         _ => Ok(vec![]),
@@ -1451,6 +1467,16 @@ async fn list_tables_once(
             drop(connections);
             let con = con.lock().map_err(|e| e.to_string())?;
             return duckdb_query_tables_in_database_with_attached(&con, database, schema, &duckdb_attached_names)
+                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
+        }
+        #[cfg(feature = "duckdb-bundled")]
+        if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
+            let database = database.to_string();
+            let schema = schema.to_string();
+            drop(connections);
+            return client
+                .list_tables(database, schema)
+                .await
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types));
         }
         if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
@@ -3432,6 +3458,14 @@ pub async fn get_columns_core(
                     table,
                     &duckdb_attached_names,
                 );
+            }
+            #[cfg(feature = "duckdb-bundled")]
+            if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
+                let database = database.to_string();
+                let schema = schema.to_string();
+                let table = table.to_string();
+                drop(connections);
+                return client.list_columns(database, schema, table).await;
             }
             if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
                 drop(connections);

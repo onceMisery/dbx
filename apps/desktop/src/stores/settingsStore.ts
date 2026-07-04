@@ -48,6 +48,7 @@ export interface DesktopSettings {
   quit_on_close: boolean;
   close_action_prompted: boolean;
   debug_logging_enabled: boolean;
+  duckdb_worker_process_isolation: boolean;
   saved_sql_sync_dir?: string | null;
   driver_store_dir?: string | null;
   plugin_store_dir?: string | null;
@@ -72,6 +73,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   quit_on_close: false,
   close_action_prompted: false,
   debug_logging_enabled: false,
+  duckdb_worker_process_isolation: false,
   saved_sql_sync_dir: null,
   driver_store_dir: null,
   plugin_store_dir: null,
@@ -79,7 +81,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   sidebar_table_page_size: DEFAULT_SIDEBAR_TABLE_PAGE_SIZE,
 };
 
-function normalizeDesktopSettings(settings: Partial<DesktopSettings> | null | undefined): DesktopSettings {
+export function normalizeDesktopSettings(settings: Partial<DesktopSettings> | null | undefined): DesktopSettings {
   const iconTheme = settings?.icon_theme === "black" ? "black" : DEFAULT_DESKTOP_SETTINGS.icon_theme;
   const sidebarTablePageSize = typeof settings?.sidebar_table_page_size === "number" && settings.sidebar_table_page_size > 0 ? settings.sidebar_table_page_size : DEFAULT_DESKTOP_SETTINGS.sidebar_table_page_size;
   return {
@@ -88,6 +90,7 @@ function normalizeDesktopSettings(settings: Partial<DesktopSettings> | null | un
     quit_on_close: settings?.quit_on_close ?? DEFAULT_DESKTOP_SETTINGS.quit_on_close,
     close_action_prompted: settings?.close_action_prompted ?? DEFAULT_DESKTOP_SETTINGS.close_action_prompted,
     debug_logging_enabled: settings?.debug_logging_enabled ?? DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled,
+    duckdb_worker_process_isolation: settings?.duckdb_worker_process_isolation ?? DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation,
     saved_sql_sync_dir: settings?.saved_sql_sync_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.saved_sql_sync_dir,
     driver_store_dir: settings?.driver_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.driver_store_dir,
     plugin_store_dir: settings?.plugin_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.plugin_store_dir,

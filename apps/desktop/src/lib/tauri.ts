@@ -144,6 +144,7 @@ export interface DesktopSettings {
   quit_on_close: boolean;
   close_action_prompted: boolean;
   debug_logging_enabled: boolean;
+  duckdb_worker_process_isolation: boolean;
   saved_sql_sync_dir?: string | null;
   driver_store_dir?: string | null;
   plugin_store_dir?: string | null;

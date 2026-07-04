@@ -651,16 +651,18 @@ pub fn run() {
                 default_agent_dir,
             );
 
-            let state = if let Some(agent_dir) = agent_dir {
-                Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
+            let mut state = if let Some(agent_dir) = agent_dir {
+                AppState::new_with_plugin_and_agent_dir_and_app_version(
                     storage,
                     plugin_dir,
                     agent_dir,
                     env!("CARGO_PKG_VERSION"),
-                ))
+                )
             } else {
-                Arc::new(AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION")))
+                AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION"))
             };
+            state.duckdb_worker_process_isolation = desktop_settings.duckdb_worker_process_isolation;
+            let state = Arc::new(state);
             app.manage(state.clone());
             commands::redis_pubsub_server::start_pubsub_server(state.clone());
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });

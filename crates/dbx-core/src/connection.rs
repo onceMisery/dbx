@@ -39,15 +39,17 @@ const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
 mod duckdb_types {
     use std::sync::Arc;
     pub type DuckDbHandle = Arc<std::sync::Mutex<duckdb::Connection>>;
+    pub type DuckDbWorkerHandle = Arc<crate::db::duckdb_worker_process::DuckDbWorkerClient>;
     pub type ExternalTabularHandle = Arc<crate::external::ExternalPool>;
 }
 #[cfg(not(feature = "duckdb-bundled"))]
 mod duckdb_types {
     pub type DuckDbHandle = ();
+    pub type DuckDbWorkerHandle = ();
     pub type ExternalTabularHandle = ();
 }
 
-use duckdb_types::{DuckDbHandle, ExternalTabularHandle};
+use duckdb_types::{DuckDbHandle, DuckDbWorkerHandle, ExternalTabularHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MysqlMode {
@@ -77,6 +79,7 @@ pub enum PoolKind {
     Turso(db::turso_driver::TursoClient),
     Redis(db::redis_driver::RedisConnection),
     DuckDb(DuckDbHandle),
+    DuckDbWorker(DuckDbWorkerHandle),
     MongoDb(mongodb::Client),
     ClickHouse(db::clickhouse_driver::ChClient),
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
@@ -167,6 +170,7 @@ pub struct AppState {
     pub plugins: PluginRegistry,
     pub agent_manager: crate::agent_manager::AgentManager,
     pub nacos_registry: crate::nacos::NacosAdminRegistry,
+    pub duckdb_worker_process_isolation: bool,
     /// PostgreSQL TLS cancel context, keyed by pool_key.
     /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
@@ -467,6 +471,7 @@ impl AppState {
                 app_version,
             ),
             nacos_registry: crate::nacos::NacosAdminRegistry::new(),
+            duckdb_worker_process_isolation: false,
             postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
             transaction_sessions: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "mq-admin")]
@@ -859,14 +864,35 @@ impl AppState {
             }
             #[cfg(feature = "duckdb-bundled")]
             DatabaseType::DuckDb => {
-                let con = db::duckdb_driver::connect_path(&expand_tilde(&db_config.host))?;
-                {
-                    let locked = con.lock().map_err(|e| e.to_string())?;
-                    for attached in &db_config.attached_databases {
-                        crate::schema::duckdb_attach_database(&locked, &attached.name, &expand_tilde(&attached.path))?;
+                if self.duckdb_worker_process_isolation {
+                    let attached_databases = db_config
+                        .attached_databases
+                        .iter()
+                        .map(|attached| crate::models::connection::AttachedDatabaseConfig {
+                            name: attached.name.clone(),
+                            path: expand_tilde(&attached.path),
+                        })
+                        .collect();
+                    let client = db::duckdb_worker_process::DuckDbWorkerClient::open(
+                        expand_tilde(&db_config.host),
+                        attached_databases,
+                    )
+                    .await?;
+                    PoolKind::DuckDbWorker(Arc::new(client))
+                } else {
+                    let con = db::duckdb_driver::connect_path(&expand_tilde(&db_config.host))?;
+                    {
+                        let locked = con.lock().map_err(|e| e.to_string())?;
+                        for attached in &db_config.attached_databases {
+                            crate::schema::duckdb_attach_database(
+                                &locked,
+                                &attached.name,
+                                &expand_tilde(&attached.path),
+                            )?;
+                        }
                     }
+                    PoolKind::DuckDb(con)
                 }
-                PoolKind::DuckDb(con)
             }
             #[cfg(not(feature = "duckdb-bundled"))]
             DatabaseType::DuckDb => {
@@ -1532,6 +1558,7 @@ impl AppState {
                 }
                 PoolKind::Sqlite(_)
                 | PoolKind::DuckDb(_)
+                | PoolKind::DuckDbWorker(_)
                 | PoolKind::ExternalTabular(_)
                 | PoolKind::ExternalDriver { .. }
                 | PoolKind::MessageQueue
@@ -1925,6 +1952,7 @@ impl AppState {
                 }
                 PoolKind::Sqlite(_)
                 | PoolKind::DuckDb(_)
+                | PoolKind::DuckDbWorker(_)
                 | PoolKind::ExternalTabular(_)
                 | PoolKind::ExternalDriver { .. }
                 | PoolKind::MessageQueue
@@ -2290,8 +2318,12 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         PoolKind::Turso(client) => PoolKind::Turso(client.clone()),
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => PoolKind::DuckDb(con.clone()),
+        #[cfg(feature = "duckdb-bundled")]
+        PoolKind::DuckDbWorker(client) => PoolKind::DuckDbWorker(client.clone()),
         #[cfg(not(feature = "duckdb-bundled"))]
         PoolKind::DuckDb(con) => PoolKind::DuckDb(con.clone()),
+        #[cfg(not(feature = "duckdb-bundled"))]
+        PoolKind::DuckDbWorker(client) => PoolKind::DuckDbWorker(client.clone()),
         PoolKind::MongoDb(client) => PoolKind::MongoDb(client.clone()),
         PoolKind::ClickHouse(client) => PoolKind::ClickHouse(client.clone()),
         PoolKind::SqlServer(client) => PoolKind::SqlServer(client.clone()),
@@ -2325,8 +2357,14 @@ pub async fn close_pool_kind(pool: PoolKind) {
         PoolKind::DuckDb(con) => {
             crate::db::duckdb_driver::close_connection(con);
         }
+        #[cfg(feature = "duckdb-bundled")]
+        PoolKind::DuckDbWorker(client) => {
+            client.shutdown().await;
+        }
         #[cfg(not(feature = "duckdb-bundled"))]
         PoolKind::DuckDb(_) => {}
+        #[cfg(not(feature = "duckdb-bundled"))]
+        PoolKind::DuckDbWorker(_) => {}
         PoolKind::MongoDb(client) => {
             drop(client);
         }

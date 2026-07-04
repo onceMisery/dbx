@@ -118,6 +118,8 @@ pub struct DesktopSettings {
     #[serde(default)]
     pub debug_logging_enabled: bool,
     #[serde(default)]
+    pub duckdb_worker_process_isolation: bool,
+    #[serde(default)]
     pub saved_sql_sync_dir: Option<String>,
     #[serde(default)]
     pub driver_store_dir: Option<String>,
@@ -141,6 +143,7 @@ impl Default for DesktopSettings {
             quit_on_close: false,
             close_action_prompted: false,
             debug_logging_enabled: false,
+            duckdb_worker_process_isolation: false,
             saved_sql_sync_dir: None,
             driver_store_dir: None,
             plugin_store_dir: None,
@@ -784,6 +787,10 @@ impl Storage {
             "debug_logging_enabled".to_string(),
             serde_json::Value::Bool(desktop_settings.debug_logging_enabled),
         );
+        settings.insert(
+            "duckdb_worker_process_isolation".to_string(),
+            serde_json::Value::Bool(desktop_settings.duckdb_worker_process_isolation),
+        );
         match desktop_settings.saved_sql_sync_dir.as_ref().filter(|path| !path.trim().is_empty()) {
             Some(path) => {
                 settings.insert("saved_sql_sync_dir".to_string(), serde_json::Value::String(path.clone()));
@@ -844,6 +851,10 @@ impl Storage {
                 .get("debug_logging_enabled")
                 .and_then(|value| value.as_bool())
                 .unwrap_or_else(|| DesktopSettings::default().debug_logging_enabled),
+            duckdb_worker_process_isolation: settings
+                .get("duckdb_worker_process_isolation")
+                .and_then(|value| value.as_bool())
+                .unwrap_or_else(|| DesktopSettings::default().duckdb_worker_process_isolation),
             saved_sql_sync_dir: settings
                 .get("saved_sql_sync_dir")
                 .and_then(|value| value.as_str())
@@ -2520,6 +2531,7 @@ mod tests {
                 quit_on_close: true,
                 close_action_prompted: false,
                 debug_logging_enabled: true,
+                duckdb_worker_process_isolation: false,
                 saved_sql_sync_dir: None,
                 driver_store_dir: Some("/tmp/dbx-drivers".to_string()),
                 plugin_store_dir: Some("/tmp/dbx-plugins".to_string()),
@@ -2538,6 +2550,7 @@ mod tests {
                 quit_on_close: true,
                 close_action_prompted: false,
                 debug_logging_enabled: true,
+                duckdb_worker_process_isolation: false,
                 saved_sql_sync_dir: None,
                 driver_store_dir: Some("/tmp/dbx-drivers".to_string()),
                 plugin_store_dir: Some("/tmp/dbx-plugins".to_string()),

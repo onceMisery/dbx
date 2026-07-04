@@ -224,6 +224,9 @@ const editQuitOnClose = ref(settingsStore.desktopSettings.quit_on_close);
 const desktopCloseBehaviorResetPending = ref(false);
 const editIconTheme = ref<DesktopIconTheme>(settingsStore.desktopSettings.icon_theme);
 const editDebugLoggingEnabled = ref(settingsStore.desktopSettings.debug_logging_enabled);
+const editDuckDbWorkerProcessIsolation = ref(settingsStore.desktopSettings.duckdb_worker_process_isolation);
+const startupDuckDbWorkerProcessIsolation = ref(settingsStore.desktopSettings.duckdb_worker_process_isolation);
+const duckDbWorkerStartupCaptured = ref(false);
 const editSidebarTablePageSize = ref(settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE);
 const debugLogCopied = ref(false);
 const debugLogDownloaded = ref(false);
@@ -523,6 +526,7 @@ watch(
       editQuitOnClose.value = settingsStore.desktopSettings.quit_on_close;
       editIconTheme.value = settingsStore.desktopSettings.icon_theme;
       editDebugLoggingEnabled.value = settingsStore.desktopSettings.debug_logging_enabled;
+      editDuckDbWorkerProcessIsolation.value = settingsStore.desktopSettings.duckdb_worker_process_isolation;
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
       editShowColumnCommentsInHeader.value = settingsStore.editorSettings.showColumnCommentsInHeader;
       editShowColumnTypesInHeader.value = settingsStore.editorSettings.showColumnTypesInHeader;
@@ -566,6 +570,7 @@ const formatterEditorShortcutIds: ShortcutActionId[] = ["formatSql", "find", "re
 const formatterEditorShortcutDefinitions = computed(() => formatterEditorShortcutIds.map((id) => SHORTCUT_DEFINITIONS.find((definition) => definition.id === id)).filter((definition): definition is (typeof SHORTCUT_DEFINITIONS)[number] => !!definition));
 const hasShortcutConflicts = computed(() => shortcutConflicts.value.length > 0);
 const shortcutsChanged = computed(() => JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts));
+const duckDbWorkerProcessIsolationRequiresRestart = computed(() => editDuckDbWorkerProcessIsolation.value !== startupDuckDbWorkerProcessIsolation.value);
 const hasBlockingShortcutConflicts = computed(() => shortcutsChanged.value && hasShortcutConflicts.value);
 const hasBlockingFormatterConfig = computed(() => activeSettingsTab.value === "formatter" && !sqlFormatterConfigValid.value);
 const hasApplyBlocker = computed(() => hasBlockingShortcutConflicts.value || hasBlockingFormatterConfig.value);
@@ -593,6 +598,7 @@ function hasChanges(): boolean {
     editQuitOnClose.value !== settingsStore.desktopSettings.quit_on_close ||
     editIconTheme.value !== settingsStore.desktopSettings.icon_theme ||
     editDebugLoggingEnabled.value !== settingsStore.desktopSettings.debug_logging_enabled ||
+    editDuckDbWorkerProcessIsolation.value !== settingsStore.desktopSettings.duckdb_worker_process_isolation ||
     editSidebarTablePageSize.value !== (settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE) ||
     editShowColumnCommentsInHeader.value !== settingsStore.editorSettings.showColumnCommentsInHeader ||
     editShowColumnTypesInHeader.value !== settingsStore.editorSettings.showColumnTypesInHeader ||
@@ -677,6 +683,7 @@ async function persistSettings() {
     close_action_prompted: desktopCloseBehaviorResetPending.value ? false : true,
     icon_theme: editIconTheme.value,
     debug_logging_enabled: editDebugLoggingEnabled.value,
+    duckdb_worker_process_isolation: editDuckDbWorkerProcessIsolation.value,
     sidebar_table_page_size: editSidebarTablePageSize.value,
   });
   desktopCloseBehaviorResetPending.value = false;
@@ -744,6 +751,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
     editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
     editInfiniteScrollMaxRows.value = DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
+    editDuckDbWorkerProcessIsolation.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation;
     editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
     editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
     editExportRowLimitEnabled.value = DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled;
@@ -781,6 +789,7 @@ function resetAllDefaults() {
   desktopCloseBehaviorResetPending.value = true;
   editIconTheme.value = DEFAULT_DESKTOP_SETTINGS.icon_theme;
   editDebugLoggingEnabled.value = DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled;
+  editDuckDbWorkerProcessIsolation.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation;
   editSidebarTablePageSize.value = DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
   editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
   editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
@@ -1423,6 +1432,11 @@ watch(
       editQuitOnClose.value = settingsStore.desktopSettings.quit_on_close;
       editIconTheme.value = settingsStore.desktopSettings.icon_theme;
       editDebugLoggingEnabled.value = settingsStore.desktopSettings.debug_logging_enabled;
+      editDuckDbWorkerProcessIsolation.value = settingsStore.desktopSettings.duckdb_worker_process_isolation;
+      if (!duckDbWorkerStartupCaptured.value) {
+        startupDuckDbWorkerProcessIsolation.value = settingsStore.desktopSettings.duckdb_worker_process_isolation;
+        duckDbWorkerStartupCaptured.value = true;
+      }
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
       webdavPassword.value = "";
       await refreshWebDavPasswordStatus();
@@ -2538,6 +2552,20 @@ onUnmounted(cleanupPreviewEditor);
 
               <div class="space-y-3">
                 <Label>{{ t("settings.dataGridDisplay") }}</Label>
+                <div v-if="!isWeb" class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="duckdb-worker-process-isolation">
+                      {{ t("settings.duckDbWorkerProcessIsolation") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.duckDbWorkerProcessIsolationDescription") }}
+                    </p>
+                    <p v-if="duckDbWorkerProcessIsolationRequiresRestart" class="text-xs font-medium text-amber-600 dark:text-amber-400">
+                      {{ t("settings.duckDbWorkerProcessIsolationRestartRequired") }}
+                    </p>
+                  </div>
+                  <Switch id="duckdb-worker-process-isolation" v-model="editDuckDbWorkerProcessIsolation" />
+                </div>
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="show-column-comments-in-header">
