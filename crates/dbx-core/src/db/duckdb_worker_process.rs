@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::db;
@@ -21,7 +21,8 @@ use crate::models::connection::AttachedDatabaseConfig;
 
 const DEFAULT_WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_WORKER_KILL_WAIT: Duration = Duration::from_secs(3);
-pub const DEFAULT_DUCKDB_WORKER_CANCEL_GRACE: Duration = Duration::from_millis(1500);
+const DEFAULT_WORKER_START_WAIT: Duration = Duration::from_secs(5);
+const DEFAULT_DUCKDB_WORKER_PROCESS_LIMIT: usize = 4;
 
 type PendingRequests = Arc<Mutex<HashMap<String, PendingRequest>>>;
 
@@ -39,10 +40,12 @@ struct DuckDbWorkerClientInner {
     state: Mutex<WorkerProcessState>,
     pending: PendingRequests,
     connect_lock: Mutex<()>,
+    query_lock: Mutex<()>,
+    process_limiter: Arc<Semaphore>,
     executable: PathBuf,
     connect_params: DuckDbWorkerConnectParams,
     request_timeout: Duration,
-    cancel_grace: Duration,
+    worker_start_timeout: Duration,
     next_id: AtomicU64,
 }
 
@@ -70,10 +73,12 @@ impl DuckDbWorkerClient {
                 state: Mutex::new(WorkerProcessState::default()),
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 connect_lock: Mutex::new(()),
+                query_lock: Mutex::new(()),
+                process_limiter: duckdb_worker_process_limiter(),
                 executable,
                 connect_params: DuckDbWorkerConnectParams { path, attached_databases },
                 request_timeout: DEFAULT_WORKER_REQUEST_TIMEOUT,
-                cancel_grace: DEFAULT_DUCKDB_WORKER_CANCEL_GRACE,
+                worker_start_timeout: DEFAULT_WORKER_START_WAIT,
                 next_id: AtomicU64::new(1),
             }),
         };
@@ -89,6 +94,7 @@ impl DuckDbWorkerClient {
         cancel_token: Option<CancellationToken>,
         query_timeout: Option<Duration>,
     ) -> Result<db::QueryResult, String> {
+        let _query_guard = self.inner.query_lock.lock().await;
         let client = self.clone();
         let future = async move {
             client
@@ -105,44 +111,31 @@ impl DuckDbWorkerClient {
             (Some(token), Some(duration)) => {
                 tokio::select! {
                     biased;
-                    _ = token.cancelled() => self.cancel_or_kill(future.as_mut(), crate::query::canceled_error()).await,
+                    _ = token.cancelled() => self.cancel_or_kill(crate::query::canceled_error()).await,
                     result = &mut future => result,
-                    _ = tokio::time::sleep(duration) => self.cancel_or_kill(future.as_mut(), crate::query::timeout_error()).await,
+                    _ = tokio::time::sleep(duration) => self.cancel_or_kill(crate::query::timeout_error()).await,
                 }
             }
             (Some(token), None) => {
                 tokio::select! {
                     biased;
-                    _ = token.cancelled() => self.cancel_or_kill(future.as_mut(), crate::query::canceled_error()).await,
+                    _ = token.cancelled() => self.cancel_or_kill(crate::query::canceled_error()).await,
                     result = &mut future => result,
                 }
             }
             (None, Some(duration)) => {
                 tokio::select! {
                     result = &mut future => result,
-                    _ = tokio::time::sleep(duration) => self.cancel_or_kill(future.as_mut(), crate::query::timeout_error()).await,
+                    _ = tokio::time::sleep(duration) => self.cancel_or_kill(crate::query::timeout_error()).await,
                 }
             }
             (None, None) => future.await,
         }
     }
 
-    async fn cancel_or_kill<F>(
-        &self,
-        future: std::pin::Pin<&mut F>,
-        final_error: String,
-    ) -> Result<db::QueryResult, String>
-    where
-        F: std::future::Future<Output = Result<db::QueryResult, String>>,
-    {
+    async fn cancel_or_kill(&self, final_error: String) -> Result<db::QueryResult, String> {
         let _ = self.cancel().await;
-        match tokio::time::timeout(self.inner.cancel_grace, future).await {
-            Ok(_) => Err(final_error),
-            Err(_) => {
-                self.kill().await;
-                Err(final_error)
-            }
-        }
+        Err(final_error)
     }
 
     pub async fn list_databases(&self) -> Result<Vec<db::DatabaseInfo>, String> {
@@ -192,7 +185,7 @@ impl DuckDbWorkerClient {
     }
 
     pub async fn cancel(&self) -> Result<(), String> {
-        self.send_notification(DuckDbWorkerMethod::Cancel, serde_json::json!({})).await?;
+        self.kill().await;
         Ok(())
     }
 
@@ -247,7 +240,7 @@ impl DuckDbWorkerClient {
         let _guard = self.inner.connect_lock.lock().await;
         {
             let mut state = self.inner.state.lock().await;
-            self.ensure_started_locked(&mut state)?;
+            self.ensure_started_locked(&mut state).await?;
             if state.connected {
                 return Ok(());
             }
@@ -265,7 +258,7 @@ impl DuckDbWorkerClient {
         Ok(())
     }
 
-    fn ensure_started_locked(&self, state: &mut WorkerProcessState) -> Result<(), String> {
+    async fn ensure_started_locked(&self, state: &mut WorkerProcessState) -> Result<(), String> {
         let should_restart = match state.child.as_mut() {
             Some(child) => match child.try_wait() {
                 Ok(Some(status)) => {
@@ -289,6 +282,12 @@ impl DuckDbWorkerClient {
         state.generation = state.generation.wrapping_add(1);
         let generation = state.generation;
 
+        let permit =
+            tokio::time::timeout(self.inner.worker_start_timeout, self.inner.process_limiter.clone().acquire_owned())
+                .await
+                .map_err(|_| duckdb_worker_process_limit_error())?
+                .map_err(|_| "DuckDB worker process limiter is closed".to_string())?;
+
         log::info!("[duckdb-worker:start] executable={}", self.inner.executable.display());
         let mut child = Command::new(&self.inner.executable)
             .arg("--duckdb-worker")
@@ -301,7 +300,7 @@ impl DuckDbWorkerClient {
 
         let stdin = child.stdin.take().ok_or("DuckDB worker stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("DuckDB worker stdout unavailable")?;
-        spawn_stdout_reader(stdout, self.inner.pending.clone(), generation);
+        spawn_stdout_reader(stdout, self.inner.pending.clone(), generation, permit);
 
         state.child = Some(child);
         state.stdin = Some(stdin);
@@ -325,7 +324,7 @@ impl DuckDbWorkerClient {
 
         let write_result = async {
             let mut state = self.inner.state.lock().await;
-            self.ensure_started_locked(&mut state)?;
+            self.ensure_started_locked(&mut state).await?;
             if method != DuckDbWorkerMethod::Connect && !state.connected {
                 return Err("DuckDB worker is not connected".to_string());
             }
@@ -366,23 +365,6 @@ impl DuckDbWorkerClient {
         serde_json::from_value(result).map_err(|e| e.to_string())
     }
 
-    async fn send_notification(&self, method: DuckDbWorkerMethod, params: impl serde::Serialize) -> Result<(), String> {
-        self.ensure_connected().await?;
-        let id = format!("duckdb-worker-{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let request = DuckDbWorkerRequest::new(id, method, params)?;
-        let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-
-        let mut state = self.inner.state.lock().await;
-        self.ensure_started_locked(&mut state)?;
-        if method != DuckDbWorkerMethod::Connect && !state.connected {
-            return Err("DuckDB worker is not connected".to_string());
-        }
-        let stdin = state.stdin.as_mut().ok_or("DuckDB worker stdin unavailable")?;
-        stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
-        stdin.write_all(b"\n").await.map_err(|e| e.to_string())?;
-        stdin.flush().await.map_err(|e| e.to_string())
-    }
-
     async fn fail_pending_for_generation(&self, generation: u64, code: &'static str, message: &'static str) {
         let pending = {
             let mut pending = self.inner.pending.lock().await;
@@ -398,8 +380,26 @@ impl DuckDbWorkerClient {
     }
 }
 
-fn spawn_stdout_reader(stdout: tokio::process::ChildStdout, pending: PendingRequests, generation: u64) {
+fn duckdb_worker_process_limiter() -> Arc<Semaphore> {
+    static LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMITER.get_or_init(|| Arc::new(Semaphore::new(DEFAULT_DUCKDB_WORKER_PROCESS_LIMIT))).clone()
+}
+
+fn duckdb_worker_process_limit_error() -> String {
+    format!(
+        "DuckDB worker process limit reached (max {}). Close another DuckDB worker connection or retry later.",
+        DEFAULT_DUCKDB_WORKER_PROCESS_LIMIT
+    )
+}
+
+fn spawn_stdout_reader(
+    stdout: tokio::process::ChildStdout,
+    pending: PendingRequests,
+    generation: u64,
+    permit: OwnedSemaphorePermit,
+) {
     tokio::spawn(async move {
+        let _permit = permit;
         let mut lines = BufReader::new(stdout).lines();
         loop {
             match lines.next_line().await {

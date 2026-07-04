@@ -2696,6 +2696,8 @@ export default {
     duckDbWorkerProcessIsolation: "DuckDB process isolation mode (Experimental)",
     duckDbWorkerProcessIsolationDescription: "Runs DuckDB queries in a separate worker process. If a long query does not respond to cancellation, DBX can stop the worker process to release the database file lock.",
     duckDbWorkerProcessIsolationRestartRequired: "Restart DBX for this change to take effect.",
+    restartDbx: "Restart DBX",
+    restartDbxFailed: "Failed to restart DBX: {error}",
     debugLogsCopy: "Copy logs",
     debugLogsCopied: "Copied",
     debugLogsDownload: "Download logs",

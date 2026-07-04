@@ -69,6 +69,7 @@ import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebarTableNameDispl
 import { normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sqlFormatterConfig";
 import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES } from "@/lib/tableColumnTemplates";
 import { buildMcpCodexConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpVsCodeConfig, type McpEnvEntry, type McpLaunchConfig } from "@/lib/mcpConfigTemplates";
+import { useToast } from "@/composables/useToast";
 import { isWindows } from "@/lib/platform";
 import { combineDataTypeForDatabase, dataTypeLengthInputValue, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/tableStructureEditorState";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
@@ -87,6 +88,7 @@ import { apiUrl } from "@/lib/webPath";
 import { DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "@/lib/appFonts";
 
 const { t } = useI18n();
+const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
 const savedSqlStore = useSavedSqlStore();
@@ -227,6 +229,7 @@ const editDebugLoggingEnabled = ref(settingsStore.desktopSettings.debug_logging_
 const editDuckDbWorkerProcessIsolation = ref(settingsStore.desktopSettings.duckdb_worker_process_isolation);
 const startupDuckDbWorkerProcessIsolation = ref(settingsStore.desktopSettings.duckdb_worker_process_isolation);
 const duckDbWorkerStartupCaptured = ref(false);
+const duckDbRestarting = ref(false);
 const editSidebarTablePageSize = ref(settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE);
 const debugLogCopied = ref(false);
 const debugLogDownloaded = ref(false);
@@ -701,6 +704,20 @@ async function applySettings() {
 async function applySettingsAndClose() {
   await persistSettings();
   closeSettings();
+}
+
+async function restartDbxForDuckDbIsolation() {
+  if (duckDbRestarting.value || hasApplyBlocker.value || isWeb) return;
+  duckDbRestarting.value = true;
+  try {
+    await persistSettings();
+    const { relaunch } = await import("@tauri-apps/plugin-process");
+    await relaunch();
+  } catch (e: any) {
+    toast(t("settings.restartDbxFailed", { error: e?.message || String(e) }), 5000);
+  } finally {
+    duckDbRestarting.value = false;
+  }
 }
 
 function resetDefaultsForTab(tab: SettingsCategory) {
@@ -2552,20 +2569,6 @@ onUnmounted(cleanupPreviewEditor);
 
               <div class="space-y-3">
                 <Label>{{ t("settings.dataGridDisplay") }}</Label>
-                <div v-if="!isWeb" class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
-                  <div class="space-y-1">
-                    <Label for="duckdb-worker-process-isolation">
-                      {{ t("settings.duckDbWorkerProcessIsolation") }}
-                    </Label>
-                    <p class="text-xs text-muted-foreground">
-                      {{ t("settings.duckDbWorkerProcessIsolationDescription") }}
-                    </p>
-                    <p v-if="duckDbWorkerProcessIsolationRequiresRestart" class="text-xs font-medium text-amber-600 dark:text-amber-400">
-                      {{ t("settings.duckDbWorkerProcessIsolationRestartRequired") }}
-                    </p>
-                  </div>
-                  <Switch id="duckdb-worker-process-isolation" v-model="editDuckDbWorkerProcessIsolation" />
-                </div>
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="show-column-comments-in-header">
@@ -2860,6 +2863,35 @@ onUnmounted(cleanupPreviewEditor);
 
             <!-- Data Tab -->
             <section v-else-if="activeSettingsTab === 'data'" class="flex flex-col gap-5 py-2">
+              <template v-if="!isWeb">
+                <div class="space-y-3">
+                  <div class="text-sm font-medium text-muted-foreground">DuckDB</div>
+                  <div class="flex items-start justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                    <div class="space-y-1">
+                      <Label for="duckdb-worker-process-isolation">
+                        {{ t("settings.duckDbWorkerProcessIsolation") }}
+                      </Label>
+                      <p class="text-xs text-muted-foreground">
+                        {{ t("settings.duckDbWorkerProcessIsolationDescription") }}
+                      </p>
+                      <div v-if="duckDbWorkerProcessIsolationRequiresRestart" class="flex flex-wrap items-center gap-2 pt-1">
+                        <p class="text-xs font-medium text-amber-600 dark:text-amber-400">
+                          {{ t("settings.duckDbWorkerProcessIsolationRestartRequired") }}
+                        </p>
+                        <Button type="button" variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" :disabled="duckDbRestarting || hasApplyBlocker" @click="restartDbxForDuckDbIsolation">
+                          <Loader2 v-if="duckDbRestarting" class="size-3.5 animate-spin" />
+                          <RefreshCw v-else class="size-3.5" />
+                          {{ t("settings.restartDbx") }}
+                        </Button>
+                      </div>
+                    </div>
+                    <Switch id="duckdb-worker-process-isolation" v-model="editDuckDbWorkerProcessIsolation" class="mt-0.5" />
+                  </div>
+                </div>
+
+                <Separator />
+              </template>
+
               <div class="space-y-3">
                 <div class="text-sm font-medium text-muted-foreground">{{ t("settings.exportSection") }}</div>
                 <div class="space-y-2">

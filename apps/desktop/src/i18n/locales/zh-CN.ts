@@ -2696,6 +2696,8 @@ export default withEnglishFallback({
     duckDbWorkerProcessIsolation: "DuckDB 进程隔离模式（实验性）",
     duckDbWorkerProcessIsolationDescription: "将 DuckDB 查询放到独立 worker 进程中运行。停止长查询时，如果 DuckDB 未及时响应取消请求，DBX 会结束 worker 进程以释放数据库文件锁。",
     duckDbWorkerProcessIsolationRestartRequired: "重启 DBX 后生效。",
+    restartDbx: "重启 DBX",
+    restartDbxFailed: "重启 DBX 失败：{error}",
     debugLogsCopy: "复制日志",
     debugLogsCopied: "已复制",
     debugLogsDownload: "下载日志",
