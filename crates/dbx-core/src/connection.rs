@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -170,7 +171,7 @@ pub struct AppState {
     pub plugins: PluginRegistry,
     pub agent_manager: crate::agent_manager::AgentManager,
     pub nacos_registry: crate::nacos::NacosAdminRegistry,
-    pub duckdb_worker_process_isolation: bool,
+    duckdb_worker_process_isolation: AtomicBool,
     /// PostgreSQL TLS cancel context, keyed by pool_key.
     /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
@@ -471,7 +472,7 @@ impl AppState {
                 app_version,
             ),
             nacos_registry: crate::nacos::NacosAdminRegistry::new(),
-            duckdb_worker_process_isolation: false,
+            duckdb_worker_process_isolation: AtomicBool::new(false),
             postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
             transaction_sessions: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "mq-admin")]
@@ -485,6 +486,21 @@ impl AppState {
             Ok(None) => JDBC_PLUGIN_NOT_INSTALLED.to_string(),
             Err(err) => format!("Failed to inspect JDBC plugin: {err}"),
         }
+    }
+
+    pub fn set_duckdb_worker_process_isolation_enabled(&self, enabled: bool) {
+        self.duckdb_worker_process_isolation.store(enabled, Ordering::Relaxed);
+    }
+
+    pub async fn apply_duckdb_worker_process_isolation(&self, enabled: bool) {
+        let previous = self.duckdb_worker_process_isolation.swap(enabled, Ordering::Relaxed);
+        if previous != enabled {
+            self.remove_duckdb_pools_detached().await;
+        }
+    }
+
+    fn duckdb_worker_process_isolation_enabled(&self) -> bool {
+        self.duckdb_worker_process_isolation.load(Ordering::Relaxed)
     }
 
     pub async fn test_external_driver(&self, driver_id: &str, config: &ConnectionConfig) -> Result<String, String> {
@@ -749,7 +765,9 @@ impl AppState {
         let conns = self.connections.read().await;
         if conns.contains_key(&pool_key) {
             drop(conns);
-            if !self.remove_stale_connection_pool(&pool_key).await {
+            if self.remove_pool_if_duckdb_isolation_mismatch(&pool_key).await {
+                // Recreate below using the current DuckDB isolation mode.
+            } else if !self.remove_stale_connection_pool(&pool_key).await {
                 self.touch_pool_activity(&pool_key).await;
                 return Ok(pool_key);
             }
@@ -864,7 +882,7 @@ impl AppState {
             }
             #[cfg(feature = "duckdb-bundled")]
             DatabaseType::DuckDb => {
-                if self.duckdb_worker_process_isolation {
+                if self.duckdb_worker_process_isolation_enabled() {
                     let attached_databases = db_config
                         .attached_databases
                         .iter()
@@ -1657,6 +1675,43 @@ impl AppState {
         }
     }
 
+    #[cfg(feature = "duckdb-bundled")]
+    async fn remove_pool_by_key_detached(&self, pool_key: &str) -> bool {
+        self.stop_keepalive_task(pool_key).await;
+        self.pool_activity.write().await.remove(pool_key);
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
+        let removed = self.connections.write().await.remove(pool_key);
+        if let Some(pool) = removed {
+            close_removed_pools_in_background(vec![(pool_key.to_string(), pool)]);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    async fn remove_pool_if_duckdb_isolation_mismatch(&self, pool_key: &str) -> bool {
+        let isolation_enabled = self.duckdb_worker_process_isolation_enabled();
+        let mismatch = {
+            let connections = self.connections.read().await;
+            match connections.get(pool_key) {
+                Some(PoolKind::DuckDb(_)) => isolation_enabled,
+                Some(PoolKind::DuckDbWorker(_)) => !isolation_enabled,
+                _ => false,
+            }
+        };
+        if mismatch {
+            self.remove_pool_by_key_detached(pool_key).await
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(feature = "duckdb-bundled"))]
+    async fn remove_pool_if_duckdb_isolation_mismatch(&self, _pool_key: &str) -> bool {
+        false
+    }
+
     pub async fn close_database_pool(&self, connection_id: &str, database: Option<&str>) -> Result<bool, String> {
         let db_type = {
             let configs = self.configs.read().await;
@@ -2021,6 +2076,15 @@ impl AppState {
         close_removed_pools_in_background(removed);
     }
 
+    #[cfg(feature = "duckdb-bundled")]
+    async fn remove_duckdb_pools_detached(&self) {
+        let removed = self.drain_duckdb_pools().await;
+        close_removed_pools_in_background(removed);
+    }
+
+    #[cfg(not(feature = "duckdb-bundled"))]
+    async fn remove_duckdb_pools_detached(&self) {}
+
     pub async fn remove_external_driver_pools(&self, driver_id: &str) {
         let removed = self.drain_external_driver_pools(driver_id).await;
         close_removed_pools(removed).await;
@@ -2056,6 +2120,37 @@ impl AppState {
         // Also drop the MQ admin adapter if this is an MQ connection.
         #[cfg(feature = "mq-admin")]
         self.mq_registry.drop_connection(connection_id).await;
+        removed
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    async fn drain_duckdb_pools(&self) -> Vec<(String, PoolKind)> {
+        let keys_to_remove: Vec<String> = self
+            .connections
+            .read()
+            .await
+            .iter()
+            .filter_map(|(key, pool)| match pool {
+                PoolKind::DuckDb(_) | PoolKind::DuckDbWorker(_) => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        self.stop_keepalive_tasks(&keys_to_remove).await;
+        {
+            let mut activity = self.pool_activity.write().await;
+            let mut cancel_contexts = self.postgres_cancel_contexts.write().await;
+            for key in &keys_to_remove {
+                activity.remove(key);
+                cancel_contexts.remove(key);
+            }
+        }
+        let mut conns = self.connections.write().await;
+        let mut removed = Vec::with_capacity(keys_to_remove.len());
+        for key in keys_to_remove {
+            if let Some(pool) = conns.remove(&key) {
+                removed.push((key, pool));
+            }
+        }
         removed
     }
 
@@ -3576,6 +3671,55 @@ mod tests {
         state.get_or_create_pool("duckdb-conn", None).await.unwrap();
 
         assert!(state.duckdb_existing_pool_is_usable_for_config(&config).await.unwrap());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test]
+    async fn applying_duckdb_worker_isolation_drops_existing_duckdb_pools() {
+        let (state, dir) = test_app_state().await;
+        let db_path = dir.join("app.duckdb");
+        duckdb::Connection::open(&db_path).unwrap();
+        let mut config = mysql_config(None);
+        config.id = "duckdb-conn".to_string();
+        config.name = "DuckDB".to_string();
+        config.db_type = DatabaseType::DuckDb;
+        config.host = db_path.to_string_lossy().to_string();
+        config.port = 0;
+
+        state.configs.write().await.insert(config.id.clone(), config);
+        state.get_or_create_pool("duckdb-conn", None).await.unwrap();
+        assert!(matches!(state.connections.read().await.get("duckdb-conn"), Some(PoolKind::DuckDb(_))));
+
+        state.apply_duckdb_worker_process_isolation(true).await;
+
+        assert!(!state.connections.read().await.contains_key("duckdb-conn"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    #[tokio::test]
+    async fn duckdb_pool_mode_mismatch_removes_existing_pool() {
+        let (state, dir) = test_app_state().await;
+        let db_path = dir.join("app.duckdb");
+        duckdb::Connection::open(&db_path).unwrap();
+        let mut config = mysql_config(None);
+        config.id = "duckdb-conn".to_string();
+        config.name = "DuckDB".to_string();
+        config.db_type = DatabaseType::DuckDb;
+        config.host = db_path.to_string_lossy().to_string();
+        config.port = 0;
+
+        state.configs.write().await.insert(config.id.clone(), config);
+        state.get_or_create_pool("duckdb-conn", None).await.unwrap();
+        assert!(matches!(state.connections.read().await.get("duckdb-conn"), Some(PoolKind::DuckDb(_))));
+
+        state.set_duckdb_worker_process_isolation_enabled(true);
+
+        assert!(state.remove_pool_if_duckdb_isolation_mismatch("duckdb-conn").await);
+        assert!(!state.connections.read().await.contains_key("duckdb-conn"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

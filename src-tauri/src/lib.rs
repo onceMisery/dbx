@@ -651,7 +651,7 @@ pub fn run() {
                 default_agent_dir,
             );
 
-            let mut state = if let Some(agent_dir) = agent_dir {
+            let state = if let Some(agent_dir) = agent_dir {
                 AppState::new_with_plugin_and_agent_dir_and_app_version(
                     storage,
                     plugin_dir,
@@ -661,7 +661,7 @@ pub fn run() {
             } else {
                 AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION"))
             };
-            state.duckdb_worker_process_isolation = desktop_settings.duckdb_worker_process_isolation;
+            state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
             let state = Arc::new(state);
             app.manage(state.clone());
             commands::redis_pubsub_server::start_pubsub_server(state.clone());

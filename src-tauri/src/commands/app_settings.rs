@@ -34,6 +34,7 @@ pub async fn save_desktop_settings(
     settings: DesktopSettings,
 ) -> Result<(), String> {
     state.storage.save_desktop_settings(&settings).await?;
+    state.apply_duckdb_worker_process_isolation(settings.duckdb_worker_process_isolation).await;
     apply_debug_log_level(settings.debug_logging_enabled);
     if let Err(err) = apply_desktop_settings(&app, &settings) {
         eprintln!("Failed to apply desktop settings: {err}");
