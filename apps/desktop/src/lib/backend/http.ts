@@ -155,6 +155,7 @@ const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   close_action_prompted: false,
   debug_logging_enabled: false,
   duckdb_worker_process_isolation: false,
+  duckdb_worker_max_processes: 4,
   saved_sql_sync_dir: null,
   driver_store_dir: null,
   plugin_store_dir: null,

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -27,7 +27,7 @@ use crate::models::connection::{
 use crate::path_utils::expand_tilde;
 use crate::plugins::{PluginDriverSession, PluginRegistry, PluginRuntimeEnv};
 use crate::query_cancel::RunningQueries;
-use crate::storage::Storage;
+use crate::storage::{normalize_duckdb_worker_max_processes, Storage, DUCKDB_WORKER_MAX_PROCESSES_DEFAULT};
 
 pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
     "JDBC plugin is not installed. Install the optional JDBC plugin to use this connection.";
@@ -172,6 +172,7 @@ pub struct AppState {
     pub agent_manager: crate::agent_manager::AgentManager,
     pub nacos_registry: crate::nacos::NacosAdminRegistry,
     duckdb_worker_process_isolation: AtomicBool,
+    duckdb_worker_max_processes: AtomicUsize,
     /// PostgreSQL TLS cancel context, keyed by pool_key.
     /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
@@ -479,6 +480,7 @@ impl AppState {
             ),
             nacos_registry: crate::nacos::NacosAdminRegistry::new(),
             duckdb_worker_process_isolation: AtomicBool::new(false),
+            duckdb_worker_max_processes: AtomicUsize::new(DUCKDB_WORKER_MAX_PROCESSES_DEFAULT),
             postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
             transaction_sessions: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "mq-admin")]
@@ -496,6 +498,10 @@ impl AppState {
 
     pub fn set_duckdb_worker_process_isolation_enabled(&self, enabled: bool) {
         self.duckdb_worker_process_isolation.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_duckdb_worker_max_processes(&self, max_processes: usize) {
+        self.duckdb_worker_max_processes.store(normalize_duckdb_worker_max_processes(max_processes), Ordering::Relaxed);
     }
 
     pub async fn apply_duckdb_worker_process_isolation(&self, enabled: bool) {
@@ -949,9 +955,10 @@ impl AppState {
                             path: expand_tilde(&attached.path),
                         })
                         .collect();
-                    let client = db::duckdb_worker_process::DuckDbWorkerClient::open(
+                    let client = db::duckdb_worker_process::DuckDbWorkerClient::open_with_process_limit(
                         expand_tilde(&db_config.host),
                         attached_databases,
+                        self.duckdb_worker_max_processes.load(Ordering::Relaxed),
                     )
                     .await?;
                     PoolKind::DuckDbWorker(Arc::new(client))

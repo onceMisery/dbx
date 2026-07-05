@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -18,12 +18,11 @@ use crate::db::duckdb_worker_protocol::{
     DuckDbWorkerResponse,
 };
 use crate::models::connection::AttachedDatabaseConfig;
+use crate::storage::{normalize_duckdb_worker_max_processes, DUCKDB_WORKER_MAX_PROCESSES_DEFAULT};
 
 const DEFAULT_WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_WORKER_KILL_WAIT: Duration = Duration::from_secs(3);
 const DEFAULT_WORKER_START_WAIT: Duration = Duration::from_secs(5);
-const DEFAULT_DUCKDB_WORKER_PROCESS_LIMIT: usize = 4;
-
 type PendingRequests = Arc<Mutex<HashMap<String, PendingRequest>>>;
 
 struct PendingRequest {
@@ -42,6 +41,7 @@ struct DuckDbWorkerClientInner {
     connect_lock: Mutex<()>,
     query_lock: Mutex<()>,
     process_limiter: Arc<Semaphore>,
+    process_limit: usize,
     executable: PathBuf,
     connect_params: DuckDbWorkerConnectParams,
     request_timeout: Duration,
@@ -63,18 +63,44 @@ impl DuckDbWorkerClient {
         Self::open_with_executable(executable, path, attached_databases).await
     }
 
+    pub async fn open_with_process_limit(
+        path: String,
+        attached_databases: Vec<AttachedDatabaseConfig>,
+        process_limit: usize,
+    ) -> Result<Self, String> {
+        let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+        Self::open_with_executable_and_process_limit(executable, path, attached_databases, process_limit).await
+    }
+
     pub async fn open_with_executable(
         executable: PathBuf,
         path: String,
         attached_databases: Vec<AttachedDatabaseConfig>,
     ) -> Result<Self, String> {
+        Self::open_with_executable_and_process_limit(
+            executable,
+            path,
+            attached_databases,
+            DUCKDB_WORKER_MAX_PROCESSES_DEFAULT,
+        )
+        .await
+    }
+
+    pub async fn open_with_executable_and_process_limit(
+        executable: PathBuf,
+        path: String,
+        attached_databases: Vec<AttachedDatabaseConfig>,
+        process_limit: usize,
+    ) -> Result<Self, String> {
+        let (process_limiter, process_limit) = duckdb_worker_process_limiter(process_limit);
         let client = Self {
             inner: Arc::new(DuckDbWorkerClientInner {
                 state: Mutex::new(WorkerProcessState::default()),
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 connect_lock: Mutex::new(()),
                 query_lock: Mutex::new(()),
-                process_limiter: duckdb_worker_process_limiter(),
+                process_limiter,
+                process_limit,
                 executable,
                 connect_params: DuckDbWorkerConnectParams { path, attached_databases },
                 request_timeout: DEFAULT_WORKER_REQUEST_TIMEOUT,
@@ -285,7 +311,7 @@ impl DuckDbWorkerClient {
         let permit =
             tokio::time::timeout(self.inner.worker_start_timeout, self.inner.process_limiter.clone().acquire_owned())
                 .await
-                .map_err(|_| duckdb_worker_process_limit_error())?
+                .map_err(|_| duckdb_worker_process_limit_error(self.inner.process_limit))?
                 .map_err(|_| "DuckDB worker process limiter is closed".to_string())?;
 
         log::info!("[duckdb-worker:start] executable={}", self.inner.executable.display());
@@ -380,15 +406,31 @@ impl DuckDbWorkerClient {
     }
 }
 
-fn duckdb_worker_process_limiter() -> Arc<Semaphore> {
-    static LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    LIMITER.get_or_init(|| Arc::new(Semaphore::new(DEFAULT_DUCKDB_WORKER_PROCESS_LIMIT))).clone()
+struct WorkerProcessLimiterState {
+    limit: usize,
+    limiter: Arc<Semaphore>,
 }
 
-fn duckdb_worker_process_limit_error() -> String {
+fn duckdb_worker_process_limiter(process_limit: usize) -> (Arc<Semaphore>, usize) {
+    static LIMITER: OnceLock<StdMutex<WorkerProcessLimiterState>> = OnceLock::new();
+    let process_limit = normalize_duckdb_worker_max_processes(process_limit);
+    let state = LIMITER.get_or_init(|| {
+        StdMutex::new(WorkerProcessLimiterState {
+            limit: process_limit,
+            limiter: Arc::new(Semaphore::new(process_limit)),
+        })
+    });
+    let mut state = state.lock().expect("DuckDB worker process limiter lock poisoned");
+    if state.limit != process_limit && state.limiter.available_permits() == state.limit {
+        *state = WorkerProcessLimiterState { limit: process_limit, limiter: Arc::new(Semaphore::new(process_limit)) };
+    }
+    (state.limiter.clone(), state.limit)
+}
+
+fn duckdb_worker_process_limit_error(process_limit: usize) -> String {
     format!(
         "DuckDB worker process limit reached (max {}). Close another DuckDB worker connection or retry later.",
-        DEFAULT_DUCKDB_WORKER_PROCESS_LIMIT
+        process_limit
     )
 }
 

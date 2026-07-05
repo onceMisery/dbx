@@ -2691,6 +2691,8 @@ export default withEnglishFallback({
     debugLoggingEnabledDescription: "Registra log diagnostici locali lato utente durante l'analisi delle segnalazioni. Disattivato per impostazione predefinita.",
     duckDbWorkerProcessIsolation: "Modalità di isolamento del processo DuckDB (sperimentale)",
     duckDbWorkerProcessIsolationDescription: "Esegue le query DuckDB in un processo worker separato. Se una query lunga non risponde all'annullamento, DBX può arrestare il processo worker per rilasciare il blocco del file di database.",
+    duckDbWorkerMaxProcesses: "Worker DuckDB simultanei massimi",
+    duckDbWorkerMaxProcessesDescription: "Limita quanti processi worker DuckDB DBX può eseguire contemporaneamente. Intervallo: 1-16. Predefinito: 4.",
     duckDbWorkerProcessIsolationRestartRequired: "Riavvia DBX affinché questa modifica abbia effetto.",
     restartDbx: "Riavvia DBX",
     restartDbxFailed: "Impossibile riavviare DBX: {error}",

@@ -68,4 +68,13 @@ describe("normalizeDesktopSettings", () => {
   it("defaults DuckDB worker process isolation to disabled for old settings", () => {
     expect(normalizeDesktopSettings({}).duckdb_worker_process_isolation).toBe(false);
   });
+
+  it("defaults DuckDB worker max processes to 4 and clamps saved values", () => {
+    expect(normalizeDesktopSettings({}).duckdb_worker_max_processes).toBe(4);
+    expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 1 }).duckdb_worker_max_processes).toBe(1);
+    expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 16 }).duckdb_worker_max_processes).toBe(16);
+    expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 0 }).duckdb_worker_max_processes).toBe(1);
+    expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 32 }).duckdb_worker_max_processes).toBe(16);
+    expect(normalizeDesktopSettings({ duckdb_worker_max_processes: 3.6 }).duckdb_worker_max_processes).toBe(4);
+  });
 });

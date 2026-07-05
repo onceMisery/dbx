@@ -662,6 +662,7 @@ pub fn run() {
                 AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION"))
             };
             state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
+            state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
             let state = Arc::new(state);
             app.manage(state.clone());
             commands::redis_pubsub_server::start_pubsub_server(state.clone());

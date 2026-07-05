@@ -123,6 +123,8 @@ pub struct DesktopSettings {
     pub debug_logging_enabled: bool,
     #[serde(default)]
     pub duckdb_worker_process_isolation: bool,
+    #[serde(default = "default_duckdb_worker_max_processes")]
+    pub duckdb_worker_max_processes: usize,
     #[serde(default)]
     pub saved_sql_sync_dir: Option<String>,
     #[serde(default)]
@@ -139,6 +141,18 @@ fn default_sidebar_table_page_size() -> usize {
     1000
 }
 
+pub const DUCKDB_WORKER_MAX_PROCESSES_MIN: usize = 1;
+pub const DUCKDB_WORKER_MAX_PROCESSES_MAX: usize = 16;
+pub const DUCKDB_WORKER_MAX_PROCESSES_DEFAULT: usize = 4;
+
+pub fn default_duckdb_worker_max_processes() -> usize {
+    DUCKDB_WORKER_MAX_PROCESSES_DEFAULT
+}
+
+pub fn normalize_duckdb_worker_max_processes(value: usize) -> usize {
+    value.clamp(DUCKDB_WORKER_MAX_PROCESSES_MIN, DUCKDB_WORKER_MAX_PROCESSES_MAX)
+}
+
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
@@ -148,6 +162,7 @@ impl Default for DesktopSettings {
             close_action_prompted: false,
             debug_logging_enabled: false,
             duckdb_worker_process_isolation: false,
+            duckdb_worker_max_processes: default_duckdb_worker_max_processes(),
             saved_sql_sync_dir: None,
             driver_store_dir: None,
             plugin_store_dir: None,
@@ -811,6 +826,12 @@ impl Storage {
             "duckdb_worker_process_isolation".to_string(),
             serde_json::Value::Bool(desktop_settings.duckdb_worker_process_isolation),
         );
+        settings.insert(
+            "duckdb_worker_max_processes".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(normalize_duckdb_worker_max_processes(
+                desktop_settings.duckdb_worker_max_processes,
+            ))),
+        );
         match desktop_settings.saved_sql_sync_dir.as_ref().filter(|path| !path.trim().is_empty()) {
             Some(path) => {
                 settings.insert("saved_sql_sync_dir".to_string(), serde_json::Value::String(path.clone()));
@@ -875,6 +896,12 @@ impl Storage {
                 .get("duckdb_worker_process_isolation")
                 .and_then(|value| value.as_bool())
                 .unwrap_or_else(|| DesktopSettings::default().duckdb_worker_process_isolation),
+            duckdb_worker_max_processes: settings
+                .get("duckdb_worker_max_processes")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .map(normalize_duckdb_worker_max_processes)
+                .unwrap_or_else(|| DesktopSettings::default().duckdb_worker_max_processes),
             saved_sql_sync_dir: settings
                 .get("saved_sql_sync_dir")
                 .and_then(|value| value.as_str())
@@ -2804,6 +2831,7 @@ mod tests {
                 close_action_prompted: false,
                 debug_logging_enabled: true,
                 duckdb_worker_process_isolation: false,
+                duckdb_worker_max_processes: DesktopSettings::default().duckdb_worker_max_processes,
                 saved_sql_sync_dir: None,
                 driver_store_dir: Some("/tmp/dbx-drivers".to_string()),
                 plugin_store_dir: Some("/tmp/dbx-plugins".to_string()),
@@ -2823,6 +2851,7 @@ mod tests {
                 close_action_prompted: false,
                 debug_logging_enabled: true,
                 duckdb_worker_process_isolation: false,
+                duckdb_worker_max_processes: DesktopSettings::default().duckdb_worker_max_processes,
                 saved_sql_sync_dir: None,
                 driver_store_dir: Some("/tmp/dbx-drivers".to_string()),
                 plugin_store_dir: Some("/tmp/dbx-plugins".to_string()),
@@ -2870,6 +2899,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage.load_desktop_settings().await.unwrap().sidebar_table_page_size, 1234);
+    }
+
+    #[tokio::test]
+    async fn desktop_settings_persist_duckdb_worker_max_processes() {
+        let path = temp_db_path("desktop-settings-duckdb-worker-max-processes");
+        let storage = Storage::open(&path).await.unwrap();
+
+        storage
+            .save_desktop_settings(&DesktopSettings { duckdb_worker_max_processes: 8, ..DesktopSettings::default() })
+            .await
+            .unwrap();
+
+        assert_eq!(storage.load_desktop_settings().await.unwrap().duckdb_worker_max_processes, 8);
     }
 
     #[tokio::test]

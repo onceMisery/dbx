@@ -25,6 +25,9 @@ import {
   DEFAULT_EDITOR_SETTINGS,
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_SIDEBAR_TABLE_PAGE_SIZE,
+  DUCKDB_WORKER_MAX_PROCESSES_MAX,
+  DUCKDB_WORKER_MAX_PROCESSES_MIN,
+  normalizeDuckDbWorkerMaxProcesses,
   normalizeAiEnv,
   type AiProvider,
   type AiApiStyle,
@@ -247,7 +250,9 @@ const desktopCloseBehaviorResetPending = ref(false);
 const editIconTheme = ref<DesktopIconTheme>(settingsStore.desktopSettings.icon_theme);
 const editDebugLoggingEnabled = ref(settingsStore.desktopSettings.debug_logging_enabled);
 const editDuckDbWorkerProcessIsolation = ref(settingsStore.desktopSettings.duckdb_worker_process_isolation);
+const editDuckDbWorkerMaxProcesses = ref(settingsStore.desktopSettings.duckdb_worker_max_processes);
 const startupDuckDbWorkerProcessIsolation = ref(settingsStore.desktopSettings.duckdb_worker_process_isolation);
+const startupDuckDbWorkerMaxProcesses = ref(settingsStore.desktopSettings.duckdb_worker_max_processes);
 const duckDbWorkerStartupCaptured = ref(false);
 const duckDbRestarting = ref(false);
 const editSidebarTablePageSize = ref(settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE);
@@ -614,7 +619,7 @@ const formatterEditorShortcutIds: ShortcutActionId[] = [
 const formatterEditorShortcutDefinitions = computed(() => formatterEditorShortcutIds.map((id) => SHORTCUT_DEFINITIONS.find((definition) => definition.id === id)).filter((definition): definition is (typeof SHORTCUT_DEFINITIONS)[number] => !!definition));
 const hasShortcutConflicts = computed(() => shortcutConflicts.value.length > 0);
 const shortcutsChanged = computed(() => JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts));
-const duckDbWorkerProcessIsolationRequiresRestart = computed(() => editDuckDbWorkerProcessIsolation.value !== startupDuckDbWorkerProcessIsolation.value);
+const duckDbWorkerSettingsRequireRestart = computed(() => editDuckDbWorkerProcessIsolation.value !== startupDuckDbWorkerProcessIsolation.value || normalizeDuckDbWorkerMaxProcesses(editDuckDbWorkerMaxProcesses.value) !== startupDuckDbWorkerMaxProcesses.value);
 const hasBlockingShortcutConflicts = computed(() => shortcutsChanged.value && hasShortcutConflicts.value);
 const hasBlockingFormatterConfig = computed(() => activeSettingsTab.value === "formatter" && !sqlFormatterConfigValid.value);
 const hasApplyBlocker = computed(() => hasBlockingShortcutConflicts.value || hasBlockingFormatterConfig.value);
@@ -643,6 +648,7 @@ function hasChanges(): boolean {
     editIconTheme.value !== settingsStore.desktopSettings.icon_theme ||
     editDebugLoggingEnabled.value !== settingsStore.desktopSettings.debug_logging_enabled ||
     editDuckDbWorkerProcessIsolation.value !== settingsStore.desktopSettings.duckdb_worker_process_isolation ||
+    normalizeDuckDbWorkerMaxProcesses(editDuckDbWorkerMaxProcesses.value) !== settingsStore.desktopSettings.duckdb_worker_max_processes ||
     editSidebarTablePageSize.value !== (settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE) ||
     editShowColumnCommentsInHeader.value !== settingsStore.editorSettings.showColumnCommentsInHeader ||
     editShowColumnTypesInHeader.value !== settingsStore.editorSettings.showColumnTypesInHeader ||
@@ -728,6 +734,7 @@ async function persistSettings() {
     icon_theme: editIconTheme.value,
     debug_logging_enabled: editDebugLoggingEnabled.value,
     duckdb_worker_process_isolation: editDuckDbWorkerProcessIsolation.value,
+    duckdb_worker_max_processes: normalizeDuckDbWorkerMaxProcesses(editDuckDbWorkerMaxProcesses.value),
     sidebar_table_page_size: editSidebarTablePageSize.value,
   });
   desktopCloseBehaviorResetPending.value = false;
@@ -810,6 +817,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
     editInfiniteScrollMaxRows.value = DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
     editDuckDbWorkerProcessIsolation.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation;
+    editDuckDbWorkerMaxProcesses.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_max_processes;
     editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
     editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
     editExportRowLimitEnabled.value = DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled;
@@ -848,6 +856,7 @@ function resetAllDefaults() {
   editIconTheme.value = DEFAULT_DESKTOP_SETTINGS.icon_theme;
   editDebugLoggingEnabled.value = DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled;
   editDuckDbWorkerProcessIsolation.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation;
+  editDuckDbWorkerMaxProcesses.value = DEFAULT_DESKTOP_SETTINGS.duckdb_worker_max_processes;
   editSidebarTablePageSize.value = DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
   editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
   editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
@@ -1505,8 +1514,10 @@ watch(
       editIconTheme.value = settingsStore.desktopSettings.icon_theme;
       editDebugLoggingEnabled.value = settingsStore.desktopSettings.debug_logging_enabled;
       editDuckDbWorkerProcessIsolation.value = settingsStore.desktopSettings.duckdb_worker_process_isolation;
+      editDuckDbWorkerMaxProcesses.value = settingsStore.desktopSettings.duckdb_worker_max_processes;
       if (!duckDbWorkerStartupCaptured.value) {
         startupDuckDbWorkerProcessIsolation.value = settingsStore.desktopSettings.duckdb_worker_process_isolation;
+        startupDuckDbWorkerMaxProcesses.value = settingsStore.desktopSettings.duckdb_worker_max_processes;
         duckDbWorkerStartupCaptured.value = true;
       }
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
@@ -2960,26 +2971,48 @@ onUnmounted(cleanupPreviewEditor);
               <template v-if="!isWeb">
                 <div class="space-y-3">
                   <div class="text-sm font-medium text-muted-foreground">DuckDB</div>
-                  <div class="flex items-start justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
-                    <div class="space-y-1">
-                      <Label for="duckdb-worker-process-isolation">
-                        {{ t("settings.duckDbWorkerProcessIsolation") }}
-                      </Label>
-                      <p class="text-xs text-muted-foreground">
-                        {{ t("settings.duckDbWorkerProcessIsolationDescription") }}
-                      </p>
-                      <div v-if="duckDbWorkerProcessIsolationRequiresRestart" class="flex flex-wrap items-center gap-2 pt-1">
-                        <p class="text-xs font-medium text-amber-600 dark:text-amber-400">
-                          {{ t("settings.duckDbWorkerProcessIsolationRestartRequired") }}
+                  <div class="space-y-3 rounded-md border bg-muted/20 px-3 py-2">
+                    <div class="flex items-start justify-between gap-4">
+                      <div class="space-y-1">
+                        <Label for="duckdb-worker-process-isolation">
+                          {{ t("settings.duckDbWorkerProcessIsolation") }}
+                        </Label>
+                        <p class="text-xs text-muted-foreground">
+                          {{ t("settings.duckDbWorkerProcessIsolationDescription") }}
                         </p>
-                        <Button type="button" variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" :disabled="duckDbRestarting || hasApplyBlocker" @click="restartDbxForDuckDbIsolation">
-                          <Loader2 v-if="duckDbRestarting" class="size-3.5 animate-spin" />
-                          <RefreshCw v-else class="size-3.5" />
-                          {{ t("settings.restartDbx") }}
-                        </Button>
                       </div>
+                      <Switch id="duckdb-worker-process-isolation" v-model="editDuckDbWorkerProcessIsolation" class="mt-0.5" />
                     </div>
-                    <Switch id="duckdb-worker-process-isolation" v-model="editDuckDbWorkerProcessIsolation" class="mt-0.5" />
+                    <div class="flex items-start justify-between gap-4">
+                      <div class="space-y-1">
+                        <Label for="duckdb-worker-max-processes">
+                          {{ t("settings.duckDbWorkerMaxProcesses") }}
+                        </Label>
+                        <p class="text-xs text-muted-foreground">
+                          {{ t("settings.duckDbWorkerMaxProcessesDescription") }}
+                        </p>
+                      </div>
+                      <Input
+                        id="duckdb-worker-max-processes"
+                        v-model.number="editDuckDbWorkerMaxProcesses"
+                        type="number"
+                        class="h-8 w-20 text-right [&::-webkit-inner-spin-button]:appearance-none"
+                        :min="DUCKDB_WORKER_MAX_PROCESSES_MIN"
+                        :max="DUCKDB_WORKER_MAX_PROCESSES_MAX"
+                        :step="1"
+                        @blur="editDuckDbWorkerMaxProcesses = normalizeDuckDbWorkerMaxProcesses(editDuckDbWorkerMaxProcesses)"
+                      />
+                    </div>
+                    <div v-if="duckDbWorkerSettingsRequireRestart" class="flex flex-wrap items-center gap-2 border-t pt-2">
+                      <p class="text-xs font-medium text-amber-600 dark:text-amber-400">
+                        {{ t("settings.duckDbWorkerProcessIsolationRestartRequired") }}
+                      </p>
+                      <Button type="button" variant="outline" size="sm" class="h-7 gap-1.5 px-2 text-xs" :disabled="duckDbRestarting || hasApplyBlocker" @click="restartDbxForDuckDbIsolation">
+                        <Loader2 v-if="duckDbRestarting" class="size-3.5 animate-spin" />
+                        <RefreshCw v-else class="size-3.5" />
+                        {{ t("settings.restartDbx") }}
+                      </Button>
+                    </div>
                   </div>
                 </div>
 

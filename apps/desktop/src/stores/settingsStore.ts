@@ -50,6 +50,7 @@ export interface DesktopSettings {
   close_action_prompted: boolean;
   debug_logging_enabled: boolean;
   duckdb_worker_process_isolation: boolean;
+  duckdb_worker_max_processes: number;
   saved_sql_sync_dir?: string | null;
   driver_store_dir?: string | null;
   plugin_store_dir?: string | null;
@@ -66,6 +67,9 @@ export type SqlSemanticDiagnosticsMode = "auto" | "enabled" | "disabled";
 export type OpenTabsRestoreMode = "all" | "pinned" | "none";
 
 export const DEFAULT_SIDEBAR_TABLE_PAGE_SIZE = 1000;
+export const DUCKDB_WORKER_MAX_PROCESSES_MIN = 1;
+export const DUCKDB_WORKER_MAX_PROCESSES_MAX = 16;
+export const DUCKDB_WORKER_MAX_PROCESSES_DEFAULT = 4;
 const SQL_SEMANTIC_DIAGNOSTICS_AUTO_ENABLED = false;
 
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
@@ -75,6 +79,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   close_action_prompted: false,
   debug_logging_enabled: false,
   duckdb_worker_process_isolation: false,
+  duckdb_worker_max_processes: DUCKDB_WORKER_MAX_PROCESSES_DEFAULT,
   saved_sql_sync_dir: null,
   driver_store_dir: null,
   plugin_store_dir: null,
@@ -92,12 +97,18 @@ export function normalizeDesktopSettings(settings: Partial<DesktopSettings> | nu
     close_action_prompted: settings?.close_action_prompted ?? DEFAULT_DESKTOP_SETTINGS.close_action_prompted,
     debug_logging_enabled: settings?.debug_logging_enabled ?? DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled,
     duckdb_worker_process_isolation: settings?.duckdb_worker_process_isolation ?? DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation,
+    duckdb_worker_max_processes: normalizeDuckDbWorkerMaxProcesses(settings?.duckdb_worker_max_processes),
     saved_sql_sync_dir: settings?.saved_sql_sync_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.saved_sql_sync_dir,
     driver_store_dir: settings?.driver_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.driver_store_dir,
     plugin_store_dir: settings?.plugin_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.plugin_store_dir,
     agent_store_dir: settings?.agent_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.agent_store_dir,
     sidebar_table_page_size: sidebarTablePageSize,
   };
+}
+
+export function normalizeDuckDbWorkerMaxProcesses(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DUCKDB_WORKER_MAX_PROCESSES_DEFAULT;
+  return Math.min(DUCKDB_WORKER_MAX_PROCESSES_MAX, Math.max(DUCKDB_WORKER_MAX_PROCESSES_MIN, Math.round(value)));
 }
 
 export interface AiProviderPreset extends Omit<AiConfig, "apiKey"> {

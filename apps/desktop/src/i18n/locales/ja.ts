@@ -2686,6 +2686,8 @@ export default withEnglishFallback({
     debugLoggingEnabledDescription: "トラブルシューティング時に、より詳細なローカル診断ログを記録します。デフォルトでは無効です。",
     duckDbWorkerProcessIsolation: "DuckDB プロセス分離モード（実験的）",
     duckDbWorkerProcessIsolationDescription: "DuckDB クエリを独立した worker プロセスで実行します。長時間クエリがキャンセルに応答しない場合、DBX は worker プロセスを停止してデータベースファイルのロックを解放できます。",
+    duckDbWorkerMaxProcesses: "DuckDB の最大同時 worker 数",
+    duckDbWorkerMaxProcessesDescription: "DBX が同時に実行できる DuckDB worker プロセス数を制限します。範囲: 1-16。既定値: 4。",
     duckDbWorkerProcessIsolationRestartRequired: "この変更を有効にするには DBX を再起動してください。",
     restartDbx: "DBX を再起動",
     restartDbxFailed: "DBX の再起動に失敗しました: {error}",

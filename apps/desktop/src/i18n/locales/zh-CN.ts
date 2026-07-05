@@ -2749,6 +2749,8 @@ export default withEnglishFallback({
     debugLoggingEnabledDescription: "开启后在本机记录更详细的用户侧诊断日志，反馈问题时可临时开启；默认关闭。",
     duckDbWorkerProcessIsolation: "DuckDB 进程隔离模式（实验性）",
     duckDbWorkerProcessIsolationDescription: "将 DuckDB 查询放到独立 worker 进程中运行。停止长查询时，如果 DuckDB 未及时响应取消请求，DBX 会结束 worker 进程以释放数据库文件锁。",
+    duckDbWorkerMaxProcesses: "DuckDB 最大并发 worker 数",
+    duckDbWorkerMaxProcessesDescription: "限制 DBX 同时运行的 DuckDB worker 进程数量。范围：1-16，默认：4。",
     duckDbWorkerProcessIsolationRestartRequired: "重启 DBX 后生效。",
     restartDbx: "重启 DBX",
     restartDbxFailed: "重启 DBX 失败：{error}",
