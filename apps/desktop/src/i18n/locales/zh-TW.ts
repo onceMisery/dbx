@@ -1969,6 +1969,7 @@ export default withEnglishFallback({
     title: "SQL 參數",
     description: "為 SQL 模板佔位符填寫參數值，DBX 會在執行前替換為 SQL 字面量。",
     name: "參數名",
+    syntax: "Syntax",
     type: "類型",
     value: "參數值",
     valuePlaceholder: "輸入參數值",

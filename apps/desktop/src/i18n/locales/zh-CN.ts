@@ -2123,6 +2123,7 @@ export default withEnglishFallback({
     title: "SQL 参数",
     description: "为 SQL 模板占位符填写参数值，DBX 会在执行前替换为 SQL 字面量。",
     name: "参数名",
+    syntax: "Syntax",
     type: "类型",
     value: "参数值",
     valuePlaceholder: "输入参数值",

@@ -2067,6 +2067,7 @@ export default withEnglishFallback({
     title: "Parámetros SQL",
     description: "Completa valores para marcadores de plantilla SQL. DBX los reemplaza antes de ejecutar el SQL.",
     name: "Parámetro",
+    syntax: "Sintaxis",
     type: "Tipo",
     value: "Valor",
     valuePlaceholder: "Introduce un valor",

@@ -2065,6 +2065,7 @@ export default withEnglishFallback({
     title: "Parametri SQL",
     description: "Compila i valori per i segnaposto del template SQL. DBX li sostituisce prima di eseguire l'SQL.",
     name: "Parametro",
+    syntax: "Sintassi",
     type: "Tipo",
     value: "Valore",
     valuePlaceholder: "Inserisci valore",
