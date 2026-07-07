@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { expandSqlLocalSetVariables, extractSqlParameterDescriptors, extractSqlParameters, sqlParameterLiteral, substituteSqlParameters } from "@/lib/sql/sqlParameters";
+import { extractSqlParameterDescriptors, extractSqlParameters, sqlParameterLiteral, substituteSqlParameters } from "@/lib/sql/sqlParameters";
 
 describe("extractSqlParameters", () => {
   it("extracts unique template parameters in order", () => {
@@ -13,6 +13,7 @@ describe("extractSqlParameters", () => {
       -- \${line_comment}
       # \${hash_comment}
       #\${hash_comment_without_space}
+      select 1 #comment \${inline_hash_comment}
       /* \${block_comment} */
       from t
       where id = \${id}
@@ -141,6 +142,11 @@ describe("extractSqlParameters", () => {
     expect(extractSqlParameters(sql)).toEqual(["tenant_id"]);
   });
 
+  it("does not treat native variable updates as template parameters", () => {
+    const sql = "set @n = 1; set @n = @n + 1; select @n;";
+    expect(extractSqlParameters(sql)).toEqual([]);
+  });
+
   it("stops SQL Server declaration scanning when a new statement starts without a semicolon", () => {
     const sql = `
       declare @id int = 1
@@ -156,48 +162,6 @@ describe("extractSqlParameters", () => {
 });
 
 describe("substituteSqlParameters", () => {
-  it("expands simple SET-defined variables before execution", () => {
-    const sql = `
-      set @date_start = '2026-07-04 00:00:00';
-
-      select * from sa_access_decision_log AS fp
-      where fp.create_at < @date_start;
-    `;
-    const expanded = expandSqlLocalSetVariables(sql);
-
-    expect(expanded).not.toContain("set @date_start");
-    expect(expanded).not.toContain("@date_start");
-    expect(expanded).toContain("where fp.create_at < '2026-07-04 00:00:00'");
-  });
-
-  it("expands SET-defined variables when the SET statement is wrapped with comments", () => {
-    const sql = `
-      -- local execution variable
-      set @date_start = '2026-07-04 00:00:00'; /* end local variable */
-
-      select * from sa_access_decision_log AS fp
-      where fp.create_at < @date_start;
-    `;
-    const expanded = expandSqlLocalSetVariables(sql);
-
-    expect(expanded).not.toContain("@date_start");
-    expect(expanded).toContain("where fp.create_at < '2026-07-04 00:00:00'");
-  });
-
-  it("expands SET-defined variables while preserving unresolved template parameters", () => {
-    const sql = `
-      set @date_start = '2026-07-04 00:00:00';
-
-      select * from fin_pur_payment
-      where create_time < @date_start
-        and tenant_id = @tenant_id;
-    `;
-    const expanded = expandSqlLocalSetVariables(sql);
-
-    expect(extractSqlParameters(expanded)).toEqual(["tenant_id"]);
-    expect(substituteSqlParameters(expanded, { tenant_id: { kind: "number", value: "7" } })).toContain("tenant_id = 7");
-  });
-
   it("replaces placeholders with SQL literals", () => {
     const sql = "select * from t where dt >= ${start_date} and amount > ${amount} and enabled = ${enabled}";
     expect(
@@ -252,6 +216,11 @@ describe("substituteSqlParameters", () => {
   it("leaves variables assigned by SET statements untouched while replacing undeclared variables", () => {
     const sql = "set @date_start = '2026-07-04 00:00:00'; select * from fin_pur_payment where create_time < @date_start and tenant_id = @tenant_id";
     expect(substituteSqlParameters(sql, { tenant_id: { kind: "number", value: "7" } })).toBe("set @date_start = '2026-07-04 00:00:00'; select * from fin_pur_payment where create_time < @date_start and tenant_id = 7");
+  });
+
+  it("preserves native variable updates instead of rewriting SQL text", () => {
+    const sql = "set @n = 1; set @n = @n + 1; select @n;";
+    expect(substituteSqlParameters(sql, {})).toBe(sql);
   });
 
   it("leaves named stored procedure arguments untouched while replacing their template values", () => {

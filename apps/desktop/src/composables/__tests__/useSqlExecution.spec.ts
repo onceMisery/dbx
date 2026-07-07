@@ -106,9 +106,9 @@ describe("useSqlExecution", () => {
     setActivePinia(createPinia());
   });
 
-  it("expands local SET variables before sending SQL to execution", async () => {
+  it("sends native SET variables without client-side expansion", async () => {
     const activeTab = ref<QueryTab | undefined>(queryTab("app"));
-    const activeConnection = ref<ConnectionConfig | undefined>(connection("postgres"));
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("mysql"));
     const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
     const queryStore = useQueryStore();
     const historyStore = useHistoryStore();
@@ -134,8 +134,7 @@ describe("useSqlExecution", () => {
     await execution.tryExecute();
 
     const executedSql = executeCurrentSql.mock.calls[0]?.[0] ?? "";
-    expect(executedSql).not.toContain("set @date_start");
-    expect(executedSql).not.toContain("@date_start");
-    expect(executedSql).toContain("where fp.create_at < '2026-07-04 00:00:00'");
+    expect(executedSql).toContain("set @date_start = '2026-07-04 00:00:00'");
+    expect(executedSql).toContain("where fp.create_at < @date_start");
   });
 });

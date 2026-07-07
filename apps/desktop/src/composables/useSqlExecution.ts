@@ -11,7 +11,7 @@ import { classifySqlActivityKind } from "@/lib/history/historyActivityKind";
 import { sqlMetadataRefreshTarget } from "@/lib/sql/sqlMetadataRefresh";
 import { classifyRedisCommandSafety, firstRedisCommandToken } from "@/lib/redis/redisCommandSafety";
 import { isSqlExecutionSnapshot, resolveExecutableSql, type SqlExecutionOverride, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
-import { expandSqlLocalSetVariables, extractSqlParameterDescriptors, type SqlParameterDescriptor } from "@/lib/sql/sqlParameters";
+import { extractSqlParameterDescriptors, type SqlParameterDescriptor } from "@/lib/sql/sqlParameters";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
 const DANGER_RE = /^\s*(DROP|DELETE|TRUNCATE|ALTER|UPDATE|MERGE|REPLACE)\b/i;
@@ -71,7 +71,7 @@ export function useSqlExecution(deps: {
 
   async function tryExecute(sqlOverride?: SqlExecutionOverride) {
     const tab = deps.activeTab.value;
-    const sql = expandSqlLocalSetVariables(await resolvedExecutableSql(sqlOverride));
+    const sql = await resolvedExecutableSql(sqlOverride);
     if (!tab || !sql.trim()) return;
     if (requiresDatabaseSelection(tab, deps.activeConnection.value, sql)) {
       deps.onMissingDatabase?.();
@@ -116,7 +116,7 @@ export function useSqlExecution(deps: {
   }
 
   async function doExecute(sql?: string) {
-    sql = expandSqlLocalSetVariables(sql ?? (await resolvedExecutableSql()));
+    sql ??= await resolvedExecutableSql();
     const tab = deps.activeTab.value;
     if (!tab || !sql.trim()) return;
     if (requiresDatabaseSelection(tab, deps.activeConnection.value, sql)) {
