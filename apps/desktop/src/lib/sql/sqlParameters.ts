@@ -58,6 +58,25 @@ export function substituteSqlParameters(sql: string, values: Record<string, SqlP
   return result;
 }
 
+export function expandSqlLocalSetVariables(sql: string): string {
+  const variables = new Map<string, string>();
+  const segments = splitSqlStatementSegments(sql);
+  if (!segments.length) return sql;
+
+  let result = "";
+  let cursor = 0;
+  for (const segment of segments) {
+    const assignments = parseLocalSetAssignments(sql.slice(segment.start, segment.end));
+    if (!assignments) continue;
+
+    result += replaceLocalSetVariables(sql.slice(cursor, segment.start), variables);
+    for (const assignment of assignments) variables.set(assignment.name.toLowerCase(), assignment.literal);
+    cursor = segment.end;
+  }
+  result += replaceLocalSetVariables(sql.slice(cursor), variables);
+  return result;
+}
+
 export function sqlParameterLiteral(input: SqlParameterInput): string {
   if (input.kind === "null") return "NULL";
   const raw = input.value;
@@ -177,6 +196,197 @@ function findSqlParameterOccurrences(sql: string): ParameterOccurrence[] {
   }
 
   return occurrences;
+}
+
+interface SqlStatementSegment {
+  start: number;
+  end: number;
+}
+
+interface LocalSetAssignment {
+  name: string;
+  literal: string;
+}
+
+function splitSqlStatementSegments(sql: string): SqlStatementSegment[] {
+  const segments: SqlStatementSegment[] = [];
+  let start = 0;
+  let i = 0;
+  let dollarQuoteEnd = "";
+
+  while (i < sql.length) {
+    if (dollarQuoteEnd) {
+      const end = sql.indexOf(dollarQuoteEnd, i);
+      if (end === -1) break;
+      i = end + dollarQuoteEnd.length;
+      dollarQuoteEnd = "";
+      continue;
+    }
+
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (ch === "'" || ch === '"' || ch === "`") {
+      i = skipQuoted(sql, i, ch);
+      continue;
+    }
+    if (ch === "[") {
+      i = skipBracketIdentifier(sql, i);
+      continue;
+    }
+    if (ch === "-" && next === "-") {
+      i = skipLine(sql, i + 2);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i = skipBlockComment(sql, i + 2);
+      continue;
+    }
+    if (ch === "$") {
+      const marker = readDollarQuoteMarker(sql, i);
+      if (marker) {
+        dollarQuoteEnd = marker;
+        i += marker.length;
+        continue;
+      }
+    }
+    if (ch === ";") {
+      segments.push({ start, end: i + 1 });
+      start = i + 1;
+    }
+    i += 1;
+  }
+  if (start < sql.length) segments.push({ start, end: sql.length });
+  return segments;
+}
+
+function parseLocalSetAssignments(statement: string): LocalSetAssignment[] | null {
+  const start = firstSqlCodeIndex(statement, 0);
+  if (!matchesWord(statement, start, "set")) return null;
+
+  const assignments: LocalSetAssignment[] = [];
+  let i = start + "set".length;
+  while (i < statement.length) {
+    i = firstSqlCodeIndex(statement, i);
+    if (statement[i] === ";") {
+      i += 1;
+      break;
+    }
+    if (i >= statement.length) break;
+    if (statement[i] !== "@") return null;
+
+    const name = readParameterName(statement, i + 1);
+    if (!name || statement[i + 1] === "@" || statement[i - 1] === "@") return null;
+    i += 1 + name.length;
+
+    i = firstSqlCodeIndex(statement, i);
+    if (statement[i] === ":" && statement[i + 1] === "=") i += 2;
+    else if (statement[i] === "=") i += 1;
+    else return null;
+
+    i = firstSqlCodeIndex(statement, i);
+    const literal = readSimpleSqlLiteral(statement, i);
+    if (!literal) return null;
+    assignments.push({ name, literal: literal.value });
+    i = firstSqlCodeIndex(statement, literal.end);
+
+    if (statement[i] === ",") {
+      i += 1;
+      continue;
+    }
+    if (statement[i] === ";") {
+      i += 1;
+      break;
+    }
+    break;
+  }
+
+  if (!assignments.length) return null;
+  if (statement.slice(firstSqlCodeIndex(statement, i)).trim()) return null;
+  return assignments;
+}
+
+function readSimpleSqlLiteral(sql: string, start: number): { value: string; end: number } | null {
+  if ((sql[start] === "N" || sql[start] === "n") && sql[start + 1] === "'") {
+    const end = skipQuoted(sql, start + 1, "'");
+    return { value: sql.slice(start, end), end };
+  }
+  if (sql[start] === "'") {
+    const end = skipQuoted(sql, start, "'");
+    return { value: sql.slice(start, end), end };
+  }
+
+  const keyword = readLiteralKeyword(sql, start);
+  if (keyword) return keyword;
+
+  const numberMatch = sql.slice(start).match(/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/);
+  if (numberMatch) return { value: numberMatch[0], end: start + numberMatch[0].length };
+  return null;
+}
+
+function readLiteralKeyword(sql: string, start: number): { value: string; end: number } | null {
+  for (const keyword of ["null", "true", "false"]) {
+    if (matchesWord(sql, start, keyword)) return { value: sql.slice(start, start + keyword.length), end: start + keyword.length };
+  }
+  return null;
+}
+
+function replaceLocalSetVariables(sql: string, variables: Map<string, string>): string {
+  if (!variables.size) return sql;
+
+  let result = "";
+  let cursor = 0;
+  let i = 0;
+  let dollarQuoteEnd = "";
+  while (i < sql.length) {
+    if (dollarQuoteEnd) {
+      const end = sql.indexOf(dollarQuoteEnd, i);
+      if (end === -1) break;
+      i = end + dollarQuoteEnd.length;
+      dollarQuoteEnd = "";
+      continue;
+    }
+
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (ch === "'" || ch === '"' || ch === "`") {
+      i = skipQuoted(sql, i, ch);
+      continue;
+    }
+    if (ch === "[") {
+      i = skipBracketIdentifier(sql, i);
+      continue;
+    }
+    if (ch === "-" && next === "-") {
+      i = skipLine(sql, i + 2);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i = skipBlockComment(sql, i + 2);
+      continue;
+    }
+    if (ch === "$") {
+      const marker = readDollarQuoteMarker(sql, i);
+      if (marker) {
+        dollarQuoteEnd = marker;
+        i += marker.length;
+        continue;
+      }
+    }
+    if (ch === "@") {
+      const name = readParameterName(sql, i + 1);
+      const literal = variables.get(name.toLowerCase());
+      if (name && literal && next !== "@" && sql[i - 1] !== "@") {
+        result += sql.slice(cursor, i);
+        result += literal;
+        i += 1 + name.length;
+        cursor = i;
+        continue;
+      }
+    }
+    i += 1;
+  }
+  result += sql.slice(cursor);
+  return result;
 }
 
 function collectNativeSqlServerParameters(sql: string): { declared: Set<string>; ignoredStarts: Set<number> } {
@@ -490,6 +700,28 @@ function isSetAssignmentTarget(sql: string, start: number): boolean {
   let i = start;
   while (i < sql.length && /\s/.test(sql[i])) i += 1;
   return sql[i] === "=" || (sql[i] === ":" && sql[i + 1] === "=");
+}
+
+function firstNonWhitespaceIndex(sql: string, start: number): number {
+  let i = start;
+  while (i < sql.length && /\s/.test(sql[i])) i += 1;
+  return i;
+}
+
+function firstSqlCodeIndex(sql: string, start: number): number {
+  let i = firstNonWhitespaceIndex(sql, start);
+  while (i < sql.length) {
+    if (sql[i] === "-" && sql[i + 1] === "-") {
+      i = firstNonWhitespaceIndex(sql, skipLine(sql, i + 2));
+      continue;
+    }
+    if (sql[i] === "/" && sql[i + 1] === "*") {
+      i = firstNonWhitespaceIndex(sql, skipBlockComment(sql, i + 2));
+      continue;
+    }
+    break;
+  }
+  return i;
 }
 
 function isLineStatementStart(sql: string, start: number): boolean {
