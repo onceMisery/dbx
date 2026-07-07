@@ -12,6 +12,7 @@ describe("extractSqlParameters", () => {
       select '\${quoted}' as a, "\${identifier}" as b, \`\${mysql_identifier}\`
       -- \${line_comment}
       # \${hash_comment}
+      #\${hash_comment_without_space}
       /* \${block_comment} */
       from t
       where id = \${id}
@@ -45,6 +46,79 @@ describe("extractSqlParameters", () => {
       declare @id int = 1, @name nvarchar(50);
       select @@version, @id, @name, @input_value
     `;
+    expect(extractSqlParameters(sql)).toEqual(["input_value"]);
+  });
+
+  it("ignores variables assigned by SET statements", () => {
+    const sql = `
+      set @date_start = '2026-07-04 00:00:00';
+      select * from fin_pur_payment AS fp where fp.create_time < @date_start and fp.tenant_id = @tenant_id
+    `;
+    expect(extractSqlParameters(sql)).toEqual(["tenant_id"]);
+  });
+
+  it("ignores multiple variables assigned by SET statements", () => {
+    const sql = `
+      set @date_start := '2026-07-01', @date_end = '2026-07-31';
+      select * from orders where created_at between @date_start and @date_end and tenant_id = @tenant_id
+    `;
+    expect(extractSqlParameters(sql)).toEqual(["tenant_id"]);
+  });
+
+  it("ignores variables assigned by SELECT statements", () => {
+    const sql = `
+      select @date_start := min(created_at), @date_end = max(created_at) from orders;
+      select * from orders where created_at between @date_start and @date_end and tenant_id = @tenant_id
+    `;
+    expect(extractSqlParameters(sql)).toEqual(["tenant_id"]);
+  });
+
+  it("ignores SQL Server procedure parameters declared in routine definitions", () => {
+    const sql = `
+      create procedure dbo.search_orders
+        @date_start datetime,
+        @status nvarchar(20) = N'paid'
+      as
+      begin
+        select * from orders where created_at >= @date_start and status = @status and tenant_id = @tenant_id;
+      end
+    `;
+    expect(extractSqlParameters(sql)).toEqual(["tenant_id"]);
+  });
+
+  it("ignores SQL Server function parameters declared in routine definitions", () => {
+    const sql = `
+      create function dbo.order_count(@date_start datetime, @status nvarchar(20))
+      returns int
+      as
+      begin
+        return (select count(*) from orders where created_at >= @date_start and status = @status and tenant_id = @tenant_id);
+      end
+    `;
+    expect(extractSqlParameters(sql)).toEqual(["tenant_id"]);
+  });
+
+  it("keeps template parameters in non-routine CREATE statements", () => {
+    const sql = "create table #orders (tenant_id int default @tenant_id);";
+    expect(extractSqlParameters(sql)).toEqual(["tenant_id"]);
+  });
+
+  it("ignores named stored procedure arguments while preserving template values", () => {
+    const sql = "exec dbo.search_orders @date_start = '2026-07-04', @status = @status_value, @tenant_id = @tenant_id";
+    expect(extractSqlParameters(sql)).toEqual(["status_value", "tenant_id"]);
+  });
+
+  it("ignores declared SQL Server table variables", () => {
+    const sql = `
+      declare @ids table (id int);
+      insert into @ids values (1);
+      select * from @ids where id = @input_id;
+    `;
+    expect(extractSqlParameters(sql)).toEqual(["input_id"]);
+  });
+
+  it("ignores SQL Server and MySQL system variables", () => {
+    const sql = "select @@ROWCOUNT, @@IDENTITY, @@SERVERNAME, @@session.sql_mode, @@global.time_zone, @input_value";
     expect(extractSqlParameters(sql)).toEqual(["input_value"]);
   });
 
@@ -112,6 +186,21 @@ describe("substituteSqlParameters", () => {
   it("leaves declared SQL Server variables untouched while replacing undeclared variables", () => {
     const sql = "DECLARE @id int = 1; SELECT * FROM users WHERE id = @id AND tenant_id = @tenant_id";
     expect(substituteSqlParameters(sql, { tenant_id: { kind: "number", value: "7" } })).toBe("DECLARE @id int = 1; SELECT * FROM users WHERE id = @id AND tenant_id = 7");
+  });
+
+  it("leaves variables assigned by SET statements untouched while replacing undeclared variables", () => {
+    const sql = "set @date_start = '2026-07-04 00:00:00'; select * from fin_pur_payment where create_time < @date_start and tenant_id = @tenant_id";
+    expect(substituteSqlParameters(sql, { tenant_id: { kind: "number", value: "7" } })).toBe("set @date_start = '2026-07-04 00:00:00'; select * from fin_pur_payment where create_time < @date_start and tenant_id = 7");
+  });
+
+  it("leaves named stored procedure arguments untouched while replacing their template values", () => {
+    const sql = "exec dbo.search_orders @date_start = '2026-07-04', @status = @status_value, @tenant_id = @tenant_id";
+    expect(
+      substituteSqlParameters(sql, {
+        status_value: { kind: "string", value: "paid" },
+        tenant_id: { kind: "number", value: "7" },
+      }),
+    ).toBe("exec dbo.search_orders @date_start = '2026-07-04', @status = 'paid', @tenant_id = 7");
   });
 });
 
