@@ -20,6 +20,11 @@ use crate::db::duckdb_worker_protocol::{
 use crate::models::connection::AttachedDatabaseConfig;
 use crate::storage::{normalize_duckdb_worker_max_processes, DUCKDB_WORKER_MAX_PROCESSES_DEFAULT};
 
+/// Error code the worker reports when a query error left the DuckDB connection poisoned
+/// (see the duckdb-rs Parser Error bug). The client kills the worker on this code so the
+/// next request starts a fresh one. Must match the code emitted in `duckdb_worker_runtime`.
+const DUCKDB_WORKER_POISONED_CODE: &str = "duckdb_worker_poisoned";
+const DUCKDB_WORKER_REQUEST_TIMEOUT_CODE: &str = "duckdb_worker_request_timeout";
 const DEFAULT_WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_WORKER_KILL_WAIT: Duration = Duration::from_secs(3);
 const DEFAULT_WORKER_START_WAIT: Duration = Duration::from_secs(5);
@@ -92,8 +97,29 @@ impl DuckDbWorkerClient {
         attached_databases: Vec<AttachedDatabaseConfig>,
         process_limit: usize,
     ) -> Result<Self, String> {
+        let client = Self::new_unconnected_with_timeouts(
+            executable,
+            path,
+            attached_databases,
+            process_limit,
+            DEFAULT_WORKER_REQUEST_TIMEOUT,
+            DEFAULT_WORKER_START_WAIT,
+        );
+        client.ensure_connected().await?;
+        Ok(client)
+    }
+
+    #[doc(hidden)]
+    pub fn new_unconnected_with_timeouts(
+        executable: PathBuf,
+        path: String,
+        attached_databases: Vec<AttachedDatabaseConfig>,
+        process_limit: usize,
+        request_timeout: Duration,
+        worker_start_timeout: Duration,
+    ) -> Self {
         let (process_limiter, process_limit) = duckdb_worker_process_limiter(process_limit);
-        let client = Self {
+        Self {
             inner: Arc::new(DuckDbWorkerClientInner {
                 state: Mutex::new(WorkerProcessState::default()),
                 pending: Arc::new(Mutex::new(HashMap::new())),
@@ -103,13 +129,11 @@ impl DuckDbWorkerClient {
                 process_limit,
                 executable,
                 connect_params: DuckDbWorkerConnectParams { path, attached_databases },
-                request_timeout: DEFAULT_WORKER_REQUEST_TIMEOUT,
-                worker_start_timeout: DEFAULT_WORKER_START_WAIT,
+                request_timeout,
+                worker_start_timeout,
                 next_id: AtomicU64::new(1),
             }),
-        };
-        client.ensure_connected().await?;
-        Ok(client)
+        }
     }
 
     pub async fn execute(
@@ -122,14 +146,32 @@ impl DuckDbWorkerClient {
     ) -> Result<db::QueryResult, String> {
         let _query_guard = self.inner.query_lock.lock().await;
         let client = self.clone();
+        // Cancellation and timeout restart the worker via cancel_or_kill below. An ordinary
+        // query error (parser/binder/catalog/runtime) leaves the worker healthy, so we keep it
+        // alive to preserve session-local state (:memory: contents, temp tables, SET, raw ATTACH).
+        // The one exception is a poisoned connection: duckdb-rs can leave the connection unusable
+        // after a syntax Parser Error, and the worker reports that with `duckdb_worker_poisoned`.
+        // We kill on that code so the next request restarts a fresh worker. Killing here (rather
+        // than letting the worker self-exit) avoids racing our own next request against a dying
+        // worker, and OS-level kill never runs the destructor that would abort the process.
         let future = async move {
-            client
-                .request::<db::QueryResult>(
+            client.ensure_connected().await?;
+            match client
+                .send_request_structured::<db::QueryResult>(
                     DuckDbWorkerMethod::Execute,
                     DuckDbWorkerExecuteParams { sql, database, max_rows },
                     None,
                 )
                 .await
+            {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    if error.code == DUCKDB_WORKER_POISONED_CODE {
+                        client.kill().await;
+                    }
+                    Err(error.message)
+                }
+            }
         };
         tokio::pin!(future);
 
@@ -165,23 +207,17 @@ impl DuckDbWorkerClient {
     }
 
     pub async fn list_databases(&self) -> Result<Vec<db::DatabaseInfo>, String> {
-        self.request(DuckDbWorkerMethod::ListDatabases, serde_json::json!({}), Some(self.inner.request_timeout)).await
+        self.metadata_request(DuckDbWorkerMethod::ListDatabases, serde_json::json!({})).await
     }
 
     pub async fn list_schemas(&self, database: String) -> Result<Vec<String>, String> {
-        self.request(
-            DuckDbWorkerMethod::ListSchemas,
-            serde_json::json!({ "database": database }),
-            Some(self.inner.request_timeout),
-        )
-        .await
+        self.metadata_request(DuckDbWorkerMethod::ListSchemas, serde_json::json!({ "database": database })).await
     }
 
     pub async fn list_tables(&self, database: String, schema: String) -> Result<Vec<db::TableInfo>, String> {
-        self.request(
+        self.metadata_request(
             DuckDbWorkerMethod::ListTables,
             serde_json::json!({ "database": database, "schema": schema }),
-            Some(self.inner.request_timeout),
         )
         .await
     }
@@ -192,22 +228,34 @@ impl DuckDbWorkerClient {
         schema: String,
         table: String,
     ) -> Result<Vec<db::ColumnInfo>, String> {
-        self.request(
+        self.metadata_request(
             DuckDbWorkerMethod::ListColumns,
             serde_json::json!({ "database": database, "schema": schema, "table": table }),
-            Some(self.inner.request_timeout),
         )
         .await
     }
 
     pub async fn attach_database(&self, attached: AttachedDatabaseConfig) -> Result<(), String> {
-        self.request::<serde_json::Value>(
-            DuckDbWorkerMethod::AttachDatabase,
-            attached,
-            Some(self.inner.request_timeout),
-        )
-        .await?;
+        self.metadata_request::<serde_json::Value>(DuckDbWorkerMethod::AttachDatabase, attached).await?;
         Ok(())
+    }
+
+    /// Runs a metadata request that executes synchronously inside the worker's stdin loop.
+    /// If it times out the worker is likely stuck inside DuckDB and can no longer read further
+    /// requests, so we kill it; the next call restarts a fresh worker via `ensure_connected`.
+    /// Ordinary errors (e.g. a missing table) leave the worker healthy and do not kill it.
+    async fn metadata_request<T>(&self, method: DuckDbWorkerMethod, params: impl serde::Serialize) -> Result<T, String>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let timeout = self.inner.request_timeout;
+        match tokio::time::timeout(timeout, self.request::<T>(method, params, None)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.kill().await;
+                Err(format!("DuckDB worker request timed out after {}s", timeout.as_secs()))
+            }
+        }
     }
 
     pub async fn cancel(&self) -> Result<(), String> {
@@ -272,12 +320,22 @@ impl DuckDbWorkerClient {
             }
         }
 
-        self.send_request::<serde_json::Value>(
-            DuckDbWorkerMethod::Connect,
-            self.inner.connect_params.clone(),
-            Some(self.inner.request_timeout),
-        )
-        .await?;
+        match self
+            .send_request_structured::<serde_json::Value>(
+                DuckDbWorkerMethod::Connect,
+                self.inner.connect_params.clone(),
+                Some(self.inner.request_timeout),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                if error.code == DUCKDB_WORKER_REQUEST_TIMEOUT_CODE {
+                    self.kill().await;
+                }
+                return Err(error.message);
+            }
+        }
 
         let mut state = self.inner.state.lock().await;
         state.connected = true;
@@ -343,6 +401,21 @@ impl DuckDbWorkerClient {
     where
         T: serde::de::DeserializeOwned,
     {
+        self.send_request_structured(method, params, timeout).await.map_err(|error| error.message)
+    }
+
+    /// Like `send_request` but preserves the worker error `code` so callers can react to
+    /// specific conditions (e.g. `duckdb_worker_poisoned`). A protocol/transport failure is
+    /// surfaced as an error with code `duckdb_worker_error`.
+    async fn send_request_structured<T>(
+        &self,
+        method: DuckDbWorkerMethod,
+        params: impl serde::Serialize,
+        timeout: Option<Duration>,
+    ) -> Result<T, DuckDbWorkerError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
         let id = format!("duckdb-worker-{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let request = DuckDbWorkerRequest::new(&id, method, params)?;
         let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
@@ -365,30 +438,33 @@ impl DuckDbWorkerClient {
 
         if let Err(err) = write_result {
             self.inner.pending.lock().await.remove(&id);
-            return Err(err);
+            return Err(err.into());
         }
 
         let response = match timeout {
             Some(timeout) => match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(_)) => return Err("DuckDB worker response channel closed".to_string()),
+                Ok(Err(_)) => return Err("DuckDB worker response channel closed".into()),
                 Err(_) => {
                     self.inner.pending.lock().await.remove(&id);
-                    return Err(format!("DuckDB worker request timed out after {}s", timeout.as_secs()));
+                    return Err(DuckDbWorkerError::new(
+                        DUCKDB_WORKER_REQUEST_TIMEOUT_CODE,
+                        format!("DuckDB worker request timed out after {}s", timeout.as_secs()),
+                    ));
                 }
             },
-            None => rx.await.map_err(|_| "DuckDB worker response channel closed".to_string())?,
+            None => rx.await.map_err(|_| DuckDbWorkerError::from("DuckDB worker response channel closed"))?,
         };
 
         if !response.ok {
             let error = response
                 .error
                 .unwrap_or_else(|| DuckDbWorkerError::new("duckdb_worker_error", "DuckDB worker request failed"));
-            return Err(error.message);
+            return Err(error);
         }
 
         let result = response.result.unwrap_or(serde_json::Value::Null);
-        serde_json::from_value(result).map_err(|e| e.to_string())
+        serde_json::from_value(result).map_err(|e| DuckDbWorkerError::from(e.to_string()))
     }
 
     async fn fail_pending_for_generation(&self, generation: u64, code: &'static str, message: &'static str) {
