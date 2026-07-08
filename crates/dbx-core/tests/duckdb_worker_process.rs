@@ -310,6 +310,104 @@ async fn worker_process_is_killed_after_connect_timeout() {
     let _ = std::fs::remove_file(&db_path);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_is_killed_after_connect_error() {
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_duckdb-worker-pid-test-host"));
+    let db_path = temp_duckdb_path();
+    let pid_file = temp_pid_path();
+    let _ = std::fs::remove_file(&pid_file);
+    let _ = std::fs::remove_file(&db_path);
+
+    let _file_owner = duckdb::Connection::open(&db_path).expect("open lock owner connection");
+
+    std::env::set_var("DBX_DUCKDB_PID_TEST_HOST_PID_FILE", &pid_file);
+    let client = DuckDbWorkerClient::new_unconnected_with_timeouts(
+        executable,
+        db_path.to_string_lossy().to_string(),
+        Vec::new(),
+        4,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+
+    let err = client
+        .execute(None, "SELECT 1".to_string(), Some(10), None, Some(Duration::from_secs(5)))
+        .await
+        .expect_err("connect should fail while another process owns the DuckDB file");
+    std::env::remove_var("DBX_DUCKDB_PID_TEST_HOST_PID_FILE");
+    assert!(
+        err.contains("Cannot open file") || err.contains("already open") || err.contains("另一个程序正在使用"),
+        "unexpected error: {err}"
+    );
+
+    let pid = read_pid_file(&pid_file).expect("worker pid");
+    wait_until_process_exits(pid, Duration::from_secs(5)).await;
+
+    let _ = std::fs::remove_file(&pid_file);
+    drop(_file_owner);
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_process_retries_connect_after_transient_file_lock() {
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_duckdb-worker-test-host"));
+    let db_path = temp_duckdb_path();
+    let _ = std::fs::remove_file(&db_path);
+
+    let mut owner_child = Command::new(&executable)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn lock owner worker");
+    let mut owner_stdin = owner_child.stdin.take().expect("owner worker stdin");
+    let owner_stdout = owner_child.stdout.take().expect("owner worker stdout");
+    let mut owner_lines = BufReader::new(owner_stdout).lines();
+    write_worker_request(
+        &mut owner_stdin,
+        DuckDbWorkerRequest::new(
+            "connect-owner",
+            DuckDbWorkerMethod::Connect,
+            DuckDbWorkerConnectParams { path: db_path.to_string_lossy().to_string(), attached_databases: Vec::new() },
+        )
+        .expect("owner connect request"),
+    )
+    .await;
+    let connected = read_worker_response(&mut owner_lines).await;
+    assert!(connected.ok, "owner connect failed: {connected:?}");
+    drop(owner_lines);
+
+    let release_owner = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(owner_stdin);
+        let _ = tokio::time::timeout(Duration::from_secs(5), owner_child.wait()).await;
+    });
+
+    let client = DuckDbWorkerClient::new_unconnected_with_timeouts(
+        executable,
+        db_path.to_string_lossy().to_string(),
+        Vec::new(),
+        4,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.execute(None, "SELECT 42 AS retried".to_string(), Some(10), None, Some(Duration::from_secs(5))),
+    )
+    .await;
+
+    let _ = release_owner.await;
+    client.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+
+    let result = result
+        .expect("retrying connect should not hang")
+        .expect("connect should retry after a transient DuckDB file lock");
+    assert_eq!(result.columns, vec!["retried".to_string()]);
+    assert_eq!(result.rows, vec![vec![serde_json::json!(42)]]);
+}
+
 async fn write_worker_request(stdin: &mut tokio::process::ChildStdin, request: DuckDbWorkerRequest) {
     let line = serde_json::to_string(&request).expect("request json");
     stdin.write_all(line.as_bytes()).await.expect("write request");

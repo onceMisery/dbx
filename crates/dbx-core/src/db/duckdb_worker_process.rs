@@ -320,20 +320,36 @@ impl DuckDbWorkerClient {
             }
         }
 
-        match self
-            .send_request_structured::<serde_json::Value>(
-                DuckDbWorkerMethod::Connect,
-                self.inner.connect_params.clone(),
-                Some(self.inner.request_timeout),
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(error) => {
-                if error.code == DUCKDB_WORKER_REQUEST_TIMEOUT_CODE {
+        let mut attempts = 0;
+        loop {
+            match self
+                .send_request_structured::<serde_json::Value>(
+                    DuckDbWorkerMethod::Connect,
+                    self.inner.connect_params.clone(),
+                    Some(self.inner.request_timeout),
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(error) => {
+                    let retry_delay = duckdb_connect_file_lock_retry_delay(attempts, &error.message);
+                    // A failed Connect leaves this worker without a valid session. Keep no stale
+                    // child around, especially after OS file-lock errors where the user may retry
+                    // once the competing process exits.
                     self.kill().await;
+                    if let Some(delay) = retry_delay {
+                        attempts += 1;
+                        log::warn!(
+                            "[duckdb-worker:connect-retry] attempt={} delay_ms={} error={}",
+                            attempts,
+                            delay.as_millis(),
+                            error.message
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(error.message);
                 }
-                return Err(error.message);
             }
         }
 
@@ -508,6 +524,35 @@ fn duckdb_worker_process_limit_error(process_limit: usize) -> String {
         "DuckDB worker process limit reached (max {}). Close another DuckDB worker connection or retry later.",
         process_limit
     )
+}
+
+fn duckdb_connect_file_lock_retry_delay(attempts: usize, message: &str) -> Option<Duration> {
+    if !is_transient_duckdb_file_lock_error(message) {
+        return None;
+    }
+    match attempts {
+        0 => Some(Duration::from_millis(50)),
+        1 => Some(Duration::from_millis(100)),
+        2 => Some(Duration::from_millis(200)),
+        3 => Some(Duration::from_millis(400)),
+        4 => Some(Duration::from_millis(800)),
+        _ => None,
+    }
+}
+
+fn is_transient_duckdb_file_lock_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let mentions_file_open = lower.contains("cannot open file")
+        || lower.contains("could not set lock")
+        || lower.contains("file is already open");
+    let mentions_lock = lower.contains("file is already open")
+        || lower.contains("being used by another process")
+        || lower.contains("process cannot access the file")
+        || lower.contains("sharing violation")
+        || lower.contains("resource temporarily unavailable")
+        || message.contains("另一个程序正在使用")
+        || message.contains("进程无法访问");
+    mentions_file_open && mentions_lock
 }
 
 fn spawn_stdout_reader(
