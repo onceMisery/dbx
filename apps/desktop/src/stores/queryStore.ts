@@ -2545,9 +2545,9 @@ export const useQueryStore = defineStore("query", () => {
         executionPromise = api.executeInManualTransaction(tab.txnSessionId, sqlToExecute, tab.database, executionSchema, pageLimit);
       } else {
         console.info("[DBX][executeTabSql:execute-multi:start]", { traceId, elapsed: elapsed() });
-        // Data tabs should reuse the already-open pool; session pools are reserved
-        // for query tabs/background tasks that need connection-local state isolation.
-        const clientSessionId = tab.mode === "query" ? tabClientSessionId(tab) : undefined;
+        // Query and data tabs use a tab-scoped pool so repeated executions keep
+        // connection-local state and avoid MySQL pool resets on every refresh.
+        const clientSessionId = tab.mode === "query" || tab.mode === "data" ? tabClientSessionId(tab) : undefined;
         const executionOptions = {
           ...(typeof pageLimit === "number"
             ? useAgentResultSession

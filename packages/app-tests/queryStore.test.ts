@@ -3515,7 +3515,7 @@ test("query execution is scoped to the tab client session", async () => {
   }
 });
 
-test("data tab execution reuses the shared connection pool", async () => {
+test("data tab execution uses a tab-scoped client session", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
@@ -3541,8 +3541,57 @@ test("data tab execution reuses the shared connection pool", async () => {
   try {
     await store.executeTabSql(tabId, "select * from users");
 
-    assert.equal(executeBody.clientSessionId, undefined);
+    assert.equal(executeBody.clientSessionId, tabId);
     assert.equal(executeBody.timeoutSecs, 30);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("closing a data tab releases its tab-scoped client session", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "db", "users", "data", "public");
+  let executeBody: any;
+  const closedSessions: any[] = [];
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/execute-multi") {
+      executeBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify([{ columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/query/close-client-session") {
+      closedSessions.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify(true), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    await store.executeTabSql(tabId, "select * from users");
+    assert.equal(executeBody.clientSessionId, tabId);
+
+    store.closeTab(tabId, { force: true });
+
+    // closeClientConnectionSession is fire-and-forget; wait for the request to land.
+    await waitFor(() => closedSessions.some((body) => body.clientSessionId === tabId));
+    assert.ok(
+      closedSessions.some((body) => body.clientSessionId === tabId && body.connectionId === "conn-1"),
+      `expected close-client-session for tab session, got ${JSON.stringify(closedSessions)}`,
+    );
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
