@@ -7,14 +7,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::MysqlMode;
-use crate::connection::{AppState, PoolKind};
+use crate::connection::{task_client_session_id, AppState, PoolKind};
 use crate::csv_export::{escape_csv, format_csv, value_to_csv_text};
 pub use crate::database_export::ExportStatus;
 use crate::database_export::{build_export_insert_statements, is_export_cancelled, BuildExportInsertStatementsOptions};
 use crate::db::agent_driver::AgentTableReadStartParams;
 use crate::models::connection::DatabaseType;
 use crate::transfer::{
-    count_sql_with_where, execute_on_pool, execute_on_pool_with_max_rows, keyset_pagination_sql,
+    count_sql_with_where, execute_read_on_pool, execute_read_on_pool_with_max_rows, keyset_pagination_sql,
     pagination_sql_with_filter_order, qualified_table, quote_identifier,
 };
 use crate::types::QueryResult;
@@ -22,6 +22,10 @@ use crate::xlsx_export::{finish_streaming_xlsx_workbook, start_streaming_xlsx_wo
 
 const DEFAULT_BATCH_SIZE: usize = 10_000;
 const SQL_INSERT_BATCH_SIZE: usize = 100;
+
+pub fn table_export_client_session_id(export_id: &str) -> String {
+    task_client_session_id("table-export", export_id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -343,7 +347,7 @@ async fn fetch_paginated_table_export_batch(
         offset,
         active_batch_size,
     );
-    execute_on_pool_with_max_rows(state, pool_key, &sql, Some(active_batch_size)).await
+    execute_read_on_pool_with_max_rows(state, pool_key, &sql, Some(active_batch_size)).await
 }
 
 async fn close_table_read_session_if_open(
@@ -758,7 +762,10 @@ pub async fn export_table_data_core(
         .ok_or_else(|| format!("Connection config not found: {}", request.connection_id))?;
 
     // 2. Get pool
-    let pool_key = state.get_or_create_pool(&request.connection_id, Some(&request.database)).await?;
+    let client_session_id = table_export_client_session_id(&request.export_id);
+    let pool_key = state
+        .get_or_create_pool_for_session(&request.connection_id, Some(&request.database), Some(&client_session_id))
+        .await?;
 
     // 3. Resolve columns. Data grid exports can provide columns/primary keys
     // directly, which avoids expensive metadata round-trips on JDBC drivers.
@@ -815,7 +822,7 @@ pub async fn export_table_data_core(
             &db_type,
             request.where_input.as_deref(),
         );
-        match execute_on_pool(state, &pool_key, &count_query).await {
+        match execute_read_on_pool(state, &pool_key, &count_query).await {
             Ok(result) => result
                 .rows
                 .first()

@@ -1608,6 +1608,8 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
           :table-info-tab="activeTab.tableInfoTab"
           :page-offset="activeTab.resultPageOffset"
           :page-limit="activeTab.resultPageLimit"
+          :total-row-count="activeTab.resultTotalRowCount"
+          :total-row-count-loading="activeTab.resultTotalRowCountLoading"
           :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
           :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
           :export-file-base-name="activeTab.title"

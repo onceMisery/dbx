@@ -841,6 +841,16 @@ pub fn should_discard_pool_after_error(db_type: Option<DatabaseType>, err: &str)
     matches!(pool_error_action(db_type, err), PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry)
 }
 
+fn non_replay_query_pool_error_action(db_type: Option<DatabaseType>, err: &str) -> PoolErrorAction {
+    match pool_error_action(db_type, err) {
+        // A connection error does not prove that the database did not receive
+        // the statement. Generic SQL may write data, so discard the stale pool
+        // and let the caller decide whether to retry.
+        PoolErrorAction::ReconnectAndRetry => PoolErrorAction::Discard,
+        action => action,
+    }
+}
+
 fn is_os_connection_error(lower: &str) -> bool {
     let os_error_codes = ["10053", "10054", "10057", "10058", "10060", "10061"];
     if let Some(pos) = lower.find("os error ") {
@@ -1577,14 +1587,8 @@ pub async fn execute_sql_statement_with_options(
         do_execute(state, &pool_key, mysql_dialect, Some(database), sql, schema, cancel_token.clone(), options.clone())
             .await;
 
-    let action = result.as_ref().err().map(|e| pool_error_action(db_type, e));
+    let action = result.as_ref().err().map(|e| non_replay_query_pool_error_action(db_type, e));
     match action {
-        Some(PoolErrorAction::ReconnectAndRetry) if !is_canceled(&cancel_token) => {
-            let db_opt = if database.is_empty() { None } else { Some(database) };
-            let new_key =
-                state.reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref()).await?;
-            do_execute(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options).await
-        }
         Some(PoolErrorAction::Discard) => {
             state.remove_pool_by_key(&pool_key).await;
             result
@@ -3063,6 +3067,14 @@ mod tests {
     fn agent_execute_batch_unsupported_ignores_unrelated_errors() {
         assert!(!is_agent_execute_batch_unsupported("ORA-00955: name is already used by an existing object"));
         assert!(!is_agent_execute_batch_unsupported("Agent RPC error (-1): unknown method: execute_query"));
+    }
+
+    #[test]
+    fn non_replay_query_policy_discards_connection_errors() {
+        assert_eq!(
+            non_replay_query_pool_error_action(Some(DatabaseType::Postgres), "connection reset by peer"),
+            PoolErrorAction::Discard
+        );
     }
 
     #[test]

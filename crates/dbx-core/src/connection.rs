@@ -2677,6 +2677,10 @@ fn normalize_client_session_id(client_session_id: Option<&str>) -> Option<String
     client_session_id.map(str::trim).filter(|session| !session.is_empty()).map(|session| session.replace(':', "_"))
 }
 
+pub fn task_client_session_id(task_kind: &str, task_id: &str) -> String {
+    format!("{task_kind}:{task_id}")
+}
+
 fn mysql_pool_max_connections_for_session(client_session_id: Option<&str>) -> usize {
     if normalize_client_session_id(client_session_id).is_some() {
         1
@@ -3106,8 +3110,8 @@ mod tests {
         metadata_connection_config, mysql_metadata_fallback_url, oceanbase_mysql_query_timeout_sql,
         oceanbase_mysql_setup_queries, prestosql_jdbc_config_for_endpoint, redacted_connection_url_for_endpoint,
         redis_sentinel_transport_id, redis_sentinel_transport_prefix, sqlserver_legacy_agent_config,
-        sqlserver_legacy_agent_error, uses_bare_mysql_pool, uses_tcp_probe, validate_h2_database_path, AppState,
-        MysqlMode, PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
+        sqlserver_legacy_agent_error, task_client_session_id, uses_bare_mysql_pool, uses_tcp_probe,
+        validate_h2_database_path, AppState, MysqlMode, PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
@@ -3173,6 +3177,13 @@ mod tests {
             one_time: false,
             read_only: false,
         }
+    }
+
+    #[test]
+    fn task_client_session_ids_are_stable_and_isolated() {
+        assert_eq!(task_client_session_id("table-export", "job-1"), "table-export:job-1");
+        assert_ne!(task_client_session_id("table-export", "job-1"), task_client_session_id("database-export", "job-1"));
+        assert_ne!(task_client_session_id("table-export", "job-1"), task_client_session_id("table-export", "job-2"));
     }
 
     #[test]
