@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { reactive } from "vue";
 import { DEFAULT_SQL_VARIABLE_SYNTAX_TOGGLES, enabledSqlParameterSyntaxes, normalizeSqlVariableSyntaxOverrides, resolveSqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
 
 describe("resolveSqlVariableSyntaxToggles", () => {
@@ -69,5 +70,14 @@ describe("normalizeSqlVariableSyntaxOverrides", () => {
   it("is stable across a round-trip", () => {
     const normalized = normalizeSqlVariableSyntaxOverrides({ mysql: { shell: false }, oracle: { atSet: false, named: false } });
     expect(normalizeSqlVariableSyntaxOverrides(normalized)).toEqual(normalized);
+  });
+
+  it("reads through a Vue reactive proxy without throwing (settings store is reactive; structuredClone would throw DataCloneError here)", () => {
+    const overrides = reactive({ mysql: { shell: false, atSet: false } });
+    const cloned = normalizeSqlVariableSyntaxOverrides(overrides);
+    expect(cloned).toEqual({ mysql: { shell: false, atSet: false } });
+    // Detached from the reactive source: mutating the clone must not touch the proxy.
+    cloned.mysql = {};
+    expect(overrides.mysql).toEqual({ shell: false, atSet: false });
   });
 });
