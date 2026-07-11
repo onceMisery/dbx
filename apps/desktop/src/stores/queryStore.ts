@@ -2249,6 +2249,16 @@ export const useQueryStore = defineStore("query", () => {
       return;
     }
 
+    // A full page was returned, so more rows may exist and determining the true
+    // total requires a potentially expensive COUNT(*) over the user's query.
+    // Only run it automatically when the user opted in; otherwise leave the
+    // total unknown and let them trigger it on demand from the result grid
+    // (matches DBeaver's default of not counting large result sets).
+    if (!useSettingsStore().editorSettings.autoCalculateTotalRows) {
+      setQueryTotalRowCountIfCurrent(options.tabId, options.executionId, options.result, undefined);
+      return;
+    }
+
     void (async () => {
       try {
         console.info("[DBX][executeTabSql:count:start]", { traceId: options.traceId, elapsed: options.elapsed() });
@@ -2784,7 +2794,7 @@ export const useQueryStore = defineStore("query", () => {
         if (!options?.preserveTotalRowCountDuringExecution) {
           current.resultTotalRowCount = undefined;
         }
-        current.resultTotalRowCountLoading = current.mode === "query" && !!current.result && !!countSql;
+        current.resultTotalRowCountLoading = current.mode === "query" && !!current.result && !!countSql && settingsStore.editorSettings.autoCalculateTotalRows;
         // Server-side pagination without a countSql: the backend (currently
         // the Elasticsearch driver) already reports the true match total via
         // affected_rows. Use it directly so the result-grid can compute the

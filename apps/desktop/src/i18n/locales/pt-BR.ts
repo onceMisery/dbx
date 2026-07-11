@@ -2914,6 +2914,8 @@ export default withEnglishFallback({
     dataGridQuickEntry: "Entrada rápida na grade",
     dataGridQuickEntryDescription: "Quando ativado, editar uma célula ou preencher a linha vazia inferior salva no banco de dados assim que o foco sai. Ajuda na entrada frequente, mas pode causar gravações acidentais.",
     infiniteScroll: "Carregamento por rolagem infinita",
+    autoCalculateTotalRows: "Calcular automaticamente o total de linhas",
+    autoCalculateTotalRowsDescription: "Executa COUNT(*) automaticamente após cada consulta para mostrar o total de linhas correspondentes. Desativado por padrão para manter consultas grandes rápidas; você pode calculá-lo quando quiser no rodapé dos resultados.",
     infiniteScrollDescription: "Carregar automaticamente a próxima página de dados ao rolar até o final da tabela.",
     infiniteScrollMaxRows: "Máximo de linhas em rolagem infinita",
     infiniteScrollMaxRowsDescription: "Número máximo de linhas a carregar no modo de rolagem infinita (1000–50000).",

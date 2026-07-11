@@ -3618,7 +3618,7 @@ const canGoNextPage = computed(() => {
 });
 const canJumpLastPage = computed(() => canGoNextPage.value && (hasKnownTotalRowCount.value || allRowsLoaded.value || !!props.tableMeta || !!props.countSql));
 const totalRowCountBusy = computed(() => props.totalRowCountLoading === true || manualTotalRowCountLoading.value);
-const canCalculateTotalRowCount = computed(() => !isResultsContext.value && !!props.connectionId && (!!props.tableMeta || !!props.countSql));
+const canCalculateTotalRowCount = computed(() => !!props.connectionId && (!!props.tableMeta || !!props.countSql));
 // When a refresh/rollback completes and the current page exceeds the last
 // available page (e.g. data was deleted while viewing), auto-navigate to the
 // last available page instead of showing an empty page.

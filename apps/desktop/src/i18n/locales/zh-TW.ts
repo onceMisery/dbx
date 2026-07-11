@@ -2763,6 +2763,8 @@ export default withEnglishFallback({
     dataGridQuickEntry: "表格快速輸入",
     dataGridQuickEntryDescription: "開啟後，編輯儲存格或填寫底部空白列並離焦會立即儲存到資料庫。適合高頻輸入，但有誤操作風險。",
     infiniteScroll: "無限滾動載入",
+    autoCalculateTotalRows: "自動統計總筆數",
+    autoCalculateTotalRowsDescription: "每次查詢後自動執行 COUNT(*) 顯示符合的總筆數。預設關閉以確保大型查詢速度 —— 可在結果列按需手動統計。",
     infiniteScrollDescription: "滾動到表格底部時自動載入下一頁資料，無需手動翻頁。",
     infiniteScrollMaxRows: "無限滾動最大筆數",
     infiniteScrollMaxRowsDescription: "無限滾動模式下最多載入的筆數（1000–50000）。",

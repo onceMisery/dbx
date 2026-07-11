@@ -2915,6 +2915,8 @@ export default withEnglishFallback({
     dataGridQuickEntry: "Entrada rápida en grilla",
     dataGridQuickEntryDescription: "Al activarlo, editar una celda o llenar la fila vacía inferior se guarda en la base de datos al perder el foco. Agiliza la captura frecuente, pero puede causar escrituras accidentales.",
     infiniteScroll: "Carga de desplazamiento infinito",
+    autoCalculateTotalRows: "Calcular automáticamente el total de filas",
+    autoCalculateTotalRowsDescription: "Ejecuta COUNT(*) automáticamente tras cada consulta para mostrar el total de filas coincidentes. Desactivado por defecto para mantener rápidas las consultas grandes; puedes calcularlo cuando quieras desde el pie de resultados.",
     infiniteScrollDescription: "Carga automáticamente la siguiente página de datos al desplazarse hasta el final de la tabla.",
     infiniteScrollMaxRows: "Máximo de filas en desplazamiento infinito",
     infiniteScrollMaxRowsDescription: "Número máximo de filas a cargar en modo desplazamiento infinito (1000–50000).",

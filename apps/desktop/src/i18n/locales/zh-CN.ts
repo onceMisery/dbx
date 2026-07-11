@@ -3019,6 +3019,8 @@ export default withEnglishFallback({
     dataGridQuickEntry: "表格快捷录入",
     dataGridQuickEntryDescription: "开启后，编辑单元格或填写底部空行并离焦会立即保存到数据库。便于高频录入，但存在误操作风险。",
     infiniteScroll: "无限滚动加载",
+    autoCalculateTotalRows: "自动统计总行数",
+    autoCalculateTotalRowsDescription: "每次查询后自动执行 COUNT(*) 显示匹配的总行数。默认关闭以保证大查询速度 —— 可在结果栏按需手动统计。",
     infiniteScrollDescription: "滚动到表格底部时自动加载下一页数据，无需手动翻页。",
     infiniteScrollMaxRows: "无限滚动最大行数",
     infiniteScrollMaxRowsDescription: "无限滚动模式下最多加载的行数（1000–50000）。",

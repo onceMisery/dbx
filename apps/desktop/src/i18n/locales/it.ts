@@ -2913,6 +2913,8 @@ export default withEnglishFallback({
     dataGridQuickEntry: "Inserimento rapido griglia",
     dataGridQuickEntryDescription: "Se attivo, la modifica di una cella o la compilazione della riga vuota in fondo viene salvata nel database appena il focus esce. Utile per inserimenti frequenti, ma può causare scritture accidentali.",
     infiniteScroll: "Caricamento a scorrimento infinito",
+    autoCalculateTotalRows: "Calcola automaticamente il totale delle righe",
+    autoCalculateTotalRowsDescription: "Esegue COUNT(*) automaticamente dopo ogni query per mostrare il totale delle righe corrispondenti. Disattivato per impostazione predefinita per mantenere veloci le query grandi; puoi calcolarlo all'occorrenza dal piè di pagina dei risultati.",
     infiniteScrollDescription: "Carica automaticamente la pagina successiva dei dati quando scorri fino in fondo alla tabella.",
     infiniteScrollMaxRows: "Righe max a scorrimento infinito",
     infiniteScrollMaxRowsDescription: "Numero massimo di righe da caricare in modalità scorrimento infinito (1000–50000).",

@@ -3193,6 +3193,8 @@ export default withEnglishFallback({
     updateDownloadSourceCnb: "CNB",
     updateDownloadSourceAtomgit: "AtomGit",
     infiniteScroll: "無限スクロール読み込み",
+    autoCalculateTotalRows: "総行数を自動計算",
+    autoCalculateTotalRowsDescription: "クエリごとに COUNT(*) を自動実行し、一致する総行数を表示します。大きなクエリを高速に保つため既定はオフです。結果フッターから必要に応じて計算できます。",
     infiniteScrollDescription: "テーブルのスクロール時に次のページのデータを自動読み込みします。",
     infiniteScrollMaxRows: "無限スクロールの最大行数",
     infiniteScrollMaxRowsDescription: "無限スクロールモードで読み込む最大行数（1000〜50000）。",
