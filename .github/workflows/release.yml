@@ -425,7 +425,8 @@ jobs:
         env:
           ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
           ATOMGIT_REPOSITORY: "t8y2/dbx"
-          ATOMGIT_UPLOAD_CONCURRENCY: "3"
+          # AtomGit throttles concurrent large-asset uploads, which can expire their temporary upload URLs.
+          ATOMGIT_UPLOAD_CONCURRENCY: "1"
         run: |
           set -euo pipefail
           node .github/scripts/sync-atomgit-release.mjs \
