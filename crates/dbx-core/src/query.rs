@@ -23,6 +23,7 @@ use crate::connection::{AppState, PoolKind, TransactionSession, TxnConnection};
 use crate::database_capabilities;
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
+use crate::query_execution_sql::is_write_sql;
 #[cfg(feature = "duckdb-bundled")]
 use crate::sql::starts_with_duckdb_result_sql_keyword;
 use crate::sql::{split_sql_batches, split_sql_statements, starts_with_executable_sql_keyword};
@@ -841,12 +842,12 @@ pub fn should_discard_pool_after_error(db_type: Option<DatabaseType>, err: &str)
     matches!(pool_error_action(db_type, err), PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry)
 }
 
-fn non_replay_query_pool_error_action(db_type: Option<DatabaseType>, err: &str) -> PoolErrorAction {
+fn query_pool_error_action(db_type: Option<DatabaseType>, sql: &str, err: &str) -> PoolErrorAction {
     match pool_error_action(db_type, err) {
         // A connection error does not prove that the database did not receive
-        // the statement. Generic SQL may write data, so discard the stale pool
-        // and let the caller decide whether to retry.
-        PoolErrorAction::ReconnectAndRetry => PoolErrorAction::Discard,
+        // a write. Only replay statements already accepted by the read-only
+        // protection classifier; writes discard the stale pool without retry.
+        PoolErrorAction::ReconnectAndRetry if is_write_sql(sql) => PoolErrorAction::Discard,
         action => action,
     }
 }
@@ -1587,8 +1588,14 @@ pub async fn execute_sql_statement_with_options(
         do_execute(state, &pool_key, mysql_dialect, Some(database), sql, schema, cancel_token.clone(), options.clone())
             .await;
 
-    let action = result.as_ref().err().map(|e| non_replay_query_pool_error_action(db_type, e));
+    let action = result.as_ref().err().map(|e| query_pool_error_action(db_type, sql, e));
     match action {
+        Some(PoolErrorAction::ReconnectAndRetry) if !is_canceled(&cancel_token) => {
+            let db_opt = if database.is_empty() { None } else { Some(database) };
+            let new_key =
+                state.reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref()).await?;
+            do_execute(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options).await
+        }
         Some(PoolErrorAction::Discard) => {
             state.remove_pool_by_key(&pool_key).await;
             result
@@ -3070,9 +3077,17 @@ mod tests {
     }
 
     #[test]
-    fn non_replay_query_policy_discards_connection_errors() {
+    fn query_pool_error_policy_retries_reads_but_not_writes() {
         assert_eq!(
-            non_replay_query_pool_error_action(Some(DatabaseType::Postgres), "connection reset by peer"),
+            query_pool_error_action(Some(DatabaseType::Postgres), "SELECT * FROM users", "connection reset by peer"),
+            PoolErrorAction::ReconnectAndRetry
+        );
+        assert_eq!(
+            query_pool_error_action(
+                Some(DatabaseType::Postgres),
+                "UPDATE users SET active = true",
+                "connection reset by peer"
+            ),
             PoolErrorAction::Discard
         );
     }
