@@ -36,7 +36,7 @@ import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedV
 import { mongodbAuthFailureHint, mongoUrlParam, mongoUrlParamIsTrue, normalizeMongoTlsFormState, setMongoUrlParam, setMongoUrlParamBoolean } from "@/lib/mongo/mongoConnectionOptions";
 import { mysqlCleartextPasswordAuthEnabled, setMysqlCleartextPasswordAuthEnabled } from "@/lib/database/mysqlConnectionOptions";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { agentDriverInstallKey, appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/connection/agentDriverInstallHint";
+import { agentDriverInstallKey, appendAgentDriverUpdateHint, hasAgentDriverUpdate, showAgentDriverInstallHint, type AgentDriverInstallState, type DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { prestoSqlBuiltinDriverPaths } from "@/lib/database/prestoSqlBuiltinDriver";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
@@ -117,7 +117,7 @@ const emit = defineEmits<{
   connectStarted: [name: string];
   connectSucceeded: [name: string];
   connectFailed: [message: string];
-  openDriverStore: [tab?: "jdbc"];
+  openDriverStore: [focus?: DriverStoreFocus];
   openTunnelProfileSettings: [];
 }>();
 
@@ -1958,6 +1958,7 @@ const zookeeperConnectString = computed({
 const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && form.value.db_type !== "access" && !isCloudflareD1Connection(form.value) && !isH2FileMode.value);
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
 const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
+const agentDriverFocus = computed<DriverStoreFocus>(() => ({ target: "driver", driver: agentDriverInstallKey(form.value.db_type, form.value.driver_profile) }));
 const canChooseVisibleDatabases = computed(() => connectionCanChooseVisibleDatabases(form.value));
 const visibleFilterUsesSchemas = computed(() => connectionUsesVisibleSchemaFilter(form.value));
 const hasVisibleDatabaseFilter = computed(() => Array.isArray(form.value.visible_databases));
@@ -4055,7 +4056,7 @@ function openExternalUrl(url: string) {
                 <div v-if="h2DriverMissing" class="grid grid-cols-4 items-center gap-4">
                   <span />
                   <p class="col-span-3 text-xs text-muted-foreground">
-                    {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore')">{{ t("toolbar.driverManager") }}</a
+                    {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore', agentDriverFocus)">{{ t("toolbar.driverManager") }}</a
                     >{{ t("connection.driverInstallHintSuffix") }}
                   </p>
                 </div>
@@ -4135,7 +4136,7 @@ function openExternalUrl(url: string) {
                         {{ t("connection.jdbcPluginHint") }}
                       </p>
                       <div class="flex flex-wrap gap-2">
-                        <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore', 'jdbc')">
+                        <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore', { target: 'tab', tab: 'jdbc' })">
                           <FolderOpen class="h-3.5 w-3.5" />
                           {{ t("toolbar.driverManager") }}
                         </Button>
@@ -4971,7 +4972,7 @@ function openExternalUrl(url: string) {
                   <div v-if="shouldShowAgentDriverInstallHint" class="grid grid-cols-4 items-center gap-4">
                     <span />
                     <p class="col-span-3 text-xs text-muted-foreground">
-                      {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore')">{{ t("toolbar.driverManager") }}</a
+                      {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore', agentDriverFocus)">{{ t("toolbar.driverManager") }}</a
                       >{{ t("connection.driverInstallHintSuffix") }}
                     </p>
                   </div>
@@ -5060,7 +5061,7 @@ function openExternalUrl(url: string) {
                           {{ t("connection.jdbcPluginHint") }}
                         </p>
                         <div class="flex flex-wrap gap-2">
-                          <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore', 'jdbc')">
+                          <Button type="button" variant="outline" size="sm" @click="emit('openDriverStore', { target: 'tab', tab: 'jdbc' })">
                             <FolderOpen class="h-3.5 w-3.5" />
                             {{ t("toolbar.driverManager") }}
                           </Button>

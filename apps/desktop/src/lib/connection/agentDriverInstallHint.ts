@@ -34,3 +34,14 @@ export function appendAgentDriverUpdateHint(message: string, hint: string): stri
   if (message.includes(hint)) return message;
   return `${message}\n\n${hint}`;
 }
+
+export type DriverStoreTab = "agent" | "jdbc" | "storage" | "runtime";
+
+export type DriverStoreFocus = { target: "driver"; driver?: string } | { target: "jre" } | { target: "tab"; tab: DriverStoreTab };
+
+/** Maps a backend connect error to the Driver Store item that can fix it. */
+export function driverStoreFocusForInstallError(message: string, dbType?: DatabaseType, driverProfile?: string): DriverStoreFocus | null {
+  if (message.includes("JRE") && message.includes("not installed")) return { target: "jre" };
+  if (!message.includes("is not installed") && !message.includes("reinstall it from the Driver Manager")) return null;
+  return { target: "driver", driver: agentDriverInstallKey(dbType, driverProfile) };
+}

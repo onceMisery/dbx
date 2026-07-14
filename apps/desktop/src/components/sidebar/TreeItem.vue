@@ -78,6 +78,7 @@ import { canTreeNodePin, canTreeNodeShowExpander, treeItemPaddingLeft, treeLabel
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
 import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTemplate, buildTableUpdateTemplate } from "@/lib/table/tableSqlTemplates";
 import { connectionFilePath, defaultSqliteBackupFileName, isMemorySqlitePath, sqliteBackupSourcePath } from "@/lib/connection/connectionFile";
+import { driverStoreFocusForInstallError } from "@/lib/connection/agentDriverInstallHint";
 import { revealPathInFileManager } from "@/lib/backend/tauri";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
 import { usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
@@ -813,9 +814,7 @@ async function toggle() {
     const errMsg = e?.message || String(e);
     if (errMsg.includes(CONNECTION_ATTEMPT_CANCELLED_MESSAGE)) return;
     toast(t("connection.connectFailed", { message: translateBackendError(t, errMsg) }), 5000);
-    if (errMsg.includes("driver is not installed") || errMsg.includes("is not installed")) {
-      window.dispatchEvent(new Event("dbx-open-driver-store"));
-    }
+    openDriverStoreForInstallError(errMsg);
   }
 }
 
@@ -852,6 +851,12 @@ function refreshActiveKvBrowserAfterOpen(mode: "etcd" | "zookeeper", connectionI
   void nextTick(() => {
     window.dispatchEvent(new CustomEvent("dbx-refresh-active-kv-browser", { detail: { mode, connectionId } }));
   });
+}
+
+function openDriverStoreForInstallError(errMsg: string) {
+  const config = props.node.connectionId ? connectionStore.getConfig(props.node.connectionId) : undefined;
+  const focus = driverStoreFocusForInstallError(errMsg, config?.db_type, config?.driver_profile);
+  if (focus) window.dispatchEvent(new CustomEvent("dbx-open-driver-store", { detail: focus }));
 }
 
 async function loadMoreObjectGroupChildren() {
@@ -1247,9 +1252,7 @@ async function openObjectBrowser() {
     }
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
-    if (e?.message?.includes("driver is not installed") || (e?.message?.includes("JRE") && e?.message?.includes("not installed"))) {
-      window.dispatchEvent(new Event("dbx-open-driver-store"));
-    }
+    openDriverStoreForInstallError(e?.message || String(e));
   }
 }
 
@@ -1611,9 +1614,7 @@ async function newQuery() {
     queryStore.createTab(node.connectionId, resolveDefaultDatabase(connection, options), undefined, "query");
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
-    if (e?.message?.includes("driver is not installed") || (e?.message?.includes("JRE") && e?.message?.includes("not installed"))) {
-      window.dispatchEvent(new Event("dbx-open-driver-store"));
-    }
+    openDriverStoreForInstallError(e?.message || String(e));
   }
 }
 
@@ -1787,9 +1788,7 @@ async function refresh() {
     await connectionStore.refreshTreeNode(props.node);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
-    if (e?.message?.includes("driver is not installed") || (e?.message?.includes("JRE") && e?.message?.includes("not installed"))) {
-      window.dispatchEvent(new Event("dbx-open-driver-store"));
-    }
+    openDriverStoreForInstallError(e?.message || String(e));
   }
 }
 

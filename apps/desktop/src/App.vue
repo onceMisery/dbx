@@ -78,6 +78,7 @@ import { assessProductionSql } from "@/lib/database/productionSafety";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/history/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/connection/agentDriverUpdateBadge";
+import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { apiUrl, webPath } from "@/lib/common/webPath";
 import { APP_FONT_SANS_CSS_VAR, DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
@@ -318,8 +319,18 @@ function closeSettingsPage() {
   driverStoreActive.value = false;
 }
 
-function openDriverStorePage(tab?: "agent" | "jdbc" | "storage" | "runtime") {
-  if (tab) driverStoreActiveTab.value = tab;
+const driverStoreFocus = ref<DriverStoreFocus | null>(null);
+
+function openDriverStorePage(target?: "agent" | "jdbc" | "storage" | "runtime" | DriverStoreFocus | null) {
+  if (typeof target === "string") {
+    driverStoreActiveTab.value = target;
+    driverStoreFocus.value = null;
+  } else if (target && target.target === "tab") {
+    driverStoreActiveTab.value = target.tab;
+    driverStoreFocus.value = null;
+  } else {
+    driverStoreFocus.value = target ?? null;
+  }
   driverStoreTabOpen.value = true;
   driverStoreActive.value = true;
   settingsStore.settingsPageActive = false;
@@ -329,6 +340,7 @@ function closeDriverStorePage() {
   driverStoreTabOpen.value = false;
   driverStoreActive.value = false;
   driverStoreActiveTab.value = "agent";
+  driverStoreFocus.value = null;
 }
 const toolbarAgentDriverUpdateCount = computed(() => (updateNotificationsEnabled.value ? agentDriverUpdateCount.value : 0));
 const toolbarHasUpdateAvailable = computed(() => updateNotificationsEnabled.value && hasUpdateAvailable.value);
@@ -1739,8 +1751,8 @@ function handleContextMenu(e: MouseEvent) {
   e.preventDefault();
 }
 
-function openDriverStoreFromEvent() {
-  openDriverStorePage();
+function openDriverStoreFromEvent(event: Event) {
+  openDriverStorePage(((event as CustomEvent).detail as DriverStoreFocus | undefined) ?? null);
 }
 
 function runUpdateNotificationChecks() {
@@ -1909,7 +1921,7 @@ onUnmounted(() => {
                 @discard-all-tab-close="handleDiscardAllPendingTabClose"
                 @cancel-tab-close="cancelPendingAppClose"
               />
-              <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" @update-count-change="updateAgentDriverUpdateCount" />
+              <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
               <EditorSettingsPage
                 v-if="settingsPageTabOpen"
                 v-show="settingsStore.settingsPageActive"
