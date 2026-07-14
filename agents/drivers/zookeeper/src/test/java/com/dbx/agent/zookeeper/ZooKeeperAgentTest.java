@@ -138,6 +138,57 @@ final class ZooKeeperAgentTest {
     }
 
     @Test
+    void connectFailsFastWhenAllServersAreUnreachable() {
+        long startedAt = System.nanoTime();
+        JsonObject error = error(request(
+            1,
+            "connect",
+            "{\"connection\":{\"connect_string\":\"127.0.0.1:1\",\"connection_timeout_ms\":15000}}"
+        ));
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000;
+
+        Assertions.assertTrue(
+            error.get("message").getAsString().contains("No reachable ZooKeeper server"),
+            "expected fast unreachable error, got: " + error.get("message").getAsString()
+        );
+        Assertions.assertTrue(elapsedMs < 4000, "expected fast failure, took " + elapsedMs + "ms");
+    }
+
+    @Test
+    void connectSkipsUnreachableServersInConnectString() throws Exception {
+        try (TestingServer server = new TestingServer()) {
+            JsonObject connect = result(request(
+                1,
+                "connect",
+                "{\"connection\":{\"connect_string\":\"127.0.0.1:1," + server.getConnectString() + "\"}}"
+            ));
+            Assertions.assertTrue(connect.get("ok").getAsBoolean());
+
+            JsonObject get = result(request(2, "kv_get", "{\"key\":\"/\"}"));
+            Assertions.assertTrue(get.get("found").getAsBoolean());
+        }
+    }
+
+    @Test
+    void reachableConnectStringFiltersDeadHostsAndPreservesChroot() throws Exception {
+        try (TestingServer server = new TestingServer()) {
+            String alive = server.getConnectString();
+
+            Assertions.assertEquals(
+                alive + "/app",
+                ZooKeeperAgent.reachableConnectString("127.0.0.1:1," + alive + "/app", 1000)
+            );
+            Assertions.assertEquals(alive, ZooKeeperAgent.reachableConnectString(alive, 1000));
+
+            IllegalStateException error = Assertions.assertThrows(
+                IllegalStateException.class,
+                () -> ZooKeeperAgent.reachableConnectString("127.0.0.1:1/app", 1000)
+            );
+            Assertions.assertTrue(error.getMessage().contains("No reachable ZooKeeper server"));
+        }
+    }
+
+    @Test
     void testConnectionDoesNotReplaceActiveClient() throws Exception {
         try (TestingServer active = new TestingServer(); TestingServer probe = new TestingServer()) {
             result(request(1, "connect", "{\"connection\":{\"connect_string\":\"" + active.getConnectString() + "\"}}"));
