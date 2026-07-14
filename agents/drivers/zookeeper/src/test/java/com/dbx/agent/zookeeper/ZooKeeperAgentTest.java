@@ -155,7 +155,7 @@ final class ZooKeeperAgentTest {
     }
 
     @Test
-    void connectSkipsUnreachableServersInConnectString() throws Exception {
+    void connectUsesReachableServerWithoutDroppingEnsembleMembers() throws Exception {
         try (TestingServer server = new TestingServer()) {
             JsonObject connect = result(request(
                 1,
@@ -170,13 +170,14 @@ final class ZooKeeperAgentTest {
     }
 
     @Test
-    void reachableConnectStringFiltersDeadHostsAndPreservesChroot() throws Exception {
+    void reachableConnectStringPreservesFullEnsembleAndChroot() throws Exception {
         try (TestingServer server = new TestingServer()) {
             String alive = server.getConnectString();
+            String ensemble = "127.0.0.1:1," + alive + "/app";
 
             Assertions.assertEquals(
-                alive + "/app",
-                ZooKeeperAgent.reachableConnectString("127.0.0.1:1," + alive + "/app", 1000)
+                ensemble,
+                ZooKeeperAgent.reachableConnectString(ensemble, 1000)
             );
             Assertions.assertEquals(alive, ZooKeeperAgent.reachableConnectString(alive, 1000));
 

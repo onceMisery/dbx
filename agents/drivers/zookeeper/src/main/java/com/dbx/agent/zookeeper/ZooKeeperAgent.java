@@ -150,7 +150,8 @@ public final class ZooKeeperAgent {
                 "No reachable ZooKeeper server within " + probeTimeoutMs + "ms: " + hostsPart
             );
         }
-        return String.join(",", reachable) + chroot;
+        // Curator needs the complete ensemble to reconnect when nodes recover or fail over later.
+        return String.join(",", hosts) + chroot;
     }
 
     private static List<String> probeReachableHosts(List<String> hosts, int probeTimeoutMs) {
