@@ -648,11 +648,13 @@ fn build_connection_params(cfg: &MqAdminConfig) -> serde_json::Value {
     } else {
         "PLAINTEXT"
     });
+    let zookeeper_connect_string = extra_str(extra, "zookeeperServers").unwrap_or("");
     let properties =
         extra.get("properties").filter(|value| value.is_object()).cloned().unwrap_or_else(|| serde_json::json!({}));
 
     serde_json::json!({
         "bootstrap_servers": bootstrap_servers(cfg),
+        "zookeeper_connect_string": zookeeper_connect_string,
         "security_protocol": security_protocol,
         "sasl_mechanism": sasl_mechanism,
         "sasl_username": sasl_username,
@@ -787,6 +789,25 @@ mod tests {
         assert_eq!(params.get("sasl_mechanism").and_then(|v| v.as_str()), Some("SCRAM-SHA-512"));
         assert_eq!(params.pointer("/tls/skip_verify").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(params.pointer("/properties/client.id").and_then(|v| v.as_str()), Some("dbx"));
+    }
+
+    #[test]
+    fn connection_params_pass_zookeeper_discovery_without_fake_bootstrap_servers() {
+        let cfg = kafka_config(
+            serde_json::json!({
+                "connectionSource": "zookeeper",
+                "zookeeperServers": "zk-1:2181,zk-2:2181/kafka",
+                "securityProtocol": "PLAINTEXT"
+            }),
+            MqAuth::None,
+            false,
+        );
+
+        let params = build_connection_params(&cfg);
+
+        assert_eq!(params.get("bootstrap_servers").and_then(|v| v.as_str()), Some(""));
+        assert_eq!(params.get("zookeeper_connect_string").and_then(|v| v.as_str()), Some("zk-1:2181,zk-2:2181/kafka"));
+        assert_eq!(params.get("security_protocol").and_then(|v| v.as_str()), Some("PLAINTEXT"));
     }
 
     #[test]

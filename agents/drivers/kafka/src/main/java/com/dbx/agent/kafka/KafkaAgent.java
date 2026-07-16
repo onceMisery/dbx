@@ -13,12 +13,17 @@ import org.apache.kafka.common.resource.PatternType;
 import org.apache.kafka.common.resource.ResourcePattern;
 import org.apache.kafka.common.resource.ResourcePatternFilter;
 import org.apache.kafka.common.resource.ResourceType;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooKeeper;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -32,6 +37,7 @@ public final class KafkaAgent {
     private static final Gson GSON = new GsonBuilder().serializeNulls().create();
     private static final int DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
     private static final int DEFAULT_SESSION_TIMEOUT_MS = 30_000;
+    private static final int DEFAULT_ZOOKEEPER_CONNECTION_TIMEOUT_MS = 10_000;
 
     private static final List<String> CAPABILITIES = Collections.unmodifiableList(Arrays.asList(
         "mq_connect", "mq_test_connection", "mq_topics", "mq_consumer_groups",
@@ -40,6 +46,7 @@ public final class KafkaAgent {
 
     private static AdminClient adminClient;
     private static KafkaProducer<String, byte[]> producer;
+    private static JsonObject activeConnection;
     private static volatile boolean shutdownRequested;
 
     private KafkaAgent() {}
@@ -137,7 +144,7 @@ public final class KafkaAgent {
     }
 
     private static Object connect(JsonObject params) throws Exception {
-        JsonObject conn = connectionObject(params);
+        JsonObject conn = resolveBrokerConnection(connectionObject(params));
         AdminClient nextAdmin = buildAdminClient(conn);
         KafkaProducer<String, byte[]> nextProducer = null;
         try {
@@ -148,6 +155,7 @@ public final class KafkaAgent {
             closeClients();
             adminClient = nextAdmin;
             producer = nextProducer;
+            activeConnection = conn.deepCopy();
             return Collections.singletonMap("ok", true);
         } catch (Exception e) {
             nextAdmin.close(Duration.ofSeconds(5));
@@ -159,7 +167,7 @@ public final class KafkaAgent {
     }
 
     private static Object testConnection(JsonObject params) throws Exception {
-        JsonObject conn = connectionObject(params);
+        JsonObject conn = resolveBrokerConnection(connectionObject(params));
         AdminClient probe = buildAdminClient(conn);
         try {
             int timeout = intOrDefault(conn, "request_timeout_ms", DEFAULT_REQUEST_TIMEOUT_MS);
@@ -210,6 +218,7 @@ public final class KafkaAgent {
             producer.close(Duration.ofSeconds(5));
             producer = null;
         }
+        activeConnection = null;
     }
 
     // -----------------------------------------------------------------------
@@ -250,14 +259,146 @@ public final class KafkaAgent {
         return servers;
     }
 
+    static JsonObject resolveBrokerConnection(JsonObject conn) throws Exception {
+        String configured = stringOrEmpty(conn, "bootstrap_servers");
+        if (configured.isBlank()) configured = stringOrEmpty(conn, "bootstrapServers");
+        if (!configured.isBlank()) return conn;
+
+        String connectString = stringOrEmpty(conn, "zookeeper_connect_string");
+        if (connectString.isBlank()) connectString = stringOrEmpty(conn, "zookeeperServers");
+        if (connectString.isBlank()) {
+            throw new IllegalArgumentException("bootstrap_servers or zookeeper_connect_string is required");
+        }
+
+        JsonObject resolved = conn.deepCopy();
+        resolved.addProperty("bootstrap_servers", discoverBootstrapServers(connectString, securityProtocol(conn), conn));
+        return resolved;
+    }
+
+    private static String discoverBootstrapServers(String connectString, String securityProtocol, JsonObject conn)
+        throws Exception {
+        int sessionTimeout = intOrDefault(conn, "zookeeper_session_timeout_ms", DEFAULT_SESSION_TIMEOUT_MS);
+        int connectionTimeout = intOrDefault(
+            conn,
+            "zookeeper_connection_timeout_ms",
+            DEFAULT_ZOOKEEPER_CONNECTION_TIMEOUT_MS
+        );
+        CountDownLatch connected = new CountDownLatch(1);
+        System.setProperty("zookeeper.sasl.client", "false");
+        ZooKeeper zooKeeper = new ZooKeeper(connectString, sessionTimeout, event -> {
+            if (event.getState() == Watcher.Event.KeeperState.SyncConnected) connected.countDown();
+        });
+        try {
+            if (!connected.await(connectionTimeout, TimeUnit.MILLISECONDS)) {
+                throw new IllegalStateException("Timed out connecting to ZooKeeper for Kafka broker discovery");
+            }
+
+            List<String> brokerIds;
+            try {
+                brokerIds = new ArrayList<>(zooKeeper.getChildren("/brokers/ids", false));
+            } catch (KeeperException.NoNodeException e) {
+                throw new IllegalStateException("ZooKeeper path /brokers/ids does not exist", e);
+            }
+            brokerIds.sort(KafkaAgent::compareBrokerIds);
+
+            List<JsonObject> registrations = new ArrayList<>();
+            for (String brokerId : brokerIds) {
+                try {
+                    byte[] data = zooKeeper.getData("/brokers/ids/" + brokerId, false, null);
+                    registrations.add(JsonParser.parseString(new String(data, StandardCharsets.UTF_8)).getAsJsonObject());
+                } catch (KeeperException.NoNodeException | RuntimeException ignored) {
+                    // A broker may disappear or refresh its registration while discovery is in progress.
+                }
+            }
+            return brokerEndpoints(registrations, securityProtocol);
+        } finally {
+            zooKeeper.close();
+        }
+    }
+
+    private static int compareBrokerIds(String left, String right) {
+        try {
+            return Integer.compare(Integer.parseInt(left), Integer.parseInt(right));
+        } catch (NumberFormatException ignored) {
+            return left.compareTo(right);
+        }
+    }
+
+    static String brokerEndpoints(List<JsonObject> registrations, String securityProtocol) {
+        String targetProtocol = securityProtocol == null || securityProtocol.isBlank()
+            ? "PLAINTEXT"
+            : securityProtocol.toUpperCase(Locale.ROOT);
+        Set<String> addresses = new LinkedHashSet<>();
+
+        for (JsonObject registration : registrations) {
+            int addressCount = addresses.size();
+            JsonObject protocolMap = registration.has("listener_security_protocol_map")
+                && registration.get("listener_security_protocol_map").isJsonObject()
+                ? registration.getAsJsonObject("listener_security_protocol_map")
+                : new JsonObject();
+            JsonArray endpoints = registration.has("endpoints") && registration.get("endpoints").isJsonArray()
+                ? registration.getAsJsonArray("endpoints")
+                : new JsonArray();
+
+            for (JsonElement element : endpoints) {
+                if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) continue;
+                String endpoint = element.getAsString();
+                int separator = endpoint.indexOf("://");
+                if (separator <= 0) continue;
+                String listener = endpoint.substring(0, separator).toUpperCase(Locale.ROOT);
+                JsonElement mapped = protocolMap.get(listener);
+                String mappedProtocol = mapped != null && mapped.isJsonPrimitive()
+                    ? mapped.getAsString().toUpperCase(Locale.ROOT)
+                    : listener;
+                if (!targetProtocol.equals(mappedProtocol)) continue;
+                String address = endpointAddress(endpoint);
+                if (address != null) addresses.add(address);
+            }
+
+            if (addresses.size() == addressCount && endpoints.size() == 0 && registration.has("host") && registration.has("port")) {
+                try {
+                    String host = registration.get("host").getAsString().trim();
+                    int port = registration.get("port").getAsInt();
+                    if (!host.isEmpty() && port > 0 && port <= 65535) addresses.add(formatHostPort(host, port));
+                } catch (RuntimeException ignored) {
+                    // Skip malformed legacy registrations and continue with the remaining brokers.
+                }
+            }
+        }
+
+        if (addresses.isEmpty()) {
+            throw new IllegalArgumentException("ZooKeeper did not return any usable Kafka broker endpoints");
+        }
+        return String.join(",", addresses);
+    }
+
+    private static String endpointAddress(String endpoint) {
+        try {
+            URI uri = URI.create(endpoint);
+            String host = uri.getHost();
+            int port = uri.getPort();
+            if (host == null || host.isBlank() || port <= 0 || port > 65535) return null;
+            return formatHostPort(host, port);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+    }
+
+    private static String formatHostPort(String host, int port) {
+        String normalizedHost = host.startsWith("[") && host.endsWith("]")
+            ? host.substring(1, host.length() - 1)
+            : host;
+        return normalizedHost.contains(":") ? "[" + normalizedHost + "]:" + port : normalizedHost + ":" + port;
+    }
+
+    private static String securityProtocol(JsonObject conn) {
+        String protocol = stringOrEmpty(conn, "security_protocol");
+        if (protocol.isBlank()) protocol = stringOrEmpty(conn, "securityProtocol");
+        return protocol.isBlank() ? "PLAINTEXT" : protocol;
+    }
+
     static void applySecurityProperties(JsonObject conn, Properties props) {
-        String securityProtocol = stringOrEmpty(conn, "security_protocol");
-        if (securityProtocol.isBlank()) {
-            securityProtocol = stringOrEmpty(conn, "securityProtocol");
-        }
-        if (securityProtocol.isBlank()) {
-            securityProtocol = "PLAINTEXT";
-        }
+        String securityProtocol = securityProtocol(conn);
         props.put("security.protocol", securityProtocol);
 
         String saslMechanism = stringOrEmpty(conn, "sasl_mechanism");
@@ -510,9 +651,42 @@ public final class KafkaAgent {
         }
 
         ConfigResource resource = new ConfigResource(ConfigResource.Type.TOPIC, name);
-        admin.incrementalAlterConfigs(Collections.singletonMap(resource, ops))
-            .all().get(timeout, TimeUnit.MILLISECONDS);
+        try {
+            admin.incrementalAlterConfigs(Collections.singletonMap(resource, ops))
+                .all().get(timeout, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            if (!isUnsupportedVersionError(e)) throw e;
+            Config current = admin.describeConfigs(Collections.singletonList(resource))
+                .all().get(timeout, TimeUnit.MILLISECONDS).get(resource);
+            Map<String, String> values = legacyTopicConfig(current, ops);
+            Config replacement = new Config(values.entrySet().stream()
+                .map(entry -> new ConfigEntry(entry.getKey(), entry.getValue()))
+                .collect(Collectors.toList()));
+            admin.alterConfigs(Collections.singletonMap(resource, replacement))
+                .all().get(timeout, TimeUnit.MILLISECONDS);
+        }
         return Collections.singletonMap("ok", true);
+    }
+
+    static Map<String, String> legacyTopicConfig(Config current, List<AlterConfigOp> ops) {
+        Map<String, String> values = new LinkedHashMap<>();
+        for (ConfigEntry entry : current.entries()) {
+            if (!entry.isDefault() && !entry.isReadOnly() && !entry.isSensitive() && entry.value() != null) {
+                values.put(entry.name(), entry.value());
+            }
+        }
+
+        for (AlterConfigOp op : ops) {
+            String key = op.configEntry().name();
+            switch (op.opType()) {
+                case SET -> values.put(key, op.configEntry().value());
+                case DELETE -> values.remove(key);
+                case APPEND, SUBTRACT -> throw new IllegalArgumentException(
+                    "Kafka broker does not support " + op.opType() + " config operations through the legacy alterConfigs API"
+                );
+            }
+        }
+        return values;
     }
 
     // -----------------------------------------------------------------------
@@ -731,16 +905,13 @@ public final class KafkaAgent {
 
         // Build a temporary consumer for peeking (no commit)
         Properties props = new Properties();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
-            adminClient != null ? adminClient.describeCluster().clusterId()
-                .get(5, TimeUnit.SECONDS) : "localhost:9092");
-        // Reuse the admin's bootstrap servers
-        JsonObject conn = params.has("connection") && params.get("connection").isJsonObject()
-            ? params.getAsJsonObject("connection") : null;
-        if (conn != null) {
-            props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers(conn));
-            applyConnectionProperties(conn, props);
+        JsonObject conn = activeConnection;
+        if (conn == null && params.has("connection") && params.get("connection").isJsonObject()) {
+            conn = resolveBrokerConnection(params.getAsJsonObject("connection"));
         }
+        if (conn == null) throw new IllegalStateException("Not connected");
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers(conn));
+        applyConnectionProperties(conn, props);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "dbx-peek-" + UUID.randomUUID());
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
             "org.apache.kafka.common.serialization.StringDeserializer");
