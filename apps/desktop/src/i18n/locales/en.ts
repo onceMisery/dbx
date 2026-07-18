@@ -2912,6 +2912,7 @@ export default {
     progress: "Progress",
     start: "Start Import",
     success: "Imported {count} rows",
+    elapsed: "Elapsed {duration}",
     back: "Back",
     next: "Next",
     truncateWarning: "Existing rows in the target table will be removed before import starts.",

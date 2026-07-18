@@ -2532,6 +2532,7 @@ export default withEnglishFallback({
     progress: "進度",
     start: "開始匯入",
     success: "已匯入 {count} 行",
+    elapsed: "耗時 {duration}",
     back: "上一步",
     next: "下一步",
     truncateWarning: "匯入開始前會先刪除目標資料表中的現有資料。",

@@ -2714,6 +2714,7 @@ export default withEnglishFallback({
     progress: "進捗",
     start: "インポート開始",
     success: "{count}行をインポートしました",
+    elapsed: "経過時間 {duration}",
     back: "Back",
     next: "Next",
     truncateWarning: "Existing rows in the target table will be removed before import starts.",

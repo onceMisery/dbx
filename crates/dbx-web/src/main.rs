@@ -591,6 +591,8 @@ async fn main() {
         .route("/sql-file/cancel", post(routes::sql_file::cancel_sql_file))
         // Table import
         .route("/import/preview", post(routes::table_import::preview_import))
+        .route("/import/preview-source", post(routes::table_import::preview_uploaded_import))
+        .route("/import/source/release", post(routes::table_import::release_import_source))
         .route("/import/execute", post(routes::table_import::execute_import))
         .route("/import/progress/{importId}", get(routes::table_import::import_progress))
         .route("/import/cancel", post(routes::table_import::cancel_import))

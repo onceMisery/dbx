@@ -26,6 +26,22 @@ export type TableImportWizardStep = "source" | "options" | "mapping" | "review" 
 
 export const TABLE_IMPORT_WIZARD_STEPS: TableImportWizardStep[] = ["source", "options", "mapping", "review", "execution"];
 
+export function formatTableImportElapsed(ms: number): string {
+  const elapsedMs = Math.max(0, Number.isFinite(ms) ? Math.round(ms) : 0);
+  if (elapsedMs < 1000) return `${elapsedMs} ms`;
+  const seconds = elapsedMs / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.round(seconds % 60)}s`;
+}
+
+export function resolveTableImportElapsed(liveElapsedMs: number, backendElapsedMs: number | undefined, terminal: boolean): number {
+  const live = Math.max(0, Number.isFinite(liveElapsedMs) ? liveElapsedMs : 0);
+  const backend = backendElapsedMs === undefined || !Number.isFinite(backendElapsedMs) ? undefined : Math.max(0, backendElapsedMs);
+  if (terminal && backend !== undefined) return backend;
+  return Math.max(live, backend ?? 0);
+}
+
 export function normalizeImportColumnName(name: string): string {
   return name.trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
 }

@@ -2715,6 +2715,7 @@ export default withEnglishFallback({
     progress: "Progreso",
     start: "Iniciar importación",
     success: "Se importaron {count} filas",
+    elapsed: "Duración: {duration}",
     back: "Back",
     next: "Next",
     truncateWarning: "Existing rows in the target table will be removed before import starts.",

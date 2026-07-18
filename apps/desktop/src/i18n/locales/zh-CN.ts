@@ -2882,6 +2882,7 @@ export default withEnglishFallback({
     progress: "进度",
     start: "开始导入",
     success: "已导入 {count} 行",
+    elapsed: "耗时 {duration}",
     back: "上一步",
     next: "下一步",
     truncateWarning: "导入开始前会先删除目标表中的现有数据。",

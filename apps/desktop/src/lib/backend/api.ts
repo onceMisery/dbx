@@ -326,6 +326,7 @@ export const sortTablesByFkDependency = forward("sortTablesByFkDependency");
 export const previewTableImportFile = forward("previewTableImportFile");
 export const importTableFile = forward("importTableFile");
 export const cancelTableImport = forward("cancelTableImport");
+export const releaseTableImportSource = forward("releaseTableImportSource");
 
 // Database Export
 export const beginDatabaseBackupSnapshot = forward("beginDatabaseBackupSnapshot");
@@ -581,6 +582,7 @@ export type {
   TableImportParseOptions,
   TableImportPreviewRequest,
   TableImportPreview,
+  TableImportPreparedSource,
   TableImportRequest,
   TableImportSummary,
   TableImportProgress,

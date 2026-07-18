@@ -2218,8 +2218,17 @@ export interface TableImportPreview {
   columns: string[];
   rows: unknown[][];
   totalRows: number;
+  sourceFingerprint: string;
   effectiveEncoding?: TableImportTextEncoding | null;
   sheets?: string[];
+}
+
+export interface TableImportPreparedSource {
+  fingerprint: string;
+  columns: string[];
+  rows: unknown[][];
+  totalRows: number;
+  effectiveEncoding?: TableImportTextEncoding | null;
 }
 
 export interface TableImportRequest {
@@ -2237,12 +2246,15 @@ export interface TableImportRequest {
   createTable?: boolean;
   batchSize: number;
   dateTimeFormat?: string;
+  preparedSource?: TableImportPreparedSource | null;
+  retainSource?: boolean;
 }
 
 export interface TableImportSummary {
   importId: string;
   rowsImported: number;
   totalRows: number;
+  elapsedMs: number;
 }
 
 export interface TableImportProgress {
@@ -2250,6 +2262,7 @@ export interface TableImportProgress {
   status: TableImportStatus;
   rowsImported: number;
   totalRows: number;
+  elapsedMs: number;
   error?: string | null;
 }
 
@@ -2280,6 +2293,10 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
 
 export async function cancelTableImport(importId: string): Promise<boolean> {
   return invoke("cancel_table_import", { importId });
+}
+
+export async function releaseTableImportSource(_sourceRef: string): Promise<boolean> {
+  return false;
 }
 
 // --- Database Export ---

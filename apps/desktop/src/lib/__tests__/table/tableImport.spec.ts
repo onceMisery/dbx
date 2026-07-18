@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { autoMapImportColumns, nextTableImportWizardStep, previousTableImportWizardStep, requiredImportTargetColumns, suggestImportTargetDataTypes, validateImportMappings } from "@/lib/table/tableImport";
+import { autoMapImportColumns, formatTableImportElapsed, nextTableImportWizardStep, previousTableImportWizardStep, requiredImportTargetColumns, resolveTableImportElapsed, suggestImportTargetDataTypes, validateImportMappings } from "@/lib/table/tableImport";
 
 describe("tableImport", () => {
+  it("formats import elapsed time for progress and terminal summaries", () => {
+    expect(formatTableImportElapsed(0)).toBe("0 ms");
+    expect(formatTableImportElapsed(999)).toBe("999 ms");
+    expect(formatTableImportElapsed(1_250)).toBe("1.3 s");
+    expect(formatTableImportElapsed(61_000)).toBe("1m 1s");
+  });
+
+  it("uses the backend elapsed time as the terminal source of truth", () => {
+    expect(resolveTableImportElapsed(1_500, 1_000, false)).toBe(1_500);
+    expect(resolveTableImportElapsed(1_500, 2_000, false)).toBe(2_000);
+    expect(resolveTableImportElapsed(2_500, 2_000, true)).toBe(2_000);
+    expect(resolveTableImportElapsed(2_500, undefined, true)).toBe(2_500);
+  });
+
   it("auto maps exact and normalized column names", () => {
     expect(autoMapImportColumns(["id", "user name", "ignored"], ["id", "user_name"])).toEqual({
       id: "id",

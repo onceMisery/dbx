@@ -2,12 +2,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read as IoRead, Seek, SeekFrom};
 use std::path::Path;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use calamine::{open_workbook_auto, Data, ExcelDateTime, Reader as CalamineReader};
+use calamine::{
+    open_workbook_auto, CellType, Data, DataRef, ExcelDateTime, Range, Reader as CalamineReader,
+    ReaderRef as CalamineReaderRef,
+};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader as XmlReader;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::connection::{task_client_session_id, AppState};
 use crate::models::connection::DatabaseType;
@@ -19,6 +24,7 @@ pub const DEFAULT_PREVIEW_LIMIT: usize = 50;
 pub const DEFAULT_BATCH_SIZE: usize = 500;
 pub const CREATE_TABLE_INFERENCE_ROWS: usize = 100;
 pub const MAX_NON_STREAMING_IMPORT_BYTES: u64 = 100 * 1024 * 1024;
+const IMPORT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn table_import_client_session_id(import_id: &str) -> String {
     task_client_session_id("table-import", import_id)
@@ -36,6 +42,13 @@ pub struct ParsedImportFile {
 pub struct ImportSqlBatch {
     pub sql: String,
     pub row_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompiledImportPlan {
+    mapped_source_indexes: Vec<usize>,
+    target_columns: Vec<String>,
+    column_types: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +215,21 @@ pub struct TableImportRequest {
     pub batch_size: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_time_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_source: Option<TableImportPreparedSource>,
+    #[serde(default)]
+    pub retain_source: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableImportPreparedSource {
+    pub fingerprint: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub total_rows: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_encoding: Option<TableImportTextEncoding>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +244,7 @@ pub struct TableImportPreview {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub total_rows: usize,
+    pub source_fingerprint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_encoding: Option<TableImportTextEncoding>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -228,6 +257,7 @@ pub struct TableImportSummary {
     pub import_id: String,
     pub rows_imported: usize,
     pub total_rows: usize,
+    pub elapsed_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,6 +267,7 @@ pub struct TableImportProgress {
     pub status: TableImportStatus,
     pub rows_imported: usize,
     pub total_rows: usize,
+    pub elapsed_ms: u128,
     pub error: Option<String>,
 }
 
@@ -624,6 +655,30 @@ pub fn parse_delimited_file_with_options(
     options: &TableImportParseOptions,
     preview_limit: usize,
 ) -> Result<ParsedImportFile, String> {
+    if options.encoding.unwrap_or(TableImportTextEncoding::Auto) == TableImportTextEncoding::Auto {
+        let mut file = File::open(path).map_err(|error| error.to_string())?;
+        let mut prefix = [0u8; 3];
+        let prefix_len = file.read(&mut prefix).map_err(|error| error.to_string())?;
+        if let Some((encoding, _)) = bom_text_encoding(&prefix[..prefix_len]) {
+            let mut explicit_options = options.clone();
+            explicit_options.encoding = Some(encoding);
+            let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, &explicit_options)?;
+            return parse_csv_reader(reader, config, preview_limit, encoding);
+        }
+
+        for encoding in [TableImportTextEncoding::Utf8, TableImportTextEncoding::Gbk] {
+            let mut explicit_options = options.clone();
+            explicit_options.encoding = Some(encoding);
+            let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, &explicit_options)?;
+            match parse_csv_reader(reader, config, preview_limit, encoding) {
+                Ok(parsed) => return Ok(parsed),
+                Err(error) if error.starts_with("Invalid byte sequence for ") => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        return Err("Could not detect text encoding; select UTF-8, GBK / GB18030, or UTF-16 manually".to_string());
+    }
+
     let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, options)?;
     parse_csv_reader(reader, config, preview_limit, encoding)
 }
@@ -872,6 +927,41 @@ fn xlsx_cell_label_with_temporal_kind(cell: &Data, temporal_kind: Option<XlsxTem
 
 pub fn xlsx_cell_label(cell: &Data) -> String {
     xlsx_cell_label_with_temporal_kind(cell, None)
+}
+
+fn xlsx_cell_ref_value_with_temporal_kind(
+    cell: &DataRef<'_>,
+    temporal_kind: Option<XlsxTemporalKind>,
+) -> serde_json::Value {
+    match cell {
+        DataRef::Empty => serde_json::Value::Null,
+        DataRef::String(s) => csv_value(s),
+        DataRef::SharedString(s) => csv_value(s),
+        DataRef::Float(n) => {
+            serde_json::Number::from_f64(*n).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+        }
+        DataRef::Int(n) => serde_json::Value::Number((*n).into()),
+        DataRef::Bool(v) => serde_json::Value::Bool(*v),
+        DataRef::DateTime(v) => serde_json::Value::String(xlsx_datetime_label(v, temporal_kind)),
+        DataRef::DateTimeIso(v) => serde_json::Value::String(v.clone()),
+        DataRef::DurationIso(v) => serde_json::Value::String(v.clone()),
+        DataRef::Error(v) => serde_json::Value::String(v.to_string()),
+    }
+}
+
+fn xlsx_cell_ref_label_with_temporal_kind(cell: &DataRef<'_>, temporal_kind: Option<XlsxTemporalKind>) -> String {
+    match cell {
+        DataRef::Empty => String::new(),
+        DataRef::String(s) => s.clone(),
+        DataRef::SharedString(s) => (*s).to_string(),
+        DataRef::Float(n) => n.to_string(),
+        DataRef::Int(n) => n.to_string(),
+        DataRef::Bool(v) => v.to_string(),
+        DataRef::DateTime(v) => xlsx_datetime_label(v, temporal_kind),
+        DataRef::DateTimeIso(v) => v.clone(),
+        DataRef::DurationIso(v) => v.clone(),
+        DataRef::Error(v) => v.to_string(),
+    }
 }
 
 pub fn xlsx_sheet_names(path: &str) -> Result<Vec<String>, String> {
@@ -1171,7 +1261,43 @@ pub fn parse_xlsx_file_with_options(
         sheet_names.first().cloned().ok_or_else(|| "Workbook has no sheets".to_string())?
     };
     let temporal_cell_kinds = xlsx_temporal_cell_kinds(path, &sheet_name).unwrap_or_default();
+    let extension = Path::new(path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
+    if extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm") {
+        let range = workbook.worksheet_range_ref(&sheet_name).map_err(|e| e.to_string())?;
+        return parse_xlsx_range(
+            &range,
+            options,
+            preview_limit,
+            &temporal_cell_kinds,
+            xlsx_cell_ref_label_with_temporal_kind,
+            xlsx_cell_ref_value_with_temporal_kind,
+        );
+    }
+
     let range = workbook.worksheet_range(&sheet_name).map_err(|e| e.to_string())?;
+    parse_xlsx_range(
+        &range,
+        options,
+        preview_limit,
+        &temporal_cell_kinds,
+        xlsx_cell_label_with_temporal_kind,
+        xlsx_cell_value_with_temporal_kind,
+    )
+}
+
+fn parse_xlsx_range<T, Label, Value>(
+    range: &Range<T>,
+    options: &TableImportParseOptions,
+    preview_limit: usize,
+    temporal_cell_kinds: &HashMap<(usize, usize), XlsxTemporalKind>,
+    cell_label: Label,
+    cell_value: Value,
+) -> Result<ParsedImportFile, String>
+where
+    T: CellType,
+    Label: Fn(&T, Option<XlsxTemporalKind>) -> String,
+    Value: Fn(&T, Option<XlsxTemporalKind>) -> serde_json::Value,
+{
     let (range_start_row, range_start_column) =
         range.start().map(|(row, column)| (row as usize, column as usize)).unwrap_or_default();
     let row_range = effective_import_row_range(options)?;
@@ -1187,10 +1313,7 @@ pub fn parse_xlsx_file_with_options(
                 .map(|(index, cell)| {
                     // Calamine rows are relative to the used range, while XLSX style coordinates are worksheet-absolute.
                     let cell_position = (range_start_row + row_number, range_start_column + index + 1);
-                    normalize_header(
-                        &xlsx_cell_label_with_temporal_kind(cell, temporal_cell_kinds.get(&cell_position).copied()),
-                        index,
-                    )
+                    normalize_header(&cell_label(cell, temporal_cell_kinds.get(&cell_position).copied()), index)
                 })
                 .collect();
             continue;
@@ -1214,9 +1337,7 @@ pub fn parse_xlsx_file_with_options(
             row.push(
                 source_row
                     .get(index)
-                    .map(|cell| {
-                        xlsx_cell_value_with_temporal_kind(cell, temporal_cell_kinds.get(&cell_position).copied())
-                    })
+                    .map(|cell| cell_value(cell, temporal_cell_kinds.get(&cell_position).copied()))
                     .unwrap_or(serde_json::Value::Null),
             );
         }
@@ -1328,6 +1449,26 @@ fn mapping_indexes_with_mappings<'a>(
     Ok(mapped)
 }
 
+fn compile_import_plan(
+    columns: &[String],
+    mappings: &[TableImportColumnMapping],
+    target_column_types: &[(String, String)],
+) -> Result<CompiledImportPlan, String> {
+    let mapped = mapping_indexes_for_columns(columns, mappings)?;
+    let mapped_source_indexes = mapped.iter().map(|(source_index, _)| *source_index).collect::<Vec<_>>();
+    let target_columns = mapped.into_iter().map(|(_, target)| target).collect::<Vec<_>>();
+    let column_types = target_columns
+        .iter()
+        .map(|column| {
+            target_column_types
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                .map(|(_, data_type)| data_type.clone())
+        })
+        .collect::<Vec<_>>();
+    Ok(CompiledImportPlan { mapped_source_indexes, target_columns, column_types })
+}
+
 pub fn build_import_insert_batch_from_rows(
     rows: &[Vec<serde_json::Value>],
     columns: &[String],
@@ -1374,28 +1515,32 @@ fn build_import_insert_batch_from_rows_with_format(
             rows.len(),
         );
     }
-    let mapped = mapping_indexes_for_columns(columns, mappings)?;
-    let target_columns = mapped.iter().map(|(_, target)| target.clone()).collect::<Vec<_>>();
-    let column_types = target_columns
-        .iter()
-        .map(|column| {
-            target_column_types
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(column))
-                .map(|(_, data_type)| data_type.clone())
-        })
-        .collect::<Vec<_>>();
+    let plan = compile_import_plan(columns, mappings, target_column_types)?;
+    build_import_insert_batch_with_plan(rows, &plan, table, schema, db_type, date_time_format)
+}
+
+fn build_import_insert_batch_with_plan(
+    rows: &[Vec<serde_json::Value>],
+    plan: &CompiledImportPlan,
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    date_time_format: Option<&str>,
+) -> Result<Option<ImportSqlBatch>, String> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
     let mapped_rows = rows
         .iter()
         .map(|row| {
-            mapped
+            plan.mapped_source_indexes
                 .iter()
                 .enumerate()
-                .map(|(target_index, (source_index, _))| {
+                .map(|(target_index, source_index)| {
                     let value = row.get(*source_index).cloned().unwrap_or(serde_json::Value::Null);
                     normalize_import_temporal_value(
                         &value,
-                        column_types.get(target_index).and_then(|data_type| data_type.as_deref()),
+                        plan.column_types.get(target_index).and_then(|data_type| data_type.as_deref()),
                         db_type,
                         date_time_format,
                     )
@@ -1403,8 +1548,36 @@ fn build_import_insert_batch_from_rows_with_format(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let sql = generate_insert_typed(&target_columns, &column_types, &mapped_rows, table, schema, db_type);
+    let sql = generate_insert_typed(&plan.target_columns, &plan.column_types, &mapped_rows, table, schema, db_type);
     Ok((!sql.trim().is_empty()).then_some(ImportSqlBatch { sql, row_count: rows.len() }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_import_execution_batch(
+    rows: &[Vec<serde_json::Value>],
+    plan: Option<&CompiledImportPlan>,
+    columns: &[String],
+    mappings: &[TableImportColumnMapping],
+    target_column_types: &[(String, String)],
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    date_time_format: Option<&str>,
+) -> Result<Option<ImportSqlBatch>, String> {
+    if let Some(plan) = plan {
+        build_import_insert_batch_with_plan(rows, plan, table, schema, db_type, date_time_format)
+    } else {
+        build_import_insert_batch_from_rows_with_format(
+            rows,
+            columns,
+            mappings,
+            target_column_types,
+            table,
+            schema,
+            db_type,
+            date_time_format,
+        )
+    }
 }
 
 fn supports_multi_row_insert_values(db_type: &DatabaseType) -> bool {
@@ -1811,24 +1984,92 @@ fn import_error_message(request: &TableImportRequest, rows_imported: usize, erro
     format!("Import into table '{}' failed after {} imported rows: {}", request.table, rows_imported, error.as_ref())
 }
 
+fn import_progress(
+    import_id: &str,
+    status: TableImportStatus,
+    rows_imported: usize,
+    total_rows: usize,
+    started_at: Instant,
+    error: Option<String>,
+) -> TableImportProgress {
+    TableImportProgress {
+        import_id: import_id.to_string(),
+        status,
+        rows_imported,
+        total_rows,
+        elapsed_ms: started_at.elapsed().as_millis(),
+        error,
+    }
+}
+
+fn import_summary(import_id: &str, rows_imported: usize, total_rows: usize, started_at: Instant) -> TableImportSummary {
+    TableImportSummary {
+        import_id: import_id.to_string(),
+        rows_imported,
+        total_rows,
+        elapsed_ms: started_at.elapsed().as_millis(),
+    }
+}
+
+async fn execute_import_statement(
+    state: &AppState,
+    pool_key: &str,
+    sql: &str,
+    db_write_ms: &mut u128,
+    statement_count: &mut usize,
+) -> Result<crate::db::QueryResult, String> {
+    let started_at = Instant::now();
+    let result = execute_on_pool(state, pool_key, sql).await;
+    *db_write_ms += started_at.elapsed().as_millis();
+    *statement_count += 1;
+    result
+}
+
+fn log_import_metrics(
+    request: &TableImportRequest,
+    source_format: TableImportSourceFormat,
+    rows_imported: usize,
+    started_at: Instant,
+    db_write_ms: u128,
+    statement_count: usize,
+) {
+    let elapsed_ms = started_at.elapsed().as_millis();
+    let non_db_ms = elapsed_ms.saturating_sub(db_write_ms);
+    let rows_per_second =
+        if elapsed_ms == 0 { rows_imported as f64 } else { rows_imported as f64 * 1000.0 / elapsed_ms as f64 };
+    log::info!(
+        "[table-import:done] import_id={} format={} rows={} elapsed_ms={} db_write_ms={} non_db_ms={} statements={} rows_per_second={:.1}",
+        request.import_id,
+        source_format.label(),
+        rows_imported,
+        elapsed_ms,
+        db_write_ms,
+        non_db_ms,
+        statement_count,
+        rows_per_second,
+    );
+}
+
 fn emit_import_error<F>(
     progress_callback: &mut F,
     request: &TableImportRequest,
     rows_imported: usize,
     total_rows: usize,
+    started_at: Instant,
     error: impl AsRef<str>,
 ) -> String
 where
     F: FnMut(TableImportProgress),
 {
     let message = import_error_message(request, rows_imported, error);
-    progress_callback(TableImportProgress {
-        import_id: request.import_id.clone(),
-        status: TableImportStatus::Error,
+    progress_callback(import_progress(
+        &request.import_id,
+        TableImportStatus::Error,
         rows_imported,
         total_rows,
-        error: Some(message.clone()),
-    });
+        started_at,
+        Some(message.clone()),
+    ));
     message
 }
 
@@ -1877,6 +2118,48 @@ fn delimited_columns_and_first_record<R: std::io::Read>(
     Err("Import file has no data rows in the selected row range".to_string())
 }
 
+fn import_source_fingerprint(
+    path: &str,
+    format: TableImportSourceFormat,
+    options: &TableImportParseOptions,
+) -> Result<String, String> {
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_path.to_string_lossy().as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified_nanos.to_le_bytes());
+    hasher.update(format.label().as_bytes());
+    hasher.update(serde_json::to_vec(options).map_err(|error| error.to_string())?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validated_prepared_import_source(
+    request: &TableImportRequest,
+    format: TableImportSourceFormat,
+) -> Option<ParsedImportFile> {
+    let prepared = request.prepared_source.as_ref()?;
+    if prepared.columns.is_empty() || prepared.total_rows == 0 {
+        return None;
+    }
+    let fingerprint = import_source_fingerprint(&request.file_path, format, &request.parse_options).ok()?;
+    if fingerprint != prepared.fingerprint {
+        return None;
+    }
+    Some(ParsedImportFile {
+        columns: prepared.columns.clone(),
+        rows: prepared.rows.clone(),
+        total_rows: prepared.total_rows,
+        effective_encoding: prepared.effective_encoding,
+    })
+}
+
 pub async fn preview_table_import_file_with_request(
     request: TableImportPreviewRequest,
 ) -> Result<TableImportPreview, String> {
@@ -1889,6 +2172,7 @@ pub async fn preview_table_import_file_with_request(
     )
     .await?;
     let metadata = tokio::fs::metadata(&request.file_path).await.map_err(|e| e.to_string())?;
+    let source_fingerprint = import_source_fingerprint(&request.file_path, format, &request.parse_options)?;
     let file_name = Path::new(&request.file_path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -1913,6 +2197,7 @@ pub async fn preview_table_import_file_with_request(
         columns: parsed.columns,
         rows: parsed.rows,
         total_rows: parsed.total_rows,
+        source_fingerprint,
         effective_encoding: parsed.effective_encoding,
         sheets,
     })
@@ -1942,11 +2227,14 @@ pub async fn import_table_file_core<F>(
 where
     F: FnMut(TableImportProgress),
 {
+    let started_at = Instant::now();
+    let mut db_write_ms = 0u128;
+    let mut statement_count = 0usize;
     let batch_size = if request.batch_size == 0 { DEFAULT_BATCH_SIZE } else { request.batch_size };
     let source_format = match effective_source_format(&request.file_path, request.source_format) {
         Ok(format) => format,
         Err(error) => {
-            return Err(emit_import_error(&mut progress_callback, request, 0, 0, error));
+            return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
         }
     };
 
@@ -1956,9 +2244,11 @@ where
             request,
             0,
             0,
+            started_at,
             format!("Import source is no longer available: {error}"),
         ));
     }
+    let prepared_source = validated_prepared_import_source(request, source_format);
 
     let mut create_table_sample: Option<ParsedImportFile> = None;
     let mut created_column_types: Option<Vec<(String, String)>> = None;
@@ -1969,20 +2259,31 @@ where
                 request,
                 0,
                 0,
+                started_at,
                 "Cannot truncate a table that is being created by the import",
             ));
         }
-        let parsed = match parse_import_file_with_options(
-            &request.file_path,
-            Some(source_format),
-            &request.parse_options,
-            CREATE_TABLE_INFERENCE_ROWS,
-        )
-        .await
+        let required_sample_rows = prepared_source
+            .as_ref()
+            .map(|prepared| prepared.total_rows.min(CREATE_TABLE_INFERENCE_ROWS))
+            .unwrap_or(CREATE_TABLE_INFERENCE_ROWS);
+        let parsed = if let Some(prepared) =
+            prepared_source.as_ref().filter(|prepared| prepared.rows.len() >= required_sample_rows).cloned()
         {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return Err(emit_import_error(&mut progress_callback, request, 0, 0, error));
+            prepared
+        } else {
+            match parse_import_file_with_options(
+                &request.file_path,
+                Some(source_format),
+                &request.parse_options,
+                CREATE_TABLE_INFERENCE_ROWS,
+            )
+            .await
+            {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+                }
             }
         };
         let total_rows = parsed.total_rows;
@@ -1995,13 +2296,15 @@ where
         ) {
             Ok(plan) => plan,
             Err(error) => {
-                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
             }
         };
         // The table must be created before streaming rows so existing import batching
         // can reuse the same INSERT path and database-specific value escaping.
-        if let Err(error) = execute_on_pool(state, pool_key, &plan.sql).await {
-            return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+        if let Err(error) =
+            execute_import_statement(state, pool_key, &plan.sql, &mut db_write_ms, &mut statement_count).await
+        {
+            return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
         }
         created_column_types =
             Some(plan.columns.iter().map(|column| (column.name.clone(), column.data_type.clone())).collect());
@@ -2009,7 +2312,7 @@ where
     }
 
     if source_format.is_delimited() {
-        let parsed = if let Some(parsed) = create_table_sample.clone() {
+        let parsed = if let Some(parsed) = create_table_sample.clone().or_else(|| prepared_source.clone()) {
             parsed
         } else {
             match parse_import_file_with_options(&request.file_path, Some(source_format), &request.parse_options, 0)
@@ -2017,22 +2320,24 @@ where
             {
                 Ok(parsed) => parsed,
                 Err(error) => {
-                    return Err(emit_import_error(&mut progress_callback, request, 0, 0, error));
+                    return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
                 }
             }
         };
         let total_rows = parsed.total_rows;
         if let Err(error) = mapping_indexes_for_columns(&parsed.columns, &request.mappings) {
-            return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+            return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
         }
 
-        progress_callback(TableImportProgress {
-            import_id: request.import_id.clone(),
-            status: TableImportStatus::Running,
-            rows_imported: 0,
+        progress_callback(import_progress(
+            &request.import_id,
+            TableImportStatus::Running,
+            0,
             total_rows,
-            error: None,
-        });
+            started_at,
+            None,
+        ));
+        let mut last_progress_emit = Instant::now();
 
         let mut target_column_types = get_columns_for_transfer(
             state,
@@ -2050,11 +2355,12 @@ where
         if target_column_types.is_empty() {
             target_column_types = created_column_types.clone().unwrap_or_default();
         }
-
         if matches!(request.mode, TableImportMode::Truncate) {
             let sql = truncate_sql(&request.table, &request.schema, db_type);
-            if let Err(error) = execute_on_pool(state, pool_key, &sql).await {
-                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+            if let Err(error) =
+                execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
+            {
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
             }
         }
 
@@ -2066,12 +2372,24 @@ where
             match open_delimited_csv_reader(&request.file_path, source_format, &streaming_options) {
                 Ok(result) => result,
                 Err(error) => {
-                    return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+                    return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
                 }
             };
         let (columns, first_record) = match delimited_columns_and_first_record(&mut reader, config) {
             Ok(result) => result,
-            Err(error) => return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error)),
+            Err(error) => {
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error))
+            }
+        };
+        let compiled_plan = if *db_type == DatabaseType::CloudflareD1 {
+            None
+        } else {
+            match compile_import_plan(&columns, &request.mappings, &target_column_types) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
+                }
+            }
         };
         let effective_batch_size = match db_type {
             DatabaseType::Oracle | DatabaseType::OceanbaseOracle => 1,
@@ -2081,25 +2399,12 @@ where
         let mut rows_imported = 0;
         let mut pending_rows: Vec<Vec<serde_json::Value>> = Vec::with_capacity(effective_batch_size);
 
-        if let Some(record) = first_record {
-            pending_rows.push(delimited_record_to_row(&record, columns.len(), config));
-        }
-
-        let mut source_row_number = config.row_range.data_start_row;
-        for record in reader.records() {
+        let first_records = first_record.into_iter().map(Ok::<csv::StringRecord, csv::Error>);
+        let mut source_row_number = config.row_range.data_start_row.saturating_sub(1);
+        for record in first_records.chain(reader.records()) {
             source_row_number += 1;
             if config.row_range.last_data_row.is_some_and(|last| source_row_number > last) {
                 break;
-            }
-            if is_cancelled(&request.import_id).await {
-                progress_callback(TableImportProgress {
-                    import_id: request.import_id.clone(),
-                    status: TableImportStatus::Cancelled,
-                    rows_imported,
-                    total_rows,
-                    error: None,
-                });
-                return Err("Import cancelled".to_string());
             }
 
             let record = match record {
@@ -2110,6 +2415,7 @@ where
                         request,
                         rows_imported,
                         total_rows,
+                        started_at,
                         error.to_string(),
                     ))
                 }
@@ -2117,8 +2423,20 @@ where
             pending_rows.push(delimited_record_to_row(&record, columns.len(), config));
 
             if pending_rows.len() >= effective_batch_size {
-                let batch = match build_import_insert_batch_from_rows_with_format(
+                if is_cancelled(&request.import_id).await {
+                    progress_callback(import_progress(
+                        &request.import_id,
+                        TableImportStatus::Cancelled,
+                        rows_imported,
+                        total_rows,
+                        started_at,
+                        None,
+                    ));
+                    return Err("Import cancelled".to_string());
+                }
+                let batch = match build_import_execution_batch(
                     &pending_rows,
+                    compiled_plan.as_ref(),
                     &columns,
                     &request.mappings,
                     &target_column_types,
@@ -2138,38 +2456,54 @@ where
                             request,
                             rows_imported,
                             total_rows,
+                            started_at,
                             error,
                         ))
                     }
                 };
-                if let Err(error) = execute_on_pool(state, pool_key, &batch.sql).await {
-                    return Err(emit_import_error(&mut progress_callback, request, rows_imported, total_rows, error));
+                if let Err(error) =
+                    execute_import_statement(state, pool_key, &batch.sql, &mut db_write_ms, &mut statement_count).await
+                {
+                    return Err(emit_import_error(
+                        &mut progress_callback,
+                        request,
+                        rows_imported,
+                        total_rows,
+                        started_at,
+                        error,
+                    ));
                 }
                 rows_imported = (rows_imported + batch.row_count).min(total_rows);
                 pending_rows.clear();
-                progress_callback(TableImportProgress {
-                    import_id: request.import_id.clone(),
-                    status: TableImportStatus::Running,
-                    rows_imported,
-                    total_rows,
-                    error: None,
-                });
+                if last_progress_emit.elapsed() >= IMPORT_PROGRESS_INTERVAL {
+                    progress_callback(import_progress(
+                        &request.import_id,
+                        TableImportStatus::Running,
+                        rows_imported,
+                        total_rows,
+                        started_at,
+                        None,
+                    ));
+                    last_progress_emit = Instant::now();
+                }
             }
         }
 
         if !pending_rows.is_empty() {
             if is_cancelled(&request.import_id).await {
-                progress_callback(TableImportProgress {
-                    import_id: request.import_id.clone(),
-                    status: TableImportStatus::Cancelled,
+                progress_callback(import_progress(
+                    &request.import_id,
+                    TableImportStatus::Cancelled,
                     rows_imported,
                     total_rows,
-                    error: None,
-                });
+                    started_at,
+                    None,
+                ));
                 return Err("Import cancelled".to_string());
             }
-            let batch = match build_import_insert_batch_from_rows_with_format(
+            let batch = match build_import_execution_batch(
                 &pending_rows,
+                compiled_plan.as_ref(),
                 &columns,
                 &request.mappings,
                 &target_column_types,
@@ -2181,26 +2515,44 @@ where
                 Ok(Some(batch)) => batch,
                 Ok(None) => ImportSqlBatch { sql: String::new(), row_count: 0 },
                 Err(error) => {
-                    return Err(emit_import_error(&mut progress_callback, request, rows_imported, total_rows, error))
+                    return Err(emit_import_error(
+                        &mut progress_callback,
+                        request,
+                        rows_imported,
+                        total_rows,
+                        started_at,
+                        error,
+                    ))
                 }
             };
             if !batch.sql.is_empty() {
-                if let Err(error) = execute_on_pool(state, pool_key, &batch.sql).await {
-                    return Err(emit_import_error(&mut progress_callback, request, rows_imported, total_rows, error));
+                if let Err(error) =
+                    execute_import_statement(state, pool_key, &batch.sql, &mut db_write_ms, &mut statement_count).await
+                {
+                    return Err(emit_import_error(
+                        &mut progress_callback,
+                        request,
+                        rows_imported,
+                        total_rows,
+                        started_at,
+                        error,
+                    ));
                 }
                 rows_imported = (rows_imported + batch.row_count).min(total_rows);
             }
         }
 
-        progress_callback(TableImportProgress {
-            import_id: request.import_id.clone(),
-            status: TableImportStatus::Done,
+        progress_callback(import_progress(
+            &request.import_id,
+            TableImportStatus::Done,
             rows_imported,
             total_rows,
-            error: None,
-        });
+            started_at,
+            None,
+        ));
+        log_import_metrics(request, source_format, rows_imported, started_at, db_write_ms, statement_count);
 
-        return Ok(TableImportSummary { import_id: request.import_id.clone(), rows_imported, total_rows });
+        return Ok(import_summary(&request.import_id, rows_imported, total_rows, started_at));
     }
 
     let parsed = match parse_import_file_with_options(
@@ -2213,21 +2565,16 @@ where
     {
         Ok(parsed) => parsed,
         Err(error) => {
-            return Err(emit_import_error(&mut progress_callback, request, 0, 0, error));
+            return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
         }
     };
 
     let total_rows = parsed.total_rows;
     if let Err(error) = mapping_indexes(&parsed, &request.mappings) {
-        return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+        return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
     }
-    progress_callback(TableImportProgress {
-        import_id: request.import_id.clone(),
-        status: TableImportStatus::Running,
-        rows_imported: 0,
-        total_rows,
-        error: None,
-    });
+    progress_callback(import_progress(&request.import_id, TableImportStatus::Running, 0, total_rows, started_at, None));
+    let mut last_progress_emit = Instant::now();
 
     let mut target_column_types = get_columns_for_transfer(
         state,
@@ -2246,64 +2593,108 @@ where
         target_column_types = created_column_types.clone().unwrap_or_default();
     }
 
-    let batches = match build_import_insert_batches_with_format(
-        &parsed,
-        &request.mappings,
-        &target_column_types,
-        &request.table,
-        &request.schema,
-        db_type,
-        batch_size,
-        request.date_time_format.as_deref(),
-    ) {
-        Ok(batches) => batches,
-        Err(error) => {
-            return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+    let effective_batch_size = if *db_type == DatabaseType::CloudflareD1 {
+        batch_size.clamp(1, 100)
+    } else if supports_multi_row_insert_values(db_type) {
+        batch_size.max(1)
+    } else {
+        1
+    };
+    let compiled_plan = if *db_type == DatabaseType::CloudflareD1 {
+        None
+    } else {
+        match compile_import_plan(&parsed.columns, &request.mappings, &target_column_types) {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
+            }
         }
     };
 
     if matches!(request.mode, TableImportMode::Truncate) {
         let sql = truncate_sql(&request.table, &request.schema, db_type);
-        if let Err(error) = execute_on_pool(state, pool_key, &sql).await {
-            return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, error));
+        if let Err(error) =
+            execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
+        {
+            return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
         }
     }
 
     let mut rows_imported = 0;
-    for batch in batches {
+    for rows in parsed.rows.chunks(effective_batch_size) {
         if is_cancelled(&request.import_id).await {
-            progress_callback(TableImportProgress {
-                import_id: request.import_id.clone(),
-                status: TableImportStatus::Cancelled,
+            progress_callback(import_progress(
+                &request.import_id,
+                TableImportStatus::Cancelled,
                 rows_imported,
                 total_rows,
-                error: None,
-            });
+                started_at,
+                None,
+            ));
             return Err("Import cancelled".to_string());
         }
 
-        if let Err(error) = execute_on_pool(state, pool_key, &batch.sql).await {
-            return Err(emit_import_error(&mut progress_callback, request, rows_imported, total_rows, error));
+        let batch = match build_import_execution_batch(
+            rows,
+            compiled_plan.as_ref(),
+            &parsed.columns,
+            &request.mappings,
+            &target_column_types,
+            &request.table,
+            &request.schema,
+            db_type,
+            request.date_time_format.as_deref(),
+        ) {
+            Ok(Some(batch)) => batch,
+            Ok(None) => continue,
+            Err(error) => {
+                return Err(emit_import_error(
+                    &mut progress_callback,
+                    request,
+                    rows_imported,
+                    total_rows,
+                    started_at,
+                    error,
+                ));
+            }
+        };
+        if let Err(error) =
+            execute_import_statement(state, pool_key, &batch.sql, &mut db_write_ms, &mut statement_count).await
+        {
+            return Err(emit_import_error(
+                &mut progress_callback,
+                request,
+                rows_imported,
+                total_rows,
+                started_at,
+                error,
+            ));
         }
         rows_imported = (rows_imported + batch.row_count).min(total_rows);
-        progress_callback(TableImportProgress {
-            import_id: request.import_id.clone(),
-            status: TableImportStatus::Running,
-            rows_imported,
-            total_rows,
-            error: None,
-        });
+        if last_progress_emit.elapsed() >= IMPORT_PROGRESS_INTERVAL {
+            progress_callback(import_progress(
+                &request.import_id,
+                TableImportStatus::Running,
+                rows_imported,
+                total_rows,
+                started_at,
+                None,
+            ));
+            last_progress_emit = Instant::now();
+        }
     }
 
-    progress_callback(TableImportProgress {
-        import_id: request.import_id.clone(),
-        status: TableImportStatus::Done,
+    progress_callback(import_progress(
+        &request.import_id,
+        TableImportStatus::Done,
         rows_imported,
         total_rows,
-        error: None,
-    });
+        started_at,
+        None,
+    ));
+    log_import_metrics(request, source_format, rows_imported, started_at, db_write_ms, statement_count);
 
-    Ok(TableImportSummary { import_id: request.import_id.clone(), rows_imported, total_rows })
+    Ok(import_summary(&request.import_id, rows_imported, total_rows, started_at))
 }
 
 #[cfg(test)]
@@ -2312,6 +2703,90 @@ mod tests {
     use crate::models::connection::DatabaseType;
     use crate::xlsx_export::{build_xlsx_workbook_multi, XlsxWorksheetData};
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn table_import_progress_and_summary_report_elapsed_ms() {
+        let started_at = std::time::Instant::now() - std::time::Duration::from_millis(25);
+
+        let progress = import_progress("import-1", TableImportStatus::Running, 10, 20, started_at, None);
+        let summary = import_summary("import-1", 20, 20, started_at);
+        let progress_json = serde_json::to_value(&progress).unwrap();
+        let summary_json = serde_json::to_value(&summary).unwrap();
+
+        assert!(progress.elapsed_ms >= 25);
+        assert!(summary.elapsed_ms >= progress.elapsed_ms);
+        assert_eq!(progress_json["elapsedMs"], serde_json::json!(progress.elapsed_ms));
+        assert_eq!(summary_json["elapsedMs"], serde_json::json!(summary.elapsed_ms));
+    }
+
+    #[test]
+    fn compiled_import_plan_reuses_source_indexes_and_target_types() {
+        let columns = vec!["name".to_string(), "id".to_string()];
+        let mappings = vec![
+            TableImportColumnMapping {
+                source_column: "id".to_string(),
+                target_column: "user_id".to_string(),
+                target_data_type: None,
+            },
+            TableImportColumnMapping {
+                source_column: "name".to_string(),
+                target_column: "display_name".to_string(),
+                target_data_type: None,
+            },
+        ];
+
+        let plan = compile_import_plan(
+            &columns,
+            &mappings,
+            &[("DISPLAY_NAME".to_string(), "VARCHAR(255)".to_string()), ("user_id".to_string(), "BIGINT".to_string())],
+        )
+        .unwrap();
+
+        assert_eq!(plan.mapped_source_indexes, vec![1, 0]);
+        assert_eq!(plan.target_columns, vec!["user_id", "display_name"]);
+        assert_eq!(plan.column_types, vec![Some("BIGINT".to_string()), Some("VARCHAR(255)".to_string())]);
+    }
+
+    #[test]
+    fn prepared_import_source_is_reused_only_while_fingerprint_matches() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-prepared-{}.csv", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"id,name\n1,Ada\n").unwrap();
+        let file_path = path.to_string_lossy().to_string();
+        let parse_options = TableImportParseOptions::default();
+        let fingerprint = import_source_fingerprint(&file_path, TableImportSourceFormat::Csv, &parse_options).unwrap();
+        let request = TableImportRequest {
+            import_id: "import-1".to_string(),
+            connection_id: "connection-1".to_string(),
+            database: "db".to_string(),
+            schema: "public".to_string(),
+            table: "users".to_string(),
+            file_path: file_path.clone(),
+            source_ref: None,
+            source_format: Some(TableImportSourceFormat::Csv),
+            parse_options,
+            mappings: vec![],
+            mode: TableImportMode::Append,
+            create_table: false,
+            batch_size: 500,
+            date_time_format: None,
+            prepared_source: Some(TableImportPreparedSource {
+                fingerprint,
+                columns: vec!["id".to_string(), "name".to_string()],
+                rows: vec![vec![serde_json::json!(1), serde_json::json!("Ada")]],
+                total_rows: 1,
+                effective_encoding: Some(TableImportTextEncoding::Utf8),
+            }),
+            retain_source: false,
+        };
+
+        let prepared = validated_prepared_import_source(&request, TableImportSourceFormat::Csv).unwrap();
+        assert_eq!(prepared.total_rows, 1);
+        assert_eq!(prepared.columns, vec!["id", "name"]);
+
+        std::fs::write(&path, b"id,name\n1,Ada\n2,Grace\n").unwrap();
+        assert!(validated_prepared_import_source(&request, TableImportSourceFormat::Csv).is_none());
+        let _ = std::fs::remove_file(path);
+    }
 
     fn write_xlsx_test_entry<W: Write + std::io::Seek>(zip: &mut zip::ZipWriter<W>, path: &str, content: &str) {
         let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -2723,6 +3198,21 @@ mod tests {
         assert_eq!(xlsx_cell_value(&duration_cell), serde_json::json!("60:00:00"));
         assert_eq!(infer_value_type(&date_value), Some(ImportInferredType::Timestamp));
         assert_eq!(infer_value_type(&time_value), Some(ImportInferredType::Decimal));
+    }
+
+    #[test]
+    fn borrowed_excel_cells_preserve_owned_cell_conversion_semantics() {
+        let shared_string = DataRef::SharedString("Ada");
+        let number = DataRef::Float(42.5);
+        let date = DataRef::DateTime(ExcelDateTime::new(45996.0, calamine::ExcelDateTimeType::DateTime, false));
+
+        assert_eq!(xlsx_cell_ref_label_with_temporal_kind(&shared_string, None), "Ada");
+        assert_eq!(xlsx_cell_ref_value_with_temporal_kind(&shared_string, None), serde_json::json!("Ada"));
+        assert_eq!(xlsx_cell_ref_value_with_temporal_kind(&number, None), serde_json::json!(42.5));
+        assert_eq!(
+            xlsx_cell_ref_value_with_temporal_kind(&date, Some(XlsxTemporalKind::Date)),
+            serde_json::json!("2025-12-05")
+        );
     }
 
     #[test]

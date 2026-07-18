@@ -1508,10 +1508,15 @@ export async function previewTableImportFile(fileOrPath: string | File | TableIm
     if (!options.sourceRef) {
       throw new Error("previewTableImportFile in web mode requires a File object for new uploads");
     }
-    const res = await fetch(apiUrl("/api/import/preview"), {
+    const res = await fetch(apiUrl("/api/import/preview-source"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ request: { ...options, filePath: fileOrPath } }),
+      body: JSON.stringify({
+        sourceRef: options.sourceRef,
+        sourceFormat: options.sourceFormat,
+        parseOptions: options.parseOptions,
+        previewLimit: options.previewLimit,
+      }),
     });
     if (!res.ok) throw new Error(await res.text());
     return res.json();
@@ -1547,6 +1552,7 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
           importId: progress.importId,
           rowsImported: progress.rowsImported,
           totalRows: progress.totalRows,
+          elapsedMs: progress.elapsedMs,
         };
         es.close();
         resolve(summary);
@@ -1564,6 +1570,11 @@ export async function importTableFile(request: TableImportRequest, onProgress: (
 
 export async function cancelTableImport(importId: string): Promise<boolean> {
   return post("/api/import/cancel", { importId });
+}
+
+export async function releaseTableImportSource(sourceRef: string): Promise<boolean> {
+  const result = await post<{ released: boolean }>("/api/import/source/release", { sourceRef });
+  return result.released;
 }
 
 // ---------------------------------------------------------------------------

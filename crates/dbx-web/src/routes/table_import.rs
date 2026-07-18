@@ -1,6 +1,6 @@
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::Bytes;
 use axum::extract::{Multipart, Path, State};
@@ -30,6 +30,24 @@ pub struct ExecuteImportWrapper {
 #[serde(rename_all = "camelCase")]
 pub struct CancelImportRequest {
     pub import_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewUploadedImportRequest {
+    pub source_ref: String,
+    #[serde(default)]
+    pub source_format: Option<TableImportSourceFormat>,
+    #[serde(default)]
+    pub parse_options: TableImportParseOptions,
+    #[serde(default)]
+    pub preview_limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseImportSourceRequest {
+    pub source_ref: String,
 }
 
 pub async fn preview_import(
@@ -133,6 +151,34 @@ pub async fn preview_import(
     Err(AppError("No file uploaded".to_string()))
 }
 
+pub async fn preview_uploaded_import(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<PreviewUploadedImportRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let file_path = uploaded_import_path_for_source_ref(&state.data_dir, &request.source_ref)?;
+    let preview = table_import::preview_table_import_file_with_request(TableImportPreviewRequest {
+        file_path: file_path.to_string_lossy().to_string(),
+        source_ref: Some(request.source_ref),
+        source_format: request.source_format,
+        parse_options: request.parse_options,
+        preview_limit: request.preview_limit,
+    })
+    .await
+    .map_err(AppError)?;
+    serde_json::to_value(preview).map(Json).map_err(|error| AppError(error.to_string()))
+}
+
+pub async fn release_import_source(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ReleaseImportSourceRequest>,
+) -> Json<serde_json::Value> {
+    let released = match uploaded_import_path_for_source_ref(&state.data_dir, &request.source_ref) {
+        Ok(file_path) => tokio::fs::remove_file(file_path).await.is_ok(),
+        Err(_) => false,
+    };
+    Json(serde_json::json!({ "released": released }))
+}
+
 async fn write_import_upload(field: axum::extract::multipart::Field<'_>, file_path: &StdPath) -> Result<(), AppError> {
     write_import_upload_stream(field, file_path, MAX_IMPORT_UPLOAD_BYTES).await
 }
@@ -176,13 +222,16 @@ pub async fn execute_import(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ExecuteImportWrapper>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let started_at = Instant::now();
     let mut req = body.request;
     let file_path = validated_uploaded_import_path(&state.data_dir, &req.file_path)?;
     req.file_path = file_path.to_string_lossy().to_string();
 
     // Reject import early if the connection is read-only
     if let Some(name) = dbx_core::query::connection_readonly_name(&state.app, &req.connection_id).await {
-        cleanup_uploaded_import_source(&req.file_path).await;
+        if !req.retain_source {
+            cleanup_uploaded_import_source(&req.file_path).await;
+        }
         return Err(AppError(format!(
             "Read-only mode: connection '{}' has read-only protection enabled. Import blocked.",
             name
@@ -207,11 +256,14 @@ pub async fn execute_import(
                         "status": "error",
                         "rowsImported": 0,
                         "totalRows": 0,
+                        "elapsedMs": started_at.elapsed().as_millis(),
                         "error": e
                     })
                     .to_string(),
                 );
-                cleanup_uploaded_import_source(&req.file_path).await;
+                if !req.retain_source {
+                    cleanup_uploaded_import_source(&req.file_path).await;
+                }
                 state_clone.sse_channels.write().await.remove(&req.import_id);
                 return;
             }
@@ -226,18 +278,20 @@ pub async fn execute_import(
                         "status": "error",
                         "rowsImported": 0,
                         "totalRows": 0,
+                        "elapsedMs": started_at.elapsed().as_millis(),
                         "error": e
                     })
                     .to_string(),
                 );
-                cleanup_uploaded_import_source(&req.file_path).await;
+                if !req.retain_source {
+                    cleanup_uploaded_import_source(&req.file_path).await;
+                }
                 state_clone.sse_channels.write().await.remove(&req.import_id);
                 return;
             }
         };
 
         let tx_clone = tx.clone();
-        let import_id_for_cancel = req.import_id.clone();
         let result = table_import::import_table_file_core(
             &app,
             &req,
@@ -261,21 +315,12 @@ pub async fn execute_import(
                     let _ = tx.send(json);
                 }
             }
-            Err(e) => {
-                let _ = tx.send(
-                    serde_json::json!({
-                        "importId": import_id_for_cancel,
-                        "status": "error",
-                        "rowsImported": 0,
-                        "totalRows": 0,
-                        "error": e
-                    })
-                    .to_string(),
-                );
-            }
+            Err(_) => {}
         }
 
-        cleanup_uploaded_import_source(&req.file_path).await;
+        if !req.retain_source {
+            cleanup_uploaded_import_source(&req.file_path).await;
+        }
         state_clone.sse_channels.write().await.remove(&req.import_id);
     });
 
@@ -326,6 +371,22 @@ fn validated_uploaded_import_path(data_dir: &StdPath, file_path: &str) -> Result
         return Err(AppError("Import source must be inside the uploaded import directory".to_string()));
     }
     Ok(canonical_path)
+}
+
+fn uploaded_import_path_for_source_ref(data_dir: &StdPath, source_ref: &str) -> Result<PathBuf, AppError> {
+    uuid::Uuid::parse_str(source_ref).map_err(|_| AppError("Invalid import source reference".to_string()))?;
+    let tmp_dir = import_upload_dir(data_dir);
+    let prefix = format!("{source_ref}-");
+    let mut matches = std::fs::read_dir(&tmp_dir)
+        .map_err(|_| AppError("Import source is no longer available".to_string()))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path());
+    let file_path = matches.next().ok_or_else(|| AppError("Import source is no longer available".to_string()))?;
+    if matches.next().is_some() {
+        return Err(AppError("Import source reference is ambiguous".to_string()));
+    }
+    validated_uploaded_import_path(data_dir, &file_path.to_string_lossy())
 }
 
 fn cleanup_expired_import_uploads(tmp_dir: &StdPath, max_age: Duration) {
@@ -400,5 +461,23 @@ mod tests {
 
         assert_eq!(error.0, "multipart stream failed");
         assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn resolves_uploaded_import_source_by_uuid_reference() {
+        let data_dir = std::env::temp_dir().join(format!("dbx-table-import-data-{}", uuid::Uuid::new_v4()));
+        let upload_dir = import_upload_dir(&data_dir);
+        std::fs::create_dir_all(&upload_dir).unwrap();
+        let source_ref = uuid::Uuid::new_v4().to_string();
+        let file_path = upload_dir.join(format!("{source_ref}-users.csv"));
+        std::fs::write(&file_path, b"id,name\n1,Ada\n").unwrap();
+
+        let resolved = uploaded_import_path_for_source_ref(&data_dir, &source_ref)
+            .unwrap_or_else(|error| panic!("failed to resolve uploaded source: {}", error.0));
+
+        assert_eq!(resolved, file_path.canonicalize().unwrap());
+        assert!(uploaded_import_path_for_source_ref(&data_dir, "../users.csv").is_err());
+        assert!(uploaded_import_path_for_source_ref(&data_dir, &uuid::Uuid::new_v4().to_string()).is_err());
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

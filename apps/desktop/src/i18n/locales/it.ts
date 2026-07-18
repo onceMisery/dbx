@@ -2713,6 +2713,7 @@ export default withEnglishFallback({
     progress: "Progresso",
     start: "Avvia Importazione",
     success: "Importate {count} righe",
+    elapsed: "Durata: {duration}",
     back: "Back",
     next: "Next",
     truncateWarning: "Existing rows in the target table will be removed before import starts.",
