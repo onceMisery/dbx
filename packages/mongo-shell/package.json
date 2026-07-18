@@ -1,6 +1,6 @@
 {
   "name": "@dbx-app/mongo-shell",
-  "version": "0.4.33",
+  "version": "0.4.34",
   "description": "Pure MongoDB shell JSON/argument parsing shared by desktop and node-core",
   "license": "Apache-2.0",
   "type": "module",

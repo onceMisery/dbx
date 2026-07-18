@@ -259,22 +259,22 @@ importers:
   packages/mcp-server:
     optionalDependencies:
       '@dbx-app/mcp-darwin-arm64':
-        specifier: 0.4.33
+        specifier: 0.4.34
         version: link:../mcp-darwin-arm64
       '@dbx-app/mcp-darwin-x64':
-        specifier: 0.4.33
+        specifier: 0.4.34
         version: link:../mcp-darwin-x64
       '@dbx-app/mcp-linux-arm64-gnu':
-        specifier: 0.4.33
+        specifier: 0.4.34
         version: link:../mcp-linux-arm64-gnu
       '@dbx-app/mcp-linux-x64-gnu':
-        specifier: 0.4.33
+        specifier: 0.4.34
         version: link:../mcp-linux-x64-gnu
       '@dbx-app/mcp-win32-arm64':
-        specifier: 0.4.33
+        specifier: 0.4.34
         version: link:../mcp-win32-arm64
       '@dbx-app/mcp-win32-x64':
-        specifier: 0.4.33
+        specifier: 0.4.34
         version: link:../mcp-win32-x64
     devDependencies:
       '@dbx-app/node-core':
