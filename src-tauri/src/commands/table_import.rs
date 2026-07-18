@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::RwLock;
@@ -22,6 +23,14 @@ fn emit_progress(app: &AppHandle, progress: TableImportProgress) {
     let _ = app.emit("table-import-progress", progress);
 }
 
+fn emit_command_progress(app: &AppHandle, mut progress: TableImportProgress) {
+    if progress.status == dbx_core::table_import::TableImportStatus::Done {
+        progress.status = dbx_core::table_import::TableImportStatus::Running;
+        progress.phase = dbx_core::table_import::TableImportPhase::Finalizing;
+    }
+    emit_progress(app, progress);
+}
+
 async fn is_cancelled(import_id: &str) -> bool {
     cancelled_imports().read().await.contains(import_id)
 }
@@ -41,6 +50,7 @@ pub async fn import_table_file(
     state: State<'_, Arc<AppState>>,
     request: TableImportRequest,
 ) -> Result<TableImportSummary, String> {
+    let command_started_at = Instant::now();
     clear_cancelled(&request.import_id).await;
     // Reject import early if the connection is read-only — importing is inherently a write operation
     ensure_connection_writable(&state, &request.connection_id, "Import").await?;
@@ -50,18 +60,42 @@ pub async fn import_table_file(
     let pool_key =
         state.get_or_create_pool_for_session(&request.connection_id, database, Some(&client_session_id)).await?;
 
+    let core_started_at = Instant::now();
     let result = dbx_core::table_import::import_table_file_core(
         &state,
         &request,
         &db_type,
         &pool_key,
         |import_id| Box::pin(is_cancelled(import_id)),
-        |progress| emit_progress(&app, progress),
+        |progress| emit_command_progress(&app, progress),
     )
     .await;
+    let core_ms = core_started_at.elapsed().as_millis();
 
-    let _ = state.close_client_session_pool(&request.connection_id, database, &client_session_id).await;
+    let cleanup_state = Arc::clone(state.inner());
+    let cleanup_connection_id = request.connection_id.clone();
+    let cleanup_database = database.map(str::to_string);
+    let cleanup_session_id = client_session_id.clone();
+    let cleanup_import_id = request.import_id.clone();
+    tokio::spawn(async move {
+        let cleanup_started_at = Instant::now();
+        let detached = cleanup_state
+            .detach_client_session_pool(&cleanup_connection_id, cleanup_database.as_deref(), &cleanup_session_id)
+            .await;
+        log::info!(
+            "[table-import:cleanup] import_id={} cleanup_detach_ms={} pool_detached={}",
+            cleanup_import_id,
+            cleanup_started_at.elapsed().as_millis(),
+            detached.unwrap_or(false)
+        );
+    });
     clear_cancelled(&request.import_id).await;
+    log::info!(
+        "[table-import:command] import_id={} core_ms={} command_ms={} cleanup_scheduled=true",
+        request.import_id,
+        core_ms,
+        command_started_at.elapsed().as_millis()
+    );
     result
 }
 

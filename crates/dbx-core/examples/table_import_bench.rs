@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use dbx_core::models::connection::DatabaseType;
 use dbx_core::table_import::{
-    build_import_insert_batches, parse_delimited_file_with_options, parse_xlsx_file_with_options, ParsedImportFile,
-    TableImportColumnMapping, TableImportParseOptions, TableImportSourceFormat,
+    build_import_insert_batches, parse_delimited_file_with_options, parse_xlsx_file_with_options,
+    preview_table_import_file_with_request, ParsedImportFile, TableImportColumnMapping, TableImportParseOptions,
+    TableImportPreviewRequest, TableImportSourceFormat,
 };
 use dbx_core::xlsx_export::{build_xlsx_workbook, XlsxWorksheetData};
 
@@ -114,7 +115,7 @@ fn mappings(data: &ParsedImportFile) -> Vec<TableImportColumnMapping> {
         .collect()
 }
 
-fn benchmark_file(
+async fn benchmark_file(
     path: &Path,
     format: TableImportSourceFormat,
     options: &Options,
@@ -122,11 +123,14 @@ fn benchmark_file(
     let path_text = path.to_string_lossy();
     let parse_options = TableImportParseOptions::default();
     let preview_started = Instant::now();
-    let preview = match format {
-        TableImportSourceFormat::Csv => parse_delimited_file_with_options(&path_text, format, &parse_options, 50)?,
-        TableImportSourceFormat::Excel => parse_xlsx_file_with_options(&path_text, &parse_options, 50)?,
-        _ => return Err("benchmark supports only CSV and Excel".to_string()),
-    };
+    let preview = preview_table_import_file_with_request(TableImportPreviewRequest {
+        file_path: path_text.to_string(),
+        source_ref: None,
+        source_format: Some(format),
+        parse_options: parse_options.clone(),
+        preview_limit: Some(50),
+    })
+    .await?;
     let preview_ms = preview_started.elapsed().as_secs_f64() * 1000.0;
 
     let full_parse_started = Instant::now();
@@ -155,9 +159,10 @@ fn benchmark_file(
     Ok(serde_json::json!({
         "format": format.label(),
         "fileBytes": fs::metadata(path).map_err(|error| error.to_string())?.len(),
-        "rows": preview.total_rows,
+        "rows": parsed.total_rows,
         "columns": preview.columns.len(),
         "previewRows": preview.rows.len(),
+        "previewTotalRowsExact": preview.total_rows_exact,
         "previewMs": preview_ms,
         "fullParseMs": full_parse_ms,
         "batchBuildMs": batch_build_ms,
@@ -166,7 +171,7 @@ fn benchmark_file(
     }))
 }
 
-fn run() -> Result<(), String> {
+async fn run() -> Result<(), String> {
     let options = parse_options()?;
     let temp_dir = std::env::temp_dir().join(format!("dbx-table-import-bench-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).map_err(|error| error.to_string())?;
@@ -175,12 +180,12 @@ fn run() -> Result<(), String> {
     if matches!(options.format, BenchFormat::Csv | BenchFormat::All) {
         let path = temp_dir.join("benchmark.csv");
         write_csv(&path, options.rows, options.columns)?;
-        results.push(benchmark_file(&path, TableImportSourceFormat::Csv, &options)?);
+        results.push(benchmark_file(&path, TableImportSourceFormat::Csv, &options).await?);
     }
     if matches!(options.format, BenchFormat::Xlsx | BenchFormat::All) {
         let path = temp_dir.join("benchmark.xlsx");
         write_xlsx(&path, options.rows, options.columns)?;
-        results.push(benchmark_file(&path, TableImportSourceFormat::Excel, &options)?);
+        results.push(benchmark_file(&path, TableImportSourceFormat::Excel, &options).await?);
     }
 
     println!(
@@ -197,8 +202,9 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn main() {
-    if let Err(error) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
         eprintln!("{error}");
         std::process::exit(1);
     }

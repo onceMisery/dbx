@@ -13,7 +13,18 @@ import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, FileJson, Fi
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
-import { autoMapImportColumns, formatTableImportElapsed, nextTableImportWizardStep, previousTableImportWizardStep, requiredImportTargetColumns, resolveTableImportElapsed, suggestImportTargetDataTypes, validateImportMappings, type TableImportWizardStep } from "@/lib/table/tableImport";
+import {
+  autoMapImportColumns,
+  formatTableImportElapsed,
+  nextTableImportWizardStep,
+  previousTableImportWizardStep,
+  requiredImportTargetColumns,
+  resolveTableImportElapsed,
+  suggestImportTargetDataTypes,
+  tableImportProgressPercent,
+  validateImportMappings,
+  type TableImportWizardStep,
+} from "@/lib/table/tableImport";
 import { getDataTypeOptions } from "@/lib/table/tableStructureEditorState";
 import { tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import type { ColumnInfo } from "@/types/database";
@@ -161,11 +172,7 @@ const canGoNext = computed(() => {
   if (wizardStep.value === "mapping") return mappingValidation.value.valid;
   return false;
 });
-const progressPercent = computed(() => {
-  const p = progress.value;
-  if (!p || p.totalRows <= 0) return 0;
-  return Math.min(100, Math.round((p.rowsImported / p.totalRows) * 100));
-});
+const progressPercent = computed(() => tableImportProgressPercent(progress.value));
 const currentStepIndex = computed(() => wizardSteps.findIndex((step) => step.value === wizardStep.value));
 const targetLabel = computed(() => {
   const pieces = [selectedConnection.value?.name, props.prefillDatabase, props.prefillSchema, targetTableName.value].filter(Boolean);
@@ -196,6 +203,16 @@ const parseOptions = computed<api.TableImportParseOptions>(() => ({
 }));
 const terminalStatus = computed(() => !!progress.value?.status && ["done", "error", "cancelled"].includes(progress.value.status));
 const displayedElapsedMs = computed(() => resolveTableImportElapsed(liveElapsedMs.value, progress.value?.elapsedMs, terminalStatus.value));
+const progressLabelKey = computed(() => {
+  if (terminalStatus.value) return `tableImport.status_${progress.value?.status || "idle"}`;
+  return `tableImport.phase_${progress.value?.phase || "writing"}`;
+});
+
+function previewRowsLabel(currentPreview: api.TableImportPreview | null | undefined): string {
+  if (!currentPreview) return "-";
+  if (currentPreview.totalRowsExact !== false) return currentPreview.totalRows.toLocaleString();
+  return t("tableImport.previewPartial", { rows: currentPreview.rows.length });
+}
 
 function stopImportElapsedClock() {
   if (importElapsedTimer) {
@@ -310,7 +327,7 @@ function taskParseOptions(format: api.TableImportSourceFormat, sheetName = ""): 
 
 function importParseOptions(format: api.TableImportSourceFormat, currentPreview: api.TableImportPreview, sheetName = ""): api.TableImportParseOptions {
   const options = taskParseOptions(format, sheetName);
-  if (isDelimitedFormat(format) && options.encoding === "auto" && currentPreview.effectiveEncoding) {
+  if (isDelimitedFormat(format) && currentPreview.totalRowsExact !== false && options.encoding === "auto" && currentPreview.effectiveEncoding) {
     options.encoding = currentPreview.effectiveEncoding;
   }
   return options;
@@ -322,6 +339,7 @@ function preparedImportSource(currentPreview: api.TableImportPreview): api.Table
     columns: currentPreview.columns,
     rows: currentPreview.rows,
     totalRows: currentPreview.totalRows,
+    totalRowsExact: currentPreview.totalRowsExact !== false,
     effectiveEncoding: currentPreview.effectiveEncoding ?? null,
   };
 }
@@ -649,8 +667,12 @@ async function startImport() {
   progress.value = {
     importId: importId.value,
     status: "running",
+    phase: "preparing",
     rowsImported: 0,
     totalRows: currentPreview.totalRows,
+    totalRowsExact: currentPreview.totalRowsExact !== false,
+    bytesRead: 0,
+    totalBytes: currentPreview.sizeBytes,
     elapsedMs: 0,
   };
 
@@ -710,11 +732,14 @@ async function startBatchImport() {
   cancelling.value = false;
   errorMessage.value = "";
   wizardStep.value = "execution";
-  const totalRows = batchTasks.value.reduce((sum, task) => sum + task.preview.totalRows, 0);
+  const totalRowsExact = batchTasks.value.every((task) => task.preview.totalRowsExact !== false);
+  const totalRows = totalRowsExact ? batchTasks.value.reduce((sum, task) => sum + task.preview.totalRows, 0) : 0;
+  const totalBytes = batchTasks.value.reduce((sum, task) => sum + task.preview.sizeBytes, 0);
   let completedRows = 0;
+  let completedBytes = 0;
   importId.value = uuid();
   startImportElapsedClock();
-  progress.value = { importId: importId.value, status: "running", rowsImported: 0, totalRows, elapsedMs: 0 };
+  progress.value = { importId: importId.value, status: "running", phase: "preparing", rowsImported: 0, totalRows, totalRowsExact, bytesRead: 0, totalBytes, elapsedMs: 0 };
 
   try {
     const tableNames = batchTasks.value.map((task) => task.tableName.trim().toLowerCase());
@@ -761,6 +786,9 @@ async function startBatchImport() {
             ...nextProgress,
             rowsImported: completedRows + nextProgress.rowsImported,
             totalRows,
+            totalRowsExact,
+            bytesRead: completedBytes + (nextProgress.bytesRead ?? 0),
+            totalBytes,
             elapsedMs: liveElapsedMs.value,
           };
         },
@@ -768,10 +796,11 @@ async function startBatchImport() {
       task.status = "done";
       task.rowsImported = summary.rowsImported;
       completedRows += summary.rowsImported;
+      completedBytes += task.preview.sizeBytes;
       store.invalidateMetadataCache(props.prefillConnectionId, props.prefillDatabase || "", props.prefillSchema || undefined, task.tableName);
     }
     refreshImportElapsedClock();
-    progress.value = { importId: importId.value, status: "done", rowsImported: completedRows, totalRows, elapsedMs: liveElapsedMs.value };
+    progress.value = { importId: importId.value, status: "done", phase: "done", rowsImported: completedRows, totalRows: completedRows, totalRowsExact: true, bytesRead: totalBytes, totalBytes, elapsedMs: liveElapsedMs.value };
     toast(t("tableImport.success", { count: completedRows }), 2500);
     store.refreshObjectListTreeNode(props.prefillConnectionId, props.prefillDatabase || "", props.prefillSchema || undefined).catch((error) => {
       console.warn("[DBX][table-import:refresh-created-table-failed]", error);
@@ -1137,7 +1166,9 @@ watch(targetMode, (mode) => {
               <RefreshCw v-else class="mr-1.5 h-3.5 w-3.5" />
               {{ preview ? t("tableImport.reloadPreview") : t("tableImport.loadPreview") }}
             </Button>
-            <span v-if="preview" class="text-xs text-muted-foreground">{{ t("tableImport.previewReady", { rows: preview.totalRows, columns: preview.columns.length }) }}</span>
+            <span v-if="preview" class="text-xs text-muted-foreground">
+              {{ preview.totalRowsExact !== false ? t("tableImport.previewReady", { rows: preview.totalRows, columns: preview.columns.length }) : t("tableImport.previewReadyPartial", { rows: preview.rows.length, columns: preview.columns.length }) }}
+            </span>
           </div>
         </div>
 
@@ -1149,7 +1180,7 @@ watch(targetMode, (mode) => {
             </div>
             <div class="rounded-md border px-3 py-2">
               <div class="text-muted-foreground">{{ t("tableImport.rows") }}</div>
-              <div class="font-medium">{{ preview.totalRows.toLocaleString() }}</div>
+              <div class="font-medium">{{ previewRowsLabel(preview) }}</div>
             </div>
             <div class="rounded-md border px-3 py-2">
               <div class="text-muted-foreground">{{ t("tableImport.mapped") }}</div>
@@ -1246,7 +1277,7 @@ watch(targetMode, (mode) => {
             </div>
             <div class="rounded-md border px-3 py-2">
               <div class="text-muted-foreground">{{ t("tableImport.rows") }}</div>
-              <div class="font-medium">{{ preview?.totalRows.toLocaleString() }}</div>
+              <div class="font-medium">{{ previewRowsLabel(preview) }}</div>
             </div>
             <div class="rounded-md border px-3 py-2">
               <div class="text-muted-foreground">{{ t("tableImport.mapped") }}</div>
@@ -1307,15 +1338,17 @@ watch(targetMode, (mode) => {
         <div v-else class="space-y-4">
           <div class="rounded-md border px-4 py-5">
             <div class="flex items-center gap-3">
-              <Loader2 v-if="running && !cancelling" class="h-5 w-5 animate-spin text-primary" />
-              <Square v-else-if="cancelling || progress?.status === 'cancelled'" class="h-5 w-5 fill-current text-destructive" />
+              <Square v-if="cancelling || progress?.status === 'cancelled'" class="h-5 w-5 fill-current text-destructive" />
               <CheckCircle2 v-else-if="progress?.status === 'done'" class="h-5 w-5 text-emerald-600" />
               <AlertTriangle v-else-if="progress?.status === 'error'" class="h-5 w-5 text-destructive" />
+              <Loader2 v-else-if="running" class="h-5 w-5 animate-spin text-primary" />
               <FileUp v-else class="h-5 w-5 text-muted-foreground" />
               <div class="min-w-0 flex-1">
-                <div class="text-sm font-medium">{{ t(`tableImport.status_${progress?.status || "idle"}`) }}</div>
+                <div class="text-sm font-medium">{{ t(progressLabelKey) }}</div>
                 <div class="mt-1 text-xs text-muted-foreground">
-                  {{ progress?.rowsImported ?? 0 }} / {{ progress?.totalRows ?? preview?.totalRows ?? 0 }} · {{ progressPercent }}% ·
+                  <template v-if="progress?.totalRowsExact !== false && (progress?.totalRows ?? 0) > 0">{{ progress?.rowsImported ?? 0 }} / {{ progress?.totalRows ?? 0 }}</template>
+                  <template v-else>{{ progress?.rowsImported ?? 0 }} {{ t("tableImport.rowsImported") }}</template>
+                  · {{ progressPercent }}% ·
                   {{ t("tableImport.elapsed", { duration: formatTableImportElapsed(displayedElapsedMs) }) }}
                 </div>
               </div>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { autoMapImportColumns, formatTableImportElapsed, nextTableImportWizardStep, previousTableImportWizardStep, requiredImportTargetColumns, resolveTableImportElapsed, suggestImportTargetDataTypes, validateImportMappings } from "@/lib/table/tableImport";
+import { autoMapImportColumns, formatTableImportElapsed, nextTableImportWizardStep, previousTableImportWizardStep, requiredImportTargetColumns, resolveTableImportElapsed, suggestImportTargetDataTypes, tableImportProgressPercent, validateImportMappings } from "@/lib/table/tableImport";
 
 describe("tableImport", () => {
   it("formats import elapsed time for progress and terminal summaries", () => {
@@ -14,6 +14,12 @@ describe("tableImport", () => {
     expect(resolveTableImportElapsed(1_500, 2_000, false)).toBe(2_000);
     expect(resolveTableImportElapsed(2_500, 2_000, true)).toBe(2_000);
     expect(resolveTableImportElapsed(2_500, undefined, true)).toBe(2_500);
+  });
+
+  it("uses byte progress for unknown totals and reserves 100 for done", () => {
+    expect(tableImportProgressPercent({ status: "running", rowsImported: 500, totalRows: 0, totalRowsExact: false, bytesRead: 50, totalBytes: 100 })).toBe(50);
+    expect(tableImportProgressPercent({ status: "running", rowsImported: 1000, totalRows: 0, totalRowsExact: false, bytesRead: 100, totalBytes: 100 })).toBe(99);
+    expect(tableImportProgressPercent({ status: "done", rowsImported: 1000, totalRows: 1000, totalRowsExact: true })).toBe(100);
   });
 
   it("auto maps exact and normalized column names", () => {

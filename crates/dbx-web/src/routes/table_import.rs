@@ -254,8 +254,12 @@ pub async fn execute_import(
                     serde_json::json!({
                         "importId": req.import_id.clone(),
                         "status": "error",
+                        "phase": "done",
                         "rowsImported": 0,
                         "totalRows": 0,
+                        "totalRowsExact": true,
+                        "bytesRead": 0,
+                        "totalBytes": 0,
                         "elapsedMs": started_at.elapsed().as_millis(),
                         "error": e
                     })
@@ -276,8 +280,12 @@ pub async fn execute_import(
                     serde_json::json!({
                         "importId": req.import_id.clone(),
                         "status": "error",
+                        "phase": "done",
                         "rowsImported": 0,
                         "totalRows": 0,
+                        "totalRowsExact": true,
+                        "bytesRead": 0,
+                        "totalBytes": 0,
                         "elapsedMs": started_at.elapsed().as_millis(),
                         "error": e
                     })

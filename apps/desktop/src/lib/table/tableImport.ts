@@ -22,6 +22,15 @@ export interface ImportTargetColumnLike {
   is_primary_key?: boolean;
 }
 
+export interface TableImportProgressLike {
+  status: "running" | "done" | "error" | "cancelled";
+  rowsImported: number;
+  totalRows: number;
+  totalRowsExact?: boolean;
+  bytesRead?: number;
+  totalBytes?: number;
+}
+
 export type TableImportWizardStep = "source" | "options" | "mapping" | "review" | "execution";
 
 export const TABLE_IMPORT_WIZARD_STEPS: TableImportWizardStep[] = ["source", "options", "mapping", "review", "execution"];
@@ -40,6 +49,18 @@ export function resolveTableImportElapsed(liveElapsedMs: number, backendElapsedM
   const backend = backendElapsedMs === undefined || !Number.isFinite(backendElapsedMs) ? undefined : Math.max(0, backendElapsedMs);
   if (terminal && backend !== undefined) return backend;
   return Math.max(live, backend ?? 0);
+}
+
+export function tableImportProgressPercent(progress: TableImportProgressLike | null | undefined): number {
+  if (!progress) return 0;
+  if (progress.status === "done") return 100;
+  let percent = 0;
+  if (progress.totalRowsExact !== false && progress.totalRows > 0) {
+    percent = (progress.rowsImported / progress.totalRows) * 100;
+  } else if ((progress.totalBytes ?? 0) > 0) {
+    percent = ((progress.bytesRead ?? 0) / (progress.totalBytes ?? 1)) * 100;
+  }
+  return Math.min(99, Math.max(0, Math.round(percent)));
 }
 
 export function normalizeImportColumnName(name: string): string {

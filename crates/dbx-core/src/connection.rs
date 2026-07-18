@@ -2128,9 +2128,36 @@ impl AppState {
         database: Option<&str>,
         client_session_id: &str,
     ) -> Result<bool, String> {
+        let Some((pool_key, pool)) = self.take_client_session_pool(connection_id, database, client_session_id).await?
+        else {
+            return Ok(false);
+        };
+        close_pool_kind_with_timeout(pool_key, pool).await;
+        Ok(true)
+    }
+
+    pub async fn detach_client_session_pool(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: &str,
+    ) -> Result<bool, String> {
+        let Some(removed) = self.take_client_session_pool(connection_id, database, client_session_id).await? else {
+            return Ok(false);
+        };
+        close_removed_pools_in_background(vec![removed]);
+        Ok(true)
+    }
+
+    async fn take_client_session_pool(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: &str,
+    ) -> Result<Option<(String, PoolKind)>, String> {
         let session = normalize_client_session_id(Some(client_session_id));
         let Some(session) = session else {
-            return Ok(false);
+            return Ok(None);
         };
         let config = {
             let configs = self.configs.read().await;
@@ -2140,18 +2167,13 @@ impl AppState {
         let base_pool_key = base_pool_key_for(db_type, connection_id, database, false);
         let pool_key = session_scoped_pool_key_for(config.as_ref(), base_pool_key.clone(), Some(&session));
         if pool_key == base_pool_key {
-            return Ok(false);
+            return Ok(None);
         }
         self.stop_keepalive_task(&pool_key).await;
         self.pool_activity.write().await.remove(&pool_key);
         self.postgres_cancel_contexts.write().await.remove(&pool_key);
         let removed = self.connections.write().await.remove(&pool_key);
-        if let Some(pool) = removed {
-            close_pool_kind_with_timeout(pool_key, pool).await;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(removed.map(|pool| (pool_key, pool)))
     }
 
     pub async fn remove_pool_by_key(&self, pool_key: &str) -> bool {
@@ -4770,6 +4792,26 @@ mod tests {
         state.pool_activity.write().await.insert(pool_key.to_string(), super::PoolActivity::now());
 
         assert!(state.close_client_session_pool("conn", None, "tab-1").await.unwrap());
+        assert!(!state.connections.read().await.contains_key(pool_key));
+        assert!(!state.pool_activity.read().await.contains_key(pool_key));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn detach_client_session_pool_removes_pool_before_background_close() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Sqlite;
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        let pool_key = "conn:session:import-1";
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Sqlite(pool));
+        state.pool_activity.write().await.insert(pool_key.to_string(), super::PoolActivity::now());
+
+        assert!(state.detach_client_session_pool("conn", None, "import-1").await.unwrap());
         assert!(!state.connections.read().await.contains_key(pool_key));
         assert!(!state.pool_activity.read().await.contains_key(pool_key));
 
