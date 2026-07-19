@@ -20,6 +20,10 @@ describe("tableImport", () => {
     expect(tableImportProgressPercent({ status: "running", rowsImported: 500, totalRows: 0, totalRowsExact: false, bytesRead: 50, totalBytes: 100 })).toBe(50);
     expect(tableImportProgressPercent({ status: "running", rowsImported: 1000, totalRows: 0, totalRowsExact: false, bytesRead: 100, totalBytes: 100 })).toBe(99);
     expect(tableImportProgressPercent({ status: "done", rowsImported: 1000, totalRows: 1000, totalRowsExact: true })).toBe(100);
+    expect(tableImportProgressPercent({ status: "running", phase: "detectingEncoding", rowsImported: 0, totalRows: 1000, totalRowsExact: true, bytesRead: 100, totalBytes: 100 })).toBe(10);
+    expect(tableImportProgressPercent({ status: "running", phase: "reading", rowsImported: 0, totalRows: 0, totalRowsExact: false, bytesRead: 0, totalBytes: 100 })).toBe(0);
+    expect(tableImportProgressPercent({ status: "running", phase: "writing", rowsImported: 500, totalRows: 1000, totalRowsExact: true, bytesRead: 50, totalBytes: 100 })).toBe(55);
+    expect(tableImportProgressPercent({ status: "running", phase: "finalizing", rowsImported: 1000, totalRows: 1000, totalRowsExact: true, bytesRead: 100, totalBytes: 100 })).toBe(99);
   });
 
   it("auto maps exact and normalized column names", () => {

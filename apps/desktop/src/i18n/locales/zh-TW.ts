@@ -2543,6 +2543,7 @@ export default withEnglishFallback({
     status_idle: "準備匯入",
     status_running: "正在匯入資料",
     phase_preparing: "正在準備匯入",
+    phase_detectingEncoding: "正在偵測文字編碼",
     phase_reading: "正在讀取來源檔案",
     phase_writing: "正在寫入資料",
     phase_finalizing: "正在完成匯入",

@@ -25,6 +25,7 @@ pub const DEFAULT_BATCH_SIZE: usize = 500;
 pub const CREATE_TABLE_INFERENCE_ROWS: usize = 100;
 pub const MAX_NON_STREAMING_IMPORT_BYTES: u64 = 100 * 1024 * 1024;
 const IMPORT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_FAST_PREVIEW_CELLS: usize = 100_000;
 
 pub fn table_import_client_session_id(import_id: &str) -> String {
     task_client_session_id("table-import", import_id)
@@ -291,6 +292,7 @@ pub enum TableImportStatus {
 #[serde(rename_all = "camelCase")]
 pub enum TableImportPhase {
     Preparing,
+    DetectingEncoding,
     Reading,
     Writing,
     Finalizing,
@@ -600,30 +602,103 @@ fn resolve_text_encoding_from_bytes(
     }
 }
 
-fn auto_detect_text_encoding_from_file(path: &str) -> Result<(TableImportTextEncoding, usize), String> {
+struct EncodingValidationState {
+    decoder: encoding_rs::Decoder,
+    pending: Vec<u8>,
+    output: Vec<u8>,
+    valid: bool,
+}
+
+impl EncodingValidationState {
+    fn new(encoding: &'static encoding_rs::Encoding) -> Self {
+        Self {
+            decoder: encoding.new_decoder_without_bom_handling(),
+            pending: Vec::new(),
+            output: Vec::new(),
+            valid: true,
+        }
+    }
+
+    fn push(&mut self, input: &[u8], last: bool) {
+        if !self.valid {
+            return;
+        }
+        self.pending.extend_from_slice(input);
+        loop {
+            let output_capacity = self
+                .decoder
+                .max_utf8_buffer_length_without_replacement(self.pending.len())
+                .unwrap_or(self.pending.len().saturating_mul(3).saturating_add(4))
+                .max(4);
+            self.output.resize(output_capacity, 0);
+            let (result, read, _) =
+                self.decoder.decode_to_utf8_without_replacement(&self.pending, &mut self.output, last);
+            self.pending.drain(..read);
+            match result {
+                encoding_rs::DecoderResult::Malformed(_, _) => {
+                    self.valid = false;
+                    self.pending.clear();
+                    return;
+                }
+                encoding_rs::DecoderResult::InputEmpty => return,
+                encoding_rs::DecoderResult::OutputFull if read == 0 => {
+                    self.valid = false;
+                    self.pending.clear();
+                    return;
+                }
+                encoding_rs::DecoderResult::OutputFull => {}
+            }
+        }
+    }
+}
+
+fn auto_detect_text_encoding_from_file_with_progress(
+    path: &str,
+    mut on_progress: impl FnMut(u64),
+) -> Result<(TableImportTextEncoding, usize), String> {
     let mut file = File::open(path).map_err(|error| error.to_string())?;
     let mut prefix = [0u8; 3];
     let prefix_len = file.read(&mut prefix).map_err(|error| error.to_string())?;
     if let Some(detected) = bom_text_encoding(&prefix[..prefix_len]) {
+        let total_bytes = file.metadata().map(|metadata| metadata.len()).unwrap_or(prefix_len as u64);
+        on_progress(total_bytes);
         return Ok(detected);
     }
 
-    for encoding in [TableImportTextEncoding::Utf8, TableImportTextEncoding::Gbk] {
-        let file = File::open(path).map_err(|error| error.to_string())?;
-        if reader_is_valid_for_encoding(file, encoding)? {
-            return Ok((encoding, 0));
+    file.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+    let mut utf8 = EncodingValidationState::new(encoding_rs::UTF_8);
+    let mut gbk = EncodingValidationState::new(encoding_rs::GBK);
+    let mut bytes_read = 0u64;
+    let mut input = [0u8; IMPORT_ENCODING_READ_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut input).map_err(|error| error.to_string())?;
+        if read == 0 {
+            utf8.push(&[], true);
+            gbk.push(&[], true);
+            break;
         }
+        utf8.push(&input[..read], false);
+        gbk.push(&input[..read], false);
+        bytes_read = bytes_read.saturating_add(read as u64);
+        on_progress(bytes_read);
+    }
+    if utf8.valid {
+        return Ok((TableImportTextEncoding::Utf8, 0));
+    }
+    if gbk.valid {
+        return Ok((TableImportTextEncoding::Gbk, 0));
     }
     Err("Could not detect text encoding; select UTF-8, GBK / GB18030, or UTF-16 manually".to_string())
 }
 
-fn resolve_text_encoding_from_file(
+fn resolve_text_encoding_from_file_with_progress(
     path: &str,
     requested: Option<TableImportTextEncoding>,
+    on_progress: impl FnMut(u64),
 ) -> Result<(TableImportTextEncoding, usize), String> {
     let requested = requested.unwrap_or(TableImportTextEncoding::Auto);
     if requested == TableImportTextEncoding::Auto {
-        return auto_detect_text_encoding_from_file(path);
+        return auto_detect_text_encoding_from_file_with_progress(path, on_progress);
     }
 
     let mut file = File::open(path).map_err(|error| error.to_string())?;
@@ -632,13 +707,15 @@ fn resolve_text_encoding_from_file(
     Ok((requested, matching_bom_len(&prefix[..prefix_len], requested)))
 }
 
-fn open_delimited_csv_reader(
+fn open_delimited_csv_reader_with_progress(
     path: &str,
     source_format: TableImportSourceFormat,
     options: &TableImportParseOptions,
+    on_encoding_progress: impl FnMut(u64),
 ) -> Result<(csv::Reader<StrictTranscodingReader<File>>, DelimitedParseConfig, TableImportTextEncoding), String> {
     let config = effective_delimited_config(source_format, options)?;
-    let (encoding, bom_len) = resolve_text_encoding_from_file(path, options.encoding)?;
+    let (encoding, bom_len) =
+        resolve_text_encoding_from_file_with_progress(path, options.encoding, on_encoding_progress)?;
     let mut file = File::open(path).map_err(|error| error.to_string())?;
     file.seek(SeekFrom::Start(bom_len as u64)).map_err(|error| error.to_string())?;
     let transcoded = StrictTranscodingReader::new(file, encoding)?;
@@ -690,14 +767,16 @@ pub fn parse_delimited_file_with_options(
         if let Some((encoding, _)) = bom_text_encoding(&prefix[..prefix_len]) {
             let mut explicit_options = options.clone();
             explicit_options.encoding = Some(encoding);
-            let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, &explicit_options)?;
+            let (reader, config, encoding) =
+                open_delimited_csv_reader_with_progress(path, source_format, &explicit_options, |_| {})?;
             return parse_csv_reader(reader, config, preview_limit, encoding);
         }
 
         for encoding in [TableImportTextEncoding::Utf8, TableImportTextEncoding::Gbk] {
             let mut explicit_options = options.clone();
             explicit_options.encoding = Some(encoding);
-            let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, &explicit_options)?;
+            let (reader, config, encoding) =
+                open_delimited_csv_reader_with_progress(path, source_format, &explicit_options, |_| {})?;
             match parse_csv_reader(reader, config, preview_limit, encoding) {
                 Ok(parsed) => return Ok(parsed),
                 Err(error) if error.starts_with("Invalid byte sequence for ") => continue,
@@ -707,7 +786,7 @@ pub fn parse_delimited_file_with_options(
         return Err("Could not detect text encoding; select UTF-8, GBK / GB18030, or UTF-16 manually".to_string());
     }
 
-    let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, options)?;
+    let (reader, config, encoding) = open_delimited_csv_reader_with_progress(path, source_format, options, |_| {})?;
     parse_csv_reader(reader, config, preview_limit, encoding)
 }
 
@@ -791,14 +870,16 @@ fn parse_delimited_preview_file_with_options(
         if let Some((encoding, _)) = bom_text_encoding(&prefix[..prefix_len]) {
             let mut explicit_options = options.clone();
             explicit_options.encoding = Some(encoding);
-            let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, &explicit_options)?;
+            let (reader, config, encoding) =
+                open_delimited_csv_reader_with_progress(path, source_format, &explicit_options, |_| {})?;
             return parse_csv_reader_bounded(reader, config, preview_limit, encoding);
         }
 
         for encoding in [TableImportTextEncoding::Utf8, TableImportTextEncoding::Gbk] {
             let mut explicit_options = options.clone();
             explicit_options.encoding = Some(encoding);
-            let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, &explicit_options)?;
+            let (reader, config, encoding) =
+                open_delimited_csv_reader_with_progress(path, source_format, &explicit_options, |_| {})?;
             match parse_csv_reader_bounded(reader, config, preview_limit, encoding) {
                 Ok(parsed) => return Ok(parsed),
                 Err(error) if error.starts_with("Invalid byte sequence for ") => continue,
@@ -808,7 +889,7 @@ fn parse_delimited_preview_file_with_options(
         return Err("Could not detect text encoding; select UTF-8, GBK / GB18030, or UTF-16 manually".to_string());
     }
 
-    let (reader, config, encoding) = open_delimited_csv_reader(path, source_format, options)?;
+    let (reader, config, encoding) = open_delimited_csv_reader_with_progress(path, source_format, options, |_| {})?;
     parse_csv_reader_bounded(reader, config, preview_limit, encoding)
 }
 
@@ -1359,6 +1440,7 @@ fn read_xlsx_shared_strings(
     let mut index = 0usize;
     let mut in_item = false;
     let mut in_text = false;
+    let mut phonetic_depth = 0usize;
     let mut current = String::new();
     let mut strings = HashMap::new();
     loop {
@@ -1368,13 +1450,19 @@ fn read_xlsx_shared_strings(
                 current.clear();
             }
             Ok(Event::Start(element)) if in_item && xml_local_name_eq(element.name().as_ref(), b"t") => {
-                in_text = true;
+                in_text = phonetic_depth == 0;
+            }
+            Ok(Event::Start(element)) if in_item && xml_local_name_eq(element.name().as_ref(), b"rPh") => {
+                phonetic_depth = phonetic_depth.saturating_add(1);
             }
             Ok(Event::Text(text)) if in_item && in_text => {
                 current.push_str(&text.unescape().map_err(|error| error.to_string())?);
             }
             Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => {
                 in_text = false;
+            }
+            Ok(Event::End(element)) if in_item && xml_local_name_eq(element.name().as_ref(), b"rPh") => {
+                phonetic_depth = phonetic_depth.saturating_sub(1);
             }
             Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"si") => {
                 if needed.contains(&index) {
@@ -1385,6 +1473,7 @@ fn read_xlsx_shared_strings(
                 }
                 index += 1;
                 in_item = false;
+                phonetic_depth = 0;
             }
             Ok(Event::Eof) => break,
             Err(error) => return Err(error.to_string()),
@@ -1486,8 +1575,11 @@ fn parse_xlsx_preview_file_with_options(
         let mut buf = Vec::new();
         let mut current_position = None;
         let mut current_cell = XlsxPreviewRawCell::default();
+        let mut current_row = 0usize;
+        let mut current_column = 0usize;
         let mut in_value = false;
         let mut in_inline_text = false;
+        let mut inline_phonetic_depth = 0usize;
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(element)) | Ok(Event::Empty(element))
@@ -1496,25 +1588,39 @@ fn parse_xlsx_preview_file_with_options(
                     dimension = xml_attr_value(&reader, &element, b"ref").as_deref().and_then(xlsx_dimension_bounds);
                 }
                 Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"row") => {
-                    let absolute_row = xml_attr_value(&reader, &element, b"r")
+                    current_row = xml_attr_value(&reader, &element, b"r")
                         .and_then(|value| value.parse::<usize>().ok())
-                        .unwrap_or_default();
-                    if let Some(((start_row, _), _)) = dimension {
-                        let max_absolute_row = start_row.saturating_add(max_relative_row.saturating_sub(1));
-                        if absolute_row > max_absolute_row {
-                            break;
-                        }
-                    } else if observed_min_row != usize::MAX {
+                        .filter(|row| *row > 0)
+                        .unwrap_or_else(|| current_row.saturating_add(1).max(1));
+                    current_column = 0;
+                    if observed_min_row != usize::MAX {
                         let max_absolute_row = observed_min_row.saturating_add(max_relative_row.saturating_sub(1));
-                        if absolute_row > max_absolute_row {
+                        if current_row > max_absolute_row {
                             break;
                         }
                     }
-                    observed_max_row = observed_max_row.max(absolute_row);
+                    observed_max_row = observed_max_row.max(current_row);
+                }
+                Ok(Event::Empty(element)) if xml_local_name_eq(element.name().as_ref(), b"c") => {
+                    let position = xml_attr_value(&reader, &element, b"r")
+                        .as_deref()
+                        .and_then(xlsx_cell_ref_position)
+                        .unwrap_or_else(|| (current_row.max(1), current_column.saturating_add(1).max(1)));
+                    current_row = position.0;
+                    current_column = position.1;
+                    observed_min_row = observed_min_row.min(position.0);
+                    observed_min_column = observed_min_column.min(position.1);
+                    observed_max_row = observed_max_row.max(position.0);
+                    observed_max_column = observed_max_column.max(position.1);
                 }
                 Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"c") => {
-                    current_position =
-                        xml_attr_value(&reader, &element, b"r").as_deref().and_then(xlsx_cell_ref_position);
+                    let position = xml_attr_value(&reader, &element, b"r")
+                        .as_deref()
+                        .and_then(xlsx_cell_ref_position)
+                        .unwrap_or_else(|| (current_row.max(1), current_column.saturating_add(1).max(1)));
+                    current_row = position.0;
+                    current_column = position.1;
+                    current_position = Some(position);
                     current_cell = XlsxPreviewRawCell {
                         cell_type: xml_attr_value(&reader, &element, b"t"),
                         style_id: xml_attr_value(&reader, &element, b"s").and_then(|value| value.parse::<usize>().ok()),
@@ -1525,7 +1631,10 @@ fn parse_xlsx_preview_file_with_options(
                     in_value = true;
                 }
                 Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => {
-                    in_inline_text = true;
+                    in_inline_text = inline_phonetic_depth == 0;
+                }
+                Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"rPh") => {
+                    inline_phonetic_depth = inline_phonetic_depth.saturating_add(1);
                 }
                 Ok(Event::Text(text)) if in_value => {
                     current_cell.value.push_str(&text.unescape().map_err(|error| error.to_string())?);
@@ -1539,19 +1648,24 @@ fn parse_xlsx_preview_file_with_options(
                 Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => {
                     in_inline_text = false;
                 }
+                Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"rPh") => {
+                    inline_phonetic_depth = inline_phonetic_depth.saturating_sub(1);
+                }
                 Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"c") => {
                     if let Some((row, column)) = current_position.take() {
                         observed_min_row = observed_min_row.min(row);
                         observed_min_column = observed_min_column.min(column);
                         observed_max_column = observed_max_column.max(column);
-                        let start_row = dimension.map(|bounds| bounds.0 .0).unwrap_or(observed_min_row);
-                        let relative_row = row.saturating_sub(start_row).saturating_add(1);
+                        observed_max_row = observed_max_row.max(row);
+                        let relative_row = row.saturating_sub(observed_min_row).saturating_add(1);
                         if relative_row == row_range.title_row.unwrap_or_default()
                             || (relative_row >= row_range.data_start_row && relative_row <= requested_last_row)
                         {
                             raw_cells.insert((row, column), std::mem::take(&mut current_cell));
                         }
                     }
+                    inline_phonetic_depth = 0;
+                    in_inline_text = false;
                 }
                 Ok(Event::Eof) => break,
                 Err(error) => return Err(error.to_string()),
@@ -1567,12 +1681,33 @@ fn parse_xlsx_preview_file_with_options(
         .filter_map(|cell| cell.value.parse::<usize>().ok())
         .collect::<HashSet<_>>();
     let shared_strings = read_xlsx_shared_strings(&mut zip, &needed_shared_strings)?;
-    let ((start_row, start_column), (_, dimension_end_column)) = dimension.unwrap_or_else(|| {
-        let min_row = if observed_min_row == usize::MAX { 1 } else { observed_min_row };
-        let min_column = if observed_min_column == usize::MAX { 1 } else { observed_min_column };
-        ((min_row, min_column), (observed_max_row.max(min_row), observed_max_column.max(min_column)))
-    });
-    let end_column = dimension_end_column.max(start_column);
+    if observed_min_row == usize::MAX || observed_min_column == usize::MAX {
+        return Err("Import file has no data rows in the selected row range".to_string());
+    }
+    let start_row = observed_min_row;
+    let start_column = observed_min_column;
+    let observed_end_column = observed_max_column.max(start_column);
+    let observed_column_count = observed_end_column.saturating_sub(start_column).saturating_add(1);
+    let preview_row_count = requested_last_row
+        .saturating_sub(row_range.data_start_row)
+        .saturating_add(1)
+        .saturating_add(usize::from(row_range.title_row.is_some()));
+    if observed_column_count.saturating_mul(preview_row_count) > MAX_FAST_PREVIEW_CELLS {
+        return Err(format!(
+            "Excel preview grid is too large: {} columns across {} preview rows exceed the {} cell limit",
+            observed_column_count, preview_row_count, MAX_FAST_PREVIEW_CELLS
+        ));
+    }
+    let dimension_end_column = dimension
+        .filter(|((dimension_start_row, dimension_start_column), _)| {
+            *dimension_start_row == start_row && *dimension_start_column == start_column
+        })
+        .map(|(_, (_, end_column))| end_column)
+        .filter(|end_column| {
+            end_column.saturating_sub(start_column).saturating_add(1).saturating_mul(preview_row_count)
+                <= MAX_FAST_PREVIEW_CELLS
+        });
+    let end_column = dimension_end_column.unwrap_or(observed_end_column).max(observed_end_column);
     let column_count = end_column.saturating_sub(start_column).saturating_add(1);
     let mut columns = if let Some(title_row) = row_range.title_row {
         let absolute_title_row = start_row.saturating_add(title_row.saturating_sub(1));
@@ -1596,10 +1731,8 @@ fn parse_xlsx_preview_file_with_options(
         return Err("Import file has no columns in the selected row range".to_string());
     }
 
-    let dimension_end_relative = dimension
-        .map(|(_, (end_row, _))| end_row.saturating_sub(start_row).saturating_add(1))
-        .unwrap_or_else(|| observed_max_row.saturating_sub(start_row).saturating_add(1));
-    let last_preview_row = requested_last_row.min(dimension_end_relative);
+    let observed_end_relative = observed_max_row.saturating_sub(start_row).saturating_add(1);
+    let last_preview_row = requested_last_row.min(observed_end_relative);
     if last_preview_row < row_range.data_start_row {
         return Err("Import file has no data rows in the selected row range".to_string());
     }
@@ -2822,28 +2955,58 @@ where
         if target_column_types.is_empty() {
             target_column_types = created_column_types.clone().unwrap_or_default();
         }
-        if matches!(request.mode, TableImportMode::Truncate) {
-            let sql = truncate_sql(&request.table, &request.schema, db_type);
-            if let Err(error) =
-                execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
-            {
-                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
-            }
-        }
-
         let mut streaming_options = request.parse_options.clone();
         if prepared_source_total_exact
             && streaming_options.encoding.unwrap_or(TableImportTextEncoding::Auto) == TableImportTextEncoding::Auto
         {
             streaming_options.encoding = parsed.effective_encoding;
         }
-        let (mut reader, config, _) =
-            match open_delimited_csv_reader(&request.file_path, source_format, &streaming_options) {
-                Ok(result) => result,
-                Err(error) => {
-                    return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
+        let encoding_detection_started =
+            streaming_options.encoding.unwrap_or(TableImportTextEncoding::Auto) == TableImportTextEncoding::Auto;
+        if encoding_detection_started {
+            progress_callback(import_progress_with_details(
+                &request.import_id,
+                TableImportStatus::Running,
+                TableImportPhase::DetectingEncoding,
+                0,
+                progress_total_rows,
+                total_rows_exact,
+                0,
+                total_bytes,
+                started_at,
+                None,
+            ));
+        }
+        let mut last_encoding_progress_emit = Instant::now() - IMPORT_PROGRESS_INTERVAL;
+        let (mut reader, config, _) = match open_delimited_csv_reader_with_progress(
+            &request.file_path,
+            source_format,
+            &streaming_options,
+            |bytes_read| {
+                if last_encoding_progress_emit.elapsed() >= IMPORT_PROGRESS_INTERVAL
+                    || (total_bytes > 0 && bytes_read >= total_bytes)
+                {
+                    progress_callback(import_progress_with_details(
+                        &request.import_id,
+                        TableImportStatus::Running,
+                        TableImportPhase::DetectingEncoding,
+                        0,
+                        progress_total_rows,
+                        total_rows_exact,
+                        bytes_read.min(total_bytes),
+                        total_bytes,
+                        started_at,
+                        None,
+                    ));
+                    last_encoding_progress_emit = Instant::now();
                 }
-            };
+            },
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
+            }
+        };
         let (columns, first_record) = match delimited_columns_and_first_record(&mut reader, config) {
             Ok(result) => result,
             Err(error) => {
@@ -2860,6 +3023,14 @@ where
                 }
             }
         };
+        if matches!(request.mode, TableImportMode::Truncate) {
+            let sql = truncate_sql(&request.table, &request.schema, db_type);
+            if let Err(error) =
+                execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
+            {
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
+            }
+        }
         let effective_batch_size = match db_type {
             DatabaseType::Oracle | DatabaseType::OceanbaseOracle => 1,
             DatabaseType::CloudflareD1 => batch_size.clamp(1, 100),
@@ -3051,6 +3222,19 @@ where
         return Ok(import_summary(&request.import_id, rows_imported, rows_imported, started_at));
     }
 
+    let total_bytes = tokio::fs::metadata(&request.file_path).await.map(|metadata| metadata.len()).unwrap_or(0);
+    progress_callback(import_progress_with_details(
+        &request.import_id,
+        TableImportStatus::Running,
+        TableImportPhase::Reading,
+        0,
+        0,
+        false,
+        0,
+        total_bytes,
+        started_at,
+        None,
+    ));
     let parsed = match parse_import_file_with_options(
         &request.file_path,
         Some(source_format),
@@ -3069,7 +3253,18 @@ where
     if let Err(error) = mapping_indexes(&parsed, &request.mappings) {
         return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
     }
-    progress_callback(import_progress(&request.import_id, TableImportStatus::Running, 0, total_rows, started_at, None));
+    progress_callback(import_progress_with_details(
+        &request.import_id,
+        TableImportStatus::Running,
+        TableImportPhase::Writing,
+        0,
+        total_rows,
+        true,
+        total_bytes,
+        total_bytes,
+        started_at,
+        None,
+    ));
     let mut last_progress_emit = Instant::now();
 
     let mut target_column_types = get_columns_for_transfer(
@@ -3393,6 +3588,63 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
+    fn build_preview_test_xlsx(sheet_xml: &str, shared_strings_xml: Option<&str>) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        write_xlsx_test_entry(
+            &mut zip,
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+</Types>"#,
+        );
+        write_xlsx_test_entry(
+            &mut zip,
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+        );
+        write_xlsx_test_entry(
+            &mut zip,
+            "xl/workbook.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+        );
+        write_xlsx_test_entry(
+            &mut zip,
+            "xl/_rels/workbook.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>"#,
+        );
+        write_xlsx_test_entry(
+            &mut zip,
+            "xl/styles.xml",
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <cellXfs count="1"><xf numFmtId="0"/></cellXfs>
+</styleSheet>"#,
+        );
+        if let Some(shared_strings_xml) = shared_strings_xml {
+            write_xlsx_test_entry(&mut zip, "xl/sharedStrings.xml", shared_strings_xml);
+        }
+        write_xlsx_test_entry(&mut zip, "xl/worksheets/sheet1.xml", sheet_xml);
+        zip.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn parses_csv_headers_and_preview_rows() {
         let parsed = parse_csv_bytes(b"id,name,active\n1,Ada,true\n2,,false\n", 10).unwrap();
@@ -3434,6 +3686,45 @@ mod tests {
         assert_eq!(parsed.columns, vec!["id", "name"]);
         assert_eq!(parsed.rows[0], vec![serde_json::json!("1"), serde_json::json!("中文")]);
         assert_eq!(parsed.rows[1], vec![serde_json::json!("2"), serde_json::json!("上海")]);
+    }
+
+    #[test]
+    fn file_encoding_detection_validates_utf8_and_gbk_in_one_monotonic_scan() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-encoding-{}.csv", uuid::Uuid::new_v4()));
+        let bytes = b"id,name\n1,\xD6\xD0\n";
+        std::fs::write(&path, bytes).unwrap();
+        let mut progress = Vec::new();
+
+        let (encoding, bom_len) =
+            auto_detect_text_encoding_from_file_with_progress(&path.to_string_lossy(), |bytes_read| {
+                progress.push(bytes_read)
+            })
+            .unwrap();
+
+        assert_eq!(encoding, TableImportTextEncoding::Gbk);
+        assert_eq!(bom_len, 0);
+        assert_eq!(progress.last().copied(), Some(bytes.len() as u64));
+        assert!(progress.windows(2).all(|window| window[0] <= window[1]));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bom_encoding_detection_reports_the_file_as_fully_detected() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-bom-progress-{}.csv", uuid::Uuid::new_v4()));
+        let bytes = b"\xEF\xBB\xBFid,name\n1,Ada\n";
+        std::fs::write(&path, bytes).unwrap();
+        let mut progress = Vec::new();
+
+        let (encoding, bom_len) =
+            auto_detect_text_encoding_from_file_with_progress(&path.to_string_lossy(), |bytes_read| {
+                progress.push(bytes_read)
+            })
+            .unwrap();
+
+        assert_eq!(encoding, TableImportTextEncoding::Utf8);
+        assert_eq!(bom_len, 3);
+        assert_eq!(progress, vec![bytes.len() as u64]);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -3737,6 +4028,116 @@ mod tests {
         assert_eq!(preview.columns, vec!["name"]);
         assert_eq!(preview.rows, vec![vec![serde_json::json!("Ada")]]);
         assert_eq!(preview.total_rows, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fast_excel_preview_matches_calamine_when_row_and_cell_references_are_omitted() {
+        let path =
+            std::env::temp_dir().join(format!("dbx-table-import-preview-implicit-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:B2"/>
+  <sheetData>
+    <row><c t="inlineStr"><is><t>id</t></is></c><c t="inlineStr"><is><t>name</t></is></c></row>
+    <row><c><v>7</v></c><c t="inlineStr"><is><t>Ada</t></is></c></row>
+  </sheetData>
+</worksheet>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, None)).unwrap();
+
+        let parsed =
+            parse_xlsx_file_with_options(&path.to_string_lossy(), &TableImportParseOptions::default(), 10).unwrap();
+        let (preview, _) =
+            parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &TableImportParseOptions::default(), 10)
+                .unwrap();
+
+        assert_eq!(preview.columns, parsed.columns);
+        assert_eq!(preview.rows, parsed.rows);
+        assert_eq!(preview.rows, vec![vec![serde_json::json!(7.0), serde_json::json!("Ada")]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fast_excel_preview_advances_past_empty_cells_with_implicit_references() {
+        let path =
+            std::env::temp_dir().join(format!("dbx-table-import-preview-empty-cell-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:C2"/>
+  <sheetData>
+    <row><c t="inlineStr"><is><t>id</t></is></c><c/><c t="inlineStr"><is><t>name</t></is></c></row>
+    <row><c><v>7</v></c><c/><c t="inlineStr"><is><t>Ada</t></is></c></row>
+  </sheetData>
+</worksheet>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, None)).unwrap();
+
+        let parsed =
+            parse_xlsx_file_with_options(&path.to_string_lossy(), &TableImportParseOptions::default(), 10).unwrap();
+        let (preview, _) =
+            parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &TableImportParseOptions::default(), 10)
+                .unwrap();
+
+        assert_eq!(preview.columns, parsed.columns);
+        assert_eq!(preview.rows, parsed.rows);
+        assert_eq!(preview.columns, vec!["id", "column_2", "name"]);
+        assert_eq!(preview.rows, vec![vec![serde_json::json!(7.0), serde_json::Value::Null, serde_json::json!("Ada")]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fast_excel_preview_excludes_phonetic_runs_from_shared_and_inline_strings() {
+        let path =
+            std::env::temp_dir().join(format!("dbx-table-import-preview-phonetic-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:B2"/>
+  <sheetData>
+    <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t>inline</t></is></c></row>
+    <row r="2"><c r="A2" t="s"><v>1</v></c><c r="B2" t="inlineStr"><is><r><t>大阪</t></r><rPh sb="0" eb="2"><t>おおさか</t></rPh></is></c></row>
+  </sheetData>
+</worksheet>"#;
+        let shared_strings_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2" uniqueCount="2">
+  <si><t>shared</t></si>
+  <si><r><t>東京</t></r><rPh sb="0" eb="2"><t>とうきょう</t></rPh></si>
+</sst>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, Some(shared_strings_xml))).unwrap();
+
+        let parsed =
+            parse_xlsx_file_with_options(&path.to_string_lossy(), &TableImportParseOptions::default(), 10).unwrap();
+        let (preview, _) =
+            parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &TableImportParseOptions::default(), 10)
+                .unwrap();
+
+        assert_eq!(preview.rows, parsed.rows);
+        assert_eq!(preview.rows, vec![vec![serde_json::json!("東京"), serde_json::json!("大阪")]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fast_excel_preview_ignores_stale_and_overwide_dimensions() {
+        let path =
+            std::env::temp_dir().join(format!("dbx-table-import-preview-dimension-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:XFD1048576"/>
+  <sheetData>
+    <row r="100"><c r="A100" t="inlineStr"><is><t>id</t></is></c><c r="B100" t="inlineStr"><is><t>name</t></is></c></row>
+    <row r="101"><c r="A101"><v>8</v></c><c r="B101" t="inlineStr"><is><t>Grace</t></is></c></row>
+  </sheetData>
+</worksheet>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, None)).unwrap();
+
+        let parsed =
+            parse_xlsx_file_with_options(&path.to_string_lossy(), &TableImportParseOptions::default(), 10).unwrap();
+        let (preview, _) =
+            parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &TableImportParseOptions::default(), 10)
+                .unwrap();
+
+        assert_eq!(preview.columns, parsed.columns);
+        assert_eq!(preview.rows, parsed.rows);
+        assert_eq!(preview.columns, vec!["id", "name"]);
+        assert_eq!(preview.rows, vec![vec![serde_json::json!(8.0), serde_json::json!("Grace")]]);
         let _ = std::fs::remove_file(path);
     }
 

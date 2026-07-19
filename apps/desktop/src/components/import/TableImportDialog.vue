@@ -172,7 +172,9 @@ const canGoNext = computed(() => {
   if (wizardStep.value === "mapping") return mappingValidation.value.valid;
   return false;
 });
-const progressPercent = computed(() => tableImportProgressPercent(progress.value));
+const rawProgressPercent = computed(() => tableImportProgressPercent(progress.value));
+const progressPercentFloor = ref(0);
+const progressPercent = computed(() => Math.max(rawProgressPercent.value, progressPercentFloor.value));
 const currentStepIndex = computed(() => wizardSteps.findIndex((step) => step.value === wizardStep.value));
 const targetLabel = computed(() => {
   const pieces = [selectedConnection.value?.name, props.prefillDatabase, props.prefillSchema, targetTableName.value].filter(Boolean);
@@ -659,6 +661,7 @@ async function startImport() {
   const tableName = targetTableName.value;
   if (!canImport.value || !currentPreview || !props.prefillConnectionId || !tableName) return;
   running.value = true;
+  progressPercentFloor.value = 0;
   cancelling.value = false;
   errorMessage.value = "";
   wizardStep.value = "execution";
@@ -729,6 +732,7 @@ async function startImport() {
 async function startBatchImport() {
   if (!props.prefillConnectionId || !batchTasks.value.length || running.value) return;
   running.value = true;
+  progressPercentFloor.value = 0;
   cancelling.value = false;
   errorMessage.value = "";
   wizardStep.value = "execution";
@@ -782,8 +786,13 @@ async function startBatchImport() {
         },
         (nextProgress) => {
           task.rowsImported = nextProgress.rowsImported;
+          const hasRemainingTasks = index < batchTasks.value.length - 1;
+          const aggregateStatus = nextProgress.status === "done" && hasRemainingTasks ? "running" : nextProgress.status;
+          const aggregatePhase = nextProgress.status === "done" && hasRemainingTasks ? "preparing" : nextProgress.phase;
           progress.value = {
             ...nextProgress,
+            status: aggregateStatus,
+            phase: aggregatePhase,
             rowsImported: completedRows + nextProgress.rowsImported,
             totalRows,
             totalRowsExact,
@@ -926,6 +935,14 @@ watch(targetMode, (mode) => {
     applyAutoMapping();
     applySuggestedColumnDataTypes();
     void loadDataTypeOptions();
+  }
+});
+
+watch(rawProgressPercent, (percent) => {
+  if (progress.value?.status === "running") {
+    progressPercentFloor.value = Math.max(progressPercentFloor.value, percent);
+  } else if (progress.value?.status === "done") {
+    progressPercentFloor.value = 100;
   }
 });
 </script>

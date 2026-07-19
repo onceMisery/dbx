@@ -2724,6 +2724,7 @@ export default withEnglishFallback({
     status_idle: "Ready to import",
     status_running: "Importing data",
     phase_preparing: "Preparing import",
+    phase_detectingEncoding: "Detecting text encoding",
     phase_reading: "Reading source file",
     phase_writing: "Writing data",
     phase_finalizing: "Finalizing import",

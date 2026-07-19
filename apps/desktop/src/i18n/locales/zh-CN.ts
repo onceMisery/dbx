@@ -2893,6 +2893,7 @@ export default withEnglishFallback({
     status_idle: "准备导入",
     status_running: "正在导入数据",
     phase_preparing: "正在准备导入",
+    phase_detectingEncoding: "正在检测文本编码",
     phase_reading: "正在读取源文件",
     phase_writing: "正在写入数据",
     phase_finalizing: "正在完成导入",

@@ -24,6 +24,7 @@ export interface ImportTargetColumnLike {
 
 export interface TableImportProgressLike {
   status: "running" | "done" | "error" | "cancelled";
+  phase?: "preparing" | "detectingEncoding" | "reading" | "writing" | "finalizing" | "done";
   rowsImported: number;
   totalRows: number;
   totalRowsExact?: boolean;
@@ -55,10 +56,20 @@ export function tableImportProgressPercent(progress: TableImportProgressLike | n
   if (!progress) return 0;
   if (progress.status === "done") return 100;
   let percent = 0;
-  if (progress.totalRowsExact !== false && progress.totalRows > 0) {
-    percent = (progress.rowsImported / progress.totalRows) * 100;
-  } else if ((progress.totalBytes ?? 0) > 0) {
-    percent = ((progress.bytesRead ?? 0) / (progress.totalBytes ?? 1)) * 100;
+  const totalRows = progress.totalRows ?? 0;
+  const totalBytes = progress.totalBytes ?? 0;
+  if (progress.phase === "detectingEncoding") {
+    percent = totalBytes > 0 ? ((progress.bytesRead ?? 0) / totalBytes) * 10 : 0;
+  } else if (progress.phase === "writing" || progress.phase === "finalizing") {
+    if (progress.totalRowsExact !== false && totalRows > 0) {
+      percent = 10 + (progress.rowsImported / totalRows) * 89;
+    } else if (totalBytes > 0) {
+      percent = 10 + ((progress.bytesRead ?? 0) / totalBytes) * 89;
+    }
+  } else if (progress.totalRowsExact !== false && totalRows > 0) {
+    percent = (progress.rowsImported / totalRows) * 100;
+  } else if (totalBytes > 0) {
+    percent = ((progress.bytesRead ?? 0) / totalBytes) * 100;
   }
   return Math.min(99, Math.max(0, Math.round(percent)));
 }

@@ -7,7 +7,8 @@ use axum::extract::{Multipart, Path, State};
 use axum::response::sse::{Event, Sse};
 use axum::Json;
 use dbx_core::table_import::{
-    self, TableImportParseOptions, TableImportPreviewRequest, TableImportRequest, TableImportSourceFormat,
+    self, TableImportParseOptions, TableImportPhase, TableImportPreviewRequest, TableImportProgress,
+    TableImportRequest, TableImportSourceFormat, TableImportStatus,
 };
 use dbx_core::transfer;
 use futures::stream::Stream;
@@ -19,6 +20,50 @@ use crate::error::AppError;
 use crate::state::WebState;
 
 const MAX_IMPORT_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+const TABLE_IMPORT_PROGRESS_TTL: Duration = Duration::from_secs(30);
+
+fn initial_import_progress(import_id: &str, started_at: Instant) -> TableImportProgress {
+    TableImportProgress {
+        import_id: import_id.to_string(),
+        status: TableImportStatus::Running,
+        phase: TableImportPhase::Preparing,
+        rows_imported: 0,
+        total_rows: 0,
+        total_rows_exact: false,
+        bytes_read: 0,
+        total_bytes: 0,
+        elapsed_ms: started_at.elapsed().as_millis(),
+        error: None,
+    }
+}
+
+fn failed_import_progress(import_id: &str, started_at: Instant, error: String) -> TableImportProgress {
+    TableImportProgress {
+        import_id: import_id.to_string(),
+        status: TableImportStatus::Error,
+        phase: TableImportPhase::Done,
+        rows_imported: 0,
+        total_rows: 0,
+        total_rows_exact: true,
+        bytes_read: 0,
+        total_bytes: 0,
+        elapsed_ms: started_at.elapsed().as_millis(),
+        error: Some(error),
+    }
+}
+
+fn send_import_progress(tx: &tokio::sync::watch::Sender<String>, progress: &TableImportProgress) {
+    if let Ok(json) = serde_json::to_string(progress) {
+        tx.send_replace(json);
+    }
+}
+
+fn schedule_import_progress_cleanup(state: Arc<WebState>, import_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(TABLE_IMPORT_PROGRESS_TTL).await;
+        state.table_import_channels.write().await.remove(&import_id);
+    });
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -240,8 +285,10 @@ pub async fn execute_import(
 
     let import_id = req.import_id.clone();
 
-    let (tx, _) = tokio::sync::broadcast::channel::<String>(256);
-    state.sse_channels.write().await.insert(import_id.clone(), tx.clone());
+    let initial_progress = serde_json::to_string(&initial_import_progress(&import_id, started_at))
+        .map_err(|error| AppError(error.to_string()))?;
+    let (tx, _) = tokio::sync::watch::channel(initial_progress);
+    state.table_import_channels.write().await.insert(import_id.clone(), tx.clone());
 
     let app = state.app.clone();
     let state_clone = state.clone();
@@ -250,25 +297,11 @@ pub async fn execute_import(
         let db_type = match transfer::get_db_type(&app, &req.connection_id).await {
             Ok(t) => t,
             Err(e) => {
-                let _ = tx.send(
-                    serde_json::json!({
-                        "importId": req.import_id.clone(),
-                        "status": "error",
-                        "phase": "done",
-                        "rowsImported": 0,
-                        "totalRows": 0,
-                        "totalRowsExact": true,
-                        "bytesRead": 0,
-                        "totalBytes": 0,
-                        "elapsedMs": started_at.elapsed().as_millis(),
-                        "error": e
-                    })
-                    .to_string(),
-                );
+                send_import_progress(&tx, &failed_import_progress(&req.import_id, started_at, e));
                 if !req.retain_source {
                     cleanup_uploaded_import_source(&req.file_path).await;
                 }
-                state_clone.sse_channels.write().await.remove(&req.import_id);
+                schedule_import_progress_cleanup(state_clone, req.import_id.clone());
                 return;
             }
         };
@@ -276,25 +309,11 @@ pub async fn execute_import(
         let pool_key = match app.get_or_create_pool(&req.connection_id, Some(&req.database)).await {
             Ok(k) => k,
             Err(e) => {
-                let _ = tx.send(
-                    serde_json::json!({
-                        "importId": req.import_id.clone(),
-                        "status": "error",
-                        "phase": "done",
-                        "rowsImported": 0,
-                        "totalRows": 0,
-                        "totalRowsExact": true,
-                        "bytesRead": 0,
-                        "totalBytes": 0,
-                        "elapsedMs": started_at.elapsed().as_millis(),
-                        "error": e
-                    })
-                    .to_string(),
-                );
+                send_import_progress(&tx, &failed_import_progress(&req.import_id, started_at, e));
                 if !req.retain_source {
                     cleanup_uploaded_import_source(&req.file_path).await;
                 }
-                state_clone.sse_channels.write().await.remove(&req.import_id);
+                schedule_import_progress_cleanup(state_clone, req.import_id.clone());
                 return;
             }
         };
@@ -309,27 +328,16 @@ pub async fn execute_import(
                 let id = id.to_string();
                 Box::pin(async move { transfer::is_cancelled(&id).await })
             },
-            |progress| {
-                if let Ok(json) = serde_json::to_string(&progress) {
-                    let _ = tx_clone.send(json);
-                }
-            },
+            |progress| send_import_progress(&tx_clone, &progress),
         )
         .await;
 
-        match result {
-            Ok(summary) => {
-                if let Ok(json) = serde_json::to_string(&summary) {
-                    let _ = tx.send(json);
-                }
-            }
-            Err(_) => {}
-        }
+        let _ = result;
 
         if !req.retain_source {
             cleanup_uploaded_import_source(&req.file_path).await;
         }
-        state_clone.sse_channels.write().await.remove(&req.import_id);
+        schedule_import_progress_cleanup(state_clone, req.import_id.clone());
     });
 
     Ok(Json(serde_json::json!({ "importId": import_id })))
@@ -339,11 +347,11 @@ pub async fn import_progress(
     State(state): State<Arc<WebState>>,
     Path(import_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, AppError> {
-    let channels = state.sse_channels.read().await;
+    let channels = state.table_import_channels.read().await;
     let tx = channels.get(&import_id).ok_or_else(|| AppError("Import not found".to_string()))?;
     let rx = tx.subscribe();
     drop(channels);
-    Ok(crate::sse::sse_from_channel(rx))
+    Ok(crate::sse::sse_from_watch(rx))
 }
 
 pub async fn cancel_import(
@@ -487,5 +495,30 @@ mod tests {
         assert!(uploaded_import_path_for_source_ref(&data_dir, "../users.csv").is_err());
         assert!(uploaded_import_path_for_source_ref(&data_dir, &uuid::Uuid::new_v4().to_string()).is_err());
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn import_progress_watch_replays_terminal_state_to_late_subscribers() {
+        let started_at = Instant::now();
+        let initial = serde_json::to_string(&initial_import_progress("import-1", started_at)).unwrap();
+        let (tx, _) = tokio::sync::watch::channel(initial);
+        let terminal = TableImportProgress {
+            import_id: "import-1".to_string(),
+            status: TableImportStatus::Done,
+            phase: TableImportPhase::Done,
+            rows_imported: 2,
+            total_rows: 2,
+            total_rows_exact: true,
+            bytes_read: 20,
+            total_bytes: 20,
+            elapsed_ms: 10,
+            error: None,
+        };
+        send_import_progress(&tx, &terminal);
+
+        let late_subscriber = tx.subscribe();
+        let replayed: serde_json::Value = serde_json::from_str(&late_subscriber.borrow()).unwrap();
+        assert_eq!(replayed["status"], "done");
+        assert_eq!(replayed["rowsImported"], 2);
     }
 }
