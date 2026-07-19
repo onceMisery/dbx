@@ -1,16 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read as IoRead, Seek, SeekFrom};
-use std::path::Path;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read as IoRead, Seek, SeekFrom, Write as IoWrite};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use calamine::{
     open_workbook_auto, CellType, Data, DataRef, ExcelDateTime, Range, Reader as CalamineReader,
-    ReaderRef as CalamineReaderRef, Xlsx,
+    ReaderRef as CalamineReaderRef,
 };
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use quick_xml::events::{BytesStart, Event};
@@ -21,7 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::connection::{task_client_session_id, AppState, PoolKind};
 use crate::models::connection::DatabaseType;
 use crate::transfer::{
-    execute_on_pool, generate_insert_typed, get_columns_for_transfer, qualified_table, quote_identifier,
+    execute_on_pool, generate_insert_typed, generate_insert_typed_sql_batches, get_columns_for_transfer,
+    qualified_table, quote_identifier,
 };
 
 pub const DEFAULT_PREVIEW_LIMIT: usize = 50;
@@ -31,6 +28,11 @@ pub const MAX_NON_STREAMING_IMPORT_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_LEGACY_XLS_IMPORT_BYTES: u64 = 50 * 1024 * 1024;
 const IMPORT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_FAST_PREVIEW_CELLS: usize = 100_000;
+const MAX_IN_MEMORY_XLSX_SHARED_STRINGS_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_XLSX_SHARED_STRINGS_BYTES: u64 = 1024 * 1024 * 1024;
+const XLSX_SHARED_STRING_CACHE_ENTRIES: usize = 4096;
+const XLSX_SHARED_STRING_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ORACLE_IMPORT_BATCH_ROWS: usize = 500;
 
 pub fn table_import_client_session_id(import_id: &str) -> String {
     task_client_session_id("table-import", import_id)
@@ -1185,8 +1187,10 @@ fn xlsx_cell_ref_label_with_temporal_kind(cell: &DataRef<'_>, temporal_kind: Opt
 }
 
 pub fn xlsx_sheet_names(path: &str) -> Result<Vec<String>, String> {
-    let workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
-    Ok(workbook.sheet_names().to_vec())
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|error| error.to_string())?;
+    let workbook_xml = read_xlsx_zip_text(&mut zip, "xl/workbook.xml")?;
+    Ok(xlsx_workbook_sheet_refs(&workbook_xml).into_iter().map(|(name, _)| name).collect())
 }
 
 fn xml_local_name_eq(name: &[u8], expected: &[u8]) -> bool {
@@ -1538,6 +1542,180 @@ fn read_xlsx_shared_strings(
     Ok(strings)
 }
 
+struct XlsxTempPath(PathBuf);
+
+impl Drop for XlsxTempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+struct XlsxDiskSharedStrings {
+    file: File,
+    index: File,
+    #[allow(dead_code)]
+    path: XlsxTempPath,
+    #[allow(dead_code)]
+    index_path: XlsxTempPath,
+    count: usize,
+    cache: HashMap<usize, String>,
+    cache_bytes: usize,
+}
+
+enum XlsxSharedStrings {
+    Memory(Vec<String>),
+    Disk(XlsxDiskSharedStrings),
+}
+
+impl XlsxSharedStrings {
+    fn push(&mut self, value: &str) -> Result<(), String> {
+        match self {
+            Self::Memory(strings) => strings.push(value.to_string()),
+            Self::Disk(store) => {
+                let offset = store.file.stream_position().map_err(|error| error.to_string())?;
+                let len = u32::try_from(value.len()).map_err(|_| "Excel shared string is too large".to_string())?;
+                store.file.write_all(value.as_bytes()).map_err(|error| error.to_string())?;
+                store.index.write_all(&offset.to_le_bytes()).map_err(|error| error.to_string())?;
+                store.index.write_all(&len.to_le_bytes()).map_err(|error| error.to_string())?;
+                store.count = store.count.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, index: usize) -> Result<Option<String>, String> {
+        match self {
+            Self::Memory(strings) => Ok(strings.get(index).cloned()),
+            Self::Disk(store) => {
+                if let Some(value) = store.cache.get(&index) {
+                    return Ok(Some(value.clone()));
+                }
+                if index >= store.count {
+                    return Ok(None);
+                }
+                let index_offset = (index as u64).saturating_mul(12);
+                store.index.seek(SeekFrom::Start(index_offset)).map_err(|error| error.to_string())?;
+                let mut offset_bytes = [0u8; 8];
+                let mut len_bytes = [0u8; 4];
+                store.index.read_exact(&mut offset_bytes).map_err(|error| error.to_string())?;
+                store.index.read_exact(&mut len_bytes).map_err(|error| error.to_string())?;
+                let offset = u64::from_le_bytes(offset_bytes);
+                let len = u32::from_le_bytes(len_bytes);
+                store.file.seek(SeekFrom::Start(offset)).map_err(|error| error.to_string())?;
+                let mut bytes = vec![0; len as usize];
+                store.file.read_exact(&mut bytes).map_err(|error| error.to_string())?;
+                let value = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+                if store.cache.len() >= XLSX_SHARED_STRING_CACHE_ENTRIES
+                    || store.cache_bytes.saturating_add(value.len()) > XLSX_SHARED_STRING_CACHE_BYTES
+                {
+                    store.cache.clear();
+                    store.cache_bytes = 0;
+                }
+                if value.len() <= XLSX_SHARED_STRING_CACHE_BYTES {
+                    store.cache_bytes = store.cache_bytes.saturating_add(value.len());
+                    store.cache.insert(index, value.clone());
+                }
+                Ok(Some(value))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn disk_paths(&self) -> Option<(&Path, &Path)> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Disk(store) => Some((&store.path.0, &store.index_path.0)),
+        }
+    }
+}
+
+fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) -> Result<XlsxSharedStrings, String> {
+    let uncompressed_size = match zip.by_name("xl/sharedStrings.xml") {
+        Ok(file) => file.size(),
+        Err(zip::result::ZipError::FileNotFound) => return Ok(XlsxSharedStrings::Memory(Vec::new())),
+        Err(error) => return Err(error.to_string()),
+    };
+    if uncompressed_size > MAX_XLSX_SHARED_STRINGS_BYTES {
+        return Err(format!(
+            "Excel shared strings are too large: {uncompressed_size} bytes (max {MAX_XLSX_SHARED_STRINGS_BYTES} bytes)"
+        ));
+    }
+    let mut strings = if uncompressed_size <= memory_limit {
+        XlsxSharedStrings::Memory(Vec::new())
+    } else {
+        let path = std::env::temp_dir().join(format!("dbx-xlsx-shared-{}.tmp", uuid::Uuid::new_v4()));
+        let index_path = path.with_extension("idx");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        let index = match OpenOptions::new().read(true).write(true).create_new(true).open(&index_path) {
+            Ok(index) => index,
+            Err(error) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(error.to_string());
+            }
+        };
+        XlsxSharedStrings::Disk(XlsxDiskSharedStrings {
+            file,
+            index,
+            path: XlsxTempPath(path),
+            index_path: XlsxTempPath(index_path),
+            count: 0,
+            cache: HashMap::new(),
+            cache_bytes: 0,
+        })
+    };
+
+    let file = zip.by_name("xl/sharedStrings.xml").map_err(|error| error.to_string())?;
+    let mut reader = XmlReader::from_reader(BufReader::new(file));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut in_item = false;
+    let mut in_text = false;
+    let mut phonetic_depth = 0usize;
+    let mut current = String::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"si") => {
+                in_item = true;
+                current.clear();
+            }
+            Ok(Event::Start(element)) if in_item && xml_local_name_eq(element.name().as_ref(), b"t") => {
+                in_text = phonetic_depth == 0;
+            }
+            Ok(Event::Start(element)) if in_item && xml_local_name_eq(element.name().as_ref(), b"rPh") => {
+                phonetic_depth = phonetic_depth.saturating_add(1);
+            }
+            Ok(Event::Text(text)) if in_item && in_text => {
+                current.push_str(&text.unescape().map_err(|error| error.to_string())?);
+            }
+            Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => {
+                in_text = false;
+            }
+            Ok(Event::End(element)) if in_item && xml_local_name_eq(element.name().as_ref(), b"rPh") => {
+                phonetic_depth = phonetic_depth.saturating_sub(1);
+            }
+            Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"si") => {
+                strings.push(&current)?;
+                in_item = false;
+                phonetic_depth = 0;
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(error.to_string()),
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if let XlsxSharedStrings::Disk(store) = &mut strings {
+        store.file.flush().map_err(|error| error.to_string())?;
+        store.index.flush().map_err(|error| error.to_string())?;
+    }
+    Ok(strings)
+}
+
 fn xlsx_preview_cell_value(
     cell: &XlsxPreviewRawCell,
     shared_strings: &HashMap<usize, String>,
@@ -1878,75 +2056,198 @@ enum XlsxStreamMessage {
     Done,
 }
 
-struct TrackedXlsxReader {
-    reader: BufReader<File>,
-    bytes_read: Arc<AtomicU64>,
-}
-
-impl IoRead for TrackedXlsxReader {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.reader.read(buffer)?;
-        self.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
-        Ok(read)
+fn xlsx_stream_cell_value(
+    cell: &XlsxPreviewRawCell,
+    shared_strings: &mut XlsxSharedStrings,
+    style_kinds: &[Option<XlsxTemporalKind>],
+    date_1904: bool,
+) -> Result<serde_json::Value, String> {
+    if cell.cell_type.as_deref() != Some("s") {
+        return Ok(xlsx_preview_cell_value(cell, &HashMap::new(), style_kinds, date_1904));
     }
+    let Some(index) = cell.value.parse::<usize>().ok() else {
+        return Ok(serde_json::Value::Null);
+    };
+    Ok(shared_strings.get(index)?.map_or(serde_json::Value::Null, |value| csv_value(&value)))
 }
 
-impl Seek for TrackedXlsxReader {
-    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        self.reader.seek(position)
+struct XlsxStreamRowsState {
+    sender: tokio::sync::mpsc::Sender<Result<XlsxStreamMessage, String>>,
+    row_range: ImportRowRange,
+    dimension: Option<((usize, usize), (usize, usize))>,
+    start_row: Option<usize>,
+    start_column: usize,
+    declared_column_count: Option<usize>,
+    columns: Vec<String>,
+    header_sent: bool,
+    pending_rows: Vec<Vec<serde_json::Value>>,
+    rows_seen: usize,
+    current_row: Option<usize>,
+    current_values: Vec<serde_json::Value>,
+    batch_size: usize,
+}
+
+impl XlsxStreamRowsState {
+    fn new(
+        sender: tokio::sync::mpsc::Sender<Result<XlsxStreamMessage, String>>,
+        row_range: ImportRowRange,
+        dimension: Option<((usize, usize), (usize, usize))>,
+        expected_columns: Option<Vec<String>>,
+        batch_size: usize,
+    ) -> Self {
+        let batch_size = batch_size.max(1);
+        Self {
+            sender,
+            row_range,
+            dimension,
+            start_row: None,
+            start_column: 0,
+            declared_column_count: None,
+            columns: expected_columns.unwrap_or_default(),
+            header_sent: false,
+            pending_rows: Vec::with_capacity(batch_size),
+            rows_seen: 0,
+            current_row: None,
+            current_values: Vec::new(),
+            batch_size,
+        }
     }
-}
 
-struct XlsxTemporalStyleReader<R: BufRead> {
-    reader: XmlReader<R>,
-    style_kinds: Vec<Option<XlsxTemporalKind>>,
-    buffer: Vec<u8>,
-    pending: Option<(Option<(usize, usize)>, Option<XlsxTemporalKind>)>,
-}
-
-impl<R: BufRead> XlsxTemporalStyleReader<R> {
-    fn new(reader: R, style_kinds: Vec<Option<XlsxTemporalKind>>) -> Self {
-        let mut reader = XmlReader::from_reader(reader);
-        reader.config_mut().trim_text(true);
-        Self { reader, style_kinds, buffer: Vec::new(), pending: None }
+    fn initialize_range(&mut self, first_row: usize, first_column: usize) {
+        if self.start_row.is_some() {
+            return;
+        }
+        let expected_column_count = (!self.columns.is_empty()).then_some(self.columns.len());
+        let dimension = self.dimension.filter(|((start_row, start_column), (end_row, end_column))| {
+            let column_count = end_column.saturating_sub(*start_column).saturating_add(1);
+            let row_count = end_row.saturating_sub(*start_row).saturating_add(1);
+            *start_row == first_row
+                && *start_column == first_column
+                && column_count <= MAX_FAST_PREVIEW_CELLS
+                && expected_column_count
+                    .map_or(column_count.saturating_mul(row_count) <= MAX_FAST_PREVIEW_CELLS, |expected| {
+                        expected == column_count
+                    })
+        });
+        self.start_row = Some(first_row);
+        self.start_column = first_column;
+        self.declared_column_count = dimension
+            .map(|((_, start_column), (_, end_column))| end_column.saturating_sub(start_column).saturating_add(1));
     }
 
-    fn next_cell_kind_for(&mut self, value_position: (usize, usize)) -> Result<Option<XlsxTemporalKind>, String> {
-        loop {
-            let Some((position, kind)) = self.next_cell_kind()? else {
-                return Ok(None);
-            };
-            match position {
-                Some(position) if position < value_position => continue,
-                Some(position) if position > value_position => {
-                    self.pending = Some((Some(position), kind));
-                    return Ok(None);
-                }
-                _ => return Ok(kind),
+    fn selected_range_finished(&self, absolute_row: usize) -> bool {
+        let Some(start_row) = self.start_row else {
+            return false;
+        };
+        self.row_range.last_data_row.is_some_and(|last| absolute_row > start_row.saturating_add(last.saturating_sub(1)))
+    }
+
+    fn push_cell(
+        &mut self,
+        absolute_row: usize,
+        absolute_column: usize,
+        value: serde_json::Value,
+        progress: u64,
+    ) -> Result<(), String> {
+        self.initialize_range(absolute_row, absolute_column);
+        if self.current_row != Some(absolute_row) {
+            self.flush_current_row(progress)?;
+            self.current_row = Some(absolute_row);
+        }
+        let column_offset = absolute_column.checked_sub(self.start_column).ok_or_else(|| {
+            format!("Excel row {absolute_row} contains a cell before the detected import range start column")
+        })?;
+        if column_offset >= MAX_FAST_PREVIEW_CELLS {
+            return Err(format!("Excel import column {} exceeds the safety limit", column_offset + 1));
+        }
+        if column_offset >= self.current_values.len() {
+            self.current_values.resize(column_offset + 1, serde_json::Value::Null);
+        }
+        self.current_values[column_offset] = value;
+        Ok(())
+    }
+
+    fn flush_current_row(&mut self, progress: u64) -> Result<(), String> {
+        let Some(absolute_row) = self.current_row.take() else {
+            return Ok(());
+        };
+        let values = std::mem::take(&mut self.current_values);
+        self.flush_row(absolute_row, values, progress)
+    }
+
+    fn flush_row(
+        &mut self,
+        absolute_row: usize,
+        mut values: Vec<serde_json::Value>,
+        progress: u64,
+    ) -> Result<(), String> {
+        let relative_row = absolute_row.saturating_sub(self.start_row.unwrap_or(absolute_row)).saturating_add(1);
+        if self.row_range.title_row == Some(relative_row) {
+            if self.columns.is_empty() {
+                let column_count = self.declared_column_count.unwrap_or(values.len()).max(values.len());
+                values.resize(column_count, serde_json::Value::Null);
+                self.columns = values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| normalize_header(&xlsx_preview_cell_label(value), index))
+                    .collect();
             }
+            return Ok(());
         }
+        if relative_row < self.row_range.data_start_row
+            || self.row_range.last_data_row.is_some_and(|last| relative_row > last)
+        {
+            return Ok(());
+        }
+        if self.columns.is_empty() {
+            let column_count = self.declared_column_count.unwrap_or(values.len()).max(values.len());
+            self.columns = (0..column_count).map(|index| format!("column_{}", index + 1)).collect();
+        }
+        if !self.header_sent {
+            self.sender
+                .blocking_send(Ok(XlsxStreamMessage::Header(self.columns.clone())))
+                .map_err(|_| "Excel import consumer closed before the stream started".to_string())?;
+            self.header_sent = true;
+        }
+        if values.len() > self.columns.len() && values[self.columns.len()..].iter().any(|value| !value.is_null()) {
+            return Err(format!(
+                "Excel row {absolute_row} contains data beyond the {} columns confirmed by the preview",
+                self.columns.len()
+            ));
+        }
+        values.resize(self.columns.len(), serde_json::Value::Null);
+        values.truncate(self.columns.len());
+        self.pending_rows.push(values);
+        self.rows_seen = self.rows_seen.saturating_add(1);
+        if self.pending_rows.len() >= self.batch_size {
+            self.emit_rows(progress)?;
+        }
+        Ok(())
     }
 
-    fn next_cell_kind(&mut self) -> Result<Option<(Option<(usize, usize)>, Option<XlsxTemporalKind>)>, String> {
-        if let Some(pending) = self.pending.take() {
-            return Ok(Some(pending));
+    fn emit_rows(&mut self, progress: u64) -> Result<(), String> {
+        if self.pending_rows.is_empty() {
+            return Ok(());
         }
-        loop {
-            self.buffer.clear();
-            match self.reader.read_event_into(&mut self.buffer) {
-                Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"c") => {
-                    let position = xml_attr_value(&self.reader, &element, b"r")
-                        .and_then(|reference| xlsx_cell_ref_position(&reference));
-                    let kind = xml_attr_value(&self.reader, &element, b"s")
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .and_then(|style_id| self.style_kinds.get(style_id).copied().flatten());
-                    return Ok(Some((position, kind)));
-                }
-                Ok(Event::Eof) => return Ok(None),
-                Err(error) => return Err(error.to_string()),
-                _ => {}
-            }
+        self.sender
+            .blocking_send(Ok(XlsxStreamMessage::Rows(std::mem::take(&mut self.pending_rows))))
+            .map_err(|_| "Excel import consumer closed before the stream finished".to_string())?;
+        self.sender
+            .blocking_send(Ok(XlsxStreamMessage::Progress(progress)))
+            .map_err(|_| "Excel import consumer closed before the stream finished".to_string())?;
+        self.pending_rows = Vec::with_capacity(self.batch_size);
+        Ok(())
+    }
+
+    fn finish(mut self, progress: u64) -> Result<(), String> {
+        self.flush_current_row(progress)?;
+        self.emit_rows(progress)?;
+        if !self.header_sent || self.rows_seen == 0 {
+            return Err("Import file has no data rows in the selected row range".to_string());
         }
+        self.sender
+            .blocking_send(Ok(XlsxStreamMessage::Done))
+            .map_err(|_| "Excel import consumer closed before the stream finished".to_string())
     }
 }
 
@@ -1957,14 +2258,13 @@ fn stream_xlsx_rows_to_channel(
     expected_columns: Option<Vec<String>>,
     sender: tokio::sync::mpsc::Sender<Result<XlsxStreamMessage, String>>,
 ) -> Result<(), String> {
-    let bytes_read = Arc::new(AtomicU64::new(0));
-    let reader = TrackedXlsxReader {
-        reader: BufReader::new(File::open(path).map_err(|error| error.to_string())?),
-        bytes_read: bytes_read.clone(),
-    };
-    let mut workbook = <Xlsx<TrackedXlsxReader> as CalamineReader<TrackedXlsxReader>>::new(reader)
+    let total_bytes = std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or_default();
+    let mut zip = zip::ZipArchive::new(File::open(path).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
-    let sheet_names = workbook.sheet_names().to_vec();
+    let workbook_xml = read_xlsx_zip_text(&mut zip, "xl/workbook.xml")?;
+    let rels_xml = read_xlsx_zip_text(&mut zip, "xl/_rels/workbook.xml.rels").unwrap_or_default();
+    let sheet_refs = xlsx_workbook_sheet_refs(&workbook_xml);
+    let sheet_names = sheet_refs.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
     let sheet_name = if let Some(name) = options.sheet_name.as_ref().filter(|name| !name.trim().is_empty()) {
         if !sheet_names.iter().any(|sheet| sheet == name) {
             return Err(format!("Workbook sheet not found: {name}"));
@@ -1975,148 +2275,106 @@ fn stream_xlsx_rows_to_channel(
     } else {
         sheet_names.first().cloned().ok_or_else(|| "Workbook has no sheets".to_string())?
     };
-    let mut temporal_zip = zip::ZipArchive::new(File::open(path).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())?;
-    let styles_xml = read_xlsx_zip_text(&mut temporal_zip, "xl/styles.xml").unwrap_or_default();
+    let styles_xml = read_xlsx_zip_text(&mut zip, "xl/styles.xml").unwrap_or_default();
     let style_kinds = parse_xlsx_style_temporal_kinds(&styles_xml);
-    let workbook_xml = read_xlsx_zip_text(&mut temporal_zip, "xl/workbook.xml")?;
-    let rels_xml = read_xlsx_zip_text(&mut temporal_zip, "xl/_rels/workbook.xml.rels").unwrap_or_default();
+    let date_1904 = xlsx_workbook_uses_1904_date_system(&workbook_xml);
     let sheet_path = xlsx_sheet_path_for_name(&workbook_xml, &rels_xml, &sheet_name)
         .ok_or_else(|| format!("Workbook sheet not found: {sheet_name}"))?;
-    let temporal_sheet = temporal_zip.by_name(&sheet_path).map_err(|error| error.to_string())?;
-    let mut temporal_styles = XlsxTemporalStyleReader::new(BufReader::new(temporal_sheet), style_kinds);
+    let mut shared_strings = open_xlsx_shared_strings(&mut zip, MAX_IN_MEMORY_XLSX_SHARED_STRINGS_BYTES)?;
     let row_range = effective_import_row_range(options)?;
-    let mut reader = workbook.worksheet_cells_reader(&sheet_name).map_err(|error| error.to_string())?;
-    let dimensions = reader.dimensions();
-    let first_cell = reader
-        .next_cell()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Import file has no data rows in the selected row range".to_string())?;
-    let (first_row, first_column) = first_cell.get_position();
-    let dimension_column_count = dimensions.end.1.saturating_sub(dimensions.start.1).saturating_add(1) as usize;
-    let expected_column_count = expected_columns.as_ref().map(Vec::len).filter(|count| *count > 0);
-    let dimension_row_count = dimensions.end.0.saturating_sub(dimensions.start.0).saturating_add(1) as usize;
-    let dimension_grid_is_bounded =
-        dimension_column_count.saturating_mul(dimension_row_count) <= MAX_FAST_PREVIEW_CELLS;
-    let use_dimensions = dimensions.start.0 == first_row
-        && dimensions.contains(first_row, first_column)
-        && dimension_column_count <= MAX_FAST_PREVIEW_CELLS
-        && expected_column_count.map_or(dimension_grid_is_bounded, |expected| expected == dimension_column_count);
-    let (start_row, start_column, declared_column_count) = if use_dimensions {
-        (dimensions.start.0 as usize, dimensions.start.1 as usize, Some(dimension_column_count))
-    } else {
-        (first_row as usize, first_column as usize, None)
-    };
-    let batch_size = batch_size.max(1);
-    let mut columns = expected_columns.unwrap_or_default();
-    let mut header_sent = false;
-    let mut pending_rows = Vec::with_capacity(batch_size);
-    let mut rows_seen = 0usize;
-    let mut current_row = None;
-    let mut current_values = Vec::new();
-    let mut flush_row = |absolute_row: usize, mut values: Vec<serde_json::Value>| -> Result<(), String> {
-        let relative_row = absolute_row.saturating_sub(start_row).saturating_add(1);
-        if row_range.title_row == Some(relative_row) {
-            if columns.is_empty() {
-                let column_count = declared_column_count.unwrap_or(values.len()).max(values.len());
-                values.resize(column_count, serde_json::Value::Null);
-                columns = values
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| normalize_header(&xlsx_preview_cell_label(value), index))
-                    .collect();
-            }
-            return Ok(());
-        }
-        if relative_row < row_range.data_start_row || row_range.last_data_row.is_some_and(|last| relative_row > last) {
-            return Ok(());
-        }
-        if columns.is_empty() {
-            let column_count = declared_column_count.unwrap_or(values.len()).max(values.len());
-            columns = (0..column_count).map(|index| format!("column_{}", index + 1)).collect();
-        }
-        if !header_sent {
-            sender
-                .blocking_send(Ok(XlsxStreamMessage::Header(columns.clone())))
-                .map_err(|_| "Excel import consumer closed before the stream started".to_string())?;
-            header_sent = true;
-        }
-        if values.len() > columns.len() && values[columns.len()..].iter().any(|value| !value.is_null()) {
-            return Err(format!(
-                "Excel row {} contains data beyond the {} columns confirmed by the preview",
-                absolute_row + 1,
-                columns.len()
-            ));
-        }
-        values.resize(columns.len(), serde_json::Value::Null);
-        values.truncate(columns.len());
-        pending_rows.push(values);
-        rows_seen = rows_seen.saturating_add(1);
-        if pending_rows.len() >= batch_size {
-            sender
-                .blocking_send(Ok(XlsxStreamMessage::Rows(std::mem::take(&mut pending_rows))))
-                .map_err(|_| "Excel import consumer closed before the stream finished".to_string())?;
-            sender
-                .blocking_send(Ok(XlsxStreamMessage::Progress(bytes_read.load(Ordering::Relaxed))))
-                .map_err(|_| "Excel import consumer closed before the stream finished".to_string())?;
-            pending_rows = Vec::with_capacity(batch_size);
-        }
-        Ok(())
-    };
-
-    let mut next_cell = Some(first_cell);
+    let sheet = zip.by_name(&sheet_path).map_err(|error| error.to_string())?;
+    let uncompressed_sheet_bytes = sheet.size().max(1);
+    let mut reader = XmlReader::from_reader(BufReader::new(sheet));
+    reader.config_mut().trim_text(false);
+    let mut rows = XlsxStreamRowsState::new(sender, row_range, None, expected_columns, batch_size);
+    let mut buffer = Vec::new();
+    let mut current_row = 0usize;
+    let mut current_column = 0usize;
+    let mut current_position = None;
+    let mut current_cell = XlsxPreviewRawCell::default();
+    let mut in_value = false;
+    let mut in_inline_text = false;
+    let mut inline_phonetic_depth = 0usize;
     loop {
-        let cell = if let Some(cell) = next_cell.take() {
-            cell
-        } else {
-            let Some(cell) = reader.next_cell().map_err(|error| error.to_string())? else {
-                break;
-            };
-            cell
-        };
-        let (row, column) = cell.get_position();
-        let absolute_row = row as usize;
-        if row_range.last_data_row.is_some_and(|last| absolute_row > start_row.saturating_add(last.saturating_sub(1))) {
-            break;
-        }
-        let cell_position = (absolute_row + 1, column as usize + 1);
-        let temporal_kind = temporal_styles.next_cell_kind_for(cell_position)?;
-        if current_row != Some(absolute_row) {
-            if let Some(previous_row) = current_row {
-                flush_row(previous_row, std::mem::take(&mut current_values))?;
+        let progress = reader
+            .buffer_position()
+            .saturating_mul(total_bytes)
+            .checked_div(uncompressed_sheet_bytes)
+            .unwrap_or_default()
+            .min(total_bytes);
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if xml_local_name_eq(element.name().as_ref(), b"dimension") =>
+            {
+                rows.dimension = xml_attr_value(&reader, &element, b"ref").as_deref().and_then(xlsx_dimension_bounds);
             }
-            current_row = Some(absolute_row);
-            current_values.clear();
+            Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"row") => {
+                current_row = xml_attr_value(&reader, &element, b"r")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|row| *row > 0)
+                    .unwrap_or_else(|| current_row.saturating_add(1).max(1));
+                current_column = 0;
+                if rows.selected_range_finished(current_row) {
+                    break;
+                }
+            }
+            Ok(Event::Empty(element)) if xml_local_name_eq(element.name().as_ref(), b"c") => {
+                let position = xml_attr_value(&reader, &element, b"r")
+                    .as_deref()
+                    .and_then(xlsx_cell_ref_position)
+                    .unwrap_or_else(|| (current_row.max(1), current_column.saturating_add(1).max(1)));
+                current_row = position.0;
+                current_column = position.1;
+                rows.push_cell(position.0, position.1, serde_json::Value::Null, progress)?;
+            }
+            Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"c") => {
+                let position = xml_attr_value(&reader, &element, b"r")
+                    .as_deref()
+                    .and_then(xlsx_cell_ref_position)
+                    .unwrap_or_else(|| (current_row.max(1), current_column.saturating_add(1).max(1)));
+                current_row = position.0;
+                current_column = position.1;
+                current_position = Some(position);
+                current_cell = XlsxPreviewRawCell {
+                    cell_type: xml_attr_value(&reader, &element, b"t"),
+                    style_id: xml_attr_value(&reader, &element, b"s").and_then(|value| value.parse::<usize>().ok()),
+                    ..XlsxPreviewRawCell::default()
+                };
+            }
+            Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"v") => in_value = true,
+            Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => {
+                in_inline_text = inline_phonetic_depth == 0;
+            }
+            Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"rPh") => {
+                inline_phonetic_depth = inline_phonetic_depth.saturating_add(1);
+            }
+            Ok(Event::Text(text)) if in_value => {
+                current_cell.value.push_str(&text.unescape().map_err(|error| error.to_string())?);
+            }
+            Ok(Event::Text(text)) if in_inline_text => {
+                current_cell.inline_value.push_str(&text.unescape().map_err(|error| error.to_string())?);
+            }
+            Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"v") => in_value = false,
+            Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => in_inline_text = false,
+            Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"rPh") => {
+                inline_phonetic_depth = inline_phonetic_depth.saturating_sub(1);
+            }
+            Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"c") => {
+                if let Some((row, column)) = current_position.take() {
+                    let value = xlsx_stream_cell_value(&current_cell, &mut shared_strings, &style_kinds, date_1904)?;
+                    rows.push_cell(row, column, value, progress)?;
+                    current_cell = XlsxPreviewRawCell::default();
+                }
+                inline_phonetic_depth = 0;
+                in_inline_text = false;
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(error.to_string()),
+            _ => {}
         }
-        let column_offset = (column as usize).checked_sub(start_column).ok_or_else(|| {
-            format!("Excel row {} contains a cell before the detected import range start column", absolute_row + 1)
-        })?;
-        if column_offset >= MAX_FAST_PREVIEW_CELLS {
-            return Err(format!("Excel import column {} exceeds the safety limit", column_offset + 1));
-        }
-        if column_offset >= current_values.len() {
-            current_values.resize(column_offset + 1, serde_json::Value::Null);
-        }
-        current_values[column_offset] = xlsx_cell_ref_value_with_temporal_kind(cell.get_value(), temporal_kind);
+        buffer.clear();
     }
-    if let Some(previous_row) = current_row {
-        flush_row(previous_row, current_values)?;
-    }
-    if !pending_rows.is_empty() {
-        sender
-            .blocking_send(Ok(XlsxStreamMessage::Rows(pending_rows)))
-            .map_err(|_| "Excel import consumer closed before the stream finished".to_string())?;
-    }
-    sender
-        .blocking_send(Ok(XlsxStreamMessage::Progress(bytes_read.load(Ordering::Relaxed))))
-        .map_err(|_| "Excel import consumer closed before the stream finished".to_string())?;
-    if !header_sent || rows_seen == 0 {
-        return Err("Import file has no data rows in the selected row range".to_string());
-    }
-    sender
-        .blocking_send(Ok(XlsxStreamMessage::Done))
-        .map_err(|_| "Excel import consumer closed before the stream finished".to_string())?;
-    Ok(())
+    rows.finish(total_bytes)
 }
 
 fn parse_xlsx_range<T, Label, Value>(
@@ -2416,6 +2674,32 @@ fn build_import_insert_batch_with_plan(
     Ok((!sql.trim().is_empty()).then_some(ImportSqlBatch { sql, row_count: rows.len() }))
 }
 
+fn build_import_insert_batches_with_plan(
+    rows: &[Vec<serde_json::Value>],
+    plan: &CompiledImportPlan,
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    date_time_format: Option<&str>,
+) -> Vec<ImportSqlBatch> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mapped_rows = map_import_rows_with_plan(rows, plan, db_type, date_time_format);
+    generate_insert_typed_sql_batches(
+        &plan.target_columns,
+        &plan.column_types,
+        &mapped_rows,
+        table,
+        schema,
+        db_type,
+        rows.len(),
+    )
+    .into_iter()
+    .map(|(sql, row_count)| ImportSqlBatch { sql, row_count })
+    .collect()
+}
+
 fn map_import_rows_with_plan(
     rows: &[Vec<serde_json::Value>],
     plan: &CompiledImportPlan,
@@ -2442,7 +2726,7 @@ fn map_import_rows_with_plan(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_import_execution_batch(
+fn build_import_execution_batches(
     rows: &[Vec<serde_json::Value>],
     plan: Option<&CompiledImportPlan>,
     columns: &[String],
@@ -2452,25 +2736,33 @@ fn build_import_execution_batch(
     schema: &str,
     db_type: &DatabaseType,
     date_time_format: Option<&str>,
-) -> Result<Option<ImportSqlBatch>, String> {
+) -> Result<Vec<ImportSqlBatch>, String> {
     if let Some(plan) = plan {
-        build_import_insert_batch_with_plan(rows, plan, table, schema, db_type, date_time_format)
-    } else {
-        build_import_insert_batch_from_rows_with_format(
+        return Ok(build_import_insert_batches_with_plan(rows, plan, table, schema, db_type, date_time_format));
+    }
+    if *db_type == DatabaseType::CloudflareD1 {
+        return crate::db::cloudflare_d1::build_import_insert_batches(
             rows,
             columns,
             mappings,
             target_column_types,
             table,
             schema,
-            db_type,
-            date_time_format,
-        )
+            rows.len().max(1),
+        );
     }
+    let plan = compile_import_plan(columns, mappings, target_column_types)?;
+    Ok(build_import_insert_batches_with_plan(rows, &plan, table, schema, db_type, date_time_format))
 }
 
-fn supports_multi_row_insert_values(db_type: &DatabaseType) -> bool {
-    !matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Iris)
+fn effective_import_batch_size(db_type: &DatabaseType, requested: usize) -> usize {
+    let max_rows = match db_type {
+        DatabaseType::Oracle => MAX_ORACLE_IMPORT_BATCH_ROWS,
+        DatabaseType::OceanbaseOracle | DatabaseType::Iris => 1,
+        DatabaseType::CloudflareD1 => 100,
+        _ => usize::MAX,
+    };
+    requested.max(1).min(max_rows)
 }
 
 fn normalize_import_temporal_value(
@@ -2528,50 +2820,15 @@ fn build_import_insert_batches_with_format(
             target_column_types,
             table,
             schema,
-            batch_size.clamp(1, 100),
+            effective_import_batch_size(db_type, batch_size),
         );
     }
-    let mapped = mapping_indexes(data, mappings)?;
-    let columns = mapped.iter().map(|(_, target)| target.clone()).collect::<Vec<_>>();
-    let column_types = columns
-        .iter()
-        .map(|column| {
-            target_column_types
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(column))
-                .map(|(_, data_type)| data_type.clone())
-        })
-        .collect::<Vec<_>>();
-    // Drivers without multi-row VALUES support still benefit from the agent
-    // batching the generated single-row statements during execution.
-    let batch_size = if supports_multi_row_insert_values(db_type) { batch_size.max(1) } else { 1 };
+    let plan = compile_import_plan(&data.columns, mappings, target_column_types)?;
+    let batch_size = effective_import_batch_size(db_type, batch_size);
     let mut batches = Vec::new();
-
-    for chunk in data.rows.chunks(batch_size) {
-        let rows = chunk
-            .iter()
-            .map(|row| {
-                mapped
-                    .iter()
-                    .enumerate()
-                    .map(|(target_index, (source_index, _))| {
-                        let value = row.get(*source_index).cloned().unwrap_or(serde_json::Value::Null);
-                        normalize_import_temporal_value(
-                            &value,
-                            column_types.get(target_index).and_then(|data_type| data_type.as_deref()),
-                            db_type,
-                            date_time_format,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let sql = generate_insert_typed(&columns, &column_types, &rows, table, schema, db_type);
-        if !sql.trim().is_empty() {
-            batches.push(ImportSqlBatch { sql, row_count: chunk.len() });
-        }
+    for rows in data.rows.chunks(batch_size) {
+        batches.extend(build_import_insert_batches_with_plan(rows, &plan, table, schema, db_type, date_time_format));
     }
-
     Ok(batches)
 }
 
@@ -3059,6 +3316,18 @@ async fn postgres_copy_fast_path_eligible(state: &AppState, pool_key: &str, tabl
     }
 }
 
+#[derive(Debug)]
+struct ImportRowsBatchError {
+    rows_imported: usize,
+    message: String,
+}
+
+impl ImportRowsBatchError {
+    fn before_write(message: impl Into<String>) -> Self {
+        Self { rows_imported: 0, message: message.into() }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_import_rows_batch(
     state: &AppState,
@@ -3075,7 +3344,7 @@ async fn execute_import_rows_batch(
     date_time_format: Option<&str>,
     db_write_ms: &mut u128,
     statement_count: &mut usize,
-) -> Result<usize, String> {
+) -> Result<usize, ImportRowsBatchError> {
     if allow_postgres_copy
         && *db_type == DatabaseType::Postgres
         && !rows
@@ -3085,15 +3354,16 @@ async fn execute_import_rows_batch(
     {
         if let Some(plan) = plan {
             if plan.column_types.iter().all(|data_type| postgres_copy_compatible_column_type(data_type.as_deref())) {
-                let (copy_sql, copy_data) =
-                    build_postgres_copy_text_batch(rows, plan, table, schema, date_time_format)?;
+                let (copy_sql, copy_data) = build_postgres_copy_text_batch(rows, plan, table, schema, date_time_format)
+                    .map_err(ImportRowsBatchError::before_write)?;
                 execute_postgres_copy_batch(state, pool_key, &copy_sql, &copy_data, db_write_ms, statement_count)
-                    .await?;
+                    .await
+                    .map_err(ImportRowsBatchError::before_write)?;
                 return Ok(rows.len());
             }
         }
     }
-    let Some(batch) = build_import_execution_batch(
+    let batches = build_import_execution_batches(
         rows,
         plan,
         columns,
@@ -3103,12 +3373,16 @@ async fn execute_import_rows_batch(
         schema,
         db_type,
         date_time_format,
-    )?
-    else {
-        return Ok(0);
-    };
-    execute_import_statement(state, pool_key, &batch.sql, db_write_ms, statement_count).await?;
-    Ok(batch.row_count)
+    )
+    .map_err(ImportRowsBatchError::before_write)?;
+    let mut rows_imported = 0usize;
+    for batch in batches {
+        if let Err(error) = execute_import_statement(state, pool_key, &batch.sql, db_write_ms, statement_count).await {
+            return Err(ImportRowsBatchError { rows_imported, message: error });
+        }
+        rows_imported = rows_imported.saturating_add(batch.row_count);
+    }
+    Ok(rows_imported)
 }
 
 fn log_import_metrics(
@@ -3392,6 +3666,7 @@ where
     let prepared_source_total_exact =
         prepared_source.is_some() && request.prepared_source.as_ref().is_some_and(|prepared| prepared.total_rows_exact);
 
+    // Validate the entire text source before writing so a malformed tail cannot leave partial batches behind.
     let validated_text_encoding = if source_format.is_delimited() {
         let total_bytes = tokio::fs::metadata(&request.file_path).await.map(|metadata| metadata.len()).unwrap_or(0);
         progress_callback(import_progress_with_details(
@@ -3580,11 +3855,7 @@ where
             started_at,
             None,
         ));
-        let effective_batch_size = match db_type {
-            DatabaseType::Oracle | DatabaseType::OceanbaseOracle => 1,
-            DatabaseType::CloudflareD1 => batch_size.clamp(1, 100),
-            _ => batch_size.max(1),
-        };
+        let effective_batch_size = effective_import_batch_size(db_type, batch_size);
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<DelimitedStreamMessage, String>>(2);
         let path = request.file_path.clone();
         let producer_options = streaming_options.clone();
@@ -3710,13 +3981,14 @@ where
                         Err(error) => {
                             drop(receiver);
                             let _ = producer.await;
+                            rows_imported = rows_imported.saturating_add(error.rows_imported);
                             return Err(emit_import_error(
                                 &mut progress_callback,
                                 request,
                                 rows_imported,
                                 total_rows,
                                 started_at,
-                                error,
+                                error.message,
                             ));
                         }
                     };
@@ -3814,13 +4086,7 @@ where
             started_at,
             None,
         ));
-        let effective_batch_size = if *db_type == DatabaseType::CloudflareD1 {
-            batch_size.clamp(1, 100)
-        } else if supports_multi_row_insert_values(db_type) {
-            batch_size.max(1)
-        } else {
-            1
-        };
+        let effective_batch_size = effective_import_batch_size(db_type, batch_size);
         let expected_columns = if let Some(source) = create_table_sample.as_ref().or(prepared_source.as_ref()) {
             Some(source.columns.clone())
         } else {
@@ -3971,13 +4237,14 @@ where
                         Err(error) => {
                             drop(receiver);
                             let _ = producer.await;
+                            rows_imported = rows_imported.saturating_add(error.rows_imported);
                             return Err(emit_import_error(
                                 &mut progress_callback,
                                 request,
                                 rows_imported,
                                 0,
                                 started_at,
-                                error,
+                                error.message,
                             ));
                         }
                     };
@@ -4118,13 +4385,7 @@ where
         target_column_types = created_column_types.clone().unwrap_or_default();
     }
 
-    let effective_batch_size = if *db_type == DatabaseType::CloudflareD1 {
-        batch_size.clamp(1, 100)
-    } else if supports_multi_row_insert_values(db_type) {
-        batch_size.max(1)
-    } else {
-        1
-    };
+    let effective_batch_size = effective_import_batch_size(db_type, batch_size);
     let compiled_plan = if *db_type == DatabaseType::CloudflareD1 {
         None
     } else {
@@ -4181,13 +4442,14 @@ where
         {
             Ok(row_count) => row_count,
             Err(error) => {
+                rows_imported = (rows_imported + error.rows_imported).min(total_rows);
                 return Err(emit_import_error(
                     &mut progress_callback,
                     request,
                     rows_imported,
                     total_rows,
                     started_at,
-                    error,
+                    error.message,
                 ));
             }
         };
@@ -4945,6 +5207,37 @@ mod tests {
     }
 
     #[test]
+    fn xlsx_shared_strings_use_disk_index_above_memory_limit() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-shared-index-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A2"/>
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row><row r="2"><c r="A2" t="s"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let shared_strings_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2" uniqueCount="2">
+  <si><t>name</t></si><si><r><t>Ada</t></r><rPh sb="0" eb="3"><t>ignored</t></rPh></si>
+</sst>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, Some(shared_strings_xml))).unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+
+        let mut strings = open_xlsx_shared_strings(&mut zip, 0).unwrap();
+        let (disk_path, index_path) = strings.disk_paths().expect("disk-backed shared strings");
+        let disk_path = disk_path.to_path_buf();
+        let index_path = index_path.to_path_buf();
+
+        assert!(disk_path.exists());
+        assert!(index_path.exists());
+        assert_eq!(strings.get(0).unwrap().as_deref(), Some("name"));
+        assert_eq!(strings.get(1).unwrap().as_deref(), Some("Ada"));
+        drop(strings);
+        assert!(!disk_path.exists());
+        assert!(!index_path.exists());
+        drop(zip);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn streaming_excel_rows_avoid_materializing_the_full_range() {
         let path = std::env::temp_dir().join(format!("dbx-table-import-stream-{}.xlsx", uuid::Uuid::new_v4()));
         let workbook = build_xlsx_workbook_multi(&[XlsxWorksheetData {
@@ -5009,6 +5302,52 @@ mod tests {
         assert_eq!(
             streamed_rows,
             vec![vec![serde_json::json!("2025-12-05"), serde_json::json!("2025-12-05 00:00:00")]]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streaming_excel_rows_preserve_custom_title_and_data_range() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-stream-range-{}.xlsx", uuid::Uuid::new_v4()));
+        let workbook = build_xlsx_workbook_multi(&[XlsxWorksheetData {
+            sheet_name: Some("Rows".to_string()),
+            columns: vec!["report".to_string(), "ignored".to_string()],
+            column_types: vec![],
+            rows: vec![
+                vec![serde_json::json!("id"), serde_json::json!("name")],
+                vec![serde_json::json!(1), serde_json::json!("Ada")],
+                vec![serde_json::json!(2), serde_json::json!("Grace")],
+                vec![serde_json::json!("summary"), serde_json::json!(2)],
+            ],
+        }])
+        .unwrap();
+        std::fs::write(&path, workbook).unwrap();
+        let options = TableImportParseOptions {
+            title_row: Some(2),
+            data_start_row: Some(3),
+            last_data_row: Some(4),
+            ..TableImportParseOptions::default()
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+
+        stream_xlsx_rows_to_channel(&path.to_string_lossy(), &options, 500, None, sender).unwrap();
+
+        let mut columns = Vec::new();
+        let mut streamed_rows = Vec::new();
+        while let Some(message) = receiver.blocking_recv() {
+            match message.unwrap() {
+                XlsxStreamMessage::Header(header) => columns = header,
+                XlsxStreamMessage::Rows(rows) => streamed_rows.extend(rows),
+                _ => {}
+            }
+        }
+        assert_eq!(columns, vec!["id", "name"]);
+        assert_eq!(
+            streamed_rows,
+            vec![
+                vec![serde_json::json!(1.0), serde_json::json!("Ada")],
+                vec![serde_json::json!(2.0), serde_json::json!("Grace")],
+            ]
         );
         let _ = std::fs::remove_file(path);
     }
@@ -5522,12 +5861,13 @@ mod tests {
     }
 
     #[test]
-    fn multi_row_insert_values_support_matches_database_dialects() {
-        assert!(!supports_multi_row_insert_values(&DatabaseType::Oracle));
-        assert!(!supports_multi_row_insert_values(&DatabaseType::OceanbaseOracle));
-        assert!(!supports_multi_row_insert_values(&DatabaseType::Iris));
-        assert!(supports_multi_row_insert_values(&DatabaseType::Postgres));
-        assert!(supports_multi_row_insert_values(&DatabaseType::Mysql));
+    fn import_batch_row_limits_match_database_dialects() {
+        assert_eq!(effective_import_batch_size(&DatabaseType::Oracle, 1000), 500);
+        assert_eq!(effective_import_batch_size(&DatabaseType::OceanbaseOracle, 1000), 1);
+        assert_eq!(effective_import_batch_size(&DatabaseType::Iris, 1000), 1);
+        assert_eq!(effective_import_batch_size(&DatabaseType::CloudflareD1, 1000), 100);
+        assert_eq!(effective_import_batch_size(&DatabaseType::Postgres, 1000), 1000);
+        assert_eq!(effective_import_batch_size(&DatabaseType::Mysql, 1000), 1000);
     }
 
     #[test]
@@ -5633,7 +5973,7 @@ mod tests {
     }
 
     #[test]
-    fn oracle_import_insert_batches_use_single_row_statements() {
+    fn oracle_import_insert_batches_use_insert_all() {
         let mappings = vec![
             TableImportColumnMapping {
                 source_column: "id".to_string(),
@@ -5660,23 +6000,33 @@ mod tests {
         let batches =
             build_import_insert_batches(&data, &mappings, &[], "users", "HR", &DatabaseType::Oracle, 500).unwrap();
 
-        assert_eq!(
-            batches,
-            vec![
-                ImportSqlBatch {
-                    sql: "INSERT INTO \"HR\".\"users\" (\"id\", \"name\") VALUES\n(1, 'Ada')".to_string(),
-                    row_count: 1,
-                },
-                ImportSqlBatch {
-                    sql: "INSERT INTO \"HR\".\"users\" (\"id\", \"name\") VALUES\n(2, 'Grace')".to_string(),
-                    row_count: 1,
-                },
-                ImportSqlBatch {
-                    sql: "INSERT INTO \"HR\".\"users\" (\"id\", \"name\") VALUES\n(3, NULL)".to_string(),
-                    row_count: 1,
-                },
-            ]
-        );
+        assert_eq!(batches, vec![ImportSqlBatch {
+            sql: "INSERT ALL\nINTO \"HR\".\"users\" (\"id\", \"name\") VALUES (1, 'Ada')\nINTO \"HR\".\"users\" (\"id\", \"name\") VALUES (2, 'Grace')\nINTO \"HR\".\"users\" (\"id\", \"name\") VALUES (3, NULL)\nSELECT 1 FROM dual".to_string(),
+            row_count: 3,
+        }]);
+    }
+
+    #[test]
+    fn import_insert_batches_split_long_rows_by_sql_size() {
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "payload".to_string(),
+            target_column: "payload".to_string(),
+            target_data_type: None,
+        }];
+        let data = ParsedImportFile {
+            columns: vec!["payload".to_string()],
+            rows: (0..4).map(|index| vec![serde_json::json!(format!("{index}{}", "x".repeat(180 * 1024)))]).collect(),
+            total_rows: 4,
+            effective_encoding: None,
+        };
+
+        let batches =
+            build_import_insert_batches(&data, &mappings, &[], "events", "public", &DatabaseType::Postgres, 500)
+                .unwrap();
+
+        assert!(batches.len() > 1);
+        assert_eq!(batches.iter().map(|batch| batch.row_count).sum::<usize>(), 4);
+        assert!(batches.iter().all(|batch| batch.sql.len() <= 512 * 1024));
     }
 
     #[test]
