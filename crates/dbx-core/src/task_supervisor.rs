@@ -44,6 +44,8 @@ impl TaskSupervisor {
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        // One-shot cleanup tasks are keyed so duplicate requests do not accumulate, and
+        // completed handles remove themselves from the supervisor.
         let key = key.into();
         let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
         if !self.accepting.load(Ordering::Acquire) || tasks.contains_key(&key) {
@@ -51,6 +53,7 @@ impl TaskSupervisor {
         }
         let cleanup = self.clone();
         let task_key = key.clone();
+        // Do not let a very short task finish before its handle is registered in the map.
         let (start, started) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             if started.await.is_err() {

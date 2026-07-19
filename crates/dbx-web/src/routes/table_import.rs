@@ -59,6 +59,8 @@ fn send_import_progress(tx: &tokio::sync::watch::Sender<String>, progress: &Tabl
 }
 
 fn schedule_import_progress_cleanup(state: Arc<WebState>, import_id: String) {
+    // Keep the terminal snapshot briefly so an SSE client that connects after completion can
+    // still observe the result, then release the channel and its captured state.
     tokio::spawn(async move {
         tokio::time::sleep(TABLE_IMPORT_PROGRESS_TTL).await;
         state.table_import_channels.write().await.remove(&import_id);
@@ -287,6 +289,8 @@ pub async fn execute_import(
 
     let initial_progress = serde_json::to_string(&initial_import_progress(&import_id, started_at))
         .map_err(|error| AppError(error.to_string()))?;
+    // Unlike broadcast, watch retains the latest progress and cannot drop the terminal update
+    // when the browser subscribes slightly after the import starts.
     let (tx, _) = tokio::sync::watch::channel(initial_progress);
     state.table_import_channels.write().await.insert(import_id.clone(), tx.clone());
 

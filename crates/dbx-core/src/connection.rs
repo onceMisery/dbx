@@ -2136,6 +2136,8 @@ impl AppState {
         Ok(true)
     }
 
+    /// Removes a session-scoped pool immediately and schedules the potentially slow driver
+    /// shutdown on the supervised background task set.
     pub async fn detach_client_session_pool(
         &self,
         connection_id: &str,
@@ -3193,6 +3195,8 @@ fn close_removed_pools_in_background(supervisor: &TaskSupervisor, removed: Vec<(
     if removed.is_empty() {
         return;
     }
+    // Supervision keeps detached cleanup visible to application shutdown instead of leaving an
+    // untracked Tokio task that may be abandoned silently.
     let pool_count = removed.len();
     let task_key = format!("pool-close:{}", uuid::Uuid::new_v4());
     if !supervisor.spawn_once(task_key, move |_| async move {

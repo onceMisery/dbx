@@ -17,6 +17,8 @@ pub fn sse_from_channel(
 pub fn sse_from_watch(
     mut rx: watch::Receiver<String>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    // A watch channel stores the latest state, so late subscribers immediately receive the
+    // current progress, including a terminal result, instead of waiting for a new event.
     let stream = async_stream::stream! {
         let initial = rx.borrow().clone();
         if !initial.is_empty() {

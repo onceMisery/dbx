@@ -2109,6 +2109,8 @@ pub(crate) fn generate_insert_typed_sql_batches(
     let mut statements = Vec::new();
     let mut start = 0;
 
+    // First honor the row limit, then use binary search to find the largest statement that
+    // also fits the backend byte limit. This avoids generating every intermediate size.
     while start < rows.len() {
         let max_end = start.saturating_add(max_rows).min(rows.len());
         let mut end = max_end;

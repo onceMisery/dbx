@@ -27,11 +27,14 @@ pub const CREATE_TABLE_INFERENCE_ROWS: usize = 100;
 pub const MAX_NON_STREAMING_IMPORT_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_LEGACY_XLS_IMPORT_BYTES: u64 = 50 * 1024 * 1024;
 const IMPORT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+// Keep preview parsing bounded even when an XLSX dimension declares a huge sparse range.
 const MAX_FAST_PREVIEW_CELLS: usize = 100_000;
+// Shared strings stay in memory for small workbooks and spill to an indexed temp file for large ones.
 const MAX_IN_MEMORY_XLSX_SHARED_STRINGS_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_XLSX_SHARED_STRINGS_BYTES: u64 = 1024 * 1024 * 1024;
 const XLSX_SHARED_STRING_CACHE_ENTRIES: usize = 4096;
 const XLSX_SHARED_STRING_CACHE_BYTES: usize = 8 * 1024 * 1024;
+// INSERT ALL has a practical statement-size limit on Oracle, even when the requested batch is larger.
 const MAX_ORACLE_IMPORT_BATCH_ROWS: usize = 500;
 
 pub fn table_import_client_session_id(import_id: &str) -> String {
@@ -463,6 +466,7 @@ pub fn csv_value(value: &str) -> serde_json::Value {
 
 const IMPORT_ENCODING_READ_CHUNK_BYTES: usize = 16 * 1024;
 
+// Decodes incrementally and rejects malformed input instead of silently inserting replacement characters.
 struct StrictTranscodingReader<R> {
     reader: R,
     decoder: encoding_rs::Decoder,
@@ -703,6 +707,7 @@ fn auto_detect_text_encoding_from_file_with_progress(
     }
 
     file.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+    // Validate both candidates incrementally so auto-detection does not load the file into memory.
     let mut utf8 = EncodingValidationState::new(encoding_rs::UTF_8);
     let mut gbk = EncodingValidationState::new(encoding_rs::GBK);
     let mut bytes_read = 0u64;
@@ -1605,6 +1610,8 @@ impl XlsxSharedStrings {
                 let mut bytes = vec![0; len as usize];
                 store.file.read_exact(&mut bytes).map_err(|error| error.to_string())?;
                 let value = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+                // This cache is opportunistic; clearing it wholesale keeps lookup simple while
+                // enforcing both the entry-count and byte-size bounds.
                 if store.cache.len() >= XLSX_SHARED_STRING_CACHE_ENTRIES
                     || store.cache_bytes.saturating_add(value.len()) > XLSX_SHARED_STRING_CACHE_BYTES
                 {
@@ -1640,6 +1647,8 @@ fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) 
             "Excel shared strings are too large: {uncompressed_size} bytes (max {MAX_XLSX_SHARED_STRINGS_BYTES} bytes)"
         ));
     }
+    // A fixed-width offset/length index lets cell parsing seek individual strings without
+    // retaining the entire sharedStrings.xml payload in RAM.
     let mut strings = if uncompressed_size <= memory_limit {
         XlsxSharedStrings::Memory(Vec::new())
     } else {
@@ -1767,6 +1776,8 @@ fn parse_xlsx_preview_file_with_options(
     options: &TableImportParseOptions,
     preview_limit: usize,
 ) -> Result<(ParsedImportFile, Vec<String>), String> {
+    // Read worksheet XML directly so preview can stop after the requested rows instead of
+    // materializing the workbook's complete cell range.
     let file = File::open(path).map_err(|error| error.to_string())?;
     let mut zip = zip::ZipArchive::new(file).map_err(|error| error.to_string())?;
     let workbook_xml = read_xlsx_zip_text(&mut zip, "xl/workbook.xml")?;
@@ -2258,6 +2269,8 @@ fn stream_xlsx_rows_to_channel(
     expected_columns: Option<Vec<String>>,
     sender: tokio::sync::mpsc::Sender<Result<XlsxStreamMessage, String>>,
 ) -> Result<(), String> {
+    // This producer runs on a blocking thread and communicates in bounded batches. The small
+    // channel capacity applies backpressure when database writes are slower than XML parsing.
     let total_bytes = std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or_default();
     let mut zip = zip::ZipArchive::new(File::open(path).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
@@ -2296,6 +2309,8 @@ fn stream_xlsx_rows_to_channel(
     let mut in_inline_text = false;
     let mut inline_phonetic_depth = 0usize;
     loop {
+        // Convert the uncompressed worksheet offset into an approximate archive-byte offset so
+        // progress remains monotonic without scanning the ZIP twice.
         let progress = reader
             .buffer_position()
             .saturating_mul(total_bytes)
@@ -2756,6 +2771,8 @@ fn build_import_execution_batches(
 }
 
 fn effective_import_batch_size(db_type: &DatabaseType, requested: usize) -> usize {
+    // Some backends impose stricter limits than the UI batch setting; clamp here so every
+    // import path, including streaming producers, uses the same safe value.
     let max_rows = match db_type {
         DatabaseType::Oracle => MAX_ORACLE_IMPORT_BATCH_ROWS,
         DatabaseType::OceanbaseOracle | DatabaseType::Iris => 1,
@@ -3345,6 +3362,8 @@ async fn execute_import_rows_batch(
     db_write_ms: &mut u128,
     statement_count: &mut usize,
 ) -> Result<usize, ImportRowsBatchError> {
+    // COPY is used only for plain scalar PostgreSQL rows and ordinary tables. Any unsupported
+    // value or table feature falls through to the portable INSERT generator below.
     if allow_postgres_copy
         && *db_type == DatabaseType::Postgres
         && !rows
@@ -3492,6 +3511,8 @@ fn stream_delimited_rows_to_channel(
     batch_size: usize,
     sender: tokio::sync::mpsc::Sender<Result<DelimitedStreamMessage, String>>,
 ) -> Result<(), String> {
+    // Keep CSV parsing off the async executor while the bounded channel prevents unbounded
+    // accumulation when the database consumer is under load.
     let (mut reader, config, _) = open_delimited_csv_reader_with_progress(path, source_format, options, |_| {})?;
     let (columns, first_record) = delimited_columns_and_first_record(&mut reader, config)?;
     sender
@@ -3571,6 +3592,7 @@ fn validated_prepared_import_source(
     if prepared.columns.is_empty() || prepared.total_rows == 0 {
         return None;
     }
+    // Preview rows are reusable only while the source metadata and all parse options still match.
     let fingerprint = import_source_fingerprint(&request.file_path, format, &request.parse_options).ok()?;
     if fingerprint != prepared.fingerprint {
         return None;

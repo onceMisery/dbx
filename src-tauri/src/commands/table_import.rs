@@ -26,6 +26,8 @@ fn emit_progress(app: &AppHandle, progress: TableImportProgress) {
 fn split_command_progress(
     mut progress: TableImportProgress,
 ) -> (Option<TableImportProgress>, Option<TableImportProgress>) {
+    // Core import completion precedes session-pool cleanup. Publish a synthetic finalizing
+    // state first so the UI cannot show 100% until command-level cleanup has finished.
     match progress.status {
         dbx_core::table_import::TableImportStatus::Running => (Some(progress), None),
         dbx_core::table_import::TableImportStatus::Done => {
