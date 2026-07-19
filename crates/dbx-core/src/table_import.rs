@@ -28,6 +28,7 @@ pub const DEFAULT_PREVIEW_LIMIT: usize = 50;
 pub const DEFAULT_BATCH_SIZE: usize = 500;
 pub const CREATE_TABLE_INFERENCE_ROWS: usize = 100;
 pub const MAX_NON_STREAMING_IMPORT_BYTES: u64 = 100 * 1024 * 1024;
+pub const MAX_LEGACY_XLS_IMPORT_BYTES: u64 = 50 * 1024 * 1024;
 const IMPORT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_FAST_PREVIEW_CELLS: usize = 100_000;
 
@@ -2194,12 +2195,18 @@ fn ensure_non_streaming_file_size(path: &str, format: TableImportSourceFormat) -
         return Ok(());
     }
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    if metadata.len() > MAX_NON_STREAMING_IMPORT_BYTES {
+    let extension = Path::new(path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
+    let max_bytes = if format == TableImportSourceFormat::Excel && extension.eq_ignore_ascii_case("xls") {
+        MAX_LEGACY_XLS_IMPORT_BYTES
+    } else {
+        MAX_NON_STREAMING_IMPORT_BYTES
+    };
+    if metadata.len() > max_bytes {
         return Err(format!(
             "File too large for {} import: {} bytes (max {} bytes)",
             format.label(),
             metadata.len(),
-            MAX_NON_STREAMING_IMPORT_BYTES
+            max_bytes
         ));
     }
     Ok(())
@@ -3197,6 +3204,69 @@ fn delimited_columns_and_first_record<R: std::io::Read>(
     Err("Import file has no data rows in the selected row range".to_string())
 }
 
+#[derive(Debug)]
+enum DelimitedStreamMessage {
+    Header(Vec<String>),
+    Rows { rows: Vec<Vec<serde_json::Value>>, bytes_read: u64 },
+    Done,
+}
+
+fn stream_delimited_rows_to_channel(
+    path: &str,
+    source_format: TableImportSourceFormat,
+    options: &TableImportParseOptions,
+    batch_size: usize,
+    sender: tokio::sync::mpsc::Sender<Result<DelimitedStreamMessage, String>>,
+) -> Result<(), String> {
+    let (mut reader, config, _) = open_delimited_csv_reader_with_progress(path, source_format, options, |_| {})?;
+    let (columns, first_record) = delimited_columns_and_first_record(&mut reader, config)?;
+    sender
+        .blocking_send(Ok(DelimitedStreamMessage::Header(columns.clone())))
+        .map_err(|_| "Delimited import consumer closed before the stream started".to_string())?;
+
+    let batch_size = batch_size.max(1);
+    let mut pending_rows = Vec::with_capacity(batch_size);
+    let mut next_record = first_record;
+    let mut source_row_number = config.row_range.data_start_row.saturating_sub(1);
+    loop {
+        let record = if let Some(record) = next_record.take() {
+            record
+        } else {
+            let mut record = csv::StringRecord::new();
+            if !reader.read_record(&mut record).map_err(|error| error.to_string())? {
+                break;
+            }
+            record
+        };
+        source_row_number = source_row_number.saturating_add(1);
+        if config.row_range.last_data_row.is_some_and(|last| source_row_number > last) {
+            break;
+        }
+        pending_rows.push(delimited_record_to_row(&record, columns.len(), config));
+        if pending_rows.len() >= batch_size {
+            sender
+                .blocking_send(Ok(DelimitedStreamMessage::Rows {
+                    rows: std::mem::take(&mut pending_rows),
+                    bytes_read: reader.get_ref().source_bytes_read(),
+                }))
+                .map_err(|_| "Delimited import consumer closed before the stream finished".to_string())?;
+            pending_rows = Vec::with_capacity(batch_size);
+        }
+    }
+    if !pending_rows.is_empty() {
+        sender
+            .blocking_send(Ok(DelimitedStreamMessage::Rows {
+                rows: pending_rows,
+                bytes_read: reader.get_ref().source_bytes_read(),
+            }))
+            .map_err(|_| "Delimited import consumer closed before the stream finished".to_string())?;
+    }
+    sender
+        .blocking_send(Ok(DelimitedStreamMessage::Done))
+        .map_err(|_| "Delimited import consumer closed before the stream finished".to_string())?;
+    Ok(())
+}
+
 fn import_source_fingerprint(
     path: &str,
     format: TableImportSourceFormat,
@@ -3477,7 +3547,6 @@ where
         }
 
         let total_bytes = tokio::fs::metadata(&request.file_path).await.map(|metadata| metadata.len()).unwrap_or(0);
-        let mut last_progress_emit = Instant::now();
 
         let mut target_column_types = get_columns_for_transfer(
             state,
@@ -3499,17 +3568,6 @@ where
             validated_text_encoding.ok_or_else(|| "Delimited import encoding was not validated".to_string())?;
         let mut streaming_options = import_parse_options.clone();
         streaming_options.encoding = Some(resolved_encoding);
-        let (mut reader, config, _) = match open_delimited_csv_reader_with_progress(
-            &request.file_path,
-            source_format,
-            &streaming_options,
-            |_| {},
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
-            }
-        };
         progress_callback(import_progress_with_details(
             &request.import_id,
             TableImportStatus::Running,
@@ -3522,18 +3580,69 @@ where
             started_at,
             None,
         ));
-        let (columns, first_record) = match delimited_columns_and_first_record(&mut reader, config) {
-            Ok(result) => result,
-            Err(error) => {
-                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error))
+        let effective_batch_size = match db_type {
+            DatabaseType::Oracle | DatabaseType::OceanbaseOracle => 1,
+            DatabaseType::CloudflareD1 => batch_size.clamp(1, 100),
+            _ => batch_size.max(1),
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<DelimitedStreamMessage, String>>(2);
+        let path = request.file_path.clone();
+        let producer_options = streaming_options.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            stream_delimited_rows_to_channel(&path, source_format, &producer_options, effective_batch_size, sender)
+        });
+        let columns = match receiver.recv().await {
+            Some(Ok(DelimitedStreamMessage::Header(columns))) => columns,
+            Some(Ok(_)) => {
+                drop(receiver);
+                let _ = producer.await;
+                return Err(emit_import_error(
+                    &mut progress_callback,
+                    request,
+                    0,
+                    total_rows,
+                    started_at,
+                    "Delimited stream did not provide a header before data rows",
+                ));
+            }
+            Some(Err(error)) => {
+                let _ = producer.await;
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
+            }
+            None => {
+                let error = producer
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .err()
+                    .unwrap_or_else(|| "Delimited stream ended before providing a header".to_string());
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
             }
         };
+        if columns.is_empty() {
+            drop(receiver);
+            let _ = producer.await;
+            return Err(emit_import_error(
+                &mut progress_callback,
+                request,
+                0,
+                total_rows,
+                started_at,
+                "Import file has no columns in the selected row range",
+            ));
+        }
+        if let Err(error) = mapping_indexes_for_columns(&columns, &request.mappings) {
+            drop(receiver);
+            let _ = producer.await;
+            return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
+        }
         let compiled_plan = if *db_type == DatabaseType::CloudflareD1 {
             None
         } else {
             match compile_import_plan(&columns, &request.mappings, &target_column_types) {
                 Ok(plan) => Some(plan),
                 Err(error) => {
+                    drop(receiver);
+                    let _ = producer.await;
                     return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
                 }
             }
@@ -3545,150 +3654,96 @@ where
             if let Err(error) =
                 execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
             {
+                drop(receiver);
+                let _ = producer.await;
                 return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
             }
         }
-        let effective_batch_size = match db_type {
-            DatabaseType::Oracle | DatabaseType::OceanbaseOracle => 1,
-            DatabaseType::CloudflareD1 => batch_size.clamp(1, 100),
-            _ => batch_size.max(1),
-        };
-        let mut rows_imported = 0;
-        let mut pending_rows: Vec<Vec<serde_json::Value>> = Vec::with_capacity(effective_batch_size);
-
-        let mut next_record = first_record;
-        let mut source_row_number = config.row_range.data_start_row.saturating_sub(1);
+        let mut rows_imported = 0usize;
+        let mut last_bytes_read = 0u64;
+        let mut last_progress_emit = Instant::now();
         loop {
-            let record = if let Some(record) = next_record.take() {
-                record
-            } else {
-                let mut record = csv::StringRecord::new();
-                match reader.read_record(&mut record) {
-                    Ok(true) => record,
-                    Ok(false) => break,
-                    Err(error) => {
-                        return Err(emit_import_error(
-                            &mut progress_callback,
-                            request,
-                            rows_imported,
-                            total_rows,
-                            started_at,
-                            error.to_string(),
-                        ));
-                    }
-                }
+            let message = match receiver.recv().await {
+                Some(message) => message,
+                None => break,
             };
-            source_row_number += 1;
-            if config.row_range.last_data_row.is_some_and(|last| source_row_number > last) {
-                break;
-            }
-            pending_rows.push(delimited_record_to_row(&record, columns.len(), config));
-
-            if pending_rows.len() >= effective_batch_size {
-                if is_cancelled(&request.import_id).await {
-                    progress_callback(import_progress_with_details(
-                        &request.import_id,
-                        TableImportStatus::Cancelled,
-                        TableImportPhase::Done,
-                        rows_imported,
-                        total_rows,
-                        total_rows_exact,
-                        reader.get_ref().source_bytes_read().min(total_bytes),
-                        total_bytes,
-                        started_at,
-                        None,
-                    ));
-                    return Err("Import cancelled".to_string());
-                }
-                let row_count = match execute_import_rows_batch(
-                    state,
-                    pool_key,
-                    &pending_rows,
-                    compiled_plan.as_ref(),
-                    &columns,
-                    &request.mappings,
-                    &target_column_types,
-                    &request.table,
-                    &request.schema,
-                    db_type,
-                    allow_postgres_copy,
-                    request.date_time_format.as_deref(),
-                    &mut db_write_ms,
-                    &mut statement_count,
-                )
-                .await
-                {
-                    Ok(row_count) => row_count,
-                    Err(error) => {
-                        return Err(emit_import_error(
-                            &mut progress_callback,
-                            request,
+            match message {
+                Ok(DelimitedStreamMessage::Header(_)) => {}
+                Ok(DelimitedStreamMessage::Rows { rows, bytes_read }) => {
+                    last_bytes_read = last_bytes_read.max(bytes_read);
+                    if is_cancelled(&request.import_id).await {
+                        drop(receiver);
+                        let _ = producer.await;
+                        progress_callback(import_progress_with_details(
+                            &request.import_id,
+                            TableImportStatus::Cancelled,
+                            TableImportPhase::Done,
                             rows_imported,
                             total_rows,
+                            total_rows_exact,
+                            last_bytes_read.min(total_bytes),
+                            total_bytes,
                             started_at,
-                            error,
+                            None,
                         ));
+                        return Err("Import cancelled".to_string());
                     }
-                };
-                rows_imported = rows_imported.saturating_add(row_count);
-                if let Some(known_total_rows) = known_total_rows {
-                    rows_imported = rows_imported.min(known_total_rows);
+                    let row_count = match execute_import_rows_batch(
+                        state,
+                        pool_key,
+                        &rows,
+                        compiled_plan.as_ref(),
+                        &columns,
+                        &request.mappings,
+                        &target_column_types,
+                        &request.table,
+                        &request.schema,
+                        db_type,
+                        allow_postgres_copy,
+                        request.date_time_format.as_deref(),
+                        &mut db_write_ms,
+                        &mut statement_count,
+                    )
+                    .await
+                    {
+                        Ok(row_count) => row_count,
+                        Err(error) => {
+                            drop(receiver);
+                            let _ = producer.await;
+                            return Err(emit_import_error(
+                                &mut progress_callback,
+                                request,
+                                rows_imported,
+                                total_rows,
+                                started_at,
+                                error,
+                            ));
+                        }
+                    };
+                    rows_imported = rows_imported.saturating_add(row_count);
+                    if let Some(known_total_rows) = known_total_rows {
+                        rows_imported = rows_imported.min(known_total_rows);
+                    }
+                    if last_progress_emit.elapsed() >= IMPORT_PROGRESS_INTERVAL {
+                        progress_callback(import_progress_with_details(
+                            &request.import_id,
+                            TableImportStatus::Running,
+                            TableImportPhase::Writing,
+                            rows_imported,
+                            total_rows,
+                            total_rows_exact,
+                            last_bytes_read.min(total_bytes),
+                            total_bytes,
+                            started_at,
+                            None,
+                        ));
+                        last_progress_emit = Instant::now();
+                    }
                 }
-                pending_rows.clear();
-                if last_progress_emit.elapsed() >= IMPORT_PROGRESS_INTERVAL {
-                    progress_callback(import_progress_with_details(
-                        &request.import_id,
-                        TableImportStatus::Running,
-                        TableImportPhase::Writing,
-                        rows_imported,
-                        total_rows,
-                        total_rows_exact,
-                        reader.get_ref().source_bytes_read().min(total_bytes),
-                        total_bytes,
-                        started_at,
-                        None,
-                    ));
-                    last_progress_emit = Instant::now();
-                }
-            }
-        }
-
-        if !pending_rows.is_empty() {
-            if is_cancelled(&request.import_id).await {
-                progress_callback(import_progress_with_details(
-                    &request.import_id,
-                    TableImportStatus::Cancelled,
-                    TableImportPhase::Done,
-                    rows_imported,
-                    total_rows,
-                    total_rows_exact,
-                    reader.get_ref().source_bytes_read().min(total_bytes),
-                    total_bytes,
-                    started_at,
-                    None,
-                ));
-                return Err("Import cancelled".to_string());
-            }
-            let row_count = match execute_import_rows_batch(
-                state,
-                pool_key,
-                &pending_rows,
-                compiled_plan.as_ref(),
-                &columns,
-                &request.mappings,
-                &target_column_types,
-                &request.table,
-                &request.schema,
-                db_type,
-                allow_postgres_copy,
-                request.date_time_format.as_deref(),
-                &mut db_write_ms,
-                &mut statement_count,
-            )
-            .await
-            {
-                Ok(row_count) => row_count,
+                Ok(DelimitedStreamMessage::Done) => break,
                 Err(error) => {
+                    drop(receiver);
+                    let _ = producer.await;
                     return Err(emit_import_error(
                         &mut progress_callback,
                         request,
@@ -3698,12 +3753,29 @@ where
                         error,
                     ));
                 }
-            };
-            if row_count > 0 {
-                rows_imported = rows_imported.saturating_add(row_count);
-                if let Some(known_total_rows) = known_total_rows {
-                    rows_imported = rows_imported.min(known_total_rows);
-                }
+            }
+        }
+        match producer.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(emit_import_error(
+                    &mut progress_callback,
+                    request,
+                    rows_imported,
+                    total_rows,
+                    started_at,
+                    error,
+                ));
+            }
+            Err(error) => {
+                return Err(emit_import_error(
+                    &mut progress_callback,
+                    request,
+                    rows_imported,
+                    total_rows,
+                    started_at,
+                    error.to_string(),
+                ));
             }
         }
 
@@ -4644,6 +4716,72 @@ mod tests {
         assert_eq!(preview.columns, vec!["id", "name"]);
         assert_eq!(preview.rows, vec![vec![serde_json::json!("1"), serde_json::json!("Ada")]]);
         assert_eq!(preview.total_rows, 1);
+    }
+
+    #[test]
+    fn streams_delimited_rows_in_batches_and_preserves_selected_range() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-stream-{}.csv", uuid::Uuid::new_v4()));
+        let bytes = b"report,ignored\nid,name\nnotes,ignored\n1,Ada\n2,Grace\n3,Linus\nsummary,3\n";
+        std::fs::write(&path, bytes).unwrap();
+        let options = TableImportParseOptions {
+            encoding: Some(TableImportTextEncoding::Utf8),
+            title_row: Some(2),
+            data_start_row: Some(4),
+            last_data_row: Some(6),
+            ..TableImportParseOptions::default()
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+
+        stream_delimited_rows_to_channel(&path.to_string_lossy(), TableImportSourceFormat::Csv, &options, 2, sender)
+            .unwrap();
+
+        let messages =
+            std::iter::from_fn(|| receiver.blocking_recv()).map(|message| message.unwrap()).collect::<Vec<_>>();
+        assert!(
+            matches!(messages.first(), Some(DelimitedStreamMessage::Header(columns)) if columns == &vec!["id".to_string(), "name".to_string()])
+        );
+        assert!(matches!(messages.last(), Some(DelimitedStreamMessage::Done)));
+        let batches = messages
+            .iter()
+            .filter_map(|message| match message {
+                DelimitedStreamMessage::Rows { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0],
+            &vec![
+                vec![serde_json::json!("1"), serde_json::json!("Ada")],
+                vec![serde_json::json!("2"), serde_json::json!("Grace")],
+            ]
+        );
+        assert_eq!(batches[1], &vec![vec![serde_json::json!("3"), serde_json::json!("Linus")]]);
+        let bytes_read = messages
+            .iter()
+            .filter_map(|message| match message {
+                DelimitedStreamMessage::Rows { bytes_read, .. } => Some(*bytes_read),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(bytes_read.windows(2).all(|window| window[0] <= window[1]));
+        assert!(bytes_read.last().copied().unwrap_or_default() <= bytes.len() as u64);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_xls_uses_a_stricter_non_streaming_file_limit() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-limit-{}.xls", uuid::Uuid::new_v4()));
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_LEGACY_XLS_IMPORT_BYTES + 1).unwrap();
+        drop(file);
+
+        let error =
+            ensure_non_streaming_file_size(&path.to_string_lossy(), TableImportSourceFormat::Excel).unwrap_err();
+
+        assert!(error.contains(&MAX_LEGACY_XLS_IMPORT_BYTES.to_string()));
+        assert!(MAX_LEGACY_XLS_IMPORT_BYTES < MAX_NON_STREAMING_IMPORT_BYTES);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
