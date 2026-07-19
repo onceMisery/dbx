@@ -2145,7 +2145,7 @@ impl AppState {
         let Some(removed) = self.take_client_session_pool(connection_id, database, client_session_id).await? else {
             return Ok(false);
         };
-        close_removed_pools_in_background(vec![removed]);
+        close_removed_pools_in_background(&self.task_supervisor, vec![removed]);
         Ok(true)
     }
 
@@ -2196,7 +2196,7 @@ impl AppState {
         self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_removed_pools_in_background(vec![(pool_key.to_string(), pool)]);
+            close_removed_pools_in_background(&self.task_supervisor, vec![(pool_key.to_string(), pool)]);
             true
         } else {
             false
@@ -2751,13 +2751,13 @@ impl AppState {
 
     pub async fn remove_connection_pools_detached(&self, connection_id: &str) {
         let removed = self.drain_connection_pools(connection_id).await;
-        close_removed_pools_in_background(removed);
+        close_removed_pools_in_background(&self.task_supervisor, removed);
     }
 
     #[cfg(feature = "duckdb-bundled")]
     async fn remove_duckdb_pools_detached(&self) {
         let removed = self.drain_duckdb_pools().await;
-        close_removed_pools_in_background(removed);
+        close_removed_pools_in_background(&self.task_supervisor, removed);
     }
 
     #[cfg(not(feature = "duckdb-bundled"))]
@@ -3189,13 +3189,17 @@ async fn close_removed_pools(removed: Vec<(String, PoolKind)>) {
     }
 }
 
-fn close_removed_pools_in_background(removed: Vec<(String, PoolKind)>) {
+fn close_removed_pools_in_background(supervisor: &TaskSupervisor, removed: Vec<(String, PoolKind)>) {
     if removed.is_empty() {
         return;
     }
-    tokio::spawn(async move {
+    let pool_count = removed.len();
+    let task_key = format!("pool-close:{}", uuid::Uuid::new_v4());
+    if !supervisor.spawn_once(task_key, move |_| async move {
         close_removed_pools(removed).await;
-    });
+    }) {
+        log::debug!("Dropped {pool_count} detached pool handle(s) during application shutdown");
+    }
 }
 
 async fn close_pool_kind_with_timeout(pool_key: String, pool: PoolKind) {
