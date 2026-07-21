@@ -3607,10 +3607,76 @@ impl ImportRowsBatchError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImportBatchExecutionPolicy {
+    transactional: bool,
+    include_truncate: bool,
+    allow_postgres_copy: bool,
+}
+
+fn supports_transactional_import_truncate(db_type: &DatabaseType) -> bool {
+    matches!(
+        db_type,
+        DatabaseType::Postgres
+            | DatabaseType::Kingbase
+            | DatabaseType::Sqlite
+            | DatabaseType::CloudflareD1
+            | DatabaseType::SqlServer
+    )
+}
+
+fn supports_import_batch_transactions(db_type: &DatabaseType) -> bool {
+    // These native drivers do not expose a transaction spanning separate requests.
+    // Agent-backed JDBC drivers perform their own supportsTransactions check.
+    !matches!(db_type, DatabaseType::ClickHouse | DatabaseType::Rqlite | DatabaseType::Turso)
+}
+
+fn import_batch_execution_policy(
+    mode: &TableImportMode,
+    pending_truncate: bool,
+    db_type: &DatabaseType,
+) -> ImportBatchExecutionPolicy {
+    let transactional = matches!(mode, TableImportMode::Truncate) && supports_import_batch_transactions(db_type);
+    let include_truncate = transactional && pending_truncate;
+    ImportBatchExecutionPolicy {
+        transactional,
+        include_truncate,
+        allow_postgres_copy: *db_type == DatabaseType::Postgres && !include_truncate,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_import_transaction(
+    state: &AppState,
+    pool_key: &str,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    statements: &[String],
+    db_write_ms: &mut u128,
+    statement_count: &mut usize,
+) -> Result<crate::db::QueryResult, String> {
+    let started_at = Instant::now();
+    let result = crate::query::execute_statements_in_transaction_on_pool(
+        state,
+        pool_key,
+        connection_id,
+        database,
+        statements,
+        (!schema.trim().is_empty()).then_some(schema),
+    )
+    .await;
+    *db_write_ms += started_at.elapsed().as_millis();
+    *statement_count += statements.len();
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_import_rows_batch(
     state: &AppState,
     pool_key: &str,
+    connection_id: &str,
+    database: &str,
     rows: &[Vec<serde_json::Value>],
     plan: Option<&CompiledImportPlan>,
     columns: &[String],
@@ -3619,14 +3685,18 @@ async fn execute_import_rows_batch(
     table: &str,
     schema: &str,
     db_type: &DatabaseType,
+    mode: &TableImportMode,
+    pending_truncate: bool,
     allow_postgres_copy: bool,
     date_time_format: Option<&str>,
     db_write_ms: &mut u128,
     statement_count: &mut usize,
 ) -> Result<usize, ImportRowsBatchError> {
+    let execution_policy = import_batch_execution_policy(mode, pending_truncate, db_type);
     // COPY is used only for plain scalar PostgreSQL rows and ordinary tables. Any unsupported
     // value or table feature falls through to the portable INSERT generator below.
     if allow_postgres_copy
+        && execution_policy.allow_postgres_copy
         && *db_type == DatabaseType::Postgres
         && !rows
             .iter()
@@ -3656,6 +3726,26 @@ async fn execute_import_rows_batch(
         date_time_format,
     )
     .map_err(ImportRowsBatchError::before_write)?;
+    if execution_policy.transactional {
+        let mut statements = Vec::with_capacity(batches.len() + usize::from(execution_policy.include_truncate));
+        if execution_policy.include_truncate {
+            statements.push(truncate_sql(table, schema, db_type));
+        }
+        statements.extend(batches.into_iter().map(|batch| batch.sql));
+        execute_import_transaction(
+            state,
+            pool_key,
+            connection_id,
+            database,
+            schema,
+            &statements,
+            db_write_ms,
+            statement_count,
+        )
+        .await
+        .map_err(ImportRowsBatchError::before_write)?;
+        return Ok(rows.len());
+    }
     let mut rows_imported = 0usize;
     for batch in batches {
         if let Err(error) = execute_import_statement(state, pool_key, &batch.sql, db_write_ms, statement_count).await {
@@ -4204,7 +4294,9 @@ where
         };
         let allow_postgres_copy = *db_type == DatabaseType::Postgres
             && postgres_copy_fast_path_eligible(state, pool_key, &request.table, &request.schema).await;
-        if matches!(request.mode, TableImportMode::Truncate) {
+        let mut pending_truncate =
+            matches!(request.mode, TableImportMode::Truncate) && supports_transactional_import_truncate(db_type);
+        if matches!(request.mode, TableImportMode::Truncate) && !pending_truncate {
             let sql = truncate_sql(&request.table, &request.schema, db_type);
             if let Err(error) =
                 execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
@@ -4246,6 +4338,8 @@ where
                     let row_count = match execute_import_rows_batch(
                         state,
                         pool_key,
+                        &request.connection_id,
+                        &request.database,
                         &rows,
                         compiled_plan.as_ref(),
                         &columns,
@@ -4254,6 +4348,8 @@ where
                         &request.table,
                         &request.schema,
                         db_type,
+                        &request.mode,
+                        pending_truncate,
                         allow_postgres_copy,
                         request.date_time_format.as_deref(),
                         &mut db_write_ms,
@@ -4277,6 +4373,7 @@ where
                         }
                     };
                     rows_imported = rows_imported.saturating_add(row_count);
+                    pending_truncate = false;
                     if let Some(known_total_rows) = known_total_rows {
                         rows_imported = rows_imported.min(known_total_rows);
                     }
@@ -4471,7 +4568,9 @@ where
         };
         let allow_postgres_copy = *db_type == DatabaseType::Postgres
             && postgres_copy_fast_path_eligible(state, pool_key, &request.table, &request.schema).await;
-        if matches!(request.mode, TableImportMode::Truncate) {
+        let mut pending_truncate =
+            matches!(request.mode, TableImportMode::Truncate) && supports_transactional_import_truncate(db_type);
+        if matches!(request.mode, TableImportMode::Truncate) && !pending_truncate {
             let sql = truncate_sql(&request.table, &request.schema, db_type);
             if let Err(error) =
                 execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
@@ -4510,6 +4609,8 @@ where
                     let row_count = match execute_import_rows_batch(
                         state,
                         pool_key,
+                        &request.connection_id,
+                        &request.database,
                         &rows,
                         compiled_plan.as_ref(),
                         &columns,
@@ -4518,6 +4619,8 @@ where
                         &request.table,
                         &request.schema,
                         db_type,
+                        &request.mode,
+                        pending_truncate,
                         allow_postgres_copy,
                         request.date_time_format.as_deref(),
                         &mut db_write_ms,
@@ -4541,6 +4644,7 @@ where
                         }
                     };
                     rows_imported = rows_imported.saturating_add(row_count);
+                    pending_truncate = false;
                     progress_callback(import_progress_with_details(
                         &request.import_id,
                         TableImportStatus::Running,
@@ -4692,7 +4796,9 @@ where
     let allow_postgres_copy = *db_type == DatabaseType::Postgres
         && postgres_copy_fast_path_eligible(state, pool_key, &request.table, &request.schema).await;
 
-    if matches!(request.mode, TableImportMode::Truncate) {
+    let mut pending_truncate =
+        matches!(request.mode, TableImportMode::Truncate) && supports_transactional_import_truncate(db_type);
+    if matches!(request.mode, TableImportMode::Truncate) && !pending_truncate {
         let sql = truncate_sql(&request.table, &request.schema, db_type);
         if let Err(error) =
             execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
@@ -4718,6 +4824,8 @@ where
         let row_count = match execute_import_rows_batch(
             state,
             pool_key,
+            &request.connection_id,
+            &request.database,
             rows,
             compiled_plan.as_ref(),
             &parsed.columns,
@@ -4726,6 +4834,8 @@ where
             &request.table,
             &request.schema,
             db_type,
+            &request.mode,
+            pending_truncate,
             allow_postgres_copy,
             request.date_time_format.as_deref(),
             &mut db_write_ms,
@@ -4747,6 +4857,7 @@ where
             }
         };
         rows_imported = (rows_imported + row_count).min(total_rows);
+        pending_truncate = false;
         if last_progress_emit.elapsed() >= IMPORT_PROGRESS_INTERVAL {
             progress_callback(import_progress(
                 &request.import_id,
@@ -4776,7 +4887,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::connection::DatabaseType;
+    use crate::models::connection::{ConnectionConfig, DatabaseType};
+    use crate::storage::Storage;
     use crate::xlsx_export::{build_xlsx_workbook_multi, XlsxWorksheetData};
     use std::io::{Cursor, Write};
 
@@ -5841,6 +5953,176 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn truncate_xlsx_with_malformed_tail_keeps_only_committed_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "xlsx-truncate-tail";
+        let pool_key = format!("{connection_id}:session:import");
+        let database_path = dir.path().join("target.db");
+        let sqlite = crate::db::sqlite::connect_path_create_if_missing(database_path.to_str().unwrap()).await.unwrap();
+        crate::db::sqlite::execute_query(
+            &sqlite,
+            "CREATE TABLE items (id INTEGER, name TEXT); INSERT INTO items VALUES (999, 'old')",
+        )
+        .await
+        .unwrap();
+        state.connections.write().await.insert(pool_key.clone(), PoolKind::Sqlite(sqlite.clone()));
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": connection_id,
+            "name": "XLSX truncate tail test",
+            "db_type": "sqlite",
+            "host": "",
+            "port": 0,
+            "username": "",
+            "password": "",
+            "database": database_path.to_string_lossy()
+        }))
+        .unwrap();
+        state.configs.write().await.insert(connection_id.to_string(), config);
+
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:B4"/>
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>id</t></is></c><c r="B1" t="inlineStr"><is><t>name</t></is></c></row>
+    <row r="2"><c r="A2"><v>1</v></c><c r="B2" t="inlineStr"><is><t>Ada</t></is></c></row>
+    <row r="3"><c r="A3"><v>2</v></c><c r="B3" t="inlineStr"><is><t>Grace</t></is></c></row>
+    <row r="4"><c r="A4"><v>3</v></c><c r="B4" t="inlineStr"><is><t>Linus</t></is></c></row>
+  </broken>
+</worksheet>"#;
+        let xlsx_path = dir.path().join("malformed-tail.xlsx");
+        std::fs::write(&xlsx_path, build_preview_test_xlsx(sheet_xml, None)).unwrap();
+        let request = TableImportRequest {
+            import_id: "malformed-tail".to_string(),
+            connection_id: connection_id.to_string(),
+            database: String::new(),
+            schema: String::new(),
+            table: "items".to_string(),
+            file_path: xlsx_path.to_string_lossy().to_string(),
+            source_ref: None,
+            source_format: Some(TableImportSourceFormat::Excel),
+            parse_options: TableImportParseOptions::default(),
+            mappings: vec![
+                TableImportColumnMapping {
+                    source_column: "id".to_string(),
+                    target_column: "id".to_string(),
+                    target_data_type: None,
+                },
+                TableImportColumnMapping {
+                    source_column: "name".to_string(),
+                    target_column: "name".to_string(),
+                    target_data_type: None,
+                },
+            ],
+            mode: TableImportMode::Truncate,
+            create_table: false,
+            batch_size: 1,
+            date_time_format: None,
+            prepared_source: None,
+            retain_source: false,
+        };
+
+        let error = import_table_file_core(
+            &state,
+            &request,
+            &DatabaseType::Sqlite,
+            &pool_key,
+            |_| Box::pin(async { false }),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.is_empty());
+
+        let rows =
+            crate::db::sqlite::execute_query(&sqlite, "SELECT id, name FROM items ORDER BY id").await.unwrap().rows;
+        assert_eq!(
+            rows,
+            vec![
+                vec![serde_json::json!(1), serde_json::json!("Ada")],
+                vec![serde_json::json!(2), serde_json::json!("Grace")],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_first_truncate_batch_preserves_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "cancel-truncate-first-batch";
+        let pool_key = format!("{connection_id}:session:import");
+        let database_path = dir.path().join("target.db");
+        let sqlite = crate::db::sqlite::connect_path_create_if_missing(database_path.to_str().unwrap()).await.unwrap();
+        crate::db::sqlite::execute_query(
+            &sqlite,
+            "CREATE TABLE items (id INTEGER, name TEXT); INSERT INTO items VALUES (999, 'old')",
+        )
+        .await
+        .unwrap();
+        state.connections.write().await.insert(pool_key.clone(), PoolKind::Sqlite(sqlite.clone()));
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": connection_id,
+            "name": "Cancel truncate first batch test",
+            "db_type": "sqlite",
+            "host": "",
+            "port": 0,
+            "username": "",
+            "password": "",
+            "database": database_path.to_string_lossy()
+        }))
+        .unwrap();
+        state.configs.write().await.insert(connection_id.to_string(), config);
+        let csv_path = dir.path().join("rows.csv");
+        std::fs::write(&csv_path, b"id,name\n1,Ada\n2,Grace\n").unwrap();
+        let request = TableImportRequest {
+            import_id: "cancel-before-first-batch".to_string(),
+            connection_id: connection_id.to_string(),
+            database: String::new(),
+            schema: String::new(),
+            table: "items".to_string(),
+            file_path: csv_path.to_string_lossy().to_string(),
+            source_ref: None,
+            source_format: Some(TableImportSourceFormat::Csv),
+            parse_options: TableImportParseOptions::default(),
+            mappings: vec![
+                TableImportColumnMapping {
+                    source_column: "id".to_string(),
+                    target_column: "id".to_string(),
+                    target_data_type: None,
+                },
+                TableImportColumnMapping {
+                    source_column: "name".to_string(),
+                    target_column: "name".to_string(),
+                    target_data_type: None,
+                },
+            ],
+            mode: TableImportMode::Truncate,
+            create_table: false,
+            batch_size: 1,
+            date_time_format: None,
+            prepared_source: None,
+            retain_source: false,
+        };
+
+        let error = import_table_file_core(
+            &state,
+            &request,
+            &DatabaseType::Sqlite,
+            &pool_key,
+            |_| Box::pin(async { true }),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "Import cancelled");
+
+        let rows = crate::db::sqlite::execute_query(&sqlite, "SELECT id, name FROM items").await.unwrap().rows;
+        assert_eq!(rows, vec![vec![serde_json::json!(999), serde_json::json!("old")]]);
+    }
+
     #[test]
     fn streaming_excel_rows_preserve_offset_ranges_and_temporal_styles() {
         let path = std::env::temp_dir().join(format!("dbx-table-import-stream-offset-{}.xlsx", uuid::Uuid::new_v4()));
@@ -6661,6 +6943,42 @@ mod tests {
             "SELECT NOT c.relrowsecurity AND NOT c.relhasrules AS copy_eligible FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'items' AND c.relkind IN ('r', 'p') LIMIT 1"
         );
         assert!(postgres_copy_eligibility_sql("items", "").contains("n.nspname = current_schema()"));
+    }
+
+    #[test]
+    fn postgres_truncate_first_batch_uses_transaction_without_copy() {
+        let policy = import_batch_execution_policy(&TableImportMode::Truncate, true, &DatabaseType::Postgres);
+
+        assert!(policy.transactional);
+        assert!(policy.include_truncate);
+        assert!(!policy.allow_postgres_copy);
+    }
+
+    #[test]
+    fn postgres_truncate_later_batches_are_transactional_and_allow_copy() {
+        let policy = import_batch_execution_policy(&TableImportMode::Truncate, false, &DatabaseType::Postgres);
+
+        assert!(policy.transactional);
+        assert!(!policy.include_truncate);
+        assert!(policy.allow_postgres_copy);
+    }
+
+    #[test]
+    fn append_batches_keep_the_existing_independent_execution_path() {
+        let policy = import_batch_execution_policy(&TableImportMode::Append, true, &DatabaseType::Postgres);
+
+        assert!(!policy.transactional);
+        assert!(!policy.include_truncate);
+        assert!(policy.allow_postgres_copy);
+    }
+
+    #[test]
+    fn truncate_keeps_native_non_transactional_drivers_on_the_existing_path() {
+        let policy = import_batch_execution_policy(&TableImportMode::Truncate, false, &DatabaseType::ClickHouse);
+
+        assert!(!policy.transactional);
+        assert!(!policy.include_truncate);
+        assert!(!policy.allow_postgres_copy);
     }
 
     #[tokio::test]
