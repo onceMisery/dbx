@@ -5501,7 +5501,7 @@ mod tests {
             ensure_non_streaming_file_size(&path.to_string_lossy(), TableImportSourceFormat::Excel).unwrap_err();
 
         assert!(error.contains(&MAX_LEGACY_XLS_IMPORT_BYTES.to_string()));
-        assert!(MAX_LEGACY_XLS_IMPORT_BYTES < MAX_NON_STREAMING_IMPORT_BYTES);
+        ensure_non_streaming_file_size(&path.to_string_lossy(), TableImportSourceFormat::Json).unwrap();
         let _ = std::fs::remove_file(path);
     }
 
