@@ -2281,7 +2281,7 @@ export const useConnectionStore = defineStore("connection", () => {
           } else if (config && connectionUsesVisibleSchemaFilter(config)) {
             const schemaFilterConfig = config;
             const effectiveDb = schemaFilterConfig.database || "";
-            const cacheKey = schemaCacheKey(connectionId, effectiveDb, "schemas");
+            const cacheKey = schemaCacheKey(connectionId, effectiveDb, config.db_type === "oracle" ? "schemas-v2" : "schemas");
             if (!options?.force) {
               const cached = await loadPersistedTreeChildren(node, cacheKey);
               if (cached.hit) {
@@ -4781,39 +4781,45 @@ export const useConnectionStore = defineStore("connection", () => {
     return deduped;
   }
 
-  async function listCompletionColumns(connectionId: string, database: string, table: string, schema?: string): Promise<SqlCompletionColumn[]> {
-    if (isSchemaAwareDatabase(connectionId) && !connectionUsesDatabaseObjectTreeMode(getConfig(connectionId)) && !schema) {
+  async function listCompletionColumns(connectionId: string, database: string, table: string, schema?: string, context?: { clientSessionId?: string; version?: number }): Promise<SqlCompletionColumn[]> {
+    const config = getConfig(connectionId);
+    const completionSchema = schema?.trim() || undefined;
+    const usesOracleCurrentSchema = config?.db_type === "oracle" && !completionSchema;
+    if (isSchemaAwareDatabase(connectionId) && !connectionUsesDatabaseObjectTreeMode(config) && !completionSchema && !usesOracleCurrentSchema) {
       return [];
     }
-    const cacheKey = `${connectionId}:${database}:${schema || ""}:${table}`;
+    const sessionCacheScope = usesOracleCurrentSchema && context?.clientSessionId ? `:${context.clientSessionId}:${context.version ?? 0}` : "";
+    const cacheKey = `${connectionId}:${database}:${schema || ""}:${table}${sessionCacheScope}`;
     if (!completionColumnsCache.value[cacheKey]) {
       await withCompletionInFlight(
         `${cacheKey}:columns`,
         async () => {
           await ensureConnected(connectionId);
-          try {
-            const assistantColumns = await listCompletionAssistantColumns(connectionId, database, table, schema);
-            if (assistantColumns.length > 0) {
-              completionColumnsCache.value[cacheKey] = assistantColumns.map((column) => ({
-                name: column.name,
-                data_type: column.dataType ?? "",
-                is_nullable: column.isNullable ?? true,
-                column_default: null,
-                is_primary_key: false,
-                extra: null,
-                comment: column.comment ?? null,
-                numeric_precision: null,
-                numeric_scale: null,
-                character_maximum_length: null,
-              }));
-              evictOldestCacheEntries(completionColumnsCache.value, COMPLETION_CACHE_MAX);
-              return;
+          if (!usesOracleCurrentSchema) {
+            try {
+              const assistantColumns = await listCompletionAssistantColumns(connectionId, database, table, completionSchema);
+              if (assistantColumns.length > 0) {
+                completionColumnsCache.value[cacheKey] = assistantColumns.map((column) => ({
+                  name: column.name,
+                  data_type: column.dataType ?? "",
+                  is_nullable: column.isNullable ?? true,
+                  column_default: null,
+                  is_primary_key: false,
+                  extra: null,
+                  comment: column.comment ?? null,
+                  numeric_precision: null,
+                  numeric_scale: null,
+                  character_maximum_length: null,
+                }));
+                evictOldestCacheEntries(completionColumnsCache.value, COMPLETION_CACHE_MAX);
+                return;
+              }
+            } catch {
+              // Fall back to the existing metadata path below.
             }
-          } catch {
-            // Fall back to the existing metadata path below.
           }
-          const querySchema = metadataQuerySchema(connectionId, database, schema);
-          completionColumnsCache.value[cacheKey] = await api.getColumns(connectionId, database, querySchema, table);
+          const querySchema = usesOracleCurrentSchema ? "" : metadataQuerySchema(connectionId, database, completionSchema);
+          completionColumnsCache.value[cacheKey] = await api.getColumns(connectionId, database, querySchema, table, undefined, usesOracleCurrentSchema ? context?.clientSessionId : undefined);
           evictOldestCacheEntries(completionColumnsCache.value, COMPLETION_CACHE_MAX);
         },
         { scope: completionLimiterScope(connectionId, database), kind: "columns" },
@@ -4823,12 +4829,12 @@ export const useConnectionStore = defineStore("connection", () => {
     const columns = completionColumnsCache.value[cacheKey].map((column) => ({
       name: column.name,
       table,
-      schema,
+      schema: completionSchema,
       dataType: column.data_type,
       isNullable: column.is_nullable,
       comment: column.comment,
     }));
-    indexCompletionColumns(connectionId, database, table, schema, columns);
+    if (!usesOracleCurrentSchema) indexCompletionColumns(connectionId, database, table, schema, columns);
     return columns;
   }
 
@@ -4874,8 +4880,8 @@ export const useConnectionStore = defineStore("connection", () => {
     return listCompletionDatabases(connectionId);
   }
 
-  function refreshCompletionColumns(connectionId: string, database: string, table: string, schema?: string): Promise<SqlCompletionColumn[]> {
-    return listCompletionColumns(connectionId, database, table, schema);
+  function refreshCompletionColumns(connectionId: string, database: string, table: string, schema?: string, context?: { clientSessionId?: string; version?: number }): Promise<SqlCompletionColumn[]> {
+    return listCompletionColumns(connectionId, database, table, schema, context);
   }
 
   function refreshCompletionForeignKeys(connectionId: string, database: string, table: string, schema?: string): Promise<SqlCompletionForeignKey[]> {
