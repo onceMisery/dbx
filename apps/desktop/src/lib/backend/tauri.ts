@@ -1341,12 +1341,14 @@ export async function importAgentsFromZip(path: string | File): Promise<number> 
   return invoke("import_agents_from_zip", { path });
 }
 
-export async function importAgentJar(dbType: string, path: string | File): Promise<void> {
+export async function importAgentDriver(dbType: string, path: string | File): Promise<void> {
   if (typeof path !== "string") {
-    throw new Error("Desktop driver JAR import requires a local file path");
+    throw new Error("Desktop driver import requires a local file path");
   }
-  return invoke("import_agent_jar_cmd", { dbType, path });
+  return invoke("import_agent_driver_cmd", { dbType, path });
 }
+
+export const importAgentJar = importAgentDriver;
 
 export async function reinstallJre(jreKey?: string, source?: UpdateDownloadSource): Promise<void> {
   return invoke("reinstall_jre", { jreKey, source });

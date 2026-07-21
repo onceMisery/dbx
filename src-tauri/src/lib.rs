@@ -1471,6 +1471,7 @@ pub fn run() {
             commands::agents::reinstall_jre,
             commands::agents::invalidate_agent_registry_cache,
             commands::agents::import_agents_from_zip,
+            commands::agents::import_agent_driver_cmd,
             commands::agents::import_agent_jar_cmd,
             commands::system_fonts::list_system_fonts,
             commands::ssh_config::list_ssh_config_hosts,

@@ -4924,12 +4924,19 @@ onUnmounted(cleanupPreviewEditor);
                       </label>
                     </div>
                   </fieldset>
-                  <p class="flex items-start gap-1.5 text-xs" :class="mcpExecutionMode === 'high_risk_write' ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'">
-                    <AlertTriangle v-if="mcpExecutionMode === 'high_risk_write'" class="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span v-if="mcpExecutionMode === 'read_only'">{{ t("settings.mcpExecutionModeReadOnlyDescription") }}</span>
-                    <span v-else-if="mcpExecutionMode === 'safe_write'">{{ t("settings.mcpExecutionModeSafeWriteDescription") }}</span>
-                    <span v-else>{{ t("settings.mcpExecutionModeHighRiskWriteDescription") }}</span>
-                  </p>
+                  <!-- Keep every translation in one grid cell so mode changes cannot reflow the capability matrix. -->
+                  <div data-mcp-execution-mode-description class="grid text-xs">
+                    <p class="col-start-1 row-start-1 text-muted-foreground" :class="mcpExecutionMode === 'read_only' ? 'visible' : 'invisible'">
+                      {{ t("settings.mcpExecutionModeReadOnlyDescription") }}
+                    </p>
+                    <p class="col-start-1 row-start-1 text-muted-foreground" :class="mcpExecutionMode === 'safe_write' ? 'visible' : 'invisible'">
+                      {{ t("settings.mcpExecutionModeSafeWriteDescription") }}
+                    </p>
+                    <p class="col-start-1 row-start-1 flex items-start gap-1.5 text-amber-600 dark:text-amber-400" :class="mcpExecutionMode === 'high_risk_write' ? 'visible' : 'invisible'">
+                      <AlertTriangle class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span>{{ t("settings.mcpExecutionModeHighRiskWriteDescription") }}</span>
+                    </p>
+                  </div>
                   <div class="space-y-1.5">
                     <div class="space-y-0.5">
                       <p class="text-xs font-medium">{{ t("settings.mcpCapabilityTitle") }}</p>

@@ -7605,6 +7605,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               :current-match-index="currentMatchIndex"
               :has-deferred-search-text="!!deferredClientSearchText"
               @keydown="onSearchKeydown"
+              @navigate="navigateMatch"
               @close="closeSearch"
               @accept-suggestion="
                 suggestionIndex = $event;

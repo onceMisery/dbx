@@ -17,7 +17,28 @@ vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
 vi.mock("@lucide/vue", async () => {
   const { createPassthroughStub } = await import("./vueHostHarness");
   const icon = createPassthroughStub("Icon", "i");
-  return { Check: icon, ChevronDown: icon, ChevronLeft: icon, ChevronRight: icon, ChevronsLeft: icon, ChevronsRight: icon, Filter: icon, Loader2: icon, Upload: icon, Search: icon, X: icon, Code2: icon, Copy: icon, Eye: icon, EyeOff: icon, Info: icon, Pencil: icon, Plus: icon, Trash2: icon };
+  return {
+    Check: icon,
+    ChevronDown: icon,
+    ChevronUp: icon,
+    ChevronLeft: icon,
+    ChevronRight: icon,
+    ChevronsLeft: icon,
+    ChevronsRight: icon,
+    Filter: icon,
+    Loader2: icon,
+    Upload: icon,
+    Search: icon,
+    X: icon,
+    Code2: icon,
+    Copy: icon,
+    Eye: icon,
+    EyeOff: icon,
+    Info: icon,
+    Pencil: icon,
+    Plus: icon,
+    Trash2: icon,
+  };
 });
 
 vi.mock("@/components/ui/button", async () => ({ Button: (await import("./vueHostHarness")).createPassthroughStub("Button", "button") }));
@@ -95,10 +116,11 @@ beforeEach(() => {
 });
 
 describe("DataGridSearchBar", () => {
-  it("focuses/selects the input and forwards keyboard and suggestion interactions", () => {
+  it("focuses/selects the input and forwards keyboard, navigation, and suggestion interactions", async () => {
     const keydown = vi.fn();
     const acceptSuggestion = vi.fn();
     const hoverSuggestion = vi.fn();
+    const navigate = vi.fn();
     const close = vi.fn();
     const mounted = mountComponent(DataGridSearchBar, {
       open: true,
@@ -111,6 +133,7 @@ describe("DataGridSearchBar", () => {
       onKeydown: keydown,
       onAcceptSuggestion: acceptSuggestion,
       onHoverSuggestion: hoverSuggestion,
+      onNavigate: navigate,
       onClose: close,
     });
     const input = findOne(mounted.root, (node) => node.type === "input");
@@ -128,9 +151,20 @@ describe("DataGridSearchBar", () => {
     dispatch(suggestion, "mouseenter");
     expect(hoverSuggestion).toHaveBeenCalledWith(0);
 
-    const closeButton = findOne(mounted.root, (node) => node.type === "button");
+    const previousButton = findOne(mounted.root, (node) => node.props["aria-label"] === "search.prevMatch");
+    const nextButton = findOne(mounted.root, (node) => node.props["aria-label"] === "search.nextMatch");
+    expect(dispatch(previousButton, "mousedown").defaultPrevented).toBe(true);
+    dispatch(previousButton, "click");
+    dispatch(nextButton, "click");
+    expect(navigate.mock.calls).toEqual([[-1], [1]]);
+
+    const closeButton = findOne(mounted.root, (node) => node.props["aria-label"] === "search.close");
     dispatch(closeButton, "click");
     expect(close).toHaveBeenCalledOnce();
+
+    await mounted.setProps({ matchCount: 0 });
+    expect(previousButton.props.disabled).toBe(true);
+    expect(nextButton.props.disabled).toBe(true);
   });
 });
 

@@ -246,7 +246,8 @@ async fn main() {
         .route("/agents/upgrade-all", post(routes::agents::upgrade_all_agents))
         .route("/agents/uninstall", post(routes::agents::uninstall_agent))
         .route("/agents/import-offline", post(routes::agents::import_agents_from_zip))
-        .route("/agents/import-jar", post(routes::agents::import_agent_jar))
+        .route("/agents/import-driver", post(routes::agents::import_agent_driver_file))
+        .route("/agents/import-jar", post(routes::agents::import_agent_driver_file))
         .route(
             "/agents/java-runtime",
             get(routes::agents::get_agent_java_runtime_config).post(routes::agents::set_agent_java_runtime_config),

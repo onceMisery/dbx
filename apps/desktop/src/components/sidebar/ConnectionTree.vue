@@ -325,8 +325,8 @@ const filteredNodes = computed(() => {
   let nodes = store.treeNodes;
 
   const q = deferredSearchQuery.value;
+  nodes = filterSidebarTree(nodes, q, searchCollapsedIds.value, searchableNodeTypes.value);
   if (q) {
-    nodes = filterSidebarTree(nodes, q, searchCollapsedIds.value, searchableNodeTypes.value);
     nodes = filterSidebarSearchRootsByConnectionState(nodes, store.connectedIds);
   }
 

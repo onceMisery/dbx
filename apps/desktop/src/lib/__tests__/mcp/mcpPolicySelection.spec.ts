@@ -91,6 +91,18 @@ describe("MCP policy settings state", () => {
     expect(loadingStart).toBeLessThan(policyLoad);
     expect(loadingEnd).toBeGreaterThan(policyLoad);
   });
+
+  it("keeps translated mode descriptions in one responsive layout track", () => {
+    const descriptionStart = settingsDialogSource.indexOf("data-mcp-execution-mode-description");
+    const descriptionEnd = settingsDialogSource.indexOf("settings.mcpCapabilityTitle", descriptionStart);
+    const descriptionSource = settingsDialogSource.slice(descriptionStart, descriptionEnd);
+
+    expect(descriptionStart).toBeGreaterThan(-1);
+    expect(descriptionEnd).toBeGreaterThan(descriptionStart);
+    expect(descriptionSource).toContain('class="grid text-xs"');
+    expect(descriptionSource.match(/col-start-1 row-start-1/g)).toHaveLength(3);
+    expect(descriptionSource.match(/\? 'visible' : 'invisible'/g)).toHaveLength(3);
+  });
 });
 
 describe("MCP connection search", () => {
