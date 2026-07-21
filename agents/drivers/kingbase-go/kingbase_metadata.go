@@ -16,6 +16,10 @@ import (
 
 const metadataTimeout = 15 * time.Second
 
+// Escape '_' so only Kingbase internal SYS_/XLOG_ prefixes are hidden; names
+// such as SYSTEMS and SYSLOG may be user-created schemas in MySQL mode.
+const kingbaseMySQLCompatListSchemasSQL = `SELECT schema_name FROM information_schema.schemata WHERE UPPER(schema_name) <> 'INFORMATION_SCHEMA' AND UPPER(schema_name) NOT LIKE 'SYS\_%' ESCAPE '\' AND UPPER(schema_name) NOT LIKE 'XLOG\_%' ESCAPE '\' ORDER BY schema_name`
+
 var kingbaseDataTypes = []string{
 	"bigint", "bigserial", "bit", "bit varying", "boolean", "bytea", "char", "character",
 	"character varying", "date", "decimal", "double precision", "integer", "interval", "json",
@@ -187,7 +191,7 @@ func (s *server) listSchemas(visible []string) ([]string, error) {
 	if s.mode.postgresCatalog {
 		query = "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname NOT LIKE 'pg_temp_%' AND nspname NOT LIKE 'pg_toast_temp_%' ORDER BY nspname"
 	} else if s.mode.mysqlCompat {
-		query = "SELECT schema_name FROM information_schema.schemata WHERE UPPER(schema_name) <> 'INFORMATION_SCHEMA' AND UPPER(schema_name) NOT LIKE 'SYS%' AND UPPER(schema_name) NOT LIKE 'XLOG%' ORDER BY schema_name"
+		query = kingbaseMySQLCompatListSchemasSQL
 	}
 	rows, err := s.metadataQuery(query)
 	if err != nil {
@@ -488,13 +492,7 @@ func (s *server) listIndexes(schema, table string) ([]indexInfo, error) {
 	if s.mode.postgresCatalog {
 		catalog, prefix = "pg_catalog", "pg"
 	}
-	query := fmt.Sprintf(`SELECT i.relname, am.amname, ix.indisunique, ix.indisprimary, a.attname, pos.n
-FROM %s.%s_index ix JOIN %s.%s_class t ON t.oid = ix.indrelid
-JOIN %s.%s_class i ON i.oid = ix.indexrelid JOIN %s.%s_namespace n ON n.oid = t.relnamespace
-JOIN %s.%s_am am ON am.oid = i.relam
-JOIN generate_series(1,64) pos(n) ON pos.n <= array_length(string_to_array(ix.indkey::text,' '),1)
-JOIN %s.%s_attribute a ON a.attrelid = t.oid AND a.attnum = (string_to_array(ix.indkey::text,' '))[pos.n]::int2
-WHERE n.nspname = %s AND t.relname = %s ORDER BY i.relname, pos.n`, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(effective), quoteLiteral(table))
+	query := kingbaseListIndexesQuery(catalog, prefix, effective, table)
 	rows, err := s.metadataQuery(query)
 	if err != nil {
 		return nil, err
@@ -522,6 +520,16 @@ WHERE n.nspname = %s AND t.relname = %s ORDER BY i.relname, pos.n`, catalog, pre
 		result = append(result, *byName[name])
 	}
 	return result, rows.Err()
+}
+
+func kingbaseListIndexesQuery(catalog, prefix, schema, table string) string {
+	return fmt.Sprintf(`SELECT i.relname, am.amname, ix.indisunique, ix.indisprimary, a.attname, pos.n
+FROM %s.%s_index ix JOIN %s.%s_class t ON t.oid = ix.indrelid
+JOIN %s.%s_class i ON i.oid = ix.indexrelid JOIN %s.%s_namespace n ON n.oid = t.relnamespace
+JOIN %s.%s_am am ON am.oid = i.relam
+JOIN unnest(ix.indkey) WITH ORDINALITY AS pos(attnum,n) ON true
+JOIN %s.%s_attribute a ON a.attrelid = t.oid AND a.attnum = pos.attnum
+WHERE n.nspname = %s AND t.relname = %s ORDER BY i.relname, pos.n`, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(schema), quoteLiteral(table))
 }
 
 func (s *server) listForeignKeys(schema, table string) ([]foreignKeyInfo, error) {

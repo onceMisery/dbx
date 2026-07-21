@@ -146,6 +146,22 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
     }
 
     @Test
+    void mysqlCompatListSchemasFiltersSystemPrefixButKeepsUserSchemas() {
+        List<String> sql = new ArrayList<>();
+        KingbaseAgent agent = new KingbaseAgent();
+        agent.setMysqlCompatMode(true);
+        TestSupport.setPrivateConnection(agent, preparedConnection(sql, resultSet(
+            new String[]{"schema_name"},
+            new Object[][]{{"app"}, {"systems"}}
+        )));
+
+        Assertions.assertEquals(Arrays.asList("app", "systems"), agent.listSchemas());
+        Assertions.assertTrue(sql.get(0).contains("FROM information_schema.schemata"), sql.get(0));
+        Assertions.assertTrue(sql.get(0).contains("NOT LIKE 'SYS\\_%' ESCAPE '\\'"), sql.get(0));
+        Assertions.assertFalse(sql.get(0).contains("NOT LIKE 'SYS%'"), sql.get(0));
+    }
+
+    @Test
     void postgresCompatModeUsesPostgresCatalogForMetadata() throws Exception {
         List<String> sql = new ArrayList<>();
         KingbaseAgent agent = new KingbaseAgent();
@@ -786,6 +802,8 @@ class KingbaseAgentTest extends JdbcFakeExecutionBehaviorTest {
         Assertions.assertFalse(indexes.get(1).getIs_primary());
         Assertions.assertEquals(Arrays.asList("name", "created"), indexes.get(2).getColumns());
         Assertions.assertTrue(sql.get(0).contains("FROM SYS_CATALOG.SYS_INDEX"), sql.get(0));
+        Assertions.assertTrue(sql.get(0).contains("unnest(ix.indkey) WITH ORDINALITY"), sql.get(0));
+        Assertions.assertFalse(sql.get(0).contains("[pos.n]"), sql.get(0));
         Assertions.assertFalse(sql.get(0).contains("information_schema.table_constraints"), sql.get(0));
     }
 

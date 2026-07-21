@@ -167,8 +167,8 @@ public final class KingbaseAgent extends PostgresLikeAgent {
                 ? "SELECT schema_name " +
                     "FROM information_schema.schemata " +
                     "WHERE UPPER(schema_name) <> 'INFORMATION_SCHEMA' " +
-                    "AND UPPER(schema_name) NOT LIKE 'SYS%' " +
-                    "AND UPPER(schema_name) NOT LIKE 'XLOG%' " +
+                    "AND UPPER(schema_name) NOT LIKE 'SYS\\_%' ESCAPE '\\' " +
+                    "AND UPPER(schema_name) NOT LIKE 'XLOG\\_%' ESCAPE '\\' " +
                     "ORDER BY schema_name"
                 : "SELECT nspname AS schema_name " +
                     "FROM sys_catalog.sys_namespace " +
@@ -668,8 +668,8 @@ public final class KingbaseAgent extends PostgresLikeAgent {
                 "JOIN SYS_CATALOG.SYS_CLASS i ON i.oid = ix.indexrelid " +
                 "JOIN SYS_CATALOG.SYS_NAMESPACE n ON n.oid = t.relnamespace " +
                 "JOIN SYS_CATALOG.SYS_AM am ON am.oid = i.relam " +
-                "JOIN generate_series(1, 64) AS pos(n) ON pos.n <= array_length(string_to_array(ix.indkey::text, ' '), 1) " +
-                "JOIN SYS_CATALOG.SYS_ATTRIBUTE a ON a.attrelid = t.oid AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 " +
+                "JOIN unnest(ix.indkey) WITH ORDINALITY AS pos(attnum, n) ON true " +
+                "JOIN SYS_CATALOG.SYS_ATTRIBUTE a ON a.attrelid = t.oid AND a.attnum = pos.attnum " +
                 "WHERE n.nspname = " + sqlString(effectiveSchema(schema)) +
                 " AND t.relname = " + sqlString(table) + " " +
                 "ORDER BY i.relname, pos.n";

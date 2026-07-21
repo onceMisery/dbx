@@ -192,6 +192,29 @@ func TestBuildDSNConvertsDBXJDBCURL(t *testing.T) {
 	}
 }
 
+func TestKingbaseListIndexesQuerySupportsSQLServerMode(t *testing.T) {
+	query := kingbaseListIndexesQuery("sys_catalog", "sys", "public", "orders")
+	if !strings.Contains(query, "unnest(ix.indkey) WITH ORDINALITY") {
+		t.Fatalf("index query should preserve index column order without array subscripts: %s", query)
+	}
+	if strings.Contains(query, "[pos.n]") {
+		t.Fatalf("index query should not use dynamic array subscripts in SQL Server mode: %s", query)
+	}
+}
+
+func TestMySQLCompatSchemaQueryKeepsUserSchemasWithSystemLikeNames(t *testing.T) {
+	query := kingbaseMySQLCompatListSchemasSQL
+	for _, prefix := range []string{"SYS", "XLOG"} {
+		expected := "NOT LIKE '" + prefix + `\_%' ESCAPE '\'`
+		if !strings.Contains(query, expected) {
+			t.Fatalf("schema query must only hide the internal %s_ prefix: %s", prefix, query)
+		}
+		if strings.Contains(query, "NOT LIKE '"+prefix+"%'") {
+			t.Fatalf("schema query must preserve user schemas such as %sLOG: %s", prefix, query)
+		}
+	}
+}
+
 func TestMetadataNormalizationHelpers(t *testing.T) {
 	if normalizeTableType("BASE TABLE") != "TABLE" {
 		t.Fatal("BASE TABLE was not normalized")
