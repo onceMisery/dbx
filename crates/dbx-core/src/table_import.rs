@@ -2076,7 +2076,11 @@ where
                 .map(|(index, cell)| normalize_header(&cell_label(cell, None), index))
                 .collect();
         }
-        if row_number >= row_range.data_start_row && row_range.last_data_row.map_or(true, |last| row_number <= last) {
+        let row_is_within_range = match row_range.last_data_row {
+            Some(last) => row_number <= last,
+            None => true,
+        };
+        if row_number >= row_range.data_start_row && row_is_within_range {
             return (0..source_row.len()).map(|index| format!("column_{}", index + 1)).collect();
         }
     }
