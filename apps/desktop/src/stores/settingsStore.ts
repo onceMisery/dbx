@@ -34,11 +34,18 @@ export interface DesktopSettings {
   sidebar_table_page_size?: number | null;
 }
 
+export interface McpGlobalPolicy {
+  readOnly: boolean;
+  allowDangerousSql: boolean;
+  allowedConnectionIds: string[] | null;
+  configured: boolean;
+}
+
 export type DesktopIconTheme = "default" | "black";
 
 export type InterfaceLayout = "separated" | "classic";
 
-export type UpdateDownloadSource = "official" | "cnb" | "atomgit";
+export type UpdateDownloadSource = "official" | "cnb";
 export type SqlSemanticDiagnosticsMode = "auto" | "enabled" | "disabled";
 export type OpenTabsRestoreMode = "all" | "pinned" | "none";
 
@@ -62,6 +69,23 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   agent_store_dir: null,
   sidebar_table_page_size: DEFAULT_SIDEBAR_TABLE_PAGE_SIZE,
 };
+
+export const DEFAULT_MCP_GLOBAL_POLICY: McpGlobalPolicy = {
+  readOnly: false,
+  allowDangerousSql: false,
+  allowedConnectionIds: null,
+  configured: false,
+};
+
+export function normalizeMcpGlobalPolicy(policy: Partial<McpGlobalPolicy> | null | undefined): McpGlobalPolicy {
+  const allowedConnectionIds = policy?.allowedConnectionIds === null || policy?.allowedConnectionIds === undefined ? null : [...new Set(policy.allowedConnectionIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()))];
+  return {
+    readOnly: policy?.readOnly === true,
+    allowDangerousSql: policy?.allowDangerousSql === true,
+    allowedConnectionIds,
+    configured: policy?.configured === true,
+  };
+}
 
 export function normalizeDesktopSettings(settings: Partial<DesktopSettings> | null | undefined): DesktopSettings {
   const iconTheme = settings?.icon_theme === "black" ? "black" : DEFAULT_DESKTOP_SETTINGS.icon_theme;
@@ -162,7 +186,7 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     model: "",
     apiStyle: "completions",
     authMethod: "bearer",
-    requiresApiKey: true,
+    requiresApiKey: false,
   },
   "claude-code-cli": {
     label: "Claude Code CLI",
@@ -191,7 +215,7 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     model: "",
     apiStyle: "completions",
     authMethod: "bearer",
-    requiresApiKey: true,
+    requiresApiKey: false,
   },
 };
 
@@ -361,6 +385,7 @@ export interface EditorSettings {
   customThemes: CustomTheme[];
   activeCustomThemeId: string;
   executeMode: "all" | "current";
+  executeModeDefaultVersion: number;
   showExecutionTargetPicker: boolean;
   showStatementRunButtons: boolean;
   showCurrentStatementFrame: boolean;
@@ -377,6 +402,7 @@ export interface EditorSettings {
   tabLayout: TabLayoutMode;
   appLayout: "separated" | "classic";
   pageSize: number;
+  tableOpenPageSize: number;
   infiniteScroll: boolean;
   infiniteScrollMaxRows: number;
   autoCalculateTotalRows: boolean;
@@ -495,6 +521,8 @@ export const FONT_FAMILIES: { value: string; label: string }[] = [
   { value: "monospace", label: "System Monospace" },
 ];
 
+export const EXECUTE_MODE_CURRENT_DEFAULT_VERSION = 1;
+
 export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   fontFamily: "'Fira Code', 'Cascadia Code', 'Cascadia Mono', 'JetBrains Mono', monospace",
   fontSize: 13,
@@ -504,7 +532,8 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   customThemeColors: { ...DEFAULT_CUSTOM_THEME_COLORS },
   customThemes: [...DEFAULT_CUSTOM_THEMES],
   activeCustomThemeId: "default",
-  executeMode: "all",
+  executeMode: "current",
+  executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
   showExecutionTargetPicker: false,
   showStatementRunButtons: true,
   showCurrentStatementFrame: true,
@@ -521,6 +550,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   tabLayout: "scroll",
   appLayout: "classic",
   pageSize: 100,
+  tableOpenPageSize: 100,
   infiniteScroll: false,
   infiniteScrollMaxRows: 5000,
   autoCalculateTotalRows: false,
@@ -626,7 +656,8 @@ function normalizeTableFontSize(value: unknown): number {
 }
 
 function normalizeUpdateDownloadSource(value: unknown): UpdateDownloadSource {
-  if (value === "atomgit") return "atomgit";
+  // Preserve the intent of users who previously selected the mainland-China mirror.
+  if (value === "atomgit") return "cnb";
   return value === "cnb" ? "cnb" : DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
 }
 
@@ -719,6 +750,9 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
 
 export function normalizeEditorSettings(settings: Partial<EditorSettings>, existing?: EditorSettings): EditorSettings {
   const sqlSemanticDiagnosticsMode = normalizeSqlSemanticDiagnosticsMode(settings.sqlSemanticDiagnosticsMode, settings.sqlSemanticDiagnosticsEnabled);
+  const savedExecuteModeDefaultVersion = settings.executeModeDefaultVersion;
+  const executeModeDefaultVersion = typeof savedExecuteModeDefaultVersion === "number" && savedExecuteModeDefaultVersion >= EXECUTE_MODE_CURRENT_DEFAULT_VERSION ? savedExecuteModeDefaultVersion : EXECUTE_MODE_CURRENT_DEFAULT_VERSION;
+  const hasCurrentExecuteModeDefault = executeModeDefaultVersion === savedExecuteModeDefaultVersion;
   return {
     fontFamily: normalizeFontFamily(settings.fontFamily, DEFAULT_EDITOR_SETTINGS.fontFamily),
     fontSize: settings.fontSize ?? DEFAULT_EDITOR_SETTINGS.fontSize,
@@ -752,7 +786,8 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
         : [];
     })(),
     activeCustomThemeId: settings.activeCustomThemeId ?? "default",
-    executeMode: settings.executeMode ?? DEFAULT_EDITOR_SETTINGS.executeMode,
+    executeMode: hasCurrentExecuteModeDefault && (settings.executeMode === "all" || settings.executeMode === "current") ? settings.executeMode : DEFAULT_EDITOR_SETTINGS.executeMode,
+    executeModeDefaultVersion,
     showExecutionTargetPicker: settings.showExecutionTargetPicker ?? DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker,
     showStatementRunButtons: typeof settings.showStatementRunButtons === "boolean" ? settings.showStatementRunButtons : DEFAULT_EDITOR_SETTINGS.showStatementRunButtons,
     showCurrentStatementFrame: typeof settings.showCurrentStatementFrame === "boolean" ? settings.showCurrentStatementFrame : DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame,
@@ -769,6 +804,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     tabLayout: normalizeTabLayout(settings.tabLayout),
     appLayout: settings.appLayout ?? DEFAULT_EDITOR_SETTINGS.appLayout,
     pageSize: normalizeResultPageSize(settings.pageSize),
+    tableOpenPageSize: normalizeResultPageSize(settings.tableOpenPageSize, DEFAULT_EDITOR_SETTINGS.tableOpenPageSize),
     infiniteScroll: settings.infiniteScroll ?? DEFAULT_EDITOR_SETTINGS.infiniteScroll,
     infiniteScrollMaxRows: typeof settings.infiniteScrollMaxRows === "number" && settings.infiniteScrollMaxRows >= 1000 && settings.infiniteScrollMaxRows <= 50000 ? Math.round(settings.infiniteScrollMaxRows) : DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows,
     autoCalculateTotalRows: settings.autoCalculateTotalRows ?? DEFAULT_EDITOR_SETTINGS.autoCalculateTotalRows,
@@ -866,7 +902,9 @@ export const useSettingsStore = defineStore("settings", () => {
   const isAiConfigLoaded = ref(false);
   const aiConfigs = ref<AiConfigItem[]>([]);
   const desktopSettings = ref<DesktopSettings>({ ...DEFAULT_DESKTOP_SETTINGS });
+  const mcpGlobalPolicy = ref<McpGlobalPolicy>({ ...DEFAULT_MCP_GLOBAL_POLICY });
   const isDesktopSettingsLoaded = ref(false);
+  const isMcpGlobalPolicyLoaded = ref(false);
   const isEditorSettingsLoaded = ref(false);
 
   const editorSettings = ref<EditorSettings>(normalizeEditorSettings({}));
@@ -887,7 +925,15 @@ export const useSettingsStore = defineStore("settings", () => {
     if (isEditorSettingsLoaded.value) return;
     const saved = await api.loadEditorSettings().catch(() => null);
     if (saved && typeof saved === "object" && !Array.isArray(saved)) {
-      editorSettings.value = normalizeEditorSettings(saved as Partial<EditorSettings>);
+      const savedSettings = saved as Partial<EditorSettings>;
+      const normalized = normalizeEditorSettings(savedSettings);
+      editorSettings.value = normalized;
+      const needsExecuteModeDefaultMigration = typeof savedSettings.executeModeDefaultVersion !== "number" || savedSettings.executeModeDefaultVersion < EXECUTE_MODE_CURRENT_DEFAULT_VERSION;
+      const savedUpdateDownloadSource = (saved as { updateDownloadSource?: unknown }).updateDownloadSource;
+      if (savedUpdateDownloadSource === "atomgit" || needsExecuteModeDefaultMigration) {
+        // Persist one-time migrations so removed or unsafe defaults cannot reappear.
+        await api.saveEditorSettings(normalized).catch(() => {});
+      }
       isEditorSettingsLoaded.value = true;
       return;
     }
@@ -927,6 +973,32 @@ export const useSettingsStore = defineStore("settings", () => {
     } catch (error) {
       desktopSettings.value = previous;
       setDebugLoggingEnabled(previous.debug_logging_enabled);
+      throw error;
+    }
+  }
+
+  async function initMcpGlobalPolicy(force = false) {
+    if (isMcpGlobalPolicyLoaded.value && !force) return;
+    mcpGlobalPolicy.value = normalizeMcpGlobalPolicy(await api.loadMcpGlobalPolicy());
+    isMcpGlobalPolicyLoaded.value = true;
+  }
+
+  async function updateMcpGlobalPolicy(partial: Partial<Omit<McpGlobalPolicy, "configured">>) {
+    const previous = mcpGlobalPolicy.value;
+    const next = normalizeMcpGlobalPolicy({
+      ...previous,
+      ...partial,
+      configured: true,
+    });
+    mcpGlobalPolicy.value = next;
+    try {
+      await api.saveMcpGlobalPolicy({
+        readOnly: next.readOnly,
+        allowDangerousSql: next.allowDangerousSql,
+        allowedConnectionIds: next.allowedConnectionIds,
+      });
+    } catch (error) {
+      mcpGlobalPolicy.value = previous;
       throw error;
     }
   }
@@ -1089,6 +1161,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.tabLayout !== undefined) editorSettings.value.tabLayout = normalizeTabLayout(partial.tabLayout);
     if (partial.appLayout !== undefined) editorSettings.value.appLayout = partial.appLayout;
     if (partial.pageSize !== undefined) editorSettings.value.pageSize = normalizeResultPageSize(partial.pageSize);
+    if (partial.tableOpenPageSize !== undefined) editorSettings.value.tableOpenPageSize = normalizeResultPageSize(partial.tableOpenPageSize, DEFAULT_EDITOR_SETTINGS.tableOpenPageSize);
     if (partial.infiniteScroll !== undefined) editorSettings.value.infiniteScroll = partial.infiniteScroll;
     if (partial.infiniteScrollMaxRows !== undefined)
       editorSettings.value.infiniteScrollMaxRows = typeof partial.infiniteScrollMaxRows === "number" && partial.infiniteScrollMaxRows >= 1000 && partial.infiniteScrollMaxRows <= 50000 ? Math.round(partial.infiniteScrollMaxRows) : DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
@@ -1198,10 +1271,13 @@ export const useSettingsStore = defineStore("settings", () => {
     isEditorSettingsLoaded,
     editorSettings,
     desktopSettings,
+    mcpGlobalPolicy,
     initEditorSettings,
     updateEditorSettings,
     initDesktopSettings,
     updateDesktopSettings,
+    initMcpGlobalPolicy,
+    updateMcpGlobalPolicy,
     updateColumnFormatter,
     upsertCustomColumnFormatter,
     deleteCustomColumnFormatter,

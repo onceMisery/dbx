@@ -906,10 +906,9 @@ public final class MongoAgent {
             return converted;
         }
         if (value instanceof String text) {
+            // Plain JSON strings must retain their BSON type; only explicit shell date syntax
+            // is converted here. Extended JSON $date values are decoded by Document.parse.
             Date date = parseMongoShellDate(text);
-            if (date == null) {
-                date = parseLegacyDateDisplay(text);
-            }
             return date == null ? value : date;
         }
         return value;
@@ -933,28 +932,6 @@ public final class MongoAgent {
         try {
             Instant instant = Instant.parse(inner.substring(1, inner.length() - 1));
             return Date.from(instant);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    static Date parseLegacyDateDisplay(String value) {
-        String trimmed = value.trim();
-        if (!trimmed.matches("\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?")) {
-            return null;
-        }
-        String normalized = trimmed.replace(' ', 'T');
-        int dot = normalized.indexOf('.');
-        if (dot < 0) {
-            normalized = normalized + ".000";
-        } else {
-            int millisStart = dot + 1;
-            int millisEnd = normalized.length();
-            normalized = normalized.substring(0, millisStart)
-                + String.format("%-3s", normalized.substring(millisStart, millisEnd)).replace(' ', '0');
-        }
-        try {
-            return Date.from(Instant.parse(normalized + "Z"));
         } catch (Exception e) {
             return null;
         }

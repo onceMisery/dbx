@@ -14,6 +14,7 @@ import type {
   ObjectSource,
   ObjectSourceKind,
   ColumnInfo,
+  SqlServerColumnMetadata,
   IndexInfo,
   ForeignKeyInfo,
   TriggerInfo,
@@ -37,6 +38,7 @@ import type {
   SshConfigHostEntry,
   TunnelProfile,
 } from "@/types/database";
+import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import type { CollectionInfo } from "@/types/database";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
@@ -52,6 +54,7 @@ import type {
   UpgradeAllAgentDriversResult,
   AgentUpdateBlocker,
   DesktopSettings,
+  McpGlobalPolicy,
   SavedSqlSyncRequest,
   DriverInstallProgress,
   JavaRuntimeConfig,
@@ -639,6 +642,10 @@ export async function getColumns(connectionId: string, database: string, schema:
   return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
+export async function getSqlServerColumnMetadata(connectionId: string, database: string, schema: string, table: string): Promise<SqlServerColumnMetadata[]> {
+  return get(`/api/schema/sqlserver/column-metadata?${qs({ connection_id: connectionId, database, schema, table })}`);
+}
+
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
   return get(`/api/schema/data-types?${qs({ connection_id: connectionId, database })}`);
 }
@@ -810,12 +817,8 @@ export async function buildCreateUserSql(username: string, password: string, tab
 }
 
 export async function getExplainInfo(connectionId: string, database: string | undefined, schema: string | undefined, sql: string, mode: string): Promise<string | undefined> {
-  try {
-    const result = await post<string>("/api/query/get-explain-info", { connectionId, database, schema, sql, mode });
-    return result;
-  } catch {
-    return undefined;
-  }
+  // Match the Tauri path: transport and Agent failures must remain distinguishable from an empty plan.
+  return post<string>("/api/query/get-explain-info", { connectionId, database, schema, sql, mode });
 }
 
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
@@ -845,6 +848,10 @@ export async function buildCreateDatabaseSql(options: CreateDatabaseSqlOptions):
 
 export async function buildDuckDbAttachDatabaseSql(path: string, name: string): Promise<string> {
   return post("/api/query/build-duckdb-attach-database-sql", { options: { path, name } });
+}
+
+export async function buildSqliteAttachDatabaseSql(path: string, name: string): Promise<string> {
+  return post("/api/query/build-sqlite-attach-database-sql", { options: { path, name } });
 }
 
 export async function buildDropObjectSql(options: DropObjectSqlOptions): Promise<string> {
@@ -1159,6 +1166,19 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
 
 export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
   safeLocalStorageSet(DESKTOP_SETTINGS_STORAGE_KEY, JSON.stringify({ ...DEFAULT_DESKTOP_SETTINGS, ...settings }));
+}
+
+export async function loadMcpGlobalPolicy(): Promise<McpGlobalPolicy> {
+  return get("/api/app-settings/mcp-policy");
+}
+
+export async function saveMcpGlobalPolicy(policy: Omit<McpGlobalPolicy, "configured">): Promise<void> {
+  const res = await fetch(apiUrl("/api/app-settings/mcp-policy"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(policy),
+  });
+  if (!res.ok) throw new Error(await res.text());
 }
 
 export interface OpenTabsStatePayload {
@@ -2086,6 +2106,11 @@ export async function mongoFindDocuments(connectionId: string, database: string,
   return documentFindDocuments(connectionId, database, collection, skip, limit, filter, projection, sort, executionId);
 }
 
+export async function mongoParseShellCommand(source: string): Promise<MongoCommand> {
+  const raw = await post<Record<string, unknown>>("/api/mongo/parse-shell-command", { source });
+  return normalizeRustMongoCommand(raw);
+}
+
 export async function mongoFindOne(connectionId: string, database: string, collection: string, filter?: string, projection?: string, options?: string, executionId?: string): Promise<MongoDocumentResult> {
   return post("/api/mongo/find-one", { connectionId, database, collection, filter, projection, options, executionId });
 }
@@ -2287,7 +2312,11 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
 }
 
-export async function downloadAndInstallUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+  throw new Error("In-app update downloads are only available in the desktop app.");
+}
+
+export async function installDownloadedUpdate(): Promise<void> {
   throw new Error("In-app update installation is only available in the desktop app.");
 }
 

@@ -45,7 +45,6 @@
     <img src="https://img.shields.io/badge/InfluxDB-d30971?logo=influxdb&logoColor=white" />
     <img src="https://img.shields.io/badge/JDBC-4B5563?logoColor=white" />
     <img src="https://img.shields.io/badge/and%20more...-555555?logoColor=white" />
-    <a href="https://atomgit.com/t8y2/dbx"><img src="https://atomgit.com/t8y2/dbx/star/badge.svg" alt="AtomGit Stars" /></a>
     <a href="https://cnb.cool/dbxio.com/dbx"><img src="https://img.shields.io/badge/CNB-dbx-F76945?logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAppJREFUOE9tk01rE1EUhs+5H5lJ0iQT3FRX2Yi4avoLkv4CWxBcNt11oZiuFKGmXQhFN6kuRESSgitXKf6A5g+I6cqFLiKCiptOkraZ5H4cuZOkH9oLw+UO8z7nvGfei3DFohoEQLAKCGWyGJCSbQZsD3ei7r+f45WATV6xmjdISyAlYLaDliveux+ti5ozwLAaFPhIlk6G6f18sxuO7l9bBiWbVoncDGCMWMl++PI/gJ7IohkmD0zkBxT5oRn5LTpN7ULqBByEtFywWvRyHz8Fx3dvN0UwuMPyR0uJFycddH7tKPHZRn7BjnwwkQcUud0HO/K7oOENcTYPRCEAFERmsCpyfZDZfpdnBosOUKGx13BC60QTIdjpmSzrEWDR+UagjsgMciLXAwfhc4MNpKfQtOPE6mVh0gEOaeTXtWXXEdADpJAR/GaZ/rrM9Us82wORPd5zHbRp7JVcyxR5PRP5LTPy6uo0HXIlG9awMgLuEUABkBYI7VLyxs+yyPW3+Nyg4zqoG+UV7TDRlMBbWA/D43u3qlbLGmgRWM2BjFxjQjWQGQBuu4bYYvrm14JMnQSXcjBcny9A5DXIiDJp9/8FWCXAAOaFUEfILTgIcttOvf+2NJnLdI0fBFUyskZKBGTEJEAmBuzr9LCSUDwGQAwwgMzu+m9/VWOAeZSsk+YP48C4li/sRok1nlBd5PogBjgxNw70PfHyqBADyEVXicasZXCVpxYiLfO+HxVZDHCVYwvu2ebPT7fOLNAm65AWLnEAzvsEcOi9/lPU1aACXDfOLdhD9kxNszGdweQGYstqXgItJwDFNxKvwrp57G8h0zVwldHuA0IFt8El83yIs2FSDcpgxDJpUUTwK7gTduN3AK5iG7ehc/E2/gUPD3q3eY4awwAAAABJRU5ErkJggg==" alt="CNB" /></a>
   </p>
 	  <p>
@@ -156,6 +155,10 @@ npx @dbx-app/mcp-server
   }
 }
 ```
+
+连接 allowlist 和“只读 / 数据读写 / 完全访问”三档执行权限统一在 DBX 的“设置 → MCP”中管理。机器可读值仍为 `read_only`、`safe_write`、`high_risk_write`；客户端配置无需声明权限或连接范围环境变量。
+
+为兼容升级，旧配置中的 `DBX_MCP_ALLOW_WRITES=0`（或 `false`）仅在中央 MCP 策略首次保存前继续作为只读限制；它不能开启写入，也不能覆盖已经保存的中央策略。
 
 Windows 便携版需要在 MCP 配置中设置 `DBX_DATA_DIR`，指向 `DBX.exe` 同级的 `data` 目录（即包含 `dbx.db` 的文件夹）。
 
@@ -339,6 +342,13 @@ make docs
 
 DBX 官网文档位于 `docs/` 目录。如果你想贡献官网内容或文档页面，请修改 `docs/` 下的文件，并运行 `make docs` 在本地预览文档站。
 
+需要干净、可重复创建的本地数据库实例时，可使用 [`deploy/database/`](deploy/database/README.zh-CN.md) 下的带版本 Docker Compose 配方：
+
+```bash
+make db-list
+make db-verify DB=mysql@8.4
+```
+
 JDBC Agent 驱动开发工程位于 `agents/` 目录：
 
 ```bash
@@ -369,6 +379,7 @@ make package
 ## 文档
 
 - [官方文档](https://dbxio.com/cn/docs/what-is-dbx) — 功能说明与使用教程
+- [数据库测试实验室](https://dbxio.com/cn/docs/database-lab) — 用于开发和验证的本地数据库配方
 - [贡献指南](CONTRIBUTING.zh-CN.md) — 如何认领 Issue 并提交 PR
 - [Web API 参考](docs/content/docs/web-api.cn.mdx) — Docker/Web 部署的 HTTP API
 - [示例代码](examples/) — CLI、MCP、Docker 与 API 示例

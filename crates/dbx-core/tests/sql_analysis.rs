@@ -56,6 +56,15 @@ fn extracts_mysql_quoted_table_references() {
 }
 
 #[test]
+fn extracts_mysql_qualified_backtick_table_references() {
+    let analysis = analyze_sql_references("SELECT * FROM `core`.`products` LIMIT 100;", Some("mysql")).unwrap();
+
+    assert_eq!(analysis.tables.len(), 1);
+    assert_eq!(analysis.tables[0].schema.as_deref(), Some("core"));
+    assert_eq!(analysis.tables[0].name, "products");
+}
+
+#[test]
 fn extracts_mysql_single_quoted_table_references() {
     let analysis = analyze_sql_references("SELECT * FROM 't_10001' LIMIT 100", Some("mysql")).unwrap();
 
@@ -89,6 +98,38 @@ fn extracts_unqualified_order_by_columns_for_sqlserver_queries() {
     let columns: Vec<_> =
         analysis.columns.iter().map(|column| (column.qualifier.as_deref(), column.name.as_str())).collect();
     assert_eq!(columns, vec![(None, "PDReceiveDatePartInfo")]);
+}
+
+#[test]
+fn sqlserver_create_proc_and_procedure_are_equivalent() {
+    for sql in ["CREATE PROC test\nAS\n", "CREATE PROCEDURE test\nAS\n", "CREATE PROC test AS SELECT 1;"] {
+        let analysis = analyze_sql_references(sql, Some("sqlserver"))
+            .unwrap_or_else(|error| panic!("SQL Server procedure declaration should analyze: {error}"));
+        assert!(analysis.tables.is_empty());
+        assert!(analysis.columns.is_empty());
+    }
+}
+
+#[test]
+fn sqlserver_create_or_alter_proc_is_supported() {
+    analyze_sql_references("CREATE OR ALTER PROC test AS SELECT 1;", Some("sqlserver"))
+        .unwrap_or_else(|error| panic!("SQL Server CREATE OR ALTER PROC should analyze: {error}"));
+}
+
+#[test]
+fn create_proc_remains_invalid_outside_sqlserver() {
+    let error = analyze_sql_references("CREATE PROC test AS SELECT 1", Some("postgres"))
+        .expect_err("PostgreSQL must not inherit SQL Server's PROC synonym");
+
+    assert!(error.contains("an object type after CREATE"));
+}
+
+#[test]
+fn sqlserver_proc_identifiers_remain_identifiers_outside_create() {
+    let analysis = analyze_sql_references("SELECT proc FROM jobs", Some("sqlserver")).unwrap();
+
+    assert_eq!(analysis.tables[0].name, "jobs");
+    assert_eq!(analysis.columns[0].name, "proc");
 }
 
 #[test]

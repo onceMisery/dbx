@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import type {
   ConnectionConfig,
   ConnectionTestResult,
@@ -16,6 +17,7 @@ import type {
   ObjectSource,
   ObjectSourceKind,
   ColumnInfo,
+  SqlServerColumnMetadata,
   IndexInfo,
   ForeignKeyInfo,
   TriggerInfo,
@@ -162,6 +164,13 @@ export interface DesktopSettings {
   plugin_store_dir?: string | null;
   agent_store_dir?: string | null;
   sidebar_table_page_size?: number | null;
+}
+
+export interface McpGlobalPolicy {
+  readOnly: boolean;
+  allowDangerousSql: boolean;
+  allowedConnectionIds: string[] | null;
+  configured: boolean;
 }
 
 export interface SavedSqlSyncEntry {
@@ -444,6 +453,14 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
 
 export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
   return invoke("save_desktop_settings", { settings });
+}
+
+export async function loadMcpGlobalPolicy(): Promise<McpGlobalPolicy> {
+  return invoke("load_mcp_global_policy");
+}
+
+export async function saveMcpGlobalPolicy(policy: Omit<McpGlobalPolicy, "configured">): Promise<void> {
+  return invoke("save_mcp_global_policy", { policy });
 }
 
 export interface OpenTabsStatePayload {
@@ -788,6 +805,10 @@ export async function getColumns(connectionId: string, database: string, schema:
   return invoke("get_columns", { connectionId, database, schema, table, catalog });
 }
 
+export async function getSqlServerColumnMetadata(connectionId: string, database: string, schema: string, table: string): Promise<SqlServerColumnMetadata[]> {
+  return invoke("get_sqlserver_column_metadata", { connectionId, database, schema, table });
+}
+
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
   return invoke("list_data_types", { connectionId, database });
 }
@@ -901,13 +922,8 @@ export async function buildCreateUserSql(username: string, password: string, tab
 }
 
 export async function getExplainInfo(connectionId: string, database: string | undefined, schema: string | undefined, sql: string, mode: string): Promise<string | undefined> {
-  try {
-    const result = await invoke<string>("get_explain_info", { connectionId, database, schema, sql, mode });
-    return result;
-  } catch (e: any) {
-    console.error("[getExplainInfo] invoke failed:", e?.message || e);
-    return undefined;
-  }
+  // Preserve Agent/driver errors so the explain view can show the actionable cause.
+  return invoke<string>("get_explain_info", { connectionId, database, schema, sql, mode });
 }
 
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
@@ -937,6 +953,10 @@ export async function buildCreateDatabaseSql(options: CreateDatabaseSqlOptions):
 
 export async function buildDuckDbAttachDatabaseSql(path: string, name: string): Promise<string> {
   return invoke("build_duckdb_attach_database_sql", { options: { path, name } });
+}
+
+export async function buildSqliteAttachDatabaseSql(path: string, name: string): Promise<string> {
+  return invoke("build_sqlite_attach_database_sql", { options: { path, name } });
 }
 
 export async function buildDropObjectSql(options: DropObjectSqlOptions): Promise<string> {
@@ -1411,7 +1431,7 @@ export interface UpdateInfo {
   release_notes: string;
 }
 
-export type UpdateDownloadSource = "official" | "cnb" | "atomgit";
+export type UpdateDownloadSource = "official" | "cnb";
 
 export interface UpdateDownloadProgress {
   downloaded: number;
@@ -1453,8 +1473,12 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return invoke("get_system_proxy_url");
 }
 
-export async function downloadAndInstallUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
-  return invoke("download_and_install_update", { source, latestVersion });
+export async function downloadUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
+  return invoke("download_update", { source, latestVersion });
+}
+
+export async function installDownloadedUpdate(): Promise<void> {
+  return invoke("install_downloaded_update");
 }
 
 export async function getAppVersion(): Promise<string> {
@@ -1861,6 +1885,11 @@ export async function mongoFindDocuments(connectionId: string, database: string,
 
 export async function mongoFindOne(connectionId: string, database: string, collection: string, filter?: string, projection?: string, options?: string, executionId?: string): Promise<MongoDocumentResult> {
   return invoke("mongo_find_one", { connectionId, database, collection, filter, projection, options, executionId });
+}
+
+export async function mongoParseShellCommand(source: string): Promise<MongoCommand> {
+  const raw = await invoke<Record<string, unknown>>("mongo_parse_shell_command", { source });
+  return normalizeRustMongoCommand(raw);
 }
 
 export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
@@ -2316,6 +2345,7 @@ export interface DatabaseExportRequest {
   schema: string;
   filePath: string;
   selectedTables?: string[];
+  excludedTables?: string[];
   includeStructure: boolean;
   includeData: boolean;
   includeObjects: boolean;

@@ -334,9 +334,7 @@ fn linux_appimage_system_gtk_immodules_cache(
     let Some(gtk_im_module_file) = gtk_im_module_file else {
         return Some(system_cache_path);
     };
-    let Some(appdir) = appdir else {
-        return None;
-    };
+    let appdir = appdir?;
 
     if std::path::Path::new(gtk_im_module_file).starts_with(std::path::Path::new(appdir)) {
         Some(system_cache_path)
@@ -526,7 +524,7 @@ fn apply_macos_app_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconThe
 fn apply_desktop_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconTheme) -> tauri::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return apply_macos_app_icon_theme(app, icon_theme);
+        apply_macos_app_icon_theme(app, icon_theme)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -971,6 +969,7 @@ pub fn run() {
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
             app.manage(CloseBehaviorState::new());
+            app.manage(commands::update::PendingUpdateState::default());
             #[cfg(target_os = "macos")]
             macos_app_delegate::install_dock_quit_handler(app.handle());
             let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
@@ -1010,11 +1009,11 @@ pub fn run() {
                 let app = window.app_handle();
                 if app.try_state::<CloseBehaviorState>().is_none() {
                     api.prevent_close();
-                    hide_main_window_for_close(&app, window);
+                    hide_main_window_for_close(app, window);
                     return;
                 }
                 api.prevent_close();
-                request_app_close(&app, "settings");
+                request_app_close(app, "settings");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1047,6 +1046,8 @@ pub fn run() {
             commands::app_settings::get_driver_store_path,
             commands::app_settings::load_pinned_tree_node_ids,
             commands::app_settings::save_pinned_tree_node_ids,
+            commands::app_settings::load_mcp_global_policy,
+            commands::app_settings::save_mcp_global_policy,
             commands::app_settings::load_editor_settings,
             commands::app_settings::save_editor_settings,
             commands::app_settings::load_open_tabs_state,
@@ -1117,6 +1118,7 @@ pub fn run() {
             commands::schema::list_schema_infos,
             commands::schema::list_data_types,
             commands::schema::get_columns,
+            commands::schema::get_sqlserver_column_metadata,
             commands::schema::list_indexes,
             commands::schema::list_foreign_keys,
             commands::schema::list_triggers,
@@ -1165,6 +1167,7 @@ pub fn run() {
             commands::query::build_create_database_sql,
             #[cfg(feature = "duckdb-bundled")]
             commands::query::build_duckdb_attach_database_sql,
+            commands::query::build_sqlite_attach_database_sql,
             commands::query::build_drop_object_sql,
             commands::query::build_drop_table_sql,
             commands::query::build_drop_table_child_object_sql,
@@ -1299,6 +1302,7 @@ pub fn run() {
             commands::document_cmd::document_upload_gridfs_file,
             commands::document_cmd::document_delete_gridfs_file,
             commands::mongo_cmd::mongo_find_documents,
+            commands::mongo_cmd::mongo_parse_shell_command,
             commands::mongo_cmd::mongo_find_one,
             commands::mongo_cmd::mongo_count_documents,
             commands::mongo_cmd::mongo_server_version,
@@ -1364,6 +1368,10 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_clear_backlog,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_consumer_group_config,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_alter_consumer_group_config,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_peek_messages,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_expire_messages,
@@ -1400,6 +1408,20 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_get_cluster_info,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_topic_route,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_alter_topic_config,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_skip_topic_accumulation,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_view_message,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_query_messages_by_key,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_query_messages_by_topic,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_query_message_trace,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_raw_request,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_send_message,
@@ -1412,7 +1434,8 @@ pub fn run() {
             commands::update::check_for_updates,
             commands::update::fetch_changelog,
             commands::update::get_system_proxy_url,
-            commands::update::download_and_install_update,
+            commands::update::download_update,
+            commands::update::install_downloaded_update,
             commands::transfer::start_transfer,
             commands::transfer::preview_transfer_ownership,
             commands::transfer::cancel_transfer,

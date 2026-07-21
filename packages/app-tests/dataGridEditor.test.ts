@@ -618,6 +618,23 @@ test("undo and redo restore pending cell edits before save", () => {
   assert.deepEqual(editor.rowDataWithChanges(result.value.rows[0], 0), [1, "Ada Lovelace"]);
 });
 
+test("typing NULL preserves the literal string value", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+
+  const result = computed(() => ({
+    columns: ["id", "name"],
+    rows: [[1, "Ada"] as CellValue[]],
+  }));
+  const editor = createPeopleGridEditor(result);
+
+  editor.applyCellValue(0, 1, "NULL");
+
+  assert.equal(editor.dirtyRows.value.get(0)?.get(1), "NULL");
+  assert.deepEqual(editor.rowDataWithChanges(result.value.rows[0], 0), [1, "NULL"]);
+  assert.deepEqual(await editor.previewChanges(), [`UPDATE "people" SET "name" = 'NULL' WHERE "id" = 1;`]);
+});
+
 test("setting a cell to NULL records pending SQL and supports undo and redo", async () => {
   setActivePinia(createPinia());
   installBrowserTestGlobals();
@@ -1167,6 +1184,11 @@ test("single-statement table data save uses auto-commit and records a failed his
   assert.equal(historyEntry.rollback_sql, undefined);
   assert.equal(historyEntry.affected_rows, undefined);
   assert.equal(historyEntry.sql, `UPDATE "pp_questions" SET "title" = 'New title' WHERE "id" = 1;`);
+  const details = JSON.parse(String(historyEntry.details_json));
+  assert.equal(details.statement_count, 1);
+  assert.equal(details.rollback_statement_count, 0);
+  assert.equal("statements" in details, false);
+  assert.equal("rollback_statements" in details, false);
 });
 
 test("multi-statement table data save remains transactional", async () => {

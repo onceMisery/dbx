@@ -1611,7 +1611,7 @@ fn oracle_object_info_can_have_table_comment(object: &db::ObjectInfo) -> bool {
 }
 
 fn oracle_type_is_table_or_view(value: &str) -> bool {
-    let normalized = value.to_ascii_uppercase().replace(' ', "_").replace('-', "_");
+    let normalized = value.to_ascii_uppercase().replace([' ', '-'], "_");
     matches!(normalized.as_str(), "TABLE" | "BASE_TABLE" | "VIEW")
 }
 
@@ -1915,7 +1915,7 @@ async fn list_tables_once(
         try_sqlserver!(connections, &pool_key, list_tables, schema, filter, limit, offset);
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
-            let use_oracle_agent_paging = db_config.as_ref().is_some_and(is_default_oracle_agent_config);
+            let use_agent_table_paging = db_config.as_ref().is_some_and(supports_agent_table_paging);
             let filter_locally_after_oracle_comments =
                 is_oracle && filter.is_some_and(|filter| !filter.trim().is_empty());
             let timeout_duration = agent_metadata_timeout(db_config.as_ref());
@@ -1925,14 +1925,14 @@ async fn list_tables_once(
             let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
             let agent_limit = if filter_locally_after_oracle_comments {
                 None
-            } else if use_oracle_agent_paging {
+            } else if use_agent_table_paging {
                 limit
             } else {
                 None
             };
             let agent_offset = if filter_locally_after_oracle_comments {
                 None
-            } else if use_oracle_agent_paging {
+            } else if use_agent_table_paging {
                 offset
             } else {
                 None
@@ -1962,7 +1962,7 @@ async fn list_tables_once(
                     }
                     let final_offset = if filter_locally_after_oracle_comments {
                         offset
-                    } else if oracle_agent_paging_likely_applied(use_oracle_agent_paging, limit, tables.len()) {
+                    } else if agent_paging_likely_applied(use_agent_table_paging, limit, tables.len()) {
                         Some(0)
                     } else {
                         offset
@@ -2597,12 +2597,23 @@ mod tests {
     }
 
     #[test]
-    fn oracle_agent_paging_detection_avoids_double_offset_only_when_page_sized() {
-        assert!(super::oracle_agent_paging_likely_applied(true, Some(500), 500));
-        assert!(super::oracle_agent_paging_likely_applied(true, Some(500), 120));
-        assert!(!super::oracle_agent_paging_likely_applied(true, Some(500), 501));
-        assert!(!super::oracle_agent_paging_likely_applied(false, Some(500), 120));
-        assert!(!super::oracle_agent_paging_likely_applied(true, None, 120));
+    fn agent_table_paging_supports_tdengine_and_default_oracle_only() {
+        assert!(super::supports_agent_table_paging(&test_connection_config(DatabaseType::Tdengine)));
+        assert!(super::supports_agent_table_paging(&test_connection_config(DatabaseType::Oracle)));
+        assert!(!super::supports_agent_table_paging(&test_connection_config(DatabaseType::Dameng)));
+
+        let mut legacy_oracle = test_connection_config(DatabaseType::Oracle);
+        legacy_oracle.driver_profile = Some("oracle-legacy".to_string());
+        assert!(!super::supports_agent_table_paging(&legacy_oracle));
+    }
+
+    #[test]
+    fn agent_paging_detection_avoids_double_offset_only_when_page_sized() {
+        assert!(super::agent_paging_likely_applied(true, Some(500), 500));
+        assert!(super::agent_paging_likely_applied(true, Some(500), 120));
+        assert!(!super::agent_paging_likely_applied(true, Some(500), 501));
+        assert!(!super::agent_paging_likely_applied(false, Some(500), 120));
+        assert!(!super::agent_paging_likely_applied(true, None, 120));
     }
 
     #[test]
@@ -3516,7 +3527,7 @@ pub async fn list_objects_core(
             .await
             .map(|outcome| {
                 let final_offset = if outcome.paging_applied
-                    || oracle_agent_paging_likely_applied(use_oracle_agent_paging, limit, outcome.objects.len())
+                    || agent_paging_likely_applied(use_oracle_agent_paging, limit, outcome.objects.len())
                 {
                     Some(0)
                 } else {
@@ -4467,6 +4478,22 @@ pub async fn get_columns_core(
     .await
 }
 
+pub async fn get_sqlserver_column_metadata_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<db::sqlserver::SqlServerColumnMetadata>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+        let connections = state.connections.read().await;
+        try_sqlserver!(connections, &pool_key, get_column_metadata, schema, table);
+        Err("SQL Server column metadata requires a native SQL Server connection".to_string())
+    })
+    .await
+}
+
 fn deduplicate_column_infos(columns: Vec<db::ColumnInfo>) -> Vec<db::ColumnInfo> {
     let mut result: Vec<db::ColumnInfo> = Vec::with_capacity(columns.len());
     for column in columns {
@@ -4922,7 +4949,7 @@ pub async fn get_table_ddl_core(
             }
         }
         PoolKind::Postgres(p) => pg_ddl(p, schema, table).await,
-        PoolKind::Sqlite(p) => sqlite_ddl(p, table).await,
+        PoolKind::Sqlite(p) => sqlite_ddl(p, schema, table).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::table_ddl(client, table).await,
         PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::table_ddl(client, table).await,
         _ => Err("DDL not supported for this database type".to_string()),
@@ -4944,7 +4971,12 @@ fn is_default_oracle_agent_config(config: &ConnectionConfig) -> bool {
         && !matches!(config.driver_profile.as_deref(), Some("oracle-legacy" | "oracle-10g"))
 }
 
-fn oracle_agent_paging_likely_applied(enabled: bool, limit: Option<usize>, returned_len: usize) -> bool {
+fn supports_agent_table_paging(config: &ConnectionConfig) -> bool {
+    // Keep paging opt-in until each legacy agent is known to apply metadata constraints server-side.
+    matches!(config.db_type, DatabaseType::Tdengine) || is_default_oracle_agent_config(config)
+}
+
+fn agent_paging_likely_applied(enabled: bool, limit: Option<usize>, returned_len: usize) -> bool {
     enabled && limit.is_some_and(|limit| returned_len <= limit)
 }
 
@@ -5204,9 +5236,10 @@ pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourc
     }
 }
 
-pub fn sqlite_object_source_sql(name: &str, kind: &db::ObjectSourceKind) -> String {
+pub fn sqlite_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourceKind) -> String {
     format!(
-        "SELECT sql FROM sqlite_master WHERE type = {} AND name = {}",
+        "SELECT sql FROM {}.sqlite_master WHERE type = {} AND name = {}",
+        db::sqlite::sqlite_quote_schema_ident(schema),
         sql_string(sqlite_object_type(kind)),
         sql_string(name)
     )
@@ -5365,7 +5398,7 @@ async fn get_object_source_once(
                 }
                 PoolKind::Postgres(pool) => postgres_object_source(pool, schema, name, &object_type, signature).await?,
                 PoolKind::Sqlite(pool) => first_string_cell(
-                    db::sqlite::execute_query(pool, &sqlite_object_source_sql(name, &object_type)).await?,
+                    db::sqlite::execute_query(pool, &sqlite_object_source_sql(schema, name, &object_type)).await?,
                 )?,
                 #[cfg(feature = "duckdb-bundled")]
                 PoolKind::DuckDb(con) => {
@@ -6193,15 +6226,14 @@ fn ensure_display_ddl_terminated(sql: String) -> String {
     }
 }
 
-pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, table: &str) -> Result<String, String> {
+pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, schema: &str, table: &str) -> Result<String, String> {
     let pool = pool.clone();
+    let schema = db::sqlite::sqlite_quote_schema_ident(schema);
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
-            conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [table], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|e| e.to_string())
+            let sql = format!("SELECT sql FROM {}.sqlite_master WHERE type='table' AND name=?1", schema);
+            conn.query_row(&sql, [table], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())
         })
     })
     .await

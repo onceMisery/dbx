@@ -569,12 +569,52 @@ class MongoAgentTest {
     }
 
     @Test
-    void documentForWriteParsesLegacyDateDisplayStrings() {
-        Document doc = MongoAgent.documentForWrite("{\"$set\":{\"CreateDate\":\"2025-08-14 02:25:43.718\"}}");
+    void documentForWritePreservesDateShapedStrings() {
+        Document doc = MongoAgent.documentForWrite(
+            "{\"$set\":{\"CreateDate\":\"2025-08-14 02:25:43.718\"," +
+                "\"nested\":{\"updated\":\"2025-08-14T02:25:43\"}," +
+                "\"items\":[\"2025-08-14 02:25:43\"]}}"
+        );
 
         Document set = (Document) doc.get("$set");
-        assertTrue(set.get("CreateDate") instanceof Date);
-        assertEquals(1_755_138_343_718L, ((Date) set.get("CreateDate")).getTime());
+        assertEquals("2025-08-14 02:25:43.718", set.getString("CreateDate"));
+        assertEquals("2025-08-14T02:25:43", ((Document) set.get("nested")).getString("updated"));
+        assertEquals("2025-08-14 02:25:43", ((List<?>) set.get("items")).get(0));
+    }
+
+    @Test
+    void documentForWriteParsesExtendedJsonDates() {
+        Document doc = MongoAgent.documentForWrite(
+            "{\"created\":{\"$date\":\"2026-06-10T13:59:31.287Z\"}," +
+                "\"items\":[{\"updated\":{\"$date\":{\"$numberLong\":\"1781100000000\"}}}]}"
+        );
+
+        assertTrue(doc.get("created") instanceof Date);
+        Document item = (Document) ((List<?>) doc.get("items")).get(0);
+        assertTrue(item.get("updated") instanceof Date);
+    }
+
+    @Test
+    void updatePipelinePreservesStringsAndParsesExplicitDates() {
+        List<Document> pipeline = MongoAgent.updatePipelineForWrite(
+            "[{\"$set\":{\"label\":\"2025-08-14 02:25:43.718\"," +
+                "\"created\":\"ISODate(\\\"2026-06-10T13:59:31.287Z\\\")\"}}]"
+        );
+
+        Document set = (Document) pipeline.get(0).get("$set");
+        assertEquals("2025-08-14 02:25:43.718", set.getString("label"));
+        assertTrue(set.get("created") instanceof Date);
+    }
+
+    @Test
+    void filterDocumentsPreserveDateShapedStrings() {
+        Document filter = MongoAgent.documentForWrite(
+            "{\"created\":\"2025-08-14 02:25:43.718\"," +
+                "\"updated\":{\"$date\":\"2026-06-10T13:59:31.287Z\"}}"
+        );
+
+        assertEquals("2025-08-14 02:25:43.718", filter.getString("created"));
+        assertTrue(filter.get("updated") instanceof Date);
     }
 
     @Test

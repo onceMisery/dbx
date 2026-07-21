@@ -697,6 +697,8 @@ function refreshQueryEditorCompletionCache(): boolean {
 }
 
 function refreshData(): boolean {
+  // Reuse ObjectBrowser's reload path so schema reloads and stale object-response guards stay intact.
+  if (props.activeTab.mode === "objects") return objectBrowserRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "etcd") return etcdKeyBrowserRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "zookeeper") return zookeeperKeyBrowserRef.value?.refresh?.() ?? false;
   // Restored data tabs intentionally omit row data, so refresh must work before DataGrid mounts.
@@ -1475,7 +1477,7 @@ defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, hand
           :initial-order-by-input="activeTab.orderByInput"
           :sql="activeTab.sql"
           :loading="activeTab.isExecuting"
-          :editable="isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType)"
+          :editable="!activeTab.tableMetaPending && isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType)"
           context="table-data"
           :initial-where-input="activeTab.whereInput"
           :database-type="activeEffectiveDatabaseType"

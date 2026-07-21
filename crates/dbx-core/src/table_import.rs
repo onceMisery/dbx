@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufReader, Read as IoRead, Seek, SeekFrom, Write as IoWrite};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use calamine::{
@@ -1547,21 +1547,9 @@ fn read_xlsx_shared_strings(
     Ok(strings)
 }
 
-struct XlsxTempPath(PathBuf);
-
-impl Drop for XlsxTempPath {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 struct XlsxDiskSharedStrings {
     file: File,
     index: File,
-    #[allow(dead_code)]
-    path: XlsxTempPath,
-    #[allow(dead_code)]
-    index_path: XlsxTempPath,
     count: usize,
     cache: HashMap<usize, String>,
     cache_bytes: usize,
@@ -1628,12 +1616,22 @@ impl XlsxSharedStrings {
     }
 
     #[cfg(test)]
-    fn disk_paths(&self) -> Option<(&Path, &Path)> {
+    fn disk_files(&self) -> Option<(&File, &File)> {
         match self {
             Self::Memory(_) => None,
-            Self::Disk(store) => Some((&store.path.0, &store.index_path.0)),
+            Self::Disk(store) => Some((&store.file, &store.index)),
         }
     }
+}
+
+fn create_xlsx_spill_file() -> std::io::Result<File> {
+    let file = tempfile::tempfile()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) -> Result<XlsxSharedStrings, String> {
@@ -1652,30 +1650,11 @@ fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) 
     let mut strings = if uncompressed_size <= memory_limit {
         XlsxSharedStrings::Memory(Vec::new())
     } else {
-        let path = std::env::temp_dir().join(format!("dbx-xlsx-shared-{}.tmp", uuid::Uuid::new_v4()));
-        let index_path = path.with_extension("idx");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| error.to_string())?;
-        let index = match OpenOptions::new().read(true).write(true).create_new(true).open(&index_path) {
-            Ok(index) => index,
-            Err(error) => {
-                let _ = std::fs::remove_file(&path);
-                return Err(error.to_string());
-            }
-        };
-        XlsxSharedStrings::Disk(XlsxDiskSharedStrings {
-            file,
-            index,
-            path: XlsxTempPath(path),
-            index_path: XlsxTempPath(index_path),
-            count: 0,
-            cache: HashMap::new(),
-            cache_bytes: 0,
-        })
+        // Anonymous temporary files are owner-only on Unix and are removed by the OS when
+        // their last handles close, including after abnormal process termination.
+        let file = create_xlsx_spill_file().map_err(|error| error.to_string())?;
+        let index = create_xlsx_spill_file().map_err(|error| error.to_string())?;
+        XlsxSharedStrings::Disk(XlsxDiskSharedStrings { file, index, count: 0, cache: HashMap::new(), cache_bytes: 0 })
     };
 
     let file = zip.by_name("xl/sharedStrings.xml").map_err(|error| error.to_string())?;
@@ -4509,6 +4488,16 @@ mod tests {
     use crate::xlsx_export::{build_xlsx_workbook_multi, XlsxWorksheetData};
     use std::io::{Cursor, Write};
 
+    fn xlsx_named_spill_files() -> std::collections::HashSet<std::path::PathBuf> {
+        std::fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("dbx-xlsx-shared-"))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
     #[test]
     fn table_import_progress_and_summary_report_elapsed_ms() {
         let started_at = std::time::Instant::now() - std::time::Duration::from_millis(25);
@@ -5244,17 +5233,103 @@ mod tests {
         let mut zip = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
 
         let mut strings = open_xlsx_shared_strings(&mut zip, 0).unwrap();
-        let (disk_path, index_path) = strings.disk_paths().expect("disk-backed shared strings");
-        let disk_path = disk_path.to_path_buf();
-        let index_path = index_path.to_path_buf();
-
-        assert!(disk_path.exists());
-        assert!(index_path.exists());
+        assert!(strings.disk_files().is_some(), "disk-backed shared strings");
         assert_eq!(strings.get(0).unwrap().as_deref(), Some("name"));
         assert_eq!(strings.get(1).unwrap().as_deref(), Some("Ada"));
         drop(strings);
-        assert!(!disk_path.exists());
-        assert!(!index_path.exists());
+        drop(zip);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xlsx_disk_shared_strings_do_not_leave_named_spill_files() {
+        let path =
+            std::env::temp_dir().join(format!("dbx-table-import-shared-anonymous-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A1"/>
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>
+</worksheet>"#;
+        let shared_strings_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
+  <si><t>sensitive-value</t></si>
+</sst>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, Some(shared_strings_xml))).unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let before = xlsx_named_spill_files();
+
+        let strings = open_xlsx_shared_strings(&mut zip, 0).unwrap();
+        let named_spill_files: Vec<_> = xlsx_named_spill_files().difference(&before).cloned().collect();
+
+        drop(strings);
+        drop(zip);
+        let _ = std::fs::remove_file(path);
+        let remaining_spill_files: Vec<_> = xlsx_named_spill_files().difference(&before).cloned().collect();
+        assert!(
+            named_spill_files.is_empty(),
+            "disk-backed shared strings created named spill files: {named_spill_files:?}"
+        );
+        assert!(
+            remaining_spill_files.is_empty(),
+            "disk-backed shared strings left named spill files: {remaining_spill_files:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xlsx_disk_shared_strings_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!("dbx-table-import-shared-perms-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A2"/>
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row><row r="2"><c r="A2" t="s"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let shared_strings_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2" uniqueCount="2">
+  <si><t>name</t></si><si><t>Ada</t></si>
+</sst>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, Some(shared_strings_xml))).unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+
+        let strings = open_xlsx_shared_strings(&mut zip, 0).unwrap();
+        let (data_file, index_file) = strings.disk_files().expect("disk-backed shared strings");
+
+        // Both spill files must be readable and writable only by the owner so other local
+        // users cannot read sensitive shared-string content while an import is in flight.
+        for spill_file in [data_file, index_file] {
+            let mode = spill_file.metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "unexpected shared-string spill-file mode: {mode:o}");
+        }
+
+        drop(strings);
+        drop(zip);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xlsx_disk_shared_strings_are_cleaned_up_after_parse_failure() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-shared-fail-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A1"/>
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>
+</worksheet>"#;
+        // Malformed XML: the reader spills the first string to disk, then errors on the
+        // broken markup, so the temp files must still be removed on the error path.
+        let shared_strings_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2" uniqueCount="2">
+  <si><t>name</t></si><si><t>Ada</t></si> <<< broken"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, Some(shared_strings_xml))).unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+
+        let before = xlsx_named_spill_files();
+        let result = open_xlsx_shared_strings(&mut zip, 0);
+        assert!(result.is_err(), "expected malformed shared strings to fail parsing");
+        let leaked: Vec<_> = xlsx_named_spill_files().difference(&before).cloned().collect();
+        assert!(leaked.is_empty(), "spill files leaked after parse failure: {leaked:?}");
+
         drop(zip);
         let _ = std::fs::remove_file(path);
     }

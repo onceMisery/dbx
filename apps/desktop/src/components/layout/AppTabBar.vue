@@ -434,6 +434,7 @@ function tabDatabaseIconType(tab: QueryTab) {
     const externalConfig = connection.external_config as { systemKind?: unknown } | undefined;
     const systemKind = typeof externalConfig?.systemKind === "string" ? externalConfig.systemKind : "";
     if (connection.driver_profile === "kafka" || systemKind === "kafka") return "kafka";
+    if (connection.driver_profile === "rocketmq" || systemKind === "rocketmq") return "rocketmq";
     if (connection.driver_profile === "pulsar" || systemKind === "pulsar") return "pulsar";
   }
   return connection.driver_profile || connection.db_type;
@@ -569,7 +570,7 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
               <Tooltip>
                 <TooltipTrigger as-child>
                   <div
-                    class="group flex items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap select-none"
+                    class="app-tab-pill group flex items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap select-none"
                     :class="
                       isClassicLayout
                         ? [
@@ -644,13 +645,14 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
             <div :class="isClassicLayout ? 'h-full' : ''" @contextmenu="onContextMenu">
               <div
                 data-settings-page-tab
-                class="group flex min-w-36 items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap"
+                class="app-tab-pill group flex min-w-36 items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap"
                 :class="
                   isClassicLayout
                     ? ['h-full border-r border-border/80 dark:border-border/45 font-medium', settingsPageActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90']
                     : ['h-7 rounded-md border font-medium', settingsPageActive ? 'border-ring text-foreground' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
                 "
                 :style="isClassicLayout && settingsPageActive ? { boxShadow: '0 1px 0 0 var(--color-background)' } : {}"
+                :data-active-tab="settingsPageActive"
                 @click="emit('activate-settings-page')"
                 @mousedown.middle.prevent="emit('close-settings-page')"
               >
@@ -670,13 +672,14 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
             <div :class="isClassicLayout ? 'h-full' : ''" @contextmenu="onContextMenu">
               <div
                 data-driver-store-tab
-                class="group flex min-w-38 items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap"
+                class="app-tab-pill group flex min-w-38 items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap"
                 :class="
                   isClassicLayout
                     ? ['h-full border-r border-border/80 dark:border-border/45 font-medium', driverStoreActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90']
                     : ['h-7 rounded-md border font-medium', driverStoreActive ? 'border-ring text-foreground' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
                 "
                 :style="isClassicLayout && driverStoreActive ? { boxShadow: '0 1px 0 0 var(--color-background)' } : {}"
+                :data-active-tab="driverStoreActive"
                 @click="emit('activate-driver-store')"
                 @mousedown.middle.prevent="emit('close-driver-store')"
               >
@@ -760,7 +763,7 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
               <Tooltip>
                 <TooltipTrigger as-child>
                   <div
-                    class="group flex items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap select-none"
+                    class="app-tab-pill group flex items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap select-none"
                     :class="
                       isClassicLayout
                         ? [
