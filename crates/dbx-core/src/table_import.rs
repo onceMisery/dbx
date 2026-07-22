@@ -4541,6 +4541,23 @@ where
         {
             return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
         }
+        // Full-sheet validation can take long enough for the user to cancel. Recheck before
+        // starting the producer or executing a non-transactional truncate.
+        if is_cancelled(&request.import_id).await {
+            progress_callback(import_progress_with_details(
+                &request.import_id,
+                TableImportStatus::Cancelled,
+                TableImportPhase::Done,
+                0,
+                0,
+                false,
+                total_bytes,
+                total_bytes,
+                started_at,
+                None,
+            ));
+            return Err("Import cancelled".to_string());
+        }
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<XlsxStreamMessage, String>>(2);
         let path = request.file_path.clone();
         let options = request.parse_options.clone();
@@ -6084,6 +6101,90 @@ mod tests {
 
         let rows =
             crate::db::sqlite::execute_query(&sqlite, "SELECT id, name FROM items ORDER BY id").await.unwrap().rows;
+        assert_eq!(rows, vec![vec![serde_json::json!(999), serde_json::json!("old")]]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_xlsx_after_validation_prevents_non_transactional_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "cancel-xlsx-after-validation";
+        let pool_key = format!("{connection_id}:session:import");
+        let database_path = dir.path().join("target.db");
+        let sqlite = crate::db::sqlite::connect_path_create_if_missing(database_path.to_str().unwrap()).await.unwrap();
+        crate::db::sqlite::execute_query(
+            &sqlite,
+            "CREATE TABLE items (id INTEGER, name TEXT); INSERT INTO items VALUES (999, 'old')",
+        )
+        .await
+        .unwrap();
+        state.connections.write().await.insert(pool_key.clone(), PoolKind::Sqlite(sqlite.clone()));
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": connection_id,
+            "name": "Cancel XLSX validation test",
+            "db_type": "sqlite",
+            "host": "",
+            "port": 0,
+            "username": "",
+            "password": "",
+            "database": database_path.to_string_lossy()
+        }))
+        .unwrap();
+        state.configs.write().await.insert(connection_id.to_string(), config);
+
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>id</t></is></c><c r="B1" t="inlineStr"><is><t>name</t></is></c></row>
+    <row r="2"><c r="A2"><v>1</v></c><c r="B2" t="inlineStr"><is><t>Ada</t></is></c></row>
+  </sheetData>
+</worksheet>"#;
+        let xlsx_path = dir.path().join("cancel-after-validation.xlsx");
+        std::fs::write(&xlsx_path, build_preview_test_xlsx(sheet_xml, None)).unwrap();
+        let request = TableImportRequest {
+            import_id: "cancel-xlsx-after-validation".to_string(),
+            connection_id: connection_id.to_string(),
+            database: String::new(),
+            schema: String::new(),
+            table: "items".to_string(),
+            file_path: xlsx_path.to_string_lossy().to_string(),
+            source_ref: None,
+            source_format: Some(TableImportSourceFormat::Excel),
+            parse_options: TableImportParseOptions::default(),
+            mappings: vec![
+                TableImportColumnMapping {
+                    source_column: "id".to_string(),
+                    target_column: "id".to_string(),
+                    target_data_type: None,
+                },
+                TableImportColumnMapping {
+                    source_column: "name".to_string(),
+                    target_column: "name".to_string(),
+                    target_data_type: None,
+                },
+            ],
+            mode: TableImportMode::Truncate,
+            create_table: false,
+            batch_size: 1,
+            date_time_format: None,
+            prepared_source: None,
+            retain_source: false,
+        };
+
+        let error = import_table_file_core(
+            &state,
+            &request,
+            &DatabaseType::Mysql,
+            &pool_key,
+            |_| Box::pin(async { true }),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "Import cancelled");
+
+        let rows = crate::db::sqlite::execute_query(&sqlite, "SELECT id, name FROM items").await.unwrap().rows;
         assert_eq!(rows, vec![vec![serde_json::json!(999), serde_json::json!("old")]]);
     }
 
