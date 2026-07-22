@@ -493,7 +493,7 @@ mod tests {
         std::fs::write(&file_path, b"id,name\n1,Ada\n").unwrap();
 
         let resolved = uploaded_import_path_for_source_ref(&data_dir, &source_ref)
-            .unwrap_or_else(|error| panic!("failed to resolve uploaded source: {}", error.0));
+            .unwrap_or_else(|error| panic!("failed to resolve uploaded source: {}", error.message));
 
         assert_eq!(resolved, file_path.canonicalize().unwrap());
         assert!(uploaded_import_path_for_source_ref(&data_dir, "../users.csv").is_err());
