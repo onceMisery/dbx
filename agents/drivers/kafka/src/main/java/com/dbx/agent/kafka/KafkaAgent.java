@@ -53,6 +53,7 @@ public final class KafkaAgent {
 
     private static AdminClient adminClient;
     private static KafkaProducer<String, byte[]> producer;
+    private static JsonObject activeConnection;
     private static volatile boolean shutdownRequested;
 
     private KafkaAgent() {}
@@ -164,6 +165,7 @@ public final class KafkaAgent {
             applyKerberosSystemProperties(conn);
             adminClient = nextAdmin;
             producer = nextProducer;
+            activeConnection = conn.deepCopy();
             return Collections.singletonMap("ok", true);
         } catch (Exception e) {
             if (nextAdmin != null) {
@@ -234,6 +236,7 @@ public final class KafkaAgent {
             producer.close(Duration.ofSeconds(5));
             producer = null;
         }
+        activeConnection = null;
         restoreKerberosSystemProperties(BASELINE_KERBEROS_SYSTEM_PROPERTIES);
     }
 
@@ -979,26 +982,11 @@ public final class KafkaAgent {
         Long offset = longOrNull(params, "offset");
         int count = Math.max(1, intOrDefault(params, "count", 10));
 
-        // Build a temporary consumer for peeking (no commit)
-        Properties props = new Properties();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
-            adminClient != null ? adminClient.describeCluster().clusterId()
-                .get(5, TimeUnit.SECONDS) : "localhost:9092");
-        // Reuse the admin's bootstrap servers
-        JsonObject conn = params.has("connection") && params.get("connection").isJsonObject()
-            ? params.getAsJsonObject("connection") : null;
-        if (conn != null) {
-            props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers(conn));
-            applyConnectionProperties(conn, props);
+        JsonObject conn = activeConnection;
+        if (conn == null) {
+            throw new IllegalStateException("Kafka Agent is not connected");
         }
-        props.put(ConsumerConfig.GROUP_ID_CONFIG, "dbx-peek-" + UUID.randomUUID());
-        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
-            "org.apache.kafka.common.serialization.StringDeserializer");
-        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
-            "org.apache.kafka.common.serialization.ByteArrayDeserializer");
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
-        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, count);
+        Properties props = peekConsumerProperties(conn, count);
 
         try (KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(props)) {
             List<TopicPartition> candidatePartitions = resolvePeekPartitions(consumer, topic, partition);
@@ -1052,6 +1040,21 @@ public final class KafkaAgent {
             }
             return Collections.singletonMap("messages", messages);
         }
+    }
+
+    static Properties peekConsumerProperties(JsonObject conn, int count) {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers(conn));
+        applyConnectionProperties(conn, props);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "dbx-peek-" + UUID.randomUUID());
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+            "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
+            "org.apache.kafka.common.serialization.ByteArrayDeserializer");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "none");
+        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, count);
+        return props;
     }
 
     /**

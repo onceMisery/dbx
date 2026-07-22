@@ -121,6 +121,18 @@ class KafkaAgentTest {
     }
 
     @Test
+    void peekConsumerPropertiesReuseResolvedConnection() {
+        JsonObject resolved = new JsonObject();
+        resolved.addProperty("bootstrap_servers", "legacy-broker:9092");
+        resolved.addProperty("security_protocol", "PLAINTEXT");
+
+        Properties properties = KafkaAgent.peekConsumerProperties(resolved, 25);
+
+        assertEquals("legacy-broker:9092", properties.getProperty("bootstrap.servers"));
+        assertEquals(25, properties.get("max.poll.records"));
+    }
+
+    @Test
     void legacyTopicConfigAppliesSetAndDeleteWithoutLosingExistingOverrides() {
         Config current = new Config(Arrays.asList(
             new ConfigEntry("cleanup.policy", "delete"),
