@@ -46,7 +46,7 @@ import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDete
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
 import { appendConnectionErrorHints, isJdbcMissingRuntimeDependencyError } from "@/lib/connection/connectionErrorHints";
 import { postgresTlsModeForForm } from "@/lib/connection/postgresTlsMode";
-import { normalizeKafkaBootstrapServers } from "@/lib/connection/kafkaBootstrapServers";
+import { buildMqKafkaConnectionExtra, mqKafkaConnectionTarget, resolveMqKafkaConnectionSource, type MqKafkaConnectionSource } from "@/lib/connection/mqKafkaConnection";
 import { normalizeRocketmqNamesrvAddr } from "@/lib/connection/rocketmqNamesrv";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressPercent, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
@@ -513,9 +513,11 @@ const configTab = ref<ConfigTab>("connection");
 const MQ_KAFKA_SECURITY_PROTOCOL_AUTO = "__auto";
 const mqAdminUrl = ref("http://127.0.0.1:8080");
 const mqSystemKind = ref<MqSystemKind>("pulsar");
+const mqKafkaConnectionSource = ref<MqKafkaConnectionSource>("bootstrap");
 const mqRocketmqNamesrvAddr = ref("127.0.0.1:9876");
 const mqRocketmqClusterName = ref("");
 const mqKafkaBootstrapServers = ref("127.0.0.1:9092");
+const mqKafkaZooKeeperServers = ref("");
 const mqKafkaSecurityProtocol = ref(MQ_KAFKA_SECURITY_PROTOCOL_AUTO);
 const mqKafkaSaslMechanism = ref("PLAIN");
 const mqKafkaKerberosPrincipal = ref("");
@@ -566,6 +568,10 @@ const mqKafkaSecurityProtocolOptions = computed(() => [
   { value: "SSL", label: "SSL" },
   { value: "SASL_PLAINTEXT", label: "SASL_PLAINTEXT" },
   { value: "SASL_SSL", label: "SASL_SSL" },
+]);
+const mqKafkaConnectionSourceOptions = computed(() => [
+  { value: "bootstrap" as const, label: t("connection.mqKafkaConnectionSourceBootstrap") },
+  { value: "zookeeper" as const, label: t("connection.mqKafkaConnectionSourceZooKeeper") },
 ]);
 const mqKafkaSaslMechanismOptions = [
   { value: "PLAIN", label: "PLAIN" },
@@ -881,7 +887,9 @@ function resetMqFields(config?: Partial<MqAdminConfig>) {
   const jaasConfig = mqExtraPropertyString(extra, "sasl.jaas.config");
   mqSystemKind.value = systemKind;
   mqAdminUrl.value = config?.adminUrl?.trim() || (systemKind === "kafka" || systemKind === "rocketmq" ? "" : "http://127.0.0.1:8080");
+  mqKafkaConnectionSource.value = resolveMqKafkaConnectionSource(extra);
   mqKafkaBootstrapServers.value = mqExtraString(extra, "bootstrapServers") || "127.0.0.1:9092";
+  mqKafkaZooKeeperServers.value = mqExtraString(extra, "zookeeperServers");
   mqRocketmqNamesrvAddr.value = mqExtraString(extra, "namesrvAddr") || mqExtraString(extra, "namesrv_addr") || "127.0.0.1:9876";
   mqRocketmqClusterName.value = mqExtraString(extra, "clusterName") || mqExtraString(extra, "cluster_name");
   mqKafkaSecurityProtocol.value = mqExtraString(extra, "securityProtocol") || MQ_KAFKA_SECURITY_PROTOCOL_AUTO;
@@ -948,7 +956,7 @@ watch(selectedType, () => {
 
 watch(mqSystemKind, (kind) => {
   if (kind === "kafka") {
-    if (!mqKafkaBootstrapServers.value.trim()) mqKafkaBootstrapServers.value = "127.0.0.1:9092";
+    if (mqKafkaConnectionSource.value === "bootstrap" && !mqKafkaBootstrapServers.value.trim()) mqKafkaBootstrapServers.value = "127.0.0.1:9092";
     if (!isMqAuthKindAllowedForSystem(kind, mqAuthKind.value)) mqAuthKind.value = "none";
     return;
   }
@@ -1081,9 +1089,14 @@ function buildMqTokenSigning() {
 function buildMqAdminConfig(): MqAdminConfig {
   const systemKind = mqSystemKind.value;
   if (systemKind === "kafka") {
-    const bootstrapServers = normalizeKafkaBootstrapServers(mqKafkaBootstrapServers.value);
-    const extra: Record<string, unknown> = { bootstrapServers };
-    const securityProtocol = mqKafkaSecurityProtocol.value === MQ_KAFKA_SECURITY_PROTOCOL_AUTO ? "" : mqKafkaSecurityProtocol.value.trim();
+    const configuredSecurityProtocol = mqKafkaSecurityProtocol.value === MQ_KAFKA_SECURITY_PROTOCOL_AUTO ? "" : mqKafkaSecurityProtocol.value;
+    const extra: Record<string, unknown> = buildMqKafkaConnectionExtra({
+      connectionSource: mqKafkaConnectionSource.value,
+      bootstrapServers: mqKafkaBootstrapServers.value,
+      zookeeperServers: mqKafkaZooKeeperServers.value,
+      securityProtocol: configuredSecurityProtocol,
+    });
+    const securityProtocol = mqExtraString(extra, "securityProtocol");
     const saslMechanism = mqAuthKind.value === "kerberos" ? "GSSAPI" : mqKafkaSaslMechanism.value.trim();
     const properties: Record<string, string> = {};
     if (securityProtocol) extra.securityProtocol = securityProtocol;
@@ -1484,18 +1497,17 @@ function applyMqAdminUrl(config: LegacyConnectionConfig, adminUrl: string) {
   config.ssl = parsed.protocol === "https:";
 }
 
-function applyMqKafkaBootstrapServers(config: LegacyConnectionConfig, bootstrapServers: string, securityProtocol?: string) {
-  const first = normalizeKafkaBootstrapServers(bootstrapServers).split(",")[0];
-  if (!first) throw new Error(t("connection.mqBootstrapServersRequired"));
-  let parsed: URL;
-  try {
-    parsed = new URL(`kafka://${first}`);
-  } catch {
-    throw new Error(t("connection.mqBootstrapServersInvalid"));
-  }
-  config.host = parsed.hostname;
-  config.port = Number(parsed.port) || 9092;
-  config.ssl = securityProtocol === "SSL" || securityProtocol === "SASL_SSL";
+function applyMqKafkaConnectionTarget(config: LegacyConnectionConfig, extra: Record<string, unknown>) {
+  const source = resolveMqKafkaConnectionSource(extra);
+  const target = mqKafkaConnectionTarget({
+    connectionSource: source,
+    bootstrapServers: mqExtraString(extra, "bootstrapServers"),
+    zookeeperServers: mqExtraString(extra, "zookeeperServers"),
+    securityProtocol: mqExtraString(extra, "securityProtocol"),
+  });
+  config.host = target.host;
+  config.port = target.port;
+  config.ssl = target.ssl;
 }
 
 function applyNacosServerAddr(config: LegacyConnectionConfig, serverAddr: string) {
@@ -2414,7 +2426,7 @@ const connectionLabelTopClass = `${connectionLabelClass} mt-2`;
 const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
 const hasRequiredConnectionTarget = computed(() => {
   if (form.value.db_type === "mq") {
-    if (mqSystemKind.value === "kafka") return !!mqKafkaBootstrapServers.value.trim();
+    if (mqSystemKind.value === "kafka") return mqKafkaConnectionSource.value === "zookeeper" ? !!mqKafkaZooKeeperServers.value.trim() : !!mqKafkaBootstrapServers.value.trim();
     if (mqSystemKind.value === "rocketmq") return !!mqRocketmqNamesrvAddr.value.trim();
     return !!mqAdminUrl.value.trim();
   }
@@ -2748,7 +2760,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     config.driver_label = MQ_DRIVER_LABELS[mqConfig.systemKind];
     if (mqConfig.systemKind === "kafka") {
       const extra = mqExtraRecord(mqConfig);
-      applyMqKafkaBootstrapServers(config, mqExtraString(extra, "bootstrapServers"), mqExtraString(extra, "securityProtocol"));
+      applyMqKafkaConnectionTarget(config, extra);
     } else if (mqConfig.systemKind === "rocketmq") {
       const extra = mqExtraRecord(mqConfig);
       applyMqRocketmqNamesrv(config, mqExtraString(extra, "namesrvAddr") || mqExtraString(extra, "namesrv_addr"));
@@ -4613,8 +4625,25 @@ function openExternalUrl(url: string) {
                 <template v-else-if="form.db_type === 'mq'">
                   <template v-if="mqSystemKind === 'kafka'">
                     <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.mqKafkaConnectionSource") }}</Label>
+                      <Select v-model="mqKafkaConnectionSource">
+                        <SelectTrigger class="col-span-3 h-9">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem v-for="option in mqKafkaConnectionSourceOptions" :key="option.value" :value="option.value">
+                            {{ option.label }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div v-if="mqKafkaConnectionSource === 'bootstrap'" class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.mqBootstrapServers") }}</Label>
                       <Input v-model="mqKafkaBootstrapServers" class="col-span-3" :placeholder="t('connection.mqBootstrapServersPlaceholder')" />
+                    </div>
+                    <div v-else class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.mqKafkaZooKeeperServers") }}</Label>
+                      <Input v-model="mqKafkaZooKeeperServers" class="col-span-3" :placeholder="t('connection.mqKafkaZooKeeperServersPlaceholder')" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.mqSecurity") }}</Label>
