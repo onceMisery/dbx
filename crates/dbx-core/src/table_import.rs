@@ -2423,6 +2423,7 @@ fn stream_xlsx_rows_to_channel(
     batch_size: usize,
     expected_columns: Option<Vec<String>>,
     text_source_columns: HashSet<String>,
+    scan_full_worksheet: bool,
     sender: tokio::sync::mpsc::Sender<Result<XlsxStreamMessage, String>>,
 ) -> Result<(), String> {
     // This producer runs on a blocking thread and communicates in bounded batches. The small
@@ -2485,7 +2486,7 @@ fn stream_xlsx_rows_to_channel(
                     .filter(|row| *row > 0)
                     .unwrap_or_else(|| current_row.saturating_add(1).max(1));
                 current_column = 0;
-                if rows.selected_range_finished(current_row) {
+                if !scan_full_worksheet && rows.selected_range_finished(current_row) {
                     break;
                 }
             }
@@ -2548,6 +2549,38 @@ fn stream_xlsx_rows_to_channel(
         buffer.clear();
     }
     rows.finish(total_bytes)
+}
+
+async fn validate_xlsx_worksheet_for_import(
+    path: String,
+    options: TableImportParseOptions,
+    expected_columns: Option<Vec<String>>,
+    text_source_columns: HashSet<String>,
+) -> Result<(), String> {
+    // Drain bounded row batches without writing. Full-sheet mode keeps parsing through the
+    // worksheet EOF even when the selected import range ends earlier.
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<XlsxStreamMessage, String>>(2);
+    let validation = tokio::task::spawn_blocking(move || {
+        stream_xlsx_rows_to_channel(
+            &path,
+            &options,
+            DEFAULT_BATCH_SIZE,
+            expected_columns,
+            text_source_columns,
+            true,
+            sender,
+        )
+    });
+
+    while let Some(message) = receiver.recv().await {
+        if let Err(error) = message {
+            drop(receiver);
+            let _ = validation.await;
+            return Err(error);
+        }
+    }
+
+    validation.await.map_err(|error| error.to_string())?
 }
 
 fn parse_xlsx_range<T, Label, Value, TextValue, IsNumeric>(
@@ -4497,6 +4530,17 @@ where
             target_column_types = created_column_types.clone().unwrap_or_default();
         }
         let text_source_columns = textual_source_columns_for_import(&request.mappings, &target_column_types);
+        // No truncate, INSERT, or COPY may run until the selected worksheet parses to EOF.
+        if let Err(error) = validate_xlsx_worksheet_for_import(
+            request.file_path.clone(),
+            request.parse_options.clone(),
+            expected_columns.clone(),
+            text_source_columns.clone(),
+        )
+        .await
+        {
+            return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+        }
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<XlsxStreamMessage, String>>(2);
         let path = request.file_path.clone();
         let options = request.parse_options.clone();
@@ -4507,6 +4551,7 @@ where
                 effective_batch_size,
                 expected_columns,
                 text_source_columns,
+                false,
                 sender,
             )
         });
@@ -5928,6 +5973,7 @@ mod tests {
             1,
             None,
             HashSet::new(),
+            false,
             sender,
         )
         .unwrap();
@@ -5954,7 +6000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncate_xlsx_with_malformed_tail_keeps_only_committed_batches() {
+    async fn truncate_xlsx_with_malformed_tail_preserves_existing_rows() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
@@ -6038,13 +6084,7 @@ mod tests {
 
         let rows =
             crate::db::sqlite::execute_query(&sqlite, "SELECT id, name FROM items ORDER BY id").await.unwrap().rows;
-        assert_eq!(
-            rows,
-            vec![
-                vec![serde_json::json!(1), serde_json::json!("Ada")],
-                vec![serde_json::json!(2), serde_json::json!("Grace")],
-            ]
-        );
+        assert_eq!(rows, vec![vec![serde_json::json!(999), serde_json::json!("old")]]);
     }
 
     #[tokio::test]
@@ -6136,6 +6176,7 @@ mod tests {
             500,
             Some(vec!["column_1".to_string(), "column_2".to_string()]),
             HashSet::new(),
+            false,
             sender,
         )
         .unwrap();
@@ -6166,6 +6207,7 @@ mod tests {
             500,
             Some(vec!["column_1".to_string()]),
             HashSet::from(["column_1".to_string()]),
+            false,
             sender,
         )
         .unwrap();
@@ -6204,7 +6246,8 @@ mod tests {
         };
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
 
-        stream_xlsx_rows_to_channel(&path.to_string_lossy(), &options, 500, None, HashSet::new(), sender).unwrap();
+        stream_xlsx_rows_to_channel(&path.to_string_lossy(), &options, 500, None, HashSet::new(), false, sender)
+            .unwrap();
 
         let mut columns = Vec::new();
         let mut streamed_rows = Vec::new();
@@ -6246,6 +6289,7 @@ mod tests {
             500,
             Some(vec!["id".to_string()]),
             HashSet::new(),
+            false,
             sender,
         )
         .unwrap_err();
@@ -6274,6 +6318,7 @@ mod tests {
             500,
             None,
             HashSet::new(),
+            false,
             sender,
         )
         .unwrap();
