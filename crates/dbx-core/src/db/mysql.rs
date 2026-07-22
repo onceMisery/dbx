@@ -751,8 +751,10 @@ fn mysql_group_concat_setup_fallback_mode(setup_mode: MySqlSetupMode, error: &st
     }
 
     let lower = error.to_ascii_lowercase();
-    let setup_query_rejected =
-        lower.contains("1193") || lower.contains("unknown system variable") || lower.contains("syntax error");
+    let setup_query_rejected = lower.contains("1193")
+        || lower.contains("unknown system variable")
+        || lower.contains("syntax error")
+        || lower.contains("not supported");
     let sphinxql_setup_query_rejected = lower.contains("sphinxql")
         && lower.contains("only 0 and 1 could be used as boolean values")
         && lower.contains(&format!("near '{MYSQL_GROUP_CONCAT_MAX_LEN}'"));
@@ -1633,7 +1635,7 @@ fn should_fallback_empty_list_tables(filter: Option<&str>) -> bool {
     // MySQL proxies such as MyCat can return an empty information_schema.TABLES
     // even when SHOW TABLES exposes objects. Avoid the fallback for active
     // searches so normal MySQL "no match" queries do not rescan large schemas.
-    !filter.is_some_and(|filter| !filter.trim().is_empty())
+    filter.is_none_or(|filter| filter.trim().is_empty())
 }
 
 fn filter_list_tables_fallback(
@@ -4854,6 +4856,17 @@ UNIQUE KEY(`tenant_id`, `name``part`)
     #[test]
     fn mysql_cnch_group_concat_syntax_error_retries_without_session_variable() {
         let error = "MySQL connection failed: Server error: `ERROR HY000 (1105): unknown error: Error 62 (HY000): Code: 62, e.displayText() = DB::Exception: host = cnch-server-2: Syntax error: failed at position 13 ('group_concat_max_len'): group_concat_max_len = 1048576. Expected one of: Dot, token, Equals SQLSTATE: 42000 (version 21.8.7.1)'";
+
+        assert_eq!(
+            mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error),
+            Some(MySqlSetupMode::Compatible)
+        );
+    }
+
+    #[test]
+    fn mysql_group_concat_not_supported_error_retries_without_session_variable() {
+        let error =
+            "MySQL connection failed: Server error: `ERROR 1235 (42000): SET of group_concat_max_len is not supported'";
 
         assert_eq!(
             mysql_group_concat_setup_fallback_mode(MySqlSetupMode::Standard, error),

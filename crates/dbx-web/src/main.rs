@@ -88,6 +88,12 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
         .route("/mq/topics/route", post(routes::mq::get_topic_route))
         .route("/mq/topics/alter-config", post(routes::mq::alter_topic_config))
         .route("/mq/topics/skip-accumulation", post(routes::mq::skip_topic_accumulation))
+        .route("/mq/exchanges/list", post(routes::mq::list_exchanges))
+        .route("/mq/exchanges/create", post(routes::mq::create_exchange))
+        .route("/mq/exchanges/delete", post(routes::mq::delete_exchange))
+        .route("/mq/bindings/list", post(routes::mq::list_bindings))
+        .route("/mq/bindings/bind", post(routes::mq::bind_queue))
+        .route("/mq/bindings/unbind", post(routes::mq::unbind_queue))
         .route("/mq/messages/view", post(routes::mq::view_message))
         .route("/mq/messages/query-by-key", post(routes::mq::query_messages_by_key))
         .route("/mq/messages/query-by-topic", post(routes::mq::query_messages_by_topic))
@@ -105,19 +111,33 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
         .route("/mq/producers/list", post(routes::mq::list_producers))
         .route("/mq/consumers/list", post(routes::mq::list_consumers))
         .route("/mq/topics/unload", post(routes::mq::unload_topic))
+        .route("/mq/client-connections/list", post(routes::mq::list_client_connections))
+        .route("/mq/client-connections/close", post(routes::mq::close_client_connection))
+        .route("/mq/channels/list", post(routes::mq::list_client_channels))
         .route("/mq/policies/publish-rate", post(routes::mq::set_publish_rate))
         .route("/mq/policies/dispatch-rate", post(routes::mq::set_dispatch_rate))
         .route("/mq/policies/subscribe-rate", post(routes::mq::set_subscribe_rate))
         .route("/mq/policies/backlog-quota", post(routes::mq::set_backlog_quota))
         .route("/mq/policies/retention", post(routes::mq::set_retention))
         .route("/mq/policies/effective", post(routes::mq::get_effective_policies))
+        .route("/mq/policies/list", post(routes::mq::list_policies))
+        .route("/mq/policies/set", post(routes::mq::set_policy))
+        .route("/mq/policies/delete", post(routes::mq::delete_policy))
         .route("/mq/permissions/grant", post(routes::mq::grant_permission))
         .route("/mq/permissions/revoke", post(routes::mq::revoke_permission))
         .route("/mq/permissions/list", post(routes::mq::list_permissions))
+        .route("/mq/users/list", post(routes::mq::list_users))
+        .route("/mq/users/create", post(routes::mq::create_user))
+        .route("/mq/users/delete", post(routes::mq::delete_user))
+        .route("/mq/user-permissions/list", post(routes::mq::list_user_permissions))
+        .route("/mq/user-permissions/grant", post(routes::mq::grant_user_permission))
+        .route("/mq/user-permissions/revoke", post(routes::mq::revoke_user_permission))
         .route("/mq/tokens/issue", post(routes::mq::issue_token))
         .route("/mq/tokens/list", post(routes::mq::list_token_records))
         .route("/mq/monitoring/backlog", post(routes::mq::get_backlog))
         .route("/mq/monitoring/cluster-info", post(routes::mq::get_cluster_info))
+        .route("/mq/overview", post(routes::mq::get_overview))
+        .route("/mq/nodes", post(routes::mq::list_nodes))
         .route("/mq/raw", post(routes::mq::raw_request))
         .route("/mq/send-message", post(routes::mq::send_message))
 }
@@ -181,6 +201,7 @@ async fn main() {
         password_hash: RwLock::new(password_hash),
         sessions: RwLock::new(HashSet::new()),
         sse_channels: RwLock::new(HashMap::new()),
+        table_import_channels: RwLock::new(HashMap::new()),
         sql_file_executions: RwLock::new(HashMap::new()),
         login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
         export_files: RwLock::new(HashMap::new()),
@@ -486,6 +507,8 @@ async fn main() {
         // History
         .route("/history", get(routes::history::load_history).delete(routes::history::clear_history))
         .route("/history/save", post(routes::history::save_history))
+        .route("/history/search", post(routes::history::search_history))
+        .route("/history/options", get(routes::history::load_history_connection_options))
         .route("/history/{id}", delete(routes::history::delete_history_entry))
         // Saved SQL
         .route(
@@ -515,6 +538,16 @@ async fn main() {
         .route("/ai/cancel-stream", post(routes::ai::ai_cancel_stream))
         .route("/ai/test-connection", post(routes::ai::ai_test_connection))
         .route("/ai/models", post(routes::ai::ai_list_models))
+        // Prompt templates
+        .route(
+            "/prompt-templates",
+            get(routes::prompt_template::load_prompt_templates).post(routes::prompt_template::save_prompt_template),
+        )
+        .route("/prompt-templates/{id}", delete(routes::prompt_template::delete_prompt_template))
+        .route(
+            "/prompt-templates/global-instructions",
+            get(routes::prompt_template::get_global_instructions).put(routes::prompt_template::set_global_instructions),
+        )
         // Transfer
         .route("/transfer/start", post(routes::transfer::start_transfer))
         .route("/transfer/ownership-preview", post(routes::transfer::preview_transfer_ownership))
@@ -549,6 +582,8 @@ async fn main() {
         .route("/sql-file/cancel", post(routes::sql_file::cancel_sql_file))
         // Table import
         .route("/import/preview", post(routes::table_import::preview_import))
+        .route("/import/preview-source", post(routes::table_import::preview_uploaded_import))
+        .route("/import/source/release", post(routes::table_import::release_import_source))
         .route("/import/execute", post(routes::table_import::execute_import))
         .route("/import/progress/{importId}", get(routes::table_import::import_progress))
         .route("/import/cancel", post(routes::table_import::cancel_import))

@@ -4,6 +4,7 @@ import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "fontFamily",
   "fontSize",
+  "tableFontFamily",
   "uiFontFamily",
   "uiScale",
   "theme",

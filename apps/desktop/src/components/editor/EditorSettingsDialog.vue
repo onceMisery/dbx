@@ -21,7 +21,6 @@ import {
   useSettingsStore,
   AI_PROVIDER_PRESETS,
   EDITOR_THEMES,
-  FONT_FAMILIES,
   DEFAULT_EDITOR_SETTINGS,
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_SIDEBAR_TABLE_PAGE_SIZE,
@@ -64,7 +63,6 @@ import {
   forgetWebdavSyncSecretsPassphrase,
   forgetWebdavSavedPassword,
   getAppSupportInfo,
-  listSystemFonts,
   saveWebdavSyncSecretsPreference,
   saveWebdavSavedPassword,
   saveSnippetSavedToken,
@@ -95,9 +93,9 @@ import { currentExecutableStatementRange, type SqlTextRange } from "@/lib/sql/sq
 import { executableStatementRangeCacheForDoc, executableStatementRangeStartingAt, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
 import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES } from "@/lib/table/tableColumnTemplates";
 import { DEFAULT_SQL_VARIABLE_SYNTAX_TOGGLES, normalizeSqlVariableSyntaxOverrides, SQL_VARIABLE_SYNTAX_DATABASE_TYPES, SQL_VARIABLE_SYNTAX_KEYS, SQL_VARIABLE_SYNTAX_TOKENS, type SqlVariableSyntaxOverrides, type SqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
-import { buildMcpCherryStudioConfig, buildMcpCodexConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpVsCodeConfig, mcpWebBackendUrl, type McpLaunchConfig } from "@/lib/mcp/mcpConfigTemplates";
+import { buildMcpCherryStudioConfig, buildMcpCodexConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpTraeConfig, buildMcpVsCodeConfig, mcpWebBackendUrl, type McpLaunchConfig } from "@/lib/mcp/mcpConfigTemplates";
 import { isMcpPolicyMutationBlocked, MCP_CAPABILITY_ROWS, MCP_EXECUTION_MODE_COLUMNS, mcpExecutionModeFromPolicy, mcpPolicyFieldsForExecutionMode, type McpExecutionMode } from "@/lib/mcp/mcpPolicySelection";
-import { isMacOS } from "@/lib/backend/platform";
+import { isMacOS, isWindows } from "@/lib/backend/platform";
 import { combineDataTypeForDatabase, dataTypeLengthInputValue, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/table/tableStructureEditorState";
 import { useToast } from "@/composables/useToast";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
@@ -113,21 +111,26 @@ import { APP_THEME_PALETTES, type AppThemeAppearance, type AppThemeMode, type Ap
 import { editorSettingsDraftChanged, editorSettingsDraftFromSettings, editorSettingsPatchFromDraft, normalizeTableOpenPageSizeDraft, type EditorSettingsDraft } from "@/lib/settings/editorSettingsDraft";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
+import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { currentLocale, setLocale, type Locale } from "@/i18n";
 import { LOCALE_OPTIONS } from "@/lib/app/localeOptions";
 import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdav/webdavAutoUploadConfig";
 import { apiUrl } from "@/lib/common/webPath";
-import { DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "@/lib/app/appFonts";
+import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, normalizeCustomFontFamilyInput, readableFontFamily, SYSTEM_UI_FONT_FAMILY } from "@/lib/app/appFonts";
+import { buildFontFamilyOptions, displayFontFamily, isPresetFontFamily, loadSystemFontNames } from "@/lib/app/fontFamilyOptions";
 import { buildAppSupportInfoRows, formatAppSupportInfoForClipboard, type AppSupportInfoLabels } from "@/lib/app/supportInfo";
 import { DateTimePatterns, normalizeSupportedDateTimePattern } from "@/lib/dataGrid/columnFormatter";
 import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE } from "@/lib/dataGrid/paginationPageSize";
+import type { PromptTemplate } from "@/types/promptTemplate";
+import { GLOBAL_INSTRUCTIONS_MAX, PROMPT_TEMPLATE_CONTENT_MAX, PROMPT_TEMPLATE_NAME_MAX, promptTemplateCharacterCount } from "@/types/promptTemplate";
 
 const { t } = useI18n();
 const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
 const savedSqlStore = useSavedSqlStore();
+const promptTemplateStore = usePromptTemplateStore();
 const tunnelProfileStore = useTunnelProfileStore();
 const { isDark, themeMode, themePalette, setThemeMode, setThemePalette } = useTheme();
 
@@ -147,9 +150,6 @@ const appThemeModeOptions = computed(() => [
   { value: "system" as AppThemeMode, label: t("toolbar.themeSystem"), icon: SunMoon },
 ]);
 
-let cachedSystemFonts: string[] | null = null;
-let pendingSystemFonts: Promise<string[]> | null = null;
-
 const props = defineProps<{
   open?: boolean;
   variant?: "dialog" | "page";
@@ -168,7 +168,9 @@ const settingsRootComponent = computed(() => (isSettingsPage.value ? "div" : Dia
 const settingsRootProps = computed(() => (isSettingsPage.value ? {} : { open: props.open === true }));
 const settingsRootClass = computed(() => (isSettingsPage.value ? "h-full min-h-0 overflow-hidden bg-background" : ""));
 const settingsContentComponent = computed(() => (isSettingsPage.value ? "div" : DialogContent));
-const settingsContentClass = computed(() => (isSettingsPage.value ? "flex h-full min-h-0 flex-col gap-4 overflow-hidden bg-background p-4" : "h-[min(660px,calc(100dvh-80px))] !max-w-[min(920px,calc(100vw-32px))] grid-rows-[auto_minmax(0,1fr)] gap-3 p-4 sm:!max-w-[min(920px,calc(100vw-48px))]"));
+const settingsContentClass = computed(() =>
+  isSettingsPage.value ? "flex h-full min-h-0 flex-col gap-4 overflow-hidden bg-background p-4" : "h-[min(660px,calc(var(--dbx-viewport-height)-80px))] !max-w-[min(920px,calc(100vw-32px))] grid-rows-[auto_minmax(0,1fr)] gap-3 p-4 sm:!max-w-[min(920px,calc(100vw-48px))]",
+);
 const settingsTitleComponent = computed(() => (isSettingsPage.value ? "h2" : DialogTitle));
 
 function onSettingsRootOpenChange(value: boolean) {
@@ -258,6 +260,7 @@ function createEmptyTableColumnTemplateRow(): TableColumnTemplateGridRow {
 // Local edit state
 const editFontFamily = ref(settingsStore.editorSettings.fontFamily);
 const editFontSize = ref(settingsStore.editorSettings.fontSize);
+const editTableFontFamily = ref(settingsStore.editorSettings.tableFontFamily);
 const editUiFontFamily = ref(settingsStore.editorSettings.uiFontFamily);
 const editUiScale = ref(settingsStore.editorSettings.uiScale);
 const editTheme = ref(settingsStore.editorSettings.theme);
@@ -412,6 +415,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
   return {
     fontFamily: editFontFamily.value,
     fontSize: editFontSize.value,
+    tableFontFamily: editTableFontFamily.value,
     uiFontFamily: editUiFontFamily.value,
     uiScale: editUiScale.value,
     theme: editTheme.value,
@@ -621,42 +625,19 @@ function confirmDeleteSnippet(snippet: SqlSnippet) {
   }
 }
 
-const presetFontLabels = new Map(FONT_FAMILIES.map((font) => [font.value, font.label]));
-const presetFontValues = new Set(FONT_FAMILIES.map((font) => font.value));
 const uiFontPreviewValues = new Set([DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY]);
 
-function cssFontFamilyForName(name: string): string {
-  return `'${name.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}', monospace`;
-}
-
-function readableFontFamily(value: string): string {
-  const first = value.split(",")[0]?.trim() ?? value;
-  return first.replace(/^['"]|['"]$/g, "").replace(/\\'/g, "'");
-}
-
-function normalizeCustomFontFamilyInput(value: string): string {
-  const trimmed = value.trim();
-  if (!trimmed) return "";
-  if (trimmed.includes(",") || trimmed.includes("'") || trimmed.includes('"')) return trimmed;
-  return cssFontFamilyForName(trimmed);
-}
-
 const systemFontOptions = computed(() => {
-  const options = new Set(FONT_FAMILIES.map((font) => font.value));
-  for (const font of systemFonts.value) options.add(cssFontFamilyForName(font));
-  if (editFontFamily.value) options.add(editFontFamily.value);
-  return [...options];
+  return buildFontFamilyOptions(systemFonts.value, [editFontFamily.value]);
 });
+
+const tableFontOptions = computed(() => buildFontFamilyOptions(systemFonts.value, [editTableFontFamily.value], [DEFAULT_DATA_GRID_FONT_FAMILY]));
 
 const uiFontOptions = computed(() => {
   const options = new Set([SYSTEM_UI_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, ...systemFontOptions.value]);
   if (editUiFontFamily.value) options.add(editUiFontFamily.value);
   return [...options];
 });
-
-function displayFontFamily(value: string): string {
-  return presetFontLabels.get(value) ?? readableFontFamily(value);
-}
 
 function displayUiFontFamily(value: string): string {
   if (value === SYSTEM_UI_FONT_FAMILY) return t("settings.uiFontSystemDefault");
@@ -665,22 +646,14 @@ function displayUiFontFamily(value: string): string {
 }
 
 function fontOptionStyle(value: string, selectedValue = editFontFamily.value) {
-  return presetFontValues.has(value) || uiFontPreviewValues.has(value) || value === selectedValue ? { fontFamily: value } : undefined;
+  return isPresetFontFamily(value) || uiFontPreviewValues.has(value) || value === selectedValue ? { fontFamily: value } : undefined;
 }
 
 async function loadSystemFontOptions() {
   if (systemFontsLoaded.value || systemFontsLoading.value) return;
   systemFontsLoading.value = true;
   try {
-    if (cachedSystemFonts) {
-      systemFonts.value = cachedSystemFonts;
-    } else {
-      pendingSystemFonts ??= listSystemFonts().finally(() => {
-        pendingSystemFonts = null;
-      });
-      cachedSystemFonts = await pendingSystemFonts;
-      systemFonts.value = cachedSystemFonts;
-    }
+    systemFonts.value = await loadSystemFontNames();
     systemFontsLoaded.value = true;
   } catch {
     systemFonts.value = [];
@@ -692,6 +665,7 @@ async function loadSystemFontOptions() {
 function syncEditorSettingsDraftFromStore() {
   editFontFamily.value = settingsStore.editorSettings.fontFamily;
   editFontSize.value = settingsStore.editorSettings.fontSize;
+  editTableFontFamily.value = settingsStore.editorSettings.tableFontFamily;
   editUiFontFamily.value = settingsStore.editorSettings.uiFontFamily;
   editUiScale.value = settingsStore.editorSettings.uiScale;
   editTheme.value = settingsStore.editorSettings.theme;
@@ -909,6 +883,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editSqlFormatter.value = normalizeSqlFormatterSettings(DEFAULT_EDITOR_SETTINGS.sqlFormatter);
     sqlFormatterConfigValid.value = true;
   } else if (tab === "appearance") {
+    editTableFontFamily.value = DEFAULT_EDITOR_SETTINGS.tableFontFamily;
     editUiFontFamily.value = DEFAULT_EDITOR_SETTINGS.uiFontFamily;
     editUiScale.value = DEFAULT_EDITOR_SETTINGS.uiScale;
     editTheme.value = DEFAULT_EDITOR_SETTINGS.theme;
@@ -967,6 +942,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
 function resetAllDefaults() {
   editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;
   editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
+  editTableFontFamily.value = DEFAULT_EDITOR_SETTINGS.tableFontFamily;
   editUiFontFamily.value = DEFAULT_EDITOR_SETTINGS.uiFontFamily;
   editUiScale.value = DEFAULT_EDITOR_SETTINGS.uiScale;
   editTheme.value = DEFAULT_EDITOR_SETTINGS.theme;
@@ -1166,6 +1142,10 @@ function onSqlSemanticDiagnosticsEnabledChange(value: boolean) {
 
 function onFontFamilyChange(v: any) {
   if (typeof v === "string") editFontFamily.value = v;
+}
+
+function onTableFontFamilyChange(v: any) {
+  if (typeof v === "string") editTableFontFamily.value = v;
 }
 
 function onUiFontFamilyChange(v: any) {
@@ -1508,6 +1488,12 @@ const mcpLaunchConfig = computed<McpLaunchConfig | undefined>(() => {
 });
 
 const mcpJsonRecommendedConfig = computed(() => buildMcpJsonConfig(mcpLaunchConfig.value));
+
+const mcpTraeRecommendedConfig = computed(() => {
+  // TRAE currently splits Windows executable paths containing spaces, so bypass Node and launch the native MCP binary directly.
+  const nativeBinPath = !isWeb && isWindows() ? mcpStatus.value?.native_bin_path : undefined;
+  return buildMcpTraeConfig(mcpLaunchConfig.value, nativeBinPath ?? undefined);
+});
 
 const mcpVsCodeRecommendedConfig = computed(() => buildMcpVsCodeConfig(mcpLaunchConfig.value));
 
@@ -1961,15 +1947,33 @@ watch(snippetProvider, (provider) => {
   void refreshSnippetTokenStatus();
 });
 
-watch(activeSettingsTab, (tab) => {
+watch(activeSettingsTab, async (tab) => {
   if (tab === "mcp" && !mcpStatus.value && !mcpStatusLoading.value) void refreshMcpStatus();
   if (tab === "ai" && aiIsCliProvider.value) void ensureCliMcpStatus();
+  if (tab === "ai") {
+    // Await completion so we don't snapshot an empty default when the store
+    // is still loading its first payload (init via App.vue is fire-and-forget).
+    await promptTemplateStore.ensureLoaded();
+    editGlobalInstructions.value = promptTemplateStore.globalInstructions;
+  }
   if (tab === "about" && !appSupportInfo.value) void refreshAppSupportInfo();
   if (tab === "appearance") {
     checkLayoutDescTruncation();
     checkIconThemeDescTruncation();
   }
 });
+
+// If the store finishes loading while the AI tab is already open (e.g. a retry
+// from another entry point succeeded after the tab-switch snapshot saw a failed
+// load), backfill the textarea — but never clobber text the user already typed.
+watch(
+  () => promptTemplateStore.isLoaded,
+  (loaded) => {
+    if (loaded && activeSettingsTab.value === "ai" && !editGlobalInstructions.value) {
+      editGlobalInstructions.value = promptTemplateStore.globalInstructions;
+    }
+  },
+);
 
 onMounted(() => {
   void refreshWebDavPasswordStatus();
@@ -2019,6 +2023,116 @@ async function changePassword() {
 }
 
 // ---------- AI Settings ----------
+
+// Global Custom Instructions
+const editGlobalInstructions = ref("");
+const globalInstructionsSaving = ref(false);
+
+// Prompt Templates Management
+const templateEditing = ref<PromptTemplate | null>(null);
+const templateFormOpen = ref(false);
+const templateForm = ref<{ name: string; content: string }>({ name: "", content: "" });
+const templateFormIsNew = ref(true);
+const templateSaving = ref(false);
+const templateDeleteConfirm = ref<PromptTemplate | null>(null);
+const templateDeleteConfirmOpen = ref(false);
+
+watch(templateDeleteConfirm, (val) => {
+  templateDeleteConfirmOpen.value = val !== null;
+});
+watch(templateDeleteConfirmOpen, (val) => {
+  if (!val) templateDeleteConfirm.value = null;
+});
+
+function openNewTemplate() {
+  templateForm.value = { name: "", content: "" };
+  templateFormIsNew.value = true;
+  templateEditing.value = null;
+  templateFormOpen.value = true;
+}
+
+function openEditTemplate(tpl: PromptTemplate) {
+  templateForm.value = { name: tpl.name, content: tpl.content };
+  templateFormIsNew.value = false;
+  templateEditing.value = tpl;
+  templateFormOpen.value = true;
+}
+
+function closeTemplateForm() {
+  templateForm.value = { name: "", content: "" };
+  templateEditing.value = null;
+  templateFormOpen.value = false;
+}
+
+function templateNameValid(): boolean {
+  return templateForm.value.name.trim().length > 0;
+}
+
+function templateContentValid(): boolean {
+  return templateForm.value.content.trim().length > 0;
+}
+
+function templateNameTooLong(): boolean {
+  return promptTemplateCharacterCount(templateForm.value.name) > PROMPT_TEMPLATE_NAME_MAX;
+}
+
+function templateContentTooLong(): boolean {
+  return promptTemplateCharacterCount(templateForm.value.content) > PROMPT_TEMPLATE_CONTENT_MAX;
+}
+
+function localNameDuplicate(): boolean {
+  const name = templateForm.value.name.trim();
+  if (!name) return false;
+  const existingId = templateEditing.value?.id ?? "";
+  return promptTemplateStore.templates.some((t) => t.id !== existingId && t.name.toLowerCase() === name.toLowerCase());
+}
+
+function templateSaveDisabled(): boolean {
+  return templateSaving.value || !templateNameValid() || !templateContentValid() || templateNameTooLong() || templateContentTooLong();
+}
+
+async function saveTemplateForm() {
+  if (templateSaveDisabled()) return;
+  templateSaving.value = true;
+  try {
+    const id = templateEditing.value?.id ?? uuid();
+    await promptTemplateStore.save(id, templateForm.value.name.trim(), templateForm.value.content.trim());
+    closeTemplateForm();
+    toast(t("ai.promptTemplateSaved"));
+  } catch (e: any) {
+    toast(e?.message || String(e), 5000);
+  } finally {
+    templateSaving.value = false;
+  }
+}
+
+async function confirmDeleteTemplate(tpl: PromptTemplate) {
+  try {
+    await promptTemplateStore.remove(tpl.id);
+    toast(t("ai.promptTemplateDeleted"));
+  } catch (e: any) {
+    toast(e?.message || String(e), 5000);
+  } finally {
+    templateDeleteConfirm.value = null;
+  }
+}
+
+async function saveGlobalInstructions() {
+  if (promptTemplateCharacterCount(editGlobalInstructions.value) > GLOBAL_INSTRUCTIONS_MAX) return;
+  globalInstructionsSaving.value = true;
+  try {
+    await promptTemplateStore.saveGlobalInstructions(editGlobalInstructions.value);
+    toast(t("ai.globalInstructionsSaved"));
+  } catch (e: any) {
+    toast(e?.message || String(e), 5000);
+  } finally {
+    globalInstructionsSaving.value = false;
+  }
+}
+
+function globalInstructionsTooLong(): boolean {
+  return promptTemplateCharacterCount(editGlobalInstructions.value) > GLOBAL_INSTRUCTIONS_MAX;
+}
 
 // AI Config Delete Confirmation
 const aiDeleteConfirmOpen = ref(false);
@@ -3290,7 +3404,7 @@ onUnmounted(cleanupPreviewEditor);
               <SqlFormatterSettingsPanel v-model="editSqlFormatter" @validity-change="(value: boolean) => (sqlFormatterConfigValid = value)" />
             </section>
 
-            <section v-else-if="activeSettingsTab === 'appearance'" class="settings-appearance-section flex flex-col gap-5 py-2">
+            <section v-else-if="activeSettingsTab === 'appearance'" class="settings-appearance-section flex flex-col gap-4 py-2">
               <div class="settings-appearance-top-grid">
                 <div class="settings-appearance-field min-w-0">
                   <div class="flex h-9 items-end">
@@ -3345,7 +3459,36 @@ onUnmounted(cleanupPreviewEditor);
                 </div>
 
                 <div class="settings-appearance-field min-w-0">
-                  <div class="flex h-9 items-end gap-1">
+                  <div class="flex h-9 items-end">
+                    <div class="flex min-w-0 items-center gap-1">
+                      <Label class="min-w-0 whitespace-normal leading-tight">{{ t("settings.uiScale") }}</Label>
+                      <HelpTooltip :label="t('settings.uiScale')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
+                        <p>{{ t("settings.uiScaleDescription") }}</p>
+                      </HelpTooltip>
+                    </div>
+                  </div>
+                  <Select
+                    :model-value="String(editUiScale)"
+                    @update:model-value="
+                      (value: any) => {
+                        const next = Number(value);
+                        if (Number.isFinite(next)) editUiScale = next;
+                      }
+                    "
+                  >
+                    <SelectTrigger class="h-8 w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="scale in uiScaleOptions" :key="scale" :value="String(scale)" class="pl-2.5"> {{ Math.round(scale * 100) }}% </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              <div class="grid gap-3 md:grid-cols-2">
+                <div class="settings-appearance-field min-w-0">
+                  <div class="flex min-w-0 items-center gap-1">
                     <Label class="min-w-0 whitespace-normal leading-tight">{{ t("settings.uiFontFamily") }}</Label>
                     <HelpTooltip :label="t('settings.uiFontFamily')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
                       <p>{{ t("settings.uiFontFamilyDescription") }}</p>
@@ -3384,28 +3527,42 @@ onUnmounted(cleanupPreviewEditor);
                 </div>
 
                 <div class="settings-appearance-field min-w-0">
-                  <div class="flex h-9 items-end gap-1">
-                    <Label class="min-w-0 whitespace-normal leading-tight">{{ t("settings.uiScale") }}</Label>
-                    <HelpTooltip :label="t('settings.uiScale')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
-                      <p>{{ t("settings.uiScaleDescription") }}</p>
+                  <div class="flex min-w-0 items-center gap-1">
+                    <Label class="min-w-0 whitespace-normal leading-tight">{{ t("settings.dataGridFontFamily") }}</Label>
+                    <HelpTooltip :label="t('settings.dataGridFontFamily')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
+                      <p>{{ t("settings.dataGridFontFamilyDescription") }}</p>
                     </HelpTooltip>
                   </div>
-                  <Select
-                    :model-value="String(editUiScale)"
-                    @update:model-value="
-                      (value: any) => {
-                        const next = Number(value);
-                        if (Number.isFinite(next)) editUiScale = next;
-                      }
-                    "
+                  <SearchableSelect
+                    :model-value="editTableFontFamily"
+                    :options="tableFontOptions"
+                    :placeholder="t('settings.selectFont')"
+                    :search-placeholder="t('settings.searchFont')"
+                    :empty-text="t('settings.noFontsFound')"
+                    :loading-text="t('settings.loadingFonts')"
+                    allow-custom
+                    :display-name="displayFontFamily"
+                    :normalize-custom="normalizeCustomFontFamilyInput"
+                    trigger-variant="outline"
+                    trigger-class="h-9 w-full max-w-none justify-between"
+                    content-class="w-[var(--reka-popover-trigger-width)] min-w-[260px]"
+                    @update:model-value="onTableFontFamilyChange"
+                    @update:open="(open: boolean) => open && loadSystemFontOptions()"
                   >
-                    <SelectTrigger class="h-8 w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem v-for="scale in uiScaleOptions" :key="scale" :value="String(scale)" class="pl-2.5"> {{ Math.round(scale * 100) }}% </SelectItem>
-                    </SelectContent>
-                  </Select>
+                    <template #trigger-label="{ label, loading }">
+                      <span class="truncate" :style="{ fontFamily: editTableFontFamily }">
+                        {{ loading ? t("settings.loadingFonts") : label }}
+                      </span>
+                    </template>
+                    <template #option-label="{ option, label }">
+                      <span class="truncate" :style="fontOptionStyle(option, editTableFontFamily)">{{ label }}</span>
+                    </template>
+                    <template #custom-option-label="{ value }">
+                      <span class="truncate" :style="{ fontFamily: value }">
+                        {{ t("settings.useCustomFont", { font: readableFontFamily(value) }) }}
+                      </span>
+                    </template>
+                  </SearchableSelect>
                 </div>
               </div>
 
@@ -4562,6 +4719,92 @@ onUnmounted(cleanupPreviewEditor);
                 </div>
               </div>
 
+              <!-- Global Custom Instructions (list mode) -->
+              <div v-if="aiConfigListMode === 'list'" class="space-y-3">
+                <Separator />
+                <div>
+                  <h3 class="text-sm font-medium">{{ t("ai.globalInstructions") }}</h3>
+                  <p class="text-xs text-muted-foreground">{{ t("ai.globalInstructionsDescription") }}</p>
+                </div>
+                <textarea v-model="editGlobalInstructions" class="w-full rounded-md border bg-background px-3 py-2 text-xs font-mono resize-y min-h-[80px]" rows="4" :placeholder="t('ai.globalInstructionsDescription')"></textarea>
+                <div class="flex items-center justify-between">
+                  <span class="text-xs" :class="globalInstructionsTooLong() ? 'text-destructive' : 'text-muted-foreground'">
+                    {{ t("ai.globalInstructionsCharCount", { count: promptTemplateCharacterCount(editGlobalInstructions), max: GLOBAL_INSTRUCTIONS_MAX }) }}
+                  </span>
+                  <Button type="button" size="sm" :disabled="!promptTemplateStore.isLoaded || globalInstructionsTooLong() || globalInstructionsSaving" @click="saveGlobalInstructions">
+                    {{ globalInstructionsSaving ? t("common.processing") : t("ai.globalInstructionsSave") }}
+                  </Button>
+                </div>
+              </div>
+
+              <!-- Prompt Templates Management (list mode) -->
+              <div v-if="aiConfigListMode === 'list'" class="space-y-3">
+                <Separator />
+                <div class="flex items-center justify-between">
+                  <div>
+                    <h3 class="text-sm font-medium">{{ t("ai.promptTemplates") }}</h3>
+                    <p class="text-xs text-muted-foreground">{{ t("ai.promptTemplatesDescription") }}</p>
+                  </div>
+                  <Button v-if="!templateFormOpen" type="button" size="sm" @click="openNewTemplate">
+                    <Plus class="mr-1 h-3.5 w-3.5" />
+                    {{ t("ai.promptTemplateNew") }}
+                  </Button>
+                </div>
+
+                <!-- Template list -->
+                <div v-if="!templateFormOpen && promptTemplateStore.templates.length > 0" class="space-y-1.5">
+                  <div v-for="tpl in promptTemplateStore.templates" :key="tpl.id" class="flex items-center justify-between rounded-md border p-3">
+                    <div class="min-w-0 flex-1">
+                      <div class="text-sm font-medium truncate">{{ tpl.name }}</div>
+                      <div class="text-xs text-muted-foreground truncate">{{ tpl.content.slice(0, 100) }}{{ tpl.content.length > 100 ? "..." : "" }}</div>
+                    </div>
+                    <div class="flex items-center gap-1 shrink-0 ml-2">
+                      <Button type="button" size="sm" variant="ghost" @click="openEditTemplate(tpl)">{{ t("common.edit") }}</Button>
+                      <Button type="button" size="sm" variant="ghost" class="text-destructive" @click="templateDeleteConfirm = tpl">{{ t("common.delete") }}</Button>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-if="!templateFormOpen && promptTemplateStore.templates.length === 0" class="rounded-md border border-dashed p-6 text-center">
+                  <p class="text-sm text-muted-foreground">{{ t("ai.promptTemplateNoTemplates") }}</p>
+                </div>
+
+                <!-- Template Edit Form -->
+                <div v-if="templateFormOpen" class="rounded-md border p-4 space-y-3">
+                  <div class="flex items-center justify-between">
+                    <h4 class="text-sm font-medium">{{ templateFormIsNew ? t("ai.promptTemplateNew") : t("ai.promptTemplateEdit") }}</h4>
+                    <Button type="button" variant="ghost" size="sm" @click="closeTemplateForm">
+                      <X class="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                  <div>
+                    <Label class="text-xs">{{ t("ai.promptTemplateName") }}</Label>
+                    <Input v-model="templateForm.name" class="mt-1 h-8 text-xs" :placeholder="t('ai.promptTemplateNamePlaceholder')" />
+                    <div class="flex justify-between mt-0.5">
+                      <p v-if="templateNameTooLong()" class="text-xs text-destructive">{{ t("ai.promptTemplateNameTooLong", { max: PROMPT_TEMPLATE_NAME_MAX }) }}</p>
+                      <p v-else-if="localNameDuplicate()" class="text-xs text-destructive">{{ t("ai.promptTemplateNameExists", { name: templateForm.name.trim() }) }}</p>
+                      <span v-else></span>
+                      <span class="text-xs" :class="templateNameTooLong() ? 'text-destructive' : 'text-muted-foreground'">{{ promptTemplateCharacterCount(templateForm.name) }}/{{ PROMPT_TEMPLATE_NAME_MAX }}</span>
+                    </div>
+                  </div>
+                  <div>
+                    <Label class="text-xs">{{ t("ai.promptTemplateContent") }}</Label>
+                    <textarea v-model="templateForm.content" class="mt-1 w-full rounded-md border bg-background px-3 py-2 text-xs font-mono resize-y min-h-[80px]" rows="4" :placeholder="t('ai.promptTemplateContentPlaceholder')"></textarea>
+                    <div class="flex justify-between mt-0.5">
+                      <p v-if="templateContentTooLong()" class="text-xs text-destructive">{{ t("ai.promptTemplateTooLong", { max: PROMPT_TEMPLATE_CONTENT_MAX }) }}</p>
+                      <span v-else></span>
+                      <span class="text-xs" :class="templateContentTooLong() ? 'text-destructive' : 'text-muted-foreground'">{{ promptTemplateCharacterCount(templateForm.content) }}/{{ PROMPT_TEMPLATE_CONTENT_MAX }}</span>
+                    </div>
+                  </div>
+                  <div class="flex justify-end gap-2">
+                    <Button type="button" variant="outline" size="sm" @click="closeTemplateForm">{{ t("common.cancel") }}</Button>
+                    <Button type="button" size="sm" :disabled="templateSaveDisabled()" @click="saveTemplateForm">
+                      {{ templateSaving ? t("common.processing") : t("common.save") }}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
               <!-- Config Edit View -->
               <div v-else class="space-y-4">
                 <div class="flex items-center justify-between">
@@ -5055,8 +5298,8 @@ onUnmounted(cleanupPreviewEditor);
                         {{ t("settings.mcpTraeConfigPath") }}
                       </div>
                       <div class="relative rounded-md border bg-background p-3">
-                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
-                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('trae-config', mcpJsonRecommendedConfig)">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpTraeRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('trae-config', mcpTraeRecommendedConfig)">
                           <CheckCircle2 v-if="mcpCopied === 'trae-config'" class="h-3.5 w-3.5 text-green-500" />
                           <Copy v-else class="h-3.5 w-3.5" />
                         </Button>
@@ -5425,6 +5668,13 @@ onUnmounted(cleanupPreviewEditor);
 
     <!-- AI Config Delete Confirmation -->
     <DangerConfirmDialog v-model:open="aiDeleteConfirmOpen" :title="t('ai.deleteConfigTitle')" :message="t('ai.deleteConfigConfirm')" :confirm-label="t('common.delete')" @confirm="aiConfirmDeleteConfig" />
+    <DangerConfirmDialog
+      v-model:open="templateDeleteConfirmOpen"
+      :title="t('ai.promptTemplateDeleteTitle')"
+      :message="t('ai.promptTemplateDeleteConfirm', { name: templateDeleteConfirm?.name ?? '' })"
+      :confirm-label="t('common.delete')"
+      @confirm="templateDeleteConfirm && confirmDeleteTemplate(templateDeleteConfirm)"
+    />
   </component>
 </template>
 
@@ -5479,13 +5729,9 @@ onUnmounted(cleanupPreviewEditor);
   box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.45) !important;
 }
 
-.settings-appearance-section > * + * {
-  margin-top: 1.25rem;
-}
-
 .settings-appearance-top-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   column-gap: 0.75rem;
   row-gap: 1rem;
 }

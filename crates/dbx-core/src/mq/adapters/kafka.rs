@@ -45,6 +45,11 @@ const KAFKA_CAPABILITIES: MqCapabilities = MqCapabilities {
     supports_message_query: false,
     supports_dlq: false,
     supports_message_trace: false,
+    supports_exchanges: false,
+    supports_client_connections: false,
+    supports_user_permissions: false,
+    supports_policies: false,
+    supports_cluster_monitoring: false,
 };
 
 pub struct KafkaAdmin {
@@ -185,6 +190,7 @@ impl MessageQueueAdmin for KafkaAdmin {
                     persistent: true,
                     internal: t.get("internal").and_then(|v| v.as_bool()).unwrap_or(false),
                     message_type: None,
+                    namespace: None,
                 }
             })
             .collect())

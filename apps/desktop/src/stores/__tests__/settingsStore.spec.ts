@@ -108,6 +108,13 @@ describe("normalizeEditorSettings", () => {
     expect(invalid.dataGridHideNullColumns).toBe(false);
   });
 
+  it("defaults the data grid font and preserves a custom font family", () => {
+    const defaultFontFamily = `"Geist Variable Tabular", "Geist Variable", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif`;
+    expect(normalizeEditorSettings({}).tableFontFamily).toBe(defaultFontFamily);
+    expect(normalizeEditorSettings({ tableFontFamily: "'IBM Plex Mono', monospace" }).tableFontFamily).toBe("'IBM Plex Mono', monospace");
+    expect(normalizeEditorSettings({ tableFontFamily: "   " }).tableFontFamily).toBe(defaultFontFamily);
+  });
+
   it("shows cell detail metadata by default and preserves collapsed state", () => {
     expect(normalizeEditorSettings({}).cellDetailMetadataCollapsed).toBe(false);
     expect(normalizeEditorSettings({ cellDetailMetadataCollapsed: true }).cellDetailMetadataCollapsed).toBe(true);
