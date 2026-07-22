@@ -211,8 +211,8 @@ pub async fn preview_uploaded_import(
         preview_limit: request.preview_limit,
     })
     .await
-    .map_err(AppError)?;
-    serde_json::to_value(preview).map(Json).map_err(|error| AppError(error.to_string()))
+    .map_err(AppError::from)?;
+    serde_json::to_value(preview).map(Json).map_err(|error| AppError::from(error.to_string()))
 }
 
 pub async fn release_import_source(
@@ -288,7 +288,7 @@ pub async fn execute_import(
     let import_id = req.import_id.clone();
 
     let initial_progress = serde_json::to_string(&initial_import_progress(&import_id, started_at))
-        .map_err(|error| AppError(error.to_string()))?;
+        .map_err(|error| AppError::from(error.to_string()))?;
     // Unlike broadcast, watch retains the latest progress and cannot drop the terminal update
     // when the browser subscribes slightly after the import starts.
     let (tx, _) = tokio::sync::watch::channel(initial_progress);
@@ -394,17 +394,17 @@ fn validated_uploaded_import_path(data_dir: &StdPath, file_path: &str) -> Result
 }
 
 fn uploaded_import_path_for_source_ref(data_dir: &StdPath, source_ref: &str) -> Result<PathBuf, AppError> {
-    uuid::Uuid::parse_str(source_ref).map_err(|_| AppError("Invalid import source reference".to_string()))?;
+    uuid::Uuid::parse_str(source_ref).map_err(|_| AppError::from("Invalid import source reference".to_string()))?;
     let tmp_dir = import_upload_dir(data_dir);
     let prefix = format!("{source_ref}-");
     let mut matches = std::fs::read_dir(&tmp_dir)
-        .map_err(|_| AppError("Import source is no longer available".to_string()))?
+        .map_err(|_| AppError::from("Import source is no longer available".to_string()))?
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
         .map(|entry| entry.path());
-    let file_path = matches.next().ok_or_else(|| AppError("Import source is no longer available".to_string()))?;
+    let file_path = matches.next().ok_or_else(|| AppError::from("Import source is no longer available".to_string()))?;
     if matches.next().is_some() {
-        return Err(AppError("Import source reference is ambiguous".to_string()));
+        return Err(AppError::from("Import source reference is ambiguous".to_string()));
     }
     validated_uploaded_import_path(data_dir, &file_path.to_string_lossy())
 }
