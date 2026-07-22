@@ -133,6 +133,17 @@ class KafkaAgentTest {
     }
 
     @Test
+    void aclDisabledDetectionOnlyAcceptsKnownAuthorizerErrors() {
+        Exception disabled = new RuntimeException(
+            "ACL probe failed",
+            new IllegalStateException("No Authorizer is configured on the broker")
+        );
+
+        assertTrue(KafkaAgent.isAclDisabledError(disabled));
+        assertFalse(KafkaAgent.isAclDisabledError(new RuntimeException("Timed out waiting for broker response")));
+    }
+
+    @Test
     void legacyTopicConfigAppliesSetAndDeleteWithoutLosingExistingOverrides() {
         Config current = new Config(Arrays.asList(
             new ConfigEntry("cleanup.policy", "delete"),

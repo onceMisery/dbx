@@ -16,9 +16,12 @@ import org.apache.kafka.common.resource.ResourceType;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooKeeper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.PrintStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -34,6 +37,7 @@ import java.util.stream.Collectors;
  */
 public final class KafkaAgent {
 
+    private static final PrintStream JSON_RPC_OUT = System.out;
     private static final Gson GSON = new GsonBuilder().serializeNulls().create();
     private static final int DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
     private static final int DEFAULT_SESSION_TIMEOUT_MS = 30_000;
@@ -58,22 +62,35 @@ public final class KafkaAgent {
 
     private KafkaAgent() {}
 
+    private static Logger logger() {
+        // Initialize only after main redirects System.out, so any logging backend
+        // that defaults to stdout still cannot write into the JSON-RPC channel.
+        return LoggerHolder.INSTANCE;
+    }
+
+    private static final class LoggerHolder {
+        private static final Logger INSTANCE = LoggerFactory.getLogger(KafkaAgent.class);
+    }
+
     // -----------------------------------------------------------------------
     // Entry point
     // -----------------------------------------------------------------------
 
     public static void main(String[] args) throws Exception {
+        // Keep the original stdout exclusively for JSON-RPC. Redirect accidental
+        // System.out writes from dependencies to stderr so they cannot corrupt the protocol.
+        System.setOut(System.err);
         System.setProperty("org.slf4j.simpleLogger.logFile", "System.err");
-        System.out.println("{\"ready\":true}");
-        System.out.flush();
+        JSON_RPC_OUT.println("{\"ready\":true}");
+        JSON_RPC_OUT.flush();
 
         BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
         while (true) {
             String line = reader.readLine();
             if (line == null) break;
             String response = handleRequest(line);
-            System.out.println(response);
-            System.out.flush();
+            JSON_RPC_OUT.println(response);
+            JSON_RPC_OUT.flush();
             if (shutdownRequested) {
                 System.exit(0);
             }
@@ -99,6 +116,7 @@ public final class KafkaAgent {
             Object result = dispatch(method, params);
             response.add("result", GSON.toJsonTree(result));
         } catch (Exception e) {
+            logger().warn("Kafka Agent request failed: method={}, id={}", method, id, e);
             JsonObject error = new JsonObject();
             error.addProperty("code", -1);
             error.addProperty("message", normalizeErrorMessage(e));
@@ -197,14 +215,11 @@ public final class KafkaAgent {
                 probe.describeAcls(AclBindingFilter.ANY)
                     .values().get(timeout, TimeUnit.MILLISECONDS);
             } catch (Exception aclEx) {
-                Throwable cause = aclEx;
-                while (cause != null) {
-                    if (cause.getClass().getSimpleName().contains("SecurityDisabled")
-                        || (cause.getMessage() != null && cause.getMessage().contains("No Authorizer"))) {
-                        aclEnabled = false;
-                        break;
-                    }
-                    cause = cause.getCause();
+                if (isAclDisabledError(aclEx)) {
+                    aclEnabled = false;
+                    logger().debug("Kafka ACL support is disabled by the broker");
+                } else {
+                    logger().warn("Kafka ACL capability probe failed; leaving the capability enabled", aclEx);
                 }
             }
 
@@ -225,6 +240,18 @@ public final class KafkaAgent {
             }
             restoreKerberosSystemProperties(previousKerberosSystemProperties);
         }
+    }
+
+    static boolean isAclDisabledError(Throwable error) {
+        Throwable cause = error;
+        while (cause != null) {
+            if (cause.getClass().getSimpleName().contains("SecurityDisabled")
+                || (cause.getMessage() != null && cause.getMessage().contains("No Authorizer"))) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
     }
 
     private static void closeClients() {
@@ -326,8 +353,11 @@ public final class KafkaAgent {
                 try {
                     byte[] data = zooKeeper.getData("/brokers/ids/" + brokerId, false, null);
                     registrations.add(JsonParser.parseString(new String(data, StandardCharsets.UTF_8)).getAsJsonObject());
-                } catch (KeeperException.NoNodeException | RuntimeException ignored) {
-                    // A broker may disappear or refresh its registration while discovery is in progress.
+                } catch (KeeperException.NoNodeException e) {
+                    // Expected race: a broker may refresh its ephemeral node between list and read.
+                    logger().debug("Kafka broker {} disappeared during ZooKeeper discovery", brokerId);
+                } catch (RuntimeException e) {
+                    logger().warn("Skipping malformed ZooKeeper registration for Kafka broker {}", brokerId, e);
                 }
             }
             return brokerEndpoints(registrations, securityProtocol);
@@ -344,7 +374,9 @@ public final class KafkaAgent {
     private static int compareBrokerIds(String left, String right) {
         try {
             return Integer.compare(Integer.parseInt(left), Integer.parseInt(right));
-        } catch (NumberFormatException ignored) {
+        } catch (NumberFormatException e) {
+            // Third-party registries may use non-numeric IDs; lexical ordering remains deterministic.
+            logger().debug("Sorting non-numeric Kafka broker IDs lexically: left={}, right={}", left, right);
             return left.compareTo(right);
         }
     }
@@ -385,8 +417,8 @@ public final class KafkaAgent {
                     String host = registration.get("host").getAsString().trim();
                     int port = registration.get("port").getAsInt();
                     if (!host.isEmpty() && port > 0 && port <= 65535) addresses.add(formatHostPort(host, port));
-                } catch (RuntimeException ignored) {
-                    // Skip malformed legacy registrations and continue with the remaining brokers.
+                } catch (RuntimeException e) {
+                    logger().warn("Skipping malformed legacy Kafka broker registration", e);
                 }
             }
         }
@@ -404,7 +436,8 @@ public final class KafkaAgent {
             int port = uri.getPort();
             if (host == null || host.isBlank() || port <= 0 || port > 65535) return null;
             return formatHostPort(host, port);
-        } catch (IllegalArgumentException ignored) {
+        } catch (IllegalArgumentException e) {
+            logger().debug("Skipping malformed Kafka broker endpoint", e);
             return null;
         }
     }
@@ -733,6 +766,7 @@ public final class KafkaAgent {
                 .all().get(timeout, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             if (!isUnsupportedVersionError(e)) throw e;
+            logger().info("Kafka broker does not support incrementalAlterConfigs; using legacy alterConfigs for topic {}", name);
             Config current = admin.describeConfigs(Collections.singletonList(resource))
                 .all().get(timeout, TimeUnit.MILLISECONDS).get(resource);
             Map<String, String> values = legacyTopicConfig(current, ops);
@@ -883,6 +917,7 @@ public final class KafkaAgent {
             return Collections.singletonMap("producers", new ArrayList<>(byProducer.values()));
         } catch (Exception e) {
             if (isUnsupportedVersionError(e)) {
+                logger().info("Kafka broker does not support describeProducers; returning an empty producer list");
                 return Collections.singletonMap("producers", Collections.emptyList());
             }
             throw e;
@@ -1520,15 +1555,10 @@ public final class KafkaAgent {
     }
 
     private static String tryDecodeUtf8(byte[] bytes) {
-        try {
-            String text = new String(bytes, StandardCharsets.UTF_8);
-            // Verify round-trip
-            byte[] reEncoded = text.getBytes(StandardCharsets.UTF_8);
-            if (Arrays.equals(bytes, reEncoded)) {
-                return text;
-            }
-        } catch (Exception ignored) {}
-        return null;
+        String text = new String(bytes, StandardCharsets.UTF_8);
+        // Replacement characters change the bytes on round-trip, identifying invalid UTF-8 without exceptions.
+        byte[] reEncoded = text.getBytes(StandardCharsets.UTF_8);
+        return Arrays.equals(bytes, reEncoded) ? text : null;
     }
 
     static Long normalizePeekOffset(long requestedOffset, long beginningOffset, long endOffset) {
