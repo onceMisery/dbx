@@ -1655,6 +1655,7 @@ defineExpose({ focusSearch });
               rows="1"
               class="document-query-input flex-1 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono"
               placeholder="{}"
+              @keydown.enter.exact.prevent="applyFilter"
               @keydown.ctrl.enter.prevent="applyFilter"
               @keydown.meta.enter.prevent="applyFilter"
             />
@@ -1693,6 +1694,7 @@ defineExpose({ focusSearch });
               rows="1"
               class="document-query-input flex-1 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono"
               placeholder="{}"
+              @keydown.enter.exact.prevent="applyFilter"
               @keydown.ctrl.enter.prevent="applyFilter"
               @keydown.meta.enter.prevent="applyFilter"
             />
