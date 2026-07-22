@@ -6,6 +6,7 @@ use std::sync::RwLock;
 
 use crate::connection::task_client_session_id;
 use crate::models::connection::DatabaseType;
+use crate::mysql_ddl_normalize::DdlNormalizeOptions;
 use crate::object_source_sql::build_export_object_source_sql;
 use crate::sql_dialect::{qualified_table_name, quote_table_identifier, uses_single_row_insert_statements};
 use crate::transfer::{
@@ -39,6 +40,11 @@ pub struct DatabaseExportRequest {
     pub include_objects: bool,
     #[serde(default)]
     pub drop_table_if_exists: bool,
+    /// Drop the table-level `AUTO_INCREMENT=N` clause from exported MySQL DDL,
+    /// so the script can initialize a fresh database without pinning a sequence
+    /// position. No-op for non-MySQL databases. Defaults to `false` (preserve).
+    #[serde(default)]
+    pub omit_auto_increment: bool,
     #[serde(default)]
     pub fail_on_error: bool,
     #[serde(default)]
@@ -183,6 +189,10 @@ pub struct BuildDatabaseSqlExportOptions {
     pub database: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
+    /// Drop the table-level `AUTO_INCREMENT=N` clause from exported MySQL DDL.
+    /// Defaults to `false` (preserve). See `DatabaseExportRequest::omit_auto_increment`.
+    #[serde(default)]
+    pub omit_auto_increment: bool,
 }
 
 pub fn format_export_sql_literal(value: &Value) -> String {
@@ -293,11 +303,30 @@ fn quote_export_sql_string(text: &str) -> String {
 }
 
 fn quote_export_sql_string_for_database(text: &str, database_type: Option<DatabaseType>) -> String {
-    if is_mysql_compatible_export_literal_target(database_type) {
-        quote_mysql_compatible_export_sql_string(text)
-    } else {
-        quote_export_sql_string(text)
+    match database_type {
+        Some(DatabaseType::Dameng) => quote_dameng_export_sql_string(text),
+        database_type if is_mysql_compatible_export_literal_target(database_type) => {
+            quote_mysql_compatible_export_sql_string(text)
+        }
+        _ => quote_export_sql_string(text),
     }
+}
+
+fn quote_dameng_export_sql_string(text: &str) -> String {
+    if !text.contains('\0') {
+        return quote_export_sql_string(text);
+    }
+
+    let mut parts = Vec::new();
+    for (index, segment) in text.split('\0').enumerate() {
+        if index > 0 {
+            parts.push("CHR(0)".to_string());
+        }
+        if !segment.is_empty() {
+            parts.push(quote_export_sql_string(segment));
+        }
+    }
+    parts.join(" || ")
 }
 
 fn quote_mysql_compatible_export_sql_string(text: &str) -> String {
@@ -783,9 +812,13 @@ pub fn build_database_sql_export(options: BuildDatabaseSqlExportOptions) -> Resu
 
     for table in options.tables {
         if let Some(ddl) = table.ddl.as_ref().map(|ddl| ddl.trim()).filter(|ddl| !ddl.is_empty()) {
-            let ddl = normalize_export_table_ddl(ddl, table.database_type);
+            let ddl = format_export_table_ddl(
+                ddl,
+                table.database_type,
+                DdlNormalizeOptions { omit_auto_increment: options.omit_auto_increment },
+            );
             lines.push(format!("-- Structure for {}", table.display_name));
-            lines.push(format!("{};", ddl.trim_end_matches(';')));
+            lines.push(ddl);
             lines.push(String::new());
         }
 
@@ -833,15 +866,22 @@ fn export_qualified_table_name(
     Ok(qualified_table_name(database_type, schema, table_name))
 }
 
-fn normalize_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>) -> String {
+fn normalize_export_table_ddl(
+    ddl: &str,
+    database_type: Option<DatabaseType>,
+    opts: crate::mysql_ddl_normalize::DdlNormalizeOptions,
+) -> String {
     if database_type != Some(DatabaseType::Mysql) {
         return ddl.to_string();
     }
 
-    static LEGACY_MYSQL_ROW_FORMAT_RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bROW_FORMAT\s*=\s*(COMPACT|REDUNDANT)\b").unwrap());
+    crate::mysql_ddl_normalize::normalize_mysql_export_ddl(ddl, opts)
+}
 
-    LEGACY_MYSQL_ROW_FORMAT_RE.replace_all(ddl, "ROW_FORMAT=DYNAMIC").into_owned()
+fn format_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>, opts: DdlNormalizeOptions) -> String {
+    let ddl = normalize_export_table_ddl(ddl, database_type, opts);
+    let ddl = ddl.trim().trim_end_matches(';').trim_end();
+    format!("{ddl};")
 }
 
 fn postgres_sequence_qualified_name(schema: &str, sequence_name: &str) -> String {
@@ -1534,8 +1574,12 @@ pub async fn export_database_sql_core(
             };
             match ddl_result {
                 Ok(ddl) => {
-                    let ddl = normalize_export_table_ddl(&ddl, Some(db_type));
-                    writeln!(file, "{};\n", ddl).map_err(|e| format!("Failed to write file: {e}"))?;
+                    let ddl = format_export_table_ddl(
+                        &ddl,
+                        Some(db_type),
+                        DdlNormalizeOptions { omit_auto_increment: request.omit_auto_increment },
+                    );
+                    writeln!(file, "{ddl}\n").map_err(|e| format!("Failed to write file: {e}"))?;
                 }
                 Err(e) => {
                     record_export_error(
@@ -1952,12 +1996,12 @@ mod tests {
     use super::concurrent_metadata_prefetch_allowed;
     use super::{
         build_database_export_object_source_sql, build_database_sql_export, build_export_insert_statements,
-        drop_table_if_exists_sql, filter_export_table_infos, format_export_sql_literal,
+        drop_table_if_exists_sql, filter_export_table_infos, format_export_sql_literal, format_export_table_ddl,
         generate_postgres_extension_ddl, generate_postgres_sequence_create_ddl, generate_postgres_sequence_owner_ddl,
         generate_postgres_sequence_setval_sql, is_postgres_extension_member_routine, normalize_export_table_ddl,
-        record_export_error, BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, ExportedTableSql,
-        PostgresExportExtension, PostgresExportSequence, PostgresExtensionMembers, DATABASE_EXPORT_INSERT_BATCH_SIZE,
-        DATABASE_EXPORT_ROW_LIMIT,
+        record_export_error, BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, DdlNormalizeOptions,
+        ExportedTableSql, PostgresExportExtension, PostgresExportSequence, PostgresExtensionMembers,
+        DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
     };
     use crate::models::connection::DatabaseType;
     use crate::types::{ObjectInfo, ObjectSourceKind, TableInfo};
@@ -2435,6 +2479,47 @@ mod tests {
     }
 
     #[test]
+    fn dameng_strings_export_nul_as_chr_expression() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Dameng),
+            schema: Some("DBX_TEST".to_string()),
+            table_name: Some("NUL_VALUES".to_string()),
+            qualified_table_name: None,
+            columns: vec![
+                "PLAIN".to_string(),
+                "TRAILING".to_string(),
+                "LEADING".to_string(),
+                "MIDDLE".to_string(),
+                "CONSECUTIVE".to_string(),
+                "ONLY_NUL".to_string(),
+            ],
+            column_types: vec![Some("VARCHAR".to_string()); 6],
+            column_extras: Vec::new(),
+            rows: vec![vec![
+                json!("plain"),
+                json!("eHall\0"),
+                json!("\0leading"),
+                json!("left\0right"),
+                json!("left\0\0right"),
+                json!("\0"),
+            ]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![concat!(
+                "INSERT INTO \"DBX_TEST\".\"NUL_VALUES\" ",
+                "(\"PLAIN\", \"TRAILING\", \"LEADING\", \"MIDDLE\", \"CONSECUTIVE\", \"ONLY_NUL\") ",
+                "VALUES ('plain', 'eHall' || CHR(0), CHR(0) || 'leading', 'left' || CHR(0) || 'right', ",
+                "'left' || CHR(0) || CHR(0) || 'right', CHR(0));"
+            )]
+        );
+        assert!(!statements[0].contains('\0'));
+    }
+
+    #[test]
     fn mysql_export_uses_typed_literals_for_numeric_and_blob_columns() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
@@ -2606,6 +2691,7 @@ mod tests {
             connection_id: None,
             database: None,
             schema: None,
+            omit_auto_increment: false,
         })
         .unwrap();
 
@@ -2630,10 +2716,65 @@ mod tests {
     }
 
     #[test]
+    fn table_ddl_export_has_one_statement_terminator() {
+        let ddl = "CREATE TABLE `users` (`id` int);;\n";
+
+        assert_eq!(
+            format_export_table_ddl(ddl, Some(DatabaseType::Mysql), DdlNormalizeOptions::default()),
+            "CREATE TABLE `users` (`id` int);"
+        );
+        assert_eq!(
+            format_export_table_ddl(
+                "CREATE TABLE users (id int)",
+                Some(DatabaseType::Postgres),
+                DdlNormalizeOptions::default(),
+            ),
+            "CREATE TABLE users (id int);"
+        );
+    }
+
+    #[test]
+    fn omitted_auto_increment_preserves_mysql_line_comment_boundaries() {
+        let options = DdlNormalizeOptions { omit_auto_increment: true };
+
+        assert_eq!(
+            format_export_table_ddl(
+                "CREATE TABLE `users` (`id` int) ENGINE=InnoDB -- keep this comment\nAUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4",
+                Some(DatabaseType::Mysql),
+                options,
+            ),
+            "CREATE TABLE `users` (`id` int) ENGINE=InnoDB -- keep this comment\n DEFAULT CHARSET=utf8mb4;"
+        );
+        assert_eq!(
+            format_export_table_ddl(
+                "CREATE TABLE `users` (`id` int) ENGINE=InnoDB # keep this comment\r\nAUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4",
+                Some(DatabaseType::Mysql),
+                options,
+            ),
+            "CREATE TABLE `users` (`id` int) ENGINE=InnoDB # keep this comment\r\n DEFAULT CHARSET=utf8mb4;"
+        );
+    }
+
+    #[test]
+    fn omitted_auto_increment_consumes_only_horizontal_separator_whitespace() {
+        let options = DdlNormalizeOptions { omit_auto_increment: true };
+
+        for separator in [" ", "\t"] {
+            let ddl = format!(
+                "CREATE TABLE `users` (`id` int) ENGINE=InnoDB{separator}AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4"
+            );
+            assert_eq!(
+                format_export_table_ddl(&ddl, Some(DatabaseType::Mysql), options),
+                "CREATE TABLE `users` (`id` int) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+            );
+        }
+    }
+
+    #[test]
     fn normalizes_legacy_mysql_row_format_for_export_compatibility() {
         let ddl = "CREATE TABLE `wide_table` (\n  `payload` varchar(4096) DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=COMPACT";
 
-        let normalized = normalize_export_table_ddl(ddl, Some(DatabaseType::Mysql));
+        let normalized = normalize_export_table_ddl(ddl, Some(DatabaseType::Mysql), DdlNormalizeOptions::default());
 
         assert_eq!(
             normalized,
@@ -2645,7 +2786,7 @@ mod tests {
     fn normalizes_lowercase_redundant_mysql_row_format_for_export_compatibility() {
         let ddl = "CREATE TABLE `wide_table` (`payload` varchar(4096)) engine=InnoDB row_format = redundant";
 
-        let normalized = normalize_export_table_ddl(ddl, Some(DatabaseType::Mysql));
+        let normalized = normalize_export_table_ddl(ddl, Some(DatabaseType::Mysql), DdlNormalizeOptions::default());
 
         assert_eq!(normalized, "CREATE TABLE `wide_table` (`payload` varchar(4096)) engine=InnoDB ROW_FORMAT=DYNAMIC");
     }
@@ -2655,8 +2796,14 @@ mod tests {
         let mysql_ddl = "CREATE TABLE `ok` (`payload` text) ENGINE=InnoDB ROW_FORMAT=COMPRESSED";
         let postgres_ddl = "CREATE TABLE users (payload text) ROW_FORMAT=COMPACT";
 
-        assert_eq!(normalize_export_table_ddl(mysql_ddl, Some(DatabaseType::Mysql)), mysql_ddl);
-        assert_eq!(normalize_export_table_ddl(postgres_ddl, Some(DatabaseType::Postgres)), postgres_ddl);
+        assert_eq!(
+            normalize_export_table_ddl(mysql_ddl, Some(DatabaseType::Mysql), DdlNormalizeOptions::default()),
+            mysql_ddl
+        );
+        assert_eq!(
+            normalize_export_table_ddl(postgres_ddl, Some(DatabaseType::Postgres), DdlNormalizeOptions::default()),
+            postgres_ddl
+        );
     }
 
     fn postgres_sequence(name: &str) -> PostgresExportSequence {

@@ -34,6 +34,7 @@ pub mod mongo_ops;
 pub mod mongo_shell;
 #[cfg(feature = "mq-admin")]
 pub mod mq;
+pub(crate) mod mysql_ddl_normalize;
 pub mod nacos;
 pub mod object_source_sql;
 pub mod path_utils;

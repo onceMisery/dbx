@@ -234,6 +234,22 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     return pattern ? { ...result, rows: formatTemporalRowsForExport(result.rows, result.columnTypes, pattern) } : result;
   }
 
+  function normalizeCompleteLocalResult(result: QueryResult): { columns: string[]; columnTypes: string[]; rows: CellValue[][] } {
+    const hiddenColumnIndexes = new Set(result.hidden_column_indexes ?? []);
+    const exportedColumnIndexes = result.columns.map((_, index) => index).filter((index) => !hiddenColumnIndexes.has(index));
+    const hasHiddenColumns = exportedColumnIndexes.length !== result.columns.length;
+    const editorSettings = useSettingsStore().editorSettings;
+    const rows = editorSettings.exportRowLimitEnabled ? result.rows.slice(0, editorSettings.exportRowLimit) : result.rows;
+
+    // Internal key columns are query-only metadata. Keep every user column,
+    // including columns hidden manually in the grid, while preserving alignment.
+    return {
+      columns: hasHiddenColumns ? exportedColumnIndexes.map((index) => result.columns[index]!) : result.columns,
+      columnTypes: hasHiddenColumns ? exportedColumnIndexes.map((index) => result.column_types?.[index] ?? "") : (result.column_types ?? []),
+      rows: hasHiddenColumns ? rows.map((row) => exportedColumnIndexes.map((index) => row[index])) : rows,
+    };
+  }
+
   async function resultToExport(rowIds?: number[], onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void, useFullExport = true, formatDateTime = true): Promise<{ columns: string[]; columnTypes: string[]; rows: CellValue[][] }> {
     if (useFullExport && rowIds === undefined && fullExportResult && !hasCompleteLocalResult?.value) {
       const result = await fullExportResult(onProgress);
@@ -245,7 +261,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     // and reflects client-side filters/search and unsaved edits, which would
     // silently change what the export contains.
     if (useFullExport && rowIds === undefined && hasCompleteLocalResult?.value && completeLocalResult?.value) {
-      return applyGlobalDateTimeExportFormat({ columns: completeLocalResult.value.columns, columnTypes: completeLocalResult.value.column_types ?? [], rows: completeLocalResult.value.rows }, formatDateTime);
+      return applyGlobalDateTimeExportFormat(normalizeCompleteLocalResult(completeLocalResult.value), formatDateTime);
     }
     return applyGlobalDateTimeExportFormat(
       {
@@ -453,17 +469,23 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       });
       return;
     }
-    const key = insertCopyKey(excludePrimaryKeys, insertMode);
-    const current = insertCopyCache(excludePrimaryKeys, insertMode);
-    if (current.ready && current.key === key) return current.text;
-    if (current.loading && current.key === key && current.promise) return current.promise;
-
     const data: CopyInsertData = {
       columns: columns.value,
       sourceColumns: sourceColumns.value,
       columnTypes: columnTypes.value?.map((type) => type ?? undefined),
       rows,
     };
+    if (databaseType.value === "mongodb") {
+      // Mongo documents can approach the 16 MiB BSON limit. Yield before the
+      // synchronous shell serialization so menu close/rendering is never held up.
+      await yieldToMainThread();
+      return buildCopyInsertStatement(data, excludePrimaryKeys, insertMode);
+    }
+
+    const key = insertCopyKey(excludePrimaryKeys, insertMode);
+    const current = insertCopyCache(excludePrimaryKeys, insertMode);
+    if (current.ready && current.key === key) return current.text;
+    if (current.loading && current.key === key && current.promise) return current.promise;
     const promise = Promise.resolve().then(async () => {
       const statement = await buildCopyInsertStatement(data, excludePrimaryKeys, insertMode);
       const latest = insertCopyCache(excludePrimaryKeys, insertMode);
@@ -537,6 +559,12 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       });
       return;
     }
+    if (databaseType.value === "mongodb") {
+      // Keep context-menu work bounded; serialize the selected Mongo fields only
+      // after the user explicitly invokes the copy command.
+      await yieldToMainThread();
+      return buildCopyInsertStatement(data, false, insertMode);
+    }
     const key = selectionInsertCopyKey(insertMode);
     const current = selectionInsertCopyCache(insertMode);
     if (current.ready && current.key === key) return current.text;
@@ -584,10 +612,16 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     return cache.ready && cache.key === selectionInsertCopyKey(insertMode);
   }
 
-  function copySelectionAsInsert(insertMode: DataGridCopyInsertMode = "merged"): boolean {
-    if (!canCopyPreparedSelectionInsert(insertMode)) return false;
-    void copyText(selectionInsertCopyCache(insertMode).text);
-    return true;
+  async function copySelectionAsInsert(insertMode: DataGridCopyInsertMode = "merged"): Promise<boolean> {
+    try {
+      const statement = await prepareSelectionAsInsertStatement(insertMode);
+      if (!statement) return false;
+      await copyText(statement);
+      return true;
+    } catch (error: any) {
+      toast(t("grid.copyFailed", { message: error?.message || String(error) }), 5000);
+      return false;
+    }
   }
 
   async function prefetchRowAsUpdateStatement() {
@@ -1562,6 +1596,10 @@ function formatMongoCopyInsertStatement(statement: string | undefined): string |
   } catch {
     return statement;
   }
+}
+
+function yieldToMainThread(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function compactLocalTimestamp(date = new Date()): string {

@@ -2526,7 +2526,10 @@ fn find_column_index(database_type: Option<DatabaseType>, columns: &[Option<Stri
     // PostgreSQL can have distinct `id` and quoted `"ID"` columns. Only
     // dialects whose result metadata is known to drift in case may fall back,
     // and even then a case-only match must be unique.
-    if !matches!(database_type, Some(DatabaseType::Kingbase | DatabaseType::Tdengine | DatabaseType::Hive)) {
+    if !matches!(
+        database_type,
+        Some(DatabaseType::Goldendb | DatabaseType::Kingbase | DatabaseType::Tdengine | DatabaseType::Hive)
+    ) {
         return None;
     }
     let normalized_target = normalize_column_name(target);
@@ -4150,6 +4153,140 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn goldendb_column_index_prefers_exact_case_and_rejects_ambiguous_fallback() {
+        let columns = vec![Some("id".to_string()), Some("ID".to_string())];
+
+        assert_eq!(find_column_index(Some(DatabaseType::Goldendb), &columns, "ID"), Some(1));
+        assert_eq!(find_column_index(Some(DatabaseType::Goldendb), &columns[..1], "ID"), Some(0));
+        assert_eq!(
+            find_column_index(Some(DatabaseType::Goldendb), &[Some("id".to_string()), Some("Id".to_string())], "ID"),
+            None
+        );
+    }
+
+    #[test]
+    fn goldendb_save_uses_unique_case_insensitive_primary_key_for_update_and_delete() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Goldendb),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("app".to_string()),
+                table_name: "people".to_string(),
+                primary_keys: vec!["ID".to_string()],
+                columns: Some(vec![column("ID", "bigint", false, None), column("name", "varchar", true, None)]),
+            },
+            columns: vec!["id".to_string(), "name".to_string()],
+            source_columns: Some(vec![Some("id".to_string()), Some("name".to_string())]),
+            rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("Grace")]],
+            dirty_rows: vec![(0, vec![(1, json!("Ada Lovelace"))])],
+            deleted_rows: vec![1],
+            new_rows: vec![],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(
+            result.statements,
+            vec![
+                "UPDATE `app`.`people` SET `name` = 'Ada Lovelace' WHERE `ID` = 1;",
+                "DELETE FROM `app`.`people` WHERE `ID` = 2;",
+            ]
+        );
+    }
+
+    #[test]
+    fn goldendb_save_supports_composite_primary_keys_with_unique_case_insensitive_matches() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Goldendb),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("app".to_string()),
+                table_name: "members".to_string(),
+                primary_keys: vec!["TENANT_ID".to_string(), "USER_ID".to_string()],
+                columns: Some(vec![
+                    column("TENANT_ID", "bigint", false, None),
+                    column("USER_ID", "bigint", false, None),
+                    column("name", "varchar", true, None),
+                ]),
+            },
+            columns: vec!["tenant_id".to_string(), "user_id".to_string(), "name".to_string()],
+            source_columns: Some(vec![
+                Some("tenant_id".to_string()),
+                Some("user_id".to_string()),
+                Some("name".to_string()),
+            ]),
+            rows: vec![vec![json!(10), json!(1), json!("Ada")], vec![json!(10), json!(2), json!("Grace")]],
+            dirty_rows: vec![(0, vec![(2, json!("Ada Lovelace"))])],
+            deleted_rows: vec![1],
+            new_rows: vec![],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(
+            result.statements,
+            vec![
+                "UPDATE `app`.`members` SET `name` = 'Ada Lovelace' WHERE `TENANT_ID` = 10 AND `USER_ID` = 1;",
+                "DELETE FROM `app`.`members` WHERE `TENANT_ID` = 10 AND `USER_ID` = 2;",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_goldendb_save_when_case_insensitive_primary_key_match_is_ambiguous() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Goldendb),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("app".to_string()),
+                table_name: "people".to_string(),
+                primary_keys: vec!["ID".to_string()],
+                columns: Some(vec![column("ID", "bigint", false, None), column("name", "varchar", true, None)]),
+            },
+            columns: vec!["id".to_string(), "Id".to_string(), "name".to_string()],
+            source_columns: Some(vec![Some("id".to_string()), Some("Id".to_string()), Some("name".to_string())]),
+            rows: vec![vec![json!(1), json!(2), json!("Ada")]],
+            dirty_rows: vec![(0, vec![(2, json!("Grace"))])],
+            deleted_rows: vec![0],
+            new_rows: vec![],
+        });
+
+        assert!(result.validation_error.as_deref().is_some_and(|error| error.contains("missing: ID")));
+        assert!(result.statements.is_empty());
+        assert!(result.rollback_statements.is_empty());
+    }
+
+    #[test]
+    fn rejects_goldendb_save_when_primary_key_column_is_truly_missing() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Goldendb),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("app".to_string()),
+                table_name: "people".to_string(),
+                primary_keys: vec!["ID".to_string()],
+                columns: Some(vec![column("ID", "bigint", false, None), column("name", "varchar", true, None)]),
+            },
+            columns: vec!["tenant_id".to_string(), "name".to_string()],
+            source_columns: Some(vec![Some("tenant_id".to_string()), Some("name".to_string())]),
+            rows: vec![vec![json!(10), json!("Ada")]],
+            dirty_rows: vec![(0, vec![(1, json!("Grace"))])],
+            deleted_rows: vec![0],
+            new_rows: vec![],
+        });
+
+        assert!(result.validation_error.as_deref().is_some_and(|error| error.contains("missing: ID")));
+        assert!(result.statements.is_empty());
+        assert!(result.rollback_statements.is_empty());
     }
 
     #[test]

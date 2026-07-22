@@ -640,8 +640,8 @@ export async function getObjectSource(connectionId: string, database: string, sc
   return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType, signature })}`);
 }
 
-export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ColumnInfo[]> {
-  return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
+export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string, clientSessionId?: string): Promise<ColumnInfo[]> {
+  return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table, catalog, client_session_id: clientSessionId })}`);
 }
 
 export async function getSqlServerColumnMetadata(connectionId: string, database: string, schema: string, table: string): Promise<SqlServerColumnMetadata[]> {
@@ -2089,6 +2089,10 @@ export async function mongoDropDatabase(connectionId: string, database: string):
 
 export async function mongoDropCollection(connectionId: string, database: string, collection: string): Promise<void> {
   await post("/api/mongo/drop-collection", { connectionId, database, collection });
+}
+
+export async function mongoRenameCollection(connectionId: string, database: string, collection: string, newName: string): Promise<void> {
+  await post("/api/mongo/rename-collection", { connectionId, database, collection, newName });
 }
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {

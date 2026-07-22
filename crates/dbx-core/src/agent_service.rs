@@ -1250,7 +1250,9 @@ pub struct OfflineImportPlan {
     pub includes_jre: bool,
 }
 
+type OfflineJreEntry = (String, String);
 type OfflineDriverEntry = (String, String, bool);
+type OfflineArchiveEntries = (Vec<OfflineJreEntry>, Vec<OfflineDriverEntry>);
 
 pub fn inspect_offline_zip(zip_path: &Path) -> Result<OfflineImportPlan, String> {
     let file = std::fs::File::open(zip_path).map_err(|e| format!("Failed to open ZIP file: {e}"))?;
@@ -1401,7 +1403,7 @@ pub fn import_offline_zip(
 fn collect_offline_entries(
     archive: &mut zip::ZipArchive<std::fs::File>,
     registry: &AgentRegistry,
-) -> Result<(Vec<(String, String)>, Vec<OfflineDriverEntry>), String> {
+) -> Result<OfflineArchiveEntries, String> {
     let platform = AgentManager::current_platform();
     let mut jre_entries = Vec::new();
     let mut drivers = std::collections::BTreeMap::<String, (String, bool)>::new();
