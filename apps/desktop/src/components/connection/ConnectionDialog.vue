@@ -1428,7 +1428,8 @@ async function persistSuccessfulConnectionTest(result: ConnectionTestResult, con
 }
 
 async function testConnectionWithTimeout(config: ConnectionConfig, runId: number): Promise<ConnectionTestResult> {
-  const timeoutMs = connectionAttemptTimeoutMs(config);
+  await tunnelProfileStore.init();
+  const timeoutMs = connectionAttemptTimeoutMs(config, tunnelProfileStore.profileById);
   const timeoutMessage = connectionAttemptTimeoutMessage(timeoutMs);
   const promise = api.testConnectionWithInfo(config);
   let timedOut = false;
@@ -6376,7 +6377,7 @@ function openExternalUrl(url: string) {
 .connection-dialog-content {
   display: flex;
   flex-direction: column;
-  max-height: calc(100dvh - 2rem);
+  max-height: calc(var(--dbx-viewport-height) - 2rem);
 }
 
 @media (min-width: 640px) {

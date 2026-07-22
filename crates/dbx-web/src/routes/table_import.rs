@@ -102,7 +102,7 @@ pub async fn preview_import(
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tmp_dir = import_upload_dir(&state.data_dir);
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| AppError(e.to_string()))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| AppError::from(e.to_string()))?;
     cleanup_expired_import_uploads(&tmp_dir, Duration::from_secs(24 * 60 * 60));
 
     let mut uploaded_file: Option<(String, PathBuf)> = None;
@@ -116,14 +116,14 @@ pub async fn preview_import(
             Ok(None) => break,
             Err(error) => {
                 cleanup_pending_upload(&uploaded_file).await;
-                return Err(AppError(error.to_string()));
+                return Err(AppError::from(error.to_string()));
             }
         };
         let name = field.name().unwrap_or_default().to_string();
         if name == "file" {
             if uploaded_file.is_some() {
                 cleanup_pending_upload(&uploaded_file).await;
-                return Err(AppError("Only one import file may be uploaded".to_string()));
+                return Err(AppError::from("Only one import file may be uploaded".to_string()));
             }
             let file_name = field.file_name().unwrap_or("upload.csv").to_string();
             let source_ref = uuid::Uuid::new_v4().to_string();
@@ -138,7 +138,7 @@ pub async fn preview_import(
                 Ok(value) => value,
                 Err(error) => {
                     cleanup_pending_upload(&uploaded_file).await;
-                    return Err(AppError(error.to_string()));
+                    return Err(AppError::from(error.to_string()));
                 }
             };
             match name.as_str() {
@@ -147,7 +147,7 @@ pub async fn preview_import(
                         Ok(source_format) => Some(source_format),
                         Err(error) => {
                             cleanup_pending_upload(&uploaded_file).await;
-                            return Err(AppError(error.to_string()));
+                            return Err(AppError::from(error.to_string()));
                         }
                     };
                 }
@@ -156,7 +156,7 @@ pub async fn preview_import(
                         Ok(parse_options) => parse_options,
                         Err(error) => {
                             cleanup_pending_upload(&uploaded_file).await;
-                            return Err(AppError(error.to_string()));
+                            return Err(AppError::from(error.to_string()));
                         }
                     };
                 }
@@ -182,20 +182,20 @@ pub async fn preview_import(
             Ok(preview) => preview,
             Err(error) => {
                 cleanup_uploaded_import_path(&file_path).await;
-                return Err(AppError(error));
+                return Err(AppError::from(error));
             }
         };
         let preview = match serde_json::to_value(preview) {
             Ok(preview) => preview,
             Err(error) => {
                 cleanup_uploaded_import_path(&file_path).await;
-                return Err(AppError(error.to_string()));
+                return Err(AppError::from(error.to_string()));
             }
         };
         return Ok(Json(preview));
     }
 
-    Err(AppError("No file uploaded".to_string()))
+    Err(AppError::from("No file uploaded".to_string()))
 }
 
 pub async fn preview_uploaded_import(
@@ -239,22 +239,22 @@ where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
-    let mut upload = tokio::fs::File::create(file_path).await.map_err(|error| AppError(error.to_string()))?;
+    let mut upload = tokio::fs::File::create(file_path).await.map_err(|error| AppError::from(error.to_string()))?;
     let mut uploaded_bytes = 0usize;
 
     // Stream uploads to disk so valid large CSV files don't require a second full-size in-memory copy.
     let result = async {
         while let Some(chunk) = chunks.next().await {
-            let chunk = chunk.map_err(|error| AppError(error.to_string()))?;
+            let chunk = chunk.map_err(|error| AppError::from(error.to_string()))?;
             uploaded_bytes = uploaded_bytes.saturating_add(chunk.len());
             if uploaded_bytes > max_upload_bytes {
-                return Err(AppError(format!(
+                return Err(AppError::from(format!(
                     "File too large: {uploaded_bytes} bytes received (max {max_upload_bytes} bytes)"
                 )));
             }
-            upload.write_all(&chunk).await.map_err(|error| AppError(error.to_string()))?;
+            upload.write_all(&chunk).await.map_err(|error| AppError::from(error.to_string()))?;
         }
-        upload.flush().await.map_err(|error| AppError(error.to_string()))
+        upload.flush().await.map_err(|error| AppError::from(error.to_string()))
     }
     .await;
     drop(upload);
@@ -279,7 +279,7 @@ pub async fn execute_import(
         if !req.retain_source {
             cleanup_uploaded_import_source(&req.file_path).await;
         }
-        return Err(AppError(format!(
+        return Err(AppError::from(format!(
             "Read-only mode: connection '{}' has read-only protection enabled. Import blocked.",
             name
         )));
@@ -352,7 +352,7 @@ pub async fn import_progress(
     Path(import_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, AppError> {
     let channels = state.table_import_channels.read().await;
-    let tx = channels.get(&import_id).ok_or_else(|| AppError("Import not found".to_string()))?;
+    let tx = channels.get(&import_id).ok_or_else(|| AppError::from("Import not found".to_string()))?;
     let rx = tx.subscribe();
     drop(channels);
     Ok(crate::sse::sse_from_watch(rx))
@@ -373,7 +373,7 @@ fn import_upload_dir(data_dir: &StdPath) -> PathBuf {
 fn safe_uploaded_import_path(tmp_dir: &StdPath, file_name: &str, source_ref: &str) -> Result<PathBuf, AppError> {
     let base_name = file_name.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or("upload.csv").trim();
     if base_name.is_empty() || base_name == "." || base_name == ".." {
-        return Err(AppError("Invalid import file name".to_string()));
+        return Err(AppError::from("Invalid import file name".to_string()));
     }
     Ok(tmp_dir.join(format!("{source_ref}-{base_name}")))
 }
@@ -381,14 +381,14 @@ fn safe_uploaded_import_path(tmp_dir: &StdPath, file_name: &str, source_ref: &st
 fn validated_uploaded_import_path(data_dir: &StdPath, file_path: &str) -> Result<PathBuf, AppError> {
     let path = PathBuf::from(file_path);
     if !path.is_absolute() {
-        return Err(AppError("Import source path must be absolute".to_string()));
+        return Err(AppError::from("Import source path must be absolute".to_string()));
     }
 
-    let tmp_dir = import_upload_dir(data_dir).canonicalize().map_err(|e| AppError(e.to_string()))?;
+    let tmp_dir = import_upload_dir(data_dir).canonicalize().map_err(|e| AppError::from(e.to_string()))?;
     let canonical_path =
-        path.canonicalize().map_err(|e| AppError(format!("Import source is no longer available: {e}")))?;
+        path.canonicalize().map_err(|e| AppError::from(format!("Import source is no longer available: {e}")))?;
     if !canonical_path.starts_with(&tmp_dir) {
-        return Err(AppError("Import source must be inside the uploaded import directory".to_string()));
+        return Err(AppError::from("Import source must be inside the uploaded import directory".to_string()));
     }
     Ok(canonical_path)
 }
@@ -468,7 +468,7 @@ mod tests {
 
         let error = write_import_upload_stream(chunks, &file_path, 4).await.unwrap_err();
 
-        assert!(error.0.contains("File too large"));
+        assert!(error.message.contains("File too large"));
         assert!(!file_path.exists());
     }
 
@@ -479,7 +479,7 @@ mod tests {
 
         let error = write_import_upload_stream(chunks, &file_path, 8).await.unwrap_err();
 
-        assert_eq!(error.0, "multipart stream failed");
+        assert_eq!(error.message, "multipart stream failed");
         assert!(!file_path.exists());
     }
 

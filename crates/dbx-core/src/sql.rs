@@ -818,11 +818,11 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
                 in_backtick = !in_backtick;
                 i += ch.len_utf8();
             }
-            ';' if !in_single_quote
-                && !in_double_quote
-                && !in_backtick
-                && custom_delimiter.is_none()
-                && !(options.profile.supports_custom_delimiter_commands && is_on_delimiter_line(sql, start, i)) =>
+            ';' if !(in_single_quote
+                || in_double_quote
+                || in_backtick
+                || custom_delimiter.is_some()
+                || (options.profile.supports_custom_delimiter_commands && is_on_delimiter_line(sql, start, i))) =>
             {
                 let is_mysql_routine =
                     options.profile.supports_mysql_routine_blocks && starts_with_mysql_routine_block(&sql[start..i]);

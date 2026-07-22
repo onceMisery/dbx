@@ -117,6 +117,18 @@ func (connection *fallbackConn) QueryContext(_ context.Context, query string, _ 
 	if strings.Contains(query, "information_schema.table_constraints") {
 		return &valueRows{columns: []string{"column_name"}}, nil
 	}
+	if strings.Contains(query, "information_schema.tables") {
+		return nil, &gokb.Error{
+			Code:    gokb.ErrorCode("42501"),
+			Message: "permission denied for function sys_freespace",
+		}
+	}
+	if strings.Contains(query, "SELECT c.relname") {
+		return &valueRows{
+			columns: []string{"relname", "table_type", "description"},
+			rows:    [][]driver.Value{{"orders", "TABLE", "orders table"}},
+		}, nil
+	}
 	if strings.Contains(query, "sys_get_expr(") {
 		return nil, &gokb.Error{Code: gokb.ErrorCode("42883"), Message: "function sys_get_expr(pg_node_tree, oid) does not exist"}
 	}
@@ -331,6 +343,35 @@ func TestColumnsFallbackToPgGetExprAndCacheChoice(t *testing.T) {
 	}
 	if sysCalls != 1 || pgCalls != 2 {
 		t.Fatalf("fallback choice was not cached: sys=%d pg=%d queries=%v", sysCalls, pgCalls, state.queries)
+	}
+}
+
+func TestListTablesFallsBackForSysFreespacePermission(t *testing.T) {
+	registerExpressionFallbackDriver.Do(func() { sql.Register("kingbase-expression-fallback-test", fallbackDriver{}) })
+	state := &fallbackDriverState{}
+	expressionFallbackState.Store(state)
+	db, err := sql.Open("kingbase-expression-fallback-test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	server := newServer()
+	server.db = db
+	server.mode.mysqlCompat = true
+	tables, err := server.listTables("public", metadataListConstraints{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables) != 1 || tables[0].Name != "orders" {
+		t.Fatalf("unexpected fallback tables: %#v", tables)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.queries) != 2 || !strings.Contains(state.queries[0], "information_schema.tables") || !strings.Contains(state.queries[1], "sys_catalog.sys_class") {
+		t.Fatalf("unexpected fallback query sequence: %v", state.queries)
 	}
 }
 

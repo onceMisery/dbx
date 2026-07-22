@@ -246,6 +246,11 @@ LEFT JOIN %s.%s_description d ON d.objoid = c.oid AND d.objsubid = 0
 WHERE n.nspname = %s AND c.relkind IN ('r','p','v','m','f') ORDER BY c.relname`, catalog, catalogPrefix(catalog), catalog, catalogPrefix(catalog), catalog, catalogPrefix(catalog), quoteLiteral(effective))
 	}
 	rows, err := s.metadataQuery(query)
+	if err != nil && s.mode.mysqlCompat && isSysFreespacePermissionError(err) {
+		// Kingbase's information_schema.tables calls sys_freespace internally;
+		// restricted users need the catalog query that avoids that privileged function.
+		rows, err = s.metadataQuery(kingbaseMySQLCompatCatalogTablesQuery(effective))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -263,6 +268,31 @@ WHERE n.nspname = %s AND c.relkind IN ('r','p','v','m','f') ORDER BY c.relname`,
 		}
 	}
 	return pageTables(result, constraints), rows.Err()
+}
+
+func kingbaseMySQLCompatCatalogTablesQuery(schema string) string {
+	return fmt.Sprintf(`SELECT c.relname,
+CASE WHEN CAST(c.relkind AS varchar(16)) IN ('r', 'p') THEN 'TABLE' ELSE 'VIEW' END,
+d.description
+FROM sys_catalog.sys_class c
+JOIN sys_catalog.sys_namespace n ON n.oid = c.relnamespace
+LEFT JOIN sys_catalog.sys_description d ON CAST(d.objoid AS varchar(64)) = CAST(c.oid AS varchar(64)) AND d.objsubid = 0
+WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY c.relname`, quoteLiteral(schema))
+}
+
+func isSysFreespacePermissionError(err error) bool {
+	var kingbaseError *gokb.Error
+	if !errors.As(err, &kingbaseError) || kingbaseError.Code != gokb.ErrorCode("42501") {
+		return false
+	}
+	message := strings.ToLower(strings.Join([]string{
+		kingbaseError.Message,
+		kingbaseError.Detail,
+		kingbaseError.Hint,
+		kingbaseError.InternalQuery,
+		kingbaseError.Where,
+	}, " "))
+	return strings.Contains(message, "sys_freespace") || strings.Contains(message, "pg_relation_size_ex")
 }
 
 func (s *server) listObjects(schema string, constraints metadataListConstraints) ([]objectInfo, error) {

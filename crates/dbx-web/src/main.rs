@@ -487,6 +487,8 @@ async fn main() {
         // History
         .route("/history", get(routes::history::load_history).delete(routes::history::clear_history))
         .route("/history/save", post(routes::history::save_history))
+        .route("/history/search", post(routes::history::search_history))
+        .route("/history/options", get(routes::history::load_history_connection_options))
         .route("/history/{id}", delete(routes::history::delete_history_entry))
         // Saved SQL
         .route(
@@ -516,6 +518,16 @@ async fn main() {
         .route("/ai/cancel-stream", post(routes::ai::ai_cancel_stream))
         .route("/ai/test-connection", post(routes::ai::ai_test_connection))
         .route("/ai/models", post(routes::ai::ai_list_models))
+        // Prompt templates
+        .route(
+            "/prompt-templates",
+            get(routes::prompt_template::load_prompt_templates).post(routes::prompt_template::save_prompt_template),
+        )
+        .route("/prompt-templates/{id}", delete(routes::prompt_template::delete_prompt_template))
+        .route(
+            "/prompt-templates/global-instructions",
+            get(routes::prompt_template::get_global_instructions).put(routes::prompt_template::set_global_instructions),
+        )
         // Transfer
         .route("/transfer/start", post(routes::transfer::start_transfer))
         .route("/transfer/ownership-preview", post(routes::transfer::preview_transfer_ownership))
