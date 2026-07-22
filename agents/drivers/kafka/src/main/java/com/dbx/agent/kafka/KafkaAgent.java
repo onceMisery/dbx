@@ -16,6 +16,7 @@ import org.apache.kafka.common.resource.ResourceType;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooKeeper;
+import org.apache.zookeeper.client.ZKClientConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,6 +43,7 @@ public final class KafkaAgent {
     private static final int DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
     private static final int DEFAULT_SESSION_TIMEOUT_MS = 30_000;
     private static final int DEFAULT_ZOOKEEPER_CONNECTION_TIMEOUT_MS = 10_000;
+    private static final String ZOOKEEPER_PROPERTY_PREFIX = "zookeeper.";
     private static final Set<String> KERBEROS_SYSTEM_PROPERTY_KEYS = Set.of(
         "java.security.krb5.conf",
         "sun.security.krb5.debug",
@@ -329,12 +331,10 @@ public final class KafkaAgent {
             "zookeeper_connection_timeout_ms",
             DEFAULT_ZOOKEEPER_CONNECTION_TIMEOUT_MS
         );
-        String previousSaslSetting = System.getProperty("zookeeper.sasl.client");
-        System.setProperty("zookeeper.sasl.client", "false");
         CountDownLatch connected = new CountDownLatch(1);
         ZooKeeper zooKeeper = new ZooKeeper(connectString, sessionTimeout, event -> {
             if (event.getState() == Watcher.Event.KeeperState.SyncConnected) connected.countDown();
-        });
+        }, zooKeeperClientConfig(conn));
         try {
             if (!connected.await(connectionTimeout, TimeUnit.MILLISECONDS)) {
                 throw new IllegalStateException("Timed out connecting to ZooKeeper for Kafka broker discovery");
@@ -363,12 +363,21 @@ public final class KafkaAgent {
             return brokerEndpoints(registrations, securityProtocol);
         } finally {
             zooKeeper.close();
-            if (previousSaslSetting == null) {
-                System.clearProperty("zookeeper.sasl.client");
-            } else {
-                System.setProperty("zookeeper.sasl.client", previousSaslSetting);
+        }
+    }
+
+    static ZKClientConfig zooKeeperClientConfig(JsonObject conn) {
+        ZKClientConfig clientConfig = new ZKClientConfig();
+        JsonObject properties = connectionProperties(conn);
+        if (properties == null) return clientConfig;
+
+        for (Map.Entry<String, JsonElement> entry : properties.entrySet()) {
+            if (entry.getKey().startsWith(ZOOKEEPER_PROPERTY_PREFIX)
+                && entry.getValue().isJsonPrimitive()) {
+                clientConfig.setProperty(entry.getKey(), entry.getValue().getAsString());
             }
         }
+        return clientConfig;
     }
 
     private static int compareBrokerIds(String left, String right) {
@@ -536,6 +545,7 @@ public final class KafkaAgent {
             for (Map.Entry<String, JsonElement> entry : properties.entrySet()) {
                 if (entry.getValue().isJsonPrimitive()) {
                     String key = entry.getKey();
+                    if (key.startsWith(ZOOKEEPER_PROPERTY_PREFIX)) continue;
                     String value = entry.getValue().getAsString();
                     props.put(key, value);
                 }

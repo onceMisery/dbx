@@ -854,6 +854,44 @@ mod tests {
     }
 
     #[test]
+    fn connection_params_preserve_zookeeper_sasl_and_tls_properties() {
+        let cfg = kafka_config(
+            serde_json::json!({
+                "connectionSource": "zookeeper",
+                "zookeeperServers": "zk-secure:2281/kafka",
+                "securityProtocol": "SASL_SSL",
+                "properties": {
+                    "zookeeper.sasl.client": "true",
+                    "zookeeper.sasl.clientconfig": "DbxZooKeeperClient",
+                    "zookeeper.client.secure": "true",
+                    "zookeeper.clientCnxnSocket": "org.apache.zookeeper.ClientCnxnSocketNetty",
+                    "zookeeper.ssl.trustStore.location": "/etc/dbx/zookeeper-truststore.p12"
+                }
+            }),
+            MqAuth::None,
+            false,
+        );
+
+        let params = build_connection_params(&cfg);
+
+        assert_eq!(params.get("zookeeper_connect_string").and_then(|v| v.as_str()), Some("zk-secure:2281/kafka"));
+        assert_eq!(params.pointer("/properties/zookeeper.sasl.client").and_then(|v| v.as_str()), Some("true"));
+        assert_eq!(
+            params.pointer("/properties/zookeeper.sasl.clientconfig").and_then(|v| v.as_str()),
+            Some("DbxZooKeeperClient")
+        );
+        assert_eq!(params.pointer("/properties/zookeeper.client.secure").and_then(|v| v.as_str()), Some("true"));
+        assert_eq!(
+            params.pointer("/properties/zookeeper.clientCnxnSocket").and_then(|v| v.as_str()),
+            Some("org.apache.zookeeper.ClientCnxnSocketNetty")
+        );
+        assert_eq!(
+            params.pointer("/properties/zookeeper.ssl.trustStore.location").and_then(|v| v.as_str()),
+            Some("/etc/dbx/zookeeper-truststore.p12")
+        );
+    }
+
+    #[test]
     fn reset_cursor_params_preserve_timestamp_position() {
         let topic = TopicRef {
             tenant: "_kafka".to_string(),

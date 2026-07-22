@@ -31,6 +31,7 @@ import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooKeeper;
+import org.apache.zookeeper.client.ZKClientConfig;
 import org.apache.zookeeper.server.NIOServerCnxnFactory;
 import org.apache.zookeeper.server.ZooKeeperServer;
 import org.junit.jupiter.api.Test;
@@ -90,13 +91,111 @@ class KafkaAgentTest {
     }
 
     @Test
-    void brokerEndpointsSelectMatchingProtocolAndKeepBrokerOrder() {
+    void zooKeeperClientConfigPreservesSaslAndTlsSystemDefaults() {
+        Map<String, String> previous = preserveSystemProperties(
+            "zookeeper.sasl.client",
+            "zookeeper.sasl.clientconfig",
+            "zookeeper.client.secure",
+            "zookeeper.clientCnxnSocket",
+            "zookeeper.ssl.trustStore.location",
+            "java.security.auth.login.config"
+        );
+        try {
+            System.setProperty("zookeeper.sasl.client", "true");
+            System.setProperty("zookeeper.sasl.clientconfig", "DbxZooKeeperClient");
+            System.setProperty("zookeeper.client.secure", "true");
+            System.setProperty("zookeeper.clientCnxnSocket", "org.apache.zookeeper.ClientCnxnSocketNetty");
+            System.setProperty("zookeeper.ssl.trustStore.location", "/etc/dbx/zookeeper-truststore.p12");
+            System.setProperty("java.security.auth.login.config", "/etc/dbx/zookeeper-jaas.conf");
+
+            ZKClientConfig config = KafkaAgent.zooKeeperClientConfig(new JsonObject());
+
+            assertTrue(config.isSaslClientEnabled());
+            assertEquals("DbxZooKeeperClient", config.getProperty("zookeeper.sasl.clientconfig"));
+            assertEquals("true", config.getProperty("zookeeper.client.secure"));
+            assertEquals(
+                "org.apache.zookeeper.ClientCnxnSocketNetty",
+                config.getProperty("zookeeper.clientCnxnSocket")
+            );
+            assertEquals(
+                "/etc/dbx/zookeeper-truststore.p12",
+                config.getProperty("zookeeper.ssl.trustStore.location")
+            );
+            assertEquals("/etc/dbx/zookeeper-jaas.conf", config.getJaasConfKey());
+        } finally {
+            restoreSystemProperties(previous);
+        }
+    }
+
+    @Test
+    void zooKeeperClientConfigAppliesPerConnectionSaslAndTlsOverridesWithoutChangingJvmState() {
+        Map<String, String> previous = preserveSystemProperties(
+            "zookeeper.sasl.client",
+            "zookeeper.sasl.clientconfig",
+            "zookeeper.client.secure",
+            "zookeeper.clientCnxnSocket",
+            "zookeeper.ssl.keyStore.location"
+        );
+        try {
+            System.setProperty("zookeeper.sasl.client", "false");
+            System.setProperty("zookeeper.client.secure", "false");
+
+            JsonObject properties = new JsonObject();
+            properties.addProperty("zookeeper.sasl.client", "true");
+            properties.addProperty("zookeeper.sasl.clientconfig", "DbxZooKeeperClient");
+            properties.addProperty("zookeeper.client.secure", "true");
+            properties.addProperty("zookeeper.clientCnxnSocket", "org.apache.zookeeper.ClientCnxnSocketNetty");
+            properties.addProperty("zookeeper.ssl.keyStore.location", "/etc/dbx/zookeeper-keystore.p12");
+            properties.addProperty("security.protocol", "SASL_SSL");
+            JsonObject connection = new JsonObject();
+            connection.add("properties", properties);
+
+            ZKClientConfig config = KafkaAgent.zooKeeperClientConfig(connection);
+
+            assertTrue(config.isSaslClientEnabled());
+            assertEquals("DbxZooKeeperClient", config.getProperty("zookeeper.sasl.clientconfig"));
+            assertEquals("true", config.getProperty("zookeeper.client.secure"));
+            assertEquals(
+                "org.apache.zookeeper.ClientCnxnSocketNetty",
+                config.getProperty("zookeeper.clientCnxnSocket")
+            );
+            assertEquals(
+                "/etc/dbx/zookeeper-keystore.p12",
+                config.getProperty("zookeeper.ssl.keyStore.location")
+            );
+            assertNull(config.getProperty("security.protocol"));
+            assertEquals("false", System.getProperty("zookeeper.sasl.client"));
+            assertEquals("false", System.getProperty("zookeeper.client.secure"));
+        } finally {
+            restoreSystemProperties(previous);
+        }
+    }
+
+    @Test
+    void brokerEndpointsUseListenerSecurityProtocolMapForNamedListenersAndKeepBrokerOrder() {
         List<JsonObject> registrations = Arrays.asList(
-            broker("{\"listener_security_protocol_map\":{\"INTERNAL\":\"PLAINTEXT\",\"EXTERNAL\":\"SSL\"},\"endpoints\":[\"INTERNAL://broker-2:9092\",\"EXTERNAL://public-2:9093\"]}"),
-            broker("{\"listener_security_protocol_map\":{\"INTERNAL\":\"PLAINTEXT\",\"EXTERNAL\":\"SSL\"},\"endpoints\":[\"EXTERNAL://public-1:9093\",\"INTERNAL://broker-1:9092\"]}")
+            broker("{\"listener_security_protocol_map\":{\"INTERNAL\":\"PLAINTEXT\",\"CLIENT\":\"SASL_SSL\"},\"endpoints\":[\"INTERNAL://broker-2:9092\",\"CLIENT://public-2:9093\"]}"),
+            broker("{\"listener_security_protocol_map\":{\"INTERNAL\":\"PLAINTEXT\",\"CLIENT\":\"SASL_SSL\"},\"endpoints\":[\"CLIENT://public-1:9093\",\"INTERNAL://broker-1:9092\"]}")
         );
 
-        assertEquals("public-2:9093,public-1:9093", KafkaAgent.brokerEndpoints(registrations, "SSL"));
+        assertEquals("public-2:9093,public-1:9093", KafkaAgent.brokerEndpoints(registrations, "SASL_SSL"));
+    }
+
+    @Test
+    void kafkaClientPropertiesExcludeZooKeeperSecuritySettings() {
+        JsonObject properties = new JsonObject();
+        properties.addProperty("client.id", "dbx");
+        properties.addProperty("zookeeper.sasl.client", "true");
+        properties.addProperty("zookeeper.ssl.trustStore.password", "secret");
+        JsonObject connection = new JsonObject();
+        connection.add("properties", properties);
+
+        Properties kafkaProperties = new Properties();
+        KafkaAgent.applyConnectionProperties(connection, kafkaProperties);
+
+        assertEquals("dbx", kafkaProperties.getProperty("client.id"));
+        assertNull(kafkaProperties.getProperty("zookeeper.sasl.client"));
+        assertNull(kafkaProperties.getProperty("zookeeper.ssl.trustStore.password"));
     }
 
     @Test
@@ -403,5 +502,21 @@ class KafkaAgentTest {
 
     private static JsonObject broker(String json) {
         return JsonParser.parseString(json).getAsJsonObject();
+    }
+
+    private static Map<String, String> preserveSystemProperties(String... keys) {
+        Map<String, String> previous = new HashMap<>();
+        for (String key : keys) previous.put(key, System.getProperty(key));
+        return previous;
+    }
+
+    private static void restoreSystemProperties(Map<String, String> properties) {
+        for (Map.Entry<String, String> entry : properties.entrySet()) {
+            if (entry.getValue() == null) {
+                System.clearProperty(entry.getKey());
+            } else {
+                System.setProperty(entry.getKey(), entry.getValue());
+            }
+        }
     }
 }
