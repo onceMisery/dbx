@@ -4,10 +4,15 @@ use dbx_core::query_result_export::{export_query_result_core, ExportStatus, Quer
 use dbx_core::sql::{SqlFileRequest, SqlFileStatus};
 use dbx_core::sql_file_import::execute_sql_file_content;
 use dbx_core::storage::Storage;
+use dbx_core::table_import::{
+    import_table_file_core, TableImportColumnMapping, TableImportMode, TableImportParseOptions, TableImportRequest,
+    TableImportSourceFormat, TableImportStatus,
+};
 use dbx_core::table_structure_sql::{
     build_table_structure_change_sql, ColumnInfo, EditableStructureColumn, TableStructureSqlOptions,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -64,6 +69,337 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         production_databases: vec![],
         database_info: None,
     }
+}
+
+async fn live_sqlserver_import_state(
+    connection_id: &str,
+    database: &str,
+    suffix: &str,
+) -> (AppState, String, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("dbx-live-sqlserver-import-{suffix}"));
+    std::fs::create_dir_all(&dir).expect("create live import directory");
+    let storage = Storage::open(&dir.join("storage.db")).await.expect("open live import storage");
+    let state = AppState::new(storage);
+    let config = live_sqlserver_config(connection_id, database);
+    state.configs.write().await.insert(connection_id.to_string(), config);
+    let pool_key =
+        state.get_or_create_pool(connection_id, Some(database)).await.expect("connect live SQL Server import pool");
+    (state, pool_key, dir)
+}
+
+fn live_sqlserver_import_mapping(source: &str, target: &str) -> TableImportColumnMapping {
+    TableImportColumnMapping {
+        source_column: source.to_string(),
+        target_column: target.to_string(),
+        target_data_type: None,
+    }
+}
+
+fn live_sqlserver_import_request(
+    connection_id: &str,
+    database: &str,
+    table: &str,
+    file_path: &std::path::Path,
+    mappings: Vec<TableImportColumnMapping>,
+    mode: TableImportMode,
+) -> TableImportRequest {
+    TableImportRequest {
+        import_id: format!("live-sqlserver-import-{}", uuid::Uuid::new_v4().simple()),
+        connection_id: connection_id.to_string(),
+        database: database.to_string(),
+        schema: "dbo".to_string(),
+        table: table.to_string(),
+        file_path: file_path.to_string_lossy().to_string(),
+        source_ref: None,
+        source_format: Some(TableImportSourceFormat::Csv),
+        parse_options: TableImportParseOptions::default(),
+        mappings,
+        mode,
+        create_table: false,
+        batch_size: 500,
+        date_time_format: None,
+        prepared_source: None,
+        retain_source: false,
+    }
+}
+
+async fn run_live_sqlserver_import(
+    state: &AppState,
+    pool_key: &str,
+    request: &TableImportRequest,
+) -> Result<dbx_core::table_import::TableImportSummary, String> {
+    import_table_file_core(state, request, &DatabaseType::SqlServer, pool_key, |_| Box::pin(async { false }), |_| {})
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires DBX_LIVE_SQLSERVER_HOST/PORT/USER/PASSWORD pointing at a writable SQL Server database"]
+async fn live_sqlserver_table_import_bulk_preserves_target_semantics() {
+    let database = std::env::var("DBX_LIVE_SQLSERVER_DATABASE").unwrap_or_else(|_| "tempdb".to_string());
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let connection_id = format!("live-sqlserver-import-{suffix}");
+    let table = format!("dbx_bulk_target_{suffix}");
+    let audit_table = format!("dbx_bulk_audit_{suffix}");
+    let trigger = format!("dbx_bulk_trigger_{suffix}");
+    let mut setup_client = dbx_core::db::sqlserver::connect(
+        &std::env::var("DBX_LIVE_SQLSERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        std::env::var("DBX_LIVE_SQLSERVER_PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(1433),
+        &std::env::var("DBX_LIVE_SQLSERVER_USER").unwrap_or_else(|_| "sa".to_string()),
+        &std::env::var("DBX_LIVE_SQLSERVER_PASSWORD").expect("DBX_LIVE_SQLSERVER_PASSWORD"),
+        Some(&database),
+        None,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("connect SQL Server");
+    dbx_core::db::sqlserver::execute_batch(
+        &mut setup_client,
+        &format!(
+            "CREATE TABLE [dbo].[{table}] (\
+             [id] INT IDENTITY(1,1) NOT NULL PRIMARY KEY, \
+             [code] NVARCHAR(40) NOT NULL UNIQUE, \
+             [occurred_at] DATETIME2(7) NOT NULL, \
+             [amount] DECIMAL(38,10) NOT NULL, \
+             [name] NVARCHAR(100) NOT NULL, \
+             [payload] VARBINARY(MAX) NULL, \
+             [created_at] DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME()); \
+             CREATE TABLE [dbo].[{audit_table}] ([target_id] INT NOT NULL, [name] NVARCHAR(100) NOT NULL);"
+        ),
+    )
+    .await
+    .expect("create bulk target tables");
+    dbx_core::db::sqlserver::execute_batch(
+        &mut setup_client,
+        &format!(
+            "CREATE TRIGGER [dbo].[{trigger}] ON [dbo].[{table}] AFTER INSERT AS \
+             INSERT INTO [dbo].[{audit_table}] ([target_id], [name]) SELECT [id], [name] FROM inserted"
+        ),
+    )
+    .await
+    .expect("create bulk target trigger");
+
+    let (state, pool_key, dir) = live_sqlserver_import_state(&connection_id, &database, &suffix).await;
+    let generated_identity_csv = dir.join("generated-identity.csv");
+    std::fs::write(
+        &generated_identity_csv,
+        "code,occurred_at,amount,name,payload\nauto,2026-07-27T12:34:56.1234567,12345678901234567890.1234567890,\u{8d8a}\u{5357}\u{82b1},0x00FF10\n",
+    )
+    .expect("write generated identity CSV");
+    let generated_identity_request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &table,
+        &generated_identity_csv,
+        ["code", "occurred_at", "amount", "name", "payload"]
+            .into_iter()
+            .map(|column| live_sqlserver_import_mapping(column, column))
+            .collect(),
+        TableImportMode::Append,
+    );
+    let generated_summary = run_live_sqlserver_import(&state, &pool_key, &generated_identity_request)
+        .await
+        .expect("bulk import with generated identity");
+
+    let explicit_identity_csv = dir.join("explicit-identity.csv");
+    std::fs::write(
+        &explicit_identity_csv,
+        "id,code,occurred_at,amount,name,payload\n42,explicit,2026-07-28T01:02:03.0000000,1.0000000000,Tieng Viet,0xABCDEF\n",
+    )
+    .expect("write explicit identity CSV");
+    let explicit_identity_request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &table,
+        &explicit_identity_csv,
+        ["id", "code", "occurred_at", "amount", "name", "payload"]
+            .into_iter()
+            .map(|column| live_sqlserver_import_mapping(column, column))
+            .collect(),
+        TableImportMode::Append,
+    );
+    let explicit_summary = run_live_sqlserver_import(&state, &pool_key, &explicit_identity_request)
+        .await
+        .expect("bulk import with explicit identity");
+
+    let plain_binary_csv = dir.join("plain-binary.csv");
+    std::fs::write(
+        &plain_binary_csv,
+        "code,occurred_at,amount,name,payload\nplain,2026-07-28T02:03:04.0000000,2.0000000000,plain binary,plain\n",
+    )
+    .expect("write plain binary CSV");
+    let plain_binary_request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &table,
+        &plain_binary_csv,
+        ["code", "occurred_at", "amount", "name", "payload"]
+            .into_iter()
+            .map(|column| live_sqlserver_import_mapping(column, column))
+            .collect(),
+        TableImportMode::Append,
+    );
+    let plain_binary_summary = run_live_sqlserver_import(&state, &pool_key, &plain_binary_request)
+        .await
+        .expect("SQL fallback import with plain-text varbinary input");
+
+    let duplicate_csv = dir.join("duplicate.csv");
+    std::fs::write(
+        &duplicate_csv,
+        "code,occurred_at,amount,name,payload\nauto,2026-07-29T00:00:00,2.0000000000,duplicate,0x01\n",
+    )
+    .expect("write duplicate CSV");
+    let duplicate_request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &table,
+        &duplicate_csv,
+        ["code", "occurred_at", "amount", "name", "payload"]
+            .into_iter()
+            .map(|column| live_sqlserver_import_mapping(column, column))
+            .collect(),
+        TableImportMode::Append,
+    );
+    let duplicate_error = run_live_sqlserver_import(&state, &pool_key, &duplicate_request).await;
+
+    let rows = dbx_core::db::sqlserver::execute_query(
+        &mut setup_client,
+        &format!(
+            "SELECT CONVERT(VARCHAR(12), [id]), [code], CONVERT(VARCHAR(33), [occurred_at], 126), \
+             CONVERT(VARCHAR(50), [amount]), [name], sys.fn_varbintohexstr([payload]), \
+             CASE WHEN [created_at] IS NULL THEN N'missing' ELSE N'set' END, \
+             CASE WHEN [code] = N'plain' THEN CONVERT(NVARCHAR(100), [payload]) END \
+             FROM [dbo].[{table}] ORDER BY [id]"
+        ),
+    )
+    .await
+    .expect("verify bulk target rows");
+    let audit_count = dbx_core::db::sqlserver::execute_query(
+        &mut setup_client,
+        &format!("SELECT COUNT(*) FROM [dbo].[{audit_table}]"),
+    )
+    .await
+    .expect("verify trigger rows");
+    let cleanup = format!(
+        "DROP TRIGGER IF EXISTS [dbo].[{trigger}]; DROP TABLE IF EXISTS [dbo].[{audit_table}]; DROP TABLE IF EXISTS [dbo].[{table}];"
+    );
+    let _ = dbx_core::db::sqlserver::execute_batch(&mut setup_client, &cleanup).await;
+    state.remove_connection_pools_detached(&connection_id).await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(generated_summary.rows_imported, 1);
+    assert_eq!(explicit_summary.rows_imported, 1);
+    assert_eq!(plain_binary_summary.rows_imported, 1);
+    assert!(duplicate_error.is_err(), "unique constraint violation must fail the import");
+    assert_eq!(rows.rows.len(), 3);
+    assert_eq!(rows.rows[0][0], serde_json::json!("1"));
+    assert_eq!(rows.rows[0][1], serde_json::json!("auto"));
+    assert_eq!(rows.rows[0][2], serde_json::json!("2026-07-27T12:34:56.1234567"));
+    assert_eq!(rows.rows[0][3], serde_json::json!("12345678901234567890.1234567890"));
+    assert_eq!(rows.rows[0][4], serde_json::json!("\u{8d8a}\u{5357}\u{82b1}"));
+    assert_eq!(rows.rows[0][5], serde_json::json!("0x00ff10"));
+    assert_eq!(rows.rows[0][6], serde_json::json!("set"));
+    assert_eq!(rows.rows[1][0], serde_json::json!("42"));
+    assert_eq!(rows.rows[1][4], serde_json::json!("Tieng Viet"));
+    assert_eq!(rows.rows[1][5], serde_json::json!("0xabcdef"));
+    assert_eq!(rows.rows[2][1], serde_json::json!("plain"));
+    assert_eq!(rows.rows[2][7], serde_json::json!("plain"));
+    assert_eq!(audit_count.rows[0][0], serde_json::json!(3));
+}
+
+#[tokio::test]
+#[ignore = "requires DBX_LIVE_SQLSERVER_HOST/PORT/USER/PASSWORD pointing at a writable SQL Server database"]
+async fn live_sqlserver_table_import_bulk_cancels_before_target_write_and_rolls_back_truncate() {
+    let database = std::env::var("DBX_LIVE_SQLSERVER_DATABASE").unwrap_or_else(|_| "tempdb".to_string());
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let connection_id = format!("live-sqlserver-import-rollback-{suffix}");
+    let table = format!("dbx_bulk_rollback_{suffix}");
+    let mut setup_client = dbx_core::db::sqlserver::connect(
+        &std::env::var("DBX_LIVE_SQLSERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        std::env::var("DBX_LIVE_SQLSERVER_PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(1433),
+        &std::env::var("DBX_LIVE_SQLSERVER_USER").unwrap_or_else(|_| "sa".to_string()),
+        &std::env::var("DBX_LIVE_SQLSERVER_PASSWORD").expect("DBX_LIVE_SQLSERVER_PASSWORD"),
+        Some(&database),
+        None,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("connect SQL Server");
+    dbx_core::db::sqlserver::execute_batch(
+        &mut setup_client,
+        &format!(
+            "CREATE TABLE [dbo].[{table}] ([id] INT NOT NULL PRIMARY KEY, [amount] DECIMAL(38,10) NOT NULL CHECK ([amount] > 0)); \
+             INSERT INTO [dbo].[{table}] VALUES (999, 9.0000000000);"
+        ),
+    )
+    .await
+    .expect("create rollback target");
+    let (state, pool_key, dir) = live_sqlserver_import_state(&connection_id, &database, &suffix).await;
+
+    let invalid_csv = dir.join("invalid.csv");
+    std::fs::write(&invalid_csv, "id,amount\n1,-1.0000000000\n").expect("write invalid CSV");
+    let invalid_request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &table,
+        &invalid_csv,
+        vec![live_sqlserver_import_mapping("id", "id"), live_sqlserver_import_mapping("amount", "amount")],
+        TableImportMode::Truncate,
+    );
+    let truncate_error = run_live_sqlserver_import(&state, &pool_key, &invalid_request).await;
+    let rows_after_failed_truncate = dbx_core::db::sqlserver::execute_query(
+        &mut setup_client,
+        &format!("SELECT [id], CONVERT(VARCHAR(50), [amount]) FROM [dbo].[{table}]"),
+    )
+    .await
+    .expect("verify truncate rollback");
+
+    let valid_csv = dir.join("cancelled.csv");
+    std::fs::write(&valid_csv, "id,amount\n1,1.0000000000\n").expect("write cancellation CSV");
+    let cancel_request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &table,
+        &valid_csv,
+        vec![live_sqlserver_import_mapping("id", "id"), live_sqlserver_import_mapping("amount", "amount")],
+        TableImportMode::Truncate,
+    );
+    let cancellation_checks = Arc::new(AtomicUsize::new(0));
+    let cancellation_checks_for_import = cancellation_checks.clone();
+    let cancelled_progress = Arc::new(AtomicBool::new(false));
+    let cancelled_progress_for_import = cancelled_progress.clone();
+    let cancel_error = import_table_file_core(
+        &state,
+        &cancel_request,
+        &DatabaseType::SqlServer,
+        &pool_key,
+        move |_| {
+            let checks = cancellation_checks_for_import.clone();
+            Box::pin(async move { checks.fetch_add(1, Ordering::SeqCst) >= 1 })
+        },
+        move |progress| {
+            if progress.status == TableImportStatus::Cancelled {
+                cancelled_progress_for_import.store(true, Ordering::SeqCst);
+            }
+        },
+    )
+    .await;
+    let rows_after_cancel = dbx_core::db::sqlserver::execute_query(
+        &mut setup_client,
+        &format!("SELECT [id], CONVERT(VARCHAR(50), [amount]) FROM [dbo].[{table}]"),
+    )
+    .await
+    .expect("verify cancellation leaves target unchanged");
+    let _ = dbx_core::db::sqlserver::execute_batch(&mut setup_client, &format!("DROP TABLE IF EXISTS [dbo].[{table}]"))
+        .await;
+    state.remove_connection_pools_detached(&connection_id).await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(truncate_error.is_err(), "check constraint must fail the truncate import");
+    assert_eq!(rows_after_failed_truncate.rows, vec![vec![serde_json::json!(999), serde_json::json!("9.0000000000")]]);
+    assert_eq!(cancel_error.unwrap_err(), "Import cancelled");
+    assert!(cancellation_checks.load(Ordering::SeqCst) >= 2);
+    assert!(cancelled_progress.load(Ordering::SeqCst));
+    assert_eq!(rows_after_cancel.rows, vec![vec![serde_json::json!(999), serde_json::json!("9.0000000000")]]);
 }
 
 #[tokio::test]

@@ -25,6 +25,7 @@ use super::file_validator::validate_file_path;
 
 pub type MySqlPool = mysql_async::Pool;
 const MYSQL_TCP_KEEPALIVE_MS: u32 = 30_000;
+const MYSQL_SQL_PACKET_MARGIN_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MySqlQueryDialect {
@@ -3518,6 +3519,23 @@ pub async fn execute_query(pool: &MySqlPool, sql: &str, bare: bool) -> Result<Qu
     execute_query_with_max_rows(pool, sql, bare, None, MySqlQueryDialect::default()).await
 }
 
+pub async fn max_allowed_packet(pool: &MySqlPool) -> Result<u64, String> {
+    let mut conn = get_conn_with_health_check(pool).await?;
+    conn.query_first::<u64, _>("SELECT @@max_allowed_packet")
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "MySQL did not return @@max_allowed_packet".to_string())
+}
+
+pub(crate) fn mysql_sql_statement_hard_limit(max_allowed_packet: u64) -> Option<usize> {
+    let packet_bytes = usize::try_from(max_allowed_packet).ok()?;
+    if packet_bytes == 0 {
+        return None;
+    }
+    let margin = (packet_bytes / 10).clamp(1024, MYSQL_SQL_PACKET_MARGIN_MAX_BYTES).min(packet_bytes / 2);
+    packet_bytes.checked_sub(margin).filter(|limit| *limit > 0)
+}
+
 pub async fn execute_query_with_max_rows(
     pool: &MySqlPool,
     sql: &str,
@@ -4021,6 +4039,17 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_sql_statement_limit_reserves_packet_headroom() {
+        let packet_bytes = 64 * 1024 * 1024;
+        let hard_limit = mysql_sql_statement_hard_limit(packet_bytes).unwrap();
+
+        assert!(hard_limit < packet_bytes as usize);
+        assert!(hard_limit >= packet_bytes as usize * 9 / 10);
+        assert_eq!(mysql_sql_statement_hard_limit(0), None);
+        assert_eq!(mysql_sql_statement_hard_limit(4096), Some(3072));
+    }
     use crate::db::connection_timeout;
     use mysql_async::consts::ColumnFlags;
 
