@@ -19,7 +19,7 @@ use crate::connection::{task_client_session_id, AppState, PoolKind};
 use crate::models::connection::DatabaseType;
 use crate::transfer::{
     execute_on_pool, generate_insert_typed, generate_insert_typed_sql_batches, get_columns_for_transfer,
-    normalize_postgres_integer_literal, qualified_table, quote_identifier, SqlBatchLimits,
+    normalize_integer_literal, qualified_table, quote_identifier, SqlBatchLimits,
 };
 
 pub const DEFAULT_PREVIEW_LIMIT: usize = 50;
@@ -3131,7 +3131,7 @@ fn normalize_import_value(
         normalized.as_str().map(str::to_owned).or_else(|| normalized.as_number().map(ToString::to_string));
     if let Some(integer_text) = integer_text
         .as_deref()
-        .and_then(|value| normalize_postgres_integer_literal(value, db_type, data_type))
+        .and_then(|value| normalize_integer_literal(value, db_type, data_type))
         .and_then(|value| value.parse::<i64>().ok())
     {
         // Normalize before both INSERT and COPY paths; COPY does not pass through SQL literal escaping.
@@ -8210,7 +8210,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(fallback[0].sql, "INSERT INTO [dbo].[events] ([payload]) VALUES\n(N'plain')");
+        assert_eq!(
+            fallback[0].sql,
+            "INSERT INTO [dbo].[events] ([payload]) VALUES\n(CONVERT(varbinary(max), N'plain'))"
+        );
     }
 
     #[test]
@@ -8312,6 +8315,25 @@ mod tests {
 
         let structured = vec![vec![serde_json::json!({"nested": true}), serde_json::json!(1), serde_json::json!("x")]];
         assert!(sqlserver_bulk_text_rows(&structured, &import_plan, None).unwrap_err().contains("structured"));
+    }
+
+    #[test]
+    fn sqlserver_bulk_normalizes_zero_fraction_values_for_integer_targets() {
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0, 1, 2],
+            target_columns: vec!["id".to_string(), "enabled".to_string(), "amount".to_string()],
+            column_types: vec![Some("bigint".to_string()), Some("bit".to_string()), Some("decimal(10,2)".to_string())],
+        };
+
+        assert_eq!(
+            sqlserver_bulk_text_rows(
+                &[vec![serde_json::json!(1.0), serde_json::json!(0.0), serde_json::json!(3.0)]],
+                &plan,
+                None,
+            )
+            .unwrap(),
+            vec![vec![Some("1".to_string()), Some("0".to_string()), Some("3.0".to_string())]]
+        );
     }
 
     #[test]

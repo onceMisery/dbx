@@ -335,12 +335,28 @@ fn is_postgres_integer_like_type(data_type: &str) -> bool {
     postgres_integer_bounds(data_type).is_some()
 }
 
-pub(crate) fn normalize_postgres_integer_literal(
+fn sqlserver_integer_bounds(data_type: &str) -> Option<(i128, i128)> {
+    let normalized = data_type.trim().to_ascii_lowercase();
+    match normalized.split(['(', ' ']).next().unwrap_or("") {
+        "bit" => Some((i128::MIN, i128::MAX)),
+        "tinyint" => Some((0, i128::from(u8::MAX))),
+        "smallint" => Some((i128::from(i16::MIN), i128::from(i16::MAX))),
+        "int" | "integer" => Some((i128::from(i32::MIN), i128::from(i32::MAX))),
+        "bigint" => Some((i128::from(i64::MIN), i128::from(i64::MAX))),
+        _ => None,
+    }
+}
+
+pub(crate) fn normalize_integer_literal(
     value: &str,
     db_type: &DatabaseType,
     column_type: Option<&str>,
 ) -> Option<String> {
-    let bounds = column_type.filter(|_| is_postgres_transfer_dialect(db_type)).and_then(postgres_integer_bounds)?;
+    let bounds = match db_type {
+        db_type if is_postgres_transfer_dialect(db_type) => column_type.and_then(postgres_integer_bounds),
+        DatabaseType::SqlServer => column_type.and_then(sqlserver_integer_bounds),
+        _ => None,
+    }?;
 
     // Excel numeric cells arrive as f64; normalize only an explicit zero fraction so real decimals,
     // scientific notation, and values outside the target integer range stay untouched.
@@ -1142,7 +1158,7 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
             }
         },
         serde_json::Value::Number(n) => {
-            if let Some(integer_literal) = normalize_postgres_integer_literal(&n.to_string(), db_type, column_type) {
+            if let Some(integer_literal) = normalize_integer_literal(&n.to_string(), db_type, column_type) {
                 return integer_literal;
             }
             match db_type {
@@ -1157,7 +1173,7 @@ pub fn escape_value_typed(val: &serde_json::Value, db_type: &DatabaseType, colum
             }
         }
         serde_json::Value::String(s) => {
-            if let Some(integer_literal) = normalize_postgres_integer_literal(s, db_type, column_type) {
+            if let Some(integer_literal) = normalize_integer_literal(s, db_type, column_type) {
                 return integer_literal;
             }
             if let Some(binary_literal) = format_postgres_binary_sql_literal(s, db_type, column_type) {
@@ -1285,17 +1301,22 @@ fn format_sqlserver_binary_sql_literal(
     db_type: &DatabaseType,
     column_type: Option<&str>,
 ) -> Option<String> {
-    if !matches!(db_type, DatabaseType::SqlServer) || !column_type.is_some_and(is_binary_transfer_column_type) {
+    if !matches!(db_type, DatabaseType::SqlServer) {
         return None;
     }
+    let column_type = column_type.filter(|column_type| is_binary_transfer_column_type(column_type))?;
 
     let trimmed = value.trim();
-    let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))?;
-    if hex.len() % 2 == 0 && hex.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
-        Some(format!("0x{hex}"))
-    } else {
-        None
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        if hex.len() % 2 == 0 && hex.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+            return Some(format!("0x{hex}"));
+        }
     }
+    // SQL Server does not implicitly convert NVARCHAR literals to binary targets.
+    // Use the target type so text fallback preserves the same Unicode byte encoding
+    // that a direct typed conversion would produce.
+    let escaped = value.replace('\'', "''");
+    Some(format!("CONVERT({column_type}, N'{escaped}')"))
 }
 
 fn format_oracle_temporal_sql_literal(
@@ -6423,6 +6444,20 @@ mod tests {
         );
 
         assert_eq!(sql, "INSERT INTO [dbo].[files] ([payload], [note]) VALUES\n(0x0001ABff, N'0x0001ABff')");
+    }
+
+    #[test]
+    fn sqlserver_insert_explicitly_converts_plain_text_for_varbinary_columns() {
+        let sql = generate_insert_typed(
+            &[String::from("payload")],
+            &[Some(String::from("varbinary(max)"))],
+            &[vec![json!("O'Brien")]],
+            "files",
+            "dbo",
+            &DatabaseType::SqlServer,
+        );
+
+        assert_eq!(sql, "INSERT INTO [dbo].[files] ([payload]) VALUES\n(CONVERT(varbinary(max), N'O''Brien'))");
     }
 
     #[test]

@@ -5,12 +5,13 @@ use dbx_core::sql::{SqlFileRequest, SqlFileStatus};
 use dbx_core::sql_file_import::execute_sql_file_content;
 use dbx_core::storage::Storage;
 use dbx_core::table_import::{
-    import_table_file_core, TableImportColumnMapping, TableImportMode, TableImportParseOptions, TableImportRequest,
-    TableImportSourceFormat, TableImportStatus,
+    build_import_insert_batches, import_table_file_core, parse_delimited_file_with_options, TableImportColumnMapping,
+    TableImportMode, TableImportParseOptions, TableImportRequest, TableImportSourceFormat, TableImportStatus,
 };
 use dbx_core::table_structure_sql::{
     build_table_structure_change_sql, ColumnInfo, EditableStructureColumn, TableStructureSqlOptions,
 };
+use dbx_core::xlsx_export::{build_xlsx_workbook, XlsxWorksheetData};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -130,6 +131,409 @@ async fn run_live_sqlserver_import(
 ) -> Result<dbx_core::table_import::TableImportSummary, String> {
     import_table_file_core(state, request, &DatabaseType::SqlServer, pool_key, |_| Box::pin(async { false }), |_| {})
         .await
+}
+
+fn live_sqlserver_matrix_column_types() -> Vec<(String, String)> {
+    [
+        ("id", "int"),
+        ("code", "nvarchar(40)"),
+        ("nullable_text", "nvarchar(100)"),
+        ("amount", "decimal(38,10)"),
+        ("occurred_at", "datetime2(7)"),
+        ("offset_at", "datetimeoffset(7)"),
+        ("event_id", "uniqueidentifier"),
+        ("document", "xml"),
+        ("payload", "varbinary(max)"),
+    ]
+    .into_iter()
+    .map(|(name, data_type)| (name.to_string(), data_type.to_string()))
+    .collect()
+}
+
+fn live_sqlserver_matrix_mappings(include_identity: bool) -> Vec<TableImportColumnMapping> {
+    let columns =
+        ["id", "code", "nullable_text", "amount", "occurred_at", "offset_at", "event_id", "document", "payload"];
+    columns
+        .into_iter()
+        .filter(|column| include_identity || *column != "id")
+        .map(|column| live_sqlserver_import_mapping(column, column))
+        .collect()
+}
+
+async fn run_live_sqlserver_generated_insert(
+    client: &mut dbx_core::db::sqlserver::SqlServerClient,
+    table: &str,
+    file_path: &std::path::Path,
+    parse_options: &TableImportParseOptions,
+    include_identity: bool,
+) -> Result<usize, String> {
+    let parsed = parse_delimited_file_with_options(
+        &file_path.to_string_lossy(),
+        TableImportSourceFormat::Csv,
+        parse_options,
+        usize::MAX,
+    )?;
+    let batches = build_import_insert_batches(
+        &parsed,
+        &live_sqlserver_matrix_mappings(include_identity),
+        &live_sqlserver_matrix_column_types(),
+        table,
+        "dbo",
+        &DatabaseType::SqlServer,
+        500,
+    )?;
+    if include_identity {
+        let rows_imported = batches.iter().map(|batch| batch.row_count).sum();
+        let statements = batches.into_iter().map(|batch| batch.sql).collect::<Vec<_>>().join(";\n");
+        let sql =
+            format!("SET IDENTITY_INSERT [dbo].[{table}] ON;\n{statements};\nSET IDENTITY_INSERT [dbo].[{table}] OFF");
+        dbx_core::db::sqlserver::execute_batch(client, &sql).await?;
+        return Ok(rows_imported);
+    }
+    let mut rows_imported = 0;
+    for batch in batches {
+        dbx_core::db::sqlserver::execute_batch(client, &batch.sql).await?;
+        rows_imported += batch.row_count;
+    }
+    Ok(rows_imported)
+}
+
+fn live_sqlserver_matrix_table_ddl(table: &str, audit_table: &str) -> String {
+    format!(
+        "CREATE TABLE [dbo].[{table}] (\
+         [id] INT IDENTITY(1,1) NOT NULL PRIMARY KEY, \
+         [code] NVARCHAR(40) NOT NULL UNIQUE, \
+         [nullable_text] NVARCHAR(100) NULL, \
+         [amount] DECIMAL(38,10) NOT NULL CHECK ([amount] > 0), \
+         [occurred_at] DATETIME2(7) NOT NULL, \
+         [offset_at] DATETIMEOFFSET(7) NOT NULL, \
+         [event_id] UNIQUEIDENTIFIER NOT NULL, \
+         [document] XML NULL, \
+         [payload] VARBINARY(MAX) NULL, \
+         [default_text] NVARCHAR(40) NOT NULL DEFAULT N'defaulted'); \
+         CREATE TABLE [dbo].[{audit_table}] (\
+         [target_id] INT NOT NULL, [code] NVARCHAR(40) NOT NULL, [default_text] NVARCHAR(40) NOT NULL);"
+    )
+}
+
+fn live_sqlserver_matrix_trigger_ddl(table: &str, audit_table: &str, trigger: &str) -> String {
+    format!(
+        "CREATE TRIGGER [dbo].[{trigger}] ON [dbo].[{table}] AFTER INSERT AS \
+         INSERT INTO [dbo].[{audit_table}] ([target_id], [code], [default_text]) \
+         SELECT [id], [code], [default_text] FROM inserted;"
+    )
+}
+
+async fn live_sqlserver_matrix_rows(
+    client: &mut dbx_core::db::sqlserver::SqlServerClient,
+    table: &str,
+) -> dbx_core::db::QueryResult {
+    dbx_core::db::sqlserver::execute_query(
+        client,
+        &format!(
+            "SELECT CONVERT(VARCHAR(12), [id]), [code], \
+             CASE WHEN [nullable_text] IS NULL THEN N'<NULL>' ELSE N'<' + [nullable_text] + N'>' END, \
+             CONVERT(VARCHAR(50), [amount]), CONVERT(VARCHAR(33), [occurred_at], 126), \
+             CONVERT(VARCHAR(48), [offset_at], 127), CONVERT(VARCHAR(36), [event_id]), \
+             CASE WHEN [document] IS NULL THEN N'<NULL>' ELSE CONVERT(NVARCHAR(MAX), [document]) END, \
+             CASE WHEN [payload] IS NULL THEN N'<NULL>' ELSE sys.fn_varbintohexstr([payload]) END, \
+             [default_text] FROM [dbo].[{table}] ORDER BY [id]"
+        ),
+    )
+    .await
+    .expect("query SQL Server import matrix rows")
+}
+
+async fn live_sqlserver_table_count(client: &mut dbx_core::db::sqlserver::SqlServerClient, table: &str) -> i64 {
+    let result = dbx_core::db::sqlserver::execute_query(client, &format!("SELECT COUNT_BIG(*) FROM [dbo].[{table}]"))
+        .await
+        .expect("count SQL Server matrix rows");
+    result.rows[0][0].as_i64().expect("SQL Server COUNT_BIG result")
+}
+
+#[tokio::test]
+#[ignore = "requires DBX_LIVE_SQLSERVER_HOST/PORT/USER/PASSWORD pointing at a writable SQL Server database"]
+async fn live_sqlserver_bulk_matches_generated_insert_type_and_constraint_matrix() {
+    let database = std::env::var("DBX_LIVE_SQLSERVER_DATABASE").unwrap_or_else(|_| "tempdb".to_string());
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let connection_id = format!("live-sqlserver-matrix-{suffix}");
+    let bulk_table = format!("dbx_bulk_matrix_{suffix}");
+    let generated_table = format!("dbx_insert_matrix_{suffix}");
+    let bulk_audit = format!("dbx_bulk_matrix_audit_{suffix}");
+    let generated_audit = format!("dbx_insert_matrix_audit_{suffix}");
+    let bulk_trigger = format!("dbx_bulk_matrix_trigger_{suffix}");
+    let generated_trigger = format!("dbx_insert_matrix_trigger_{suffix}");
+    let mut client = dbx_core::db::sqlserver::connect(
+        &std::env::var("DBX_LIVE_SQLSERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        std::env::var("DBX_LIVE_SQLSERVER_PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(1433),
+        &std::env::var("DBX_LIVE_SQLSERVER_USER").unwrap_or_else(|_| "sa".to_string()),
+        &std::env::var("DBX_LIVE_SQLSERVER_PASSWORD").expect("DBX_LIVE_SQLSERVER_PASSWORD"),
+        Some(&database),
+        None,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("connect SQL Server");
+    for ddl in [
+        live_sqlserver_matrix_table_ddl(&bulk_table, &bulk_audit),
+        live_sqlserver_matrix_table_ddl(&generated_table, &generated_audit),
+        live_sqlserver_matrix_trigger_ddl(&bulk_table, &bulk_audit, &bulk_trigger),
+        live_sqlserver_matrix_trigger_ddl(&generated_table, &generated_audit, &generated_trigger),
+    ] {
+        dbx_core::db::sqlserver::execute_batch(&mut client, &ddl)
+            .await
+            .expect("create SQL Server import matrix objects");
+    }
+
+    let (state, pool_key, dir) = live_sqlserver_import_state(&connection_id, &database, &suffix).await;
+    let default_options = TableImportParseOptions::default();
+    let empty_string_options =
+        TableImportParseOptions { empty_string_as_null: Some(false), ..TableImportParseOptions::default() };
+
+    let null_csv = dir.join("matrix-null.csv");
+    std::fs::write(
+        &null_csv,
+        "code,nullable_text,amount,occurred_at,offset_at,event_id,document,payload\n\
+         auto-null,,12345678901234567890.1234567890,2026-07-27T12:34:56.1234567,2026-07-27T12:34:56.1234567+08:00,11111111-2222-3333-4444-555555555555,,\n",
+    )
+    .expect("write SQL Server NULL matrix CSV");
+    let null_request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &bulk_table,
+        &null_csv,
+        live_sqlserver_matrix_mappings(false),
+        TableImportMode::Append,
+    );
+    let null_bulk = run_live_sqlserver_import(&state, &pool_key, &null_request)
+        .await
+        .expect("bulk import SQL Server NULL matrix row");
+    let null_generated =
+        run_live_sqlserver_generated_insert(&mut client, &generated_table, &null_csv, &default_options, false)
+            .await
+            .expect("generated INSERT SQL Server NULL matrix row");
+
+    let empty_csv = dir.join("matrix-empty-string.csv");
+    std::fs::write(
+        &empty_csv,
+        "code,nullable_text,amount,occurred_at,offset_at,event_id,document,payload\n\
+         empty,,0.0000000001,2026-07-28T01:02:03.0000001,2026-07-28T01:02:03.0000001-05:30,aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,<root><value>empty-text</value></root>,0x00FF10\n",
+    )
+    .expect("write SQL Server empty-string matrix CSV");
+    let mut empty_request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &bulk_table,
+        &empty_csv,
+        live_sqlserver_matrix_mappings(false),
+        TableImportMode::Append,
+    );
+    empty_request.parse_options = empty_string_options.clone();
+    let empty_bulk = run_live_sqlserver_import(&state, &pool_key, &empty_request)
+        .await
+        .expect("bulk import SQL Server empty-string matrix row");
+    let empty_generated =
+        run_live_sqlserver_generated_insert(&mut client, &generated_table, &empty_csv, &empty_string_options, false)
+            .await
+            .expect("generated INSERT SQL Server empty-string matrix row");
+
+    let identity_csv = dir.join("matrix-explicit-identity.csv");
+    std::fs::write(
+        &identity_csv,
+        "id,code,nullable_text,amount,occurred_at,offset_at,event_id,document,payload\n\
+         42,explicit,identity,9999999999999999999999999999.9999999999,2026-07-29T23:59:59.9999999,2026-07-29T23:59:59.9999999+13:45,01234567-89ab-cdef-0123-456789abcdef,<root><value>identity</value></root>,0xABCDEF\n",
+    )
+    .expect("write SQL Server explicit-identity matrix CSV");
+    let identity_request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &bulk_table,
+        &identity_csv,
+        live_sqlserver_matrix_mappings(true),
+        TableImportMode::Append,
+    );
+    let identity_bulk = run_live_sqlserver_import(&state, &pool_key, &identity_request)
+        .await
+        .expect("bulk import SQL Server explicit-identity matrix row");
+    let identity_generated =
+        run_live_sqlserver_generated_insert(&mut client, &generated_table, &identity_csv, &default_options, true)
+            .await
+            .expect("generated INSERT SQL Server explicit-identity matrix row");
+
+    let bulk_rows = live_sqlserver_matrix_rows(&mut client, &bulk_table).await;
+    let generated_rows = live_sqlserver_matrix_rows(&mut client, &generated_table).await;
+    let bulk_audit_rows = dbx_core::db::sqlserver::execute_query(
+        &mut client,
+        &format!("SELECT [target_id], [code], [default_text] FROM [dbo].[{bulk_audit}] ORDER BY [target_id]"),
+    )
+    .await
+    .expect("query SQL Server bulk audit rows");
+    let generated_audit_rows = dbx_core::db::sqlserver::execute_query(
+        &mut client,
+        &format!("SELECT [target_id], [code], [default_text] FROM [dbo].[{generated_audit}] ORDER BY [target_id]"),
+    )
+    .await
+    .expect("query SQL Server generated INSERT audit rows");
+
+    let invalid_cases = [
+        (
+            "unique",
+            "code,nullable_text,amount,occurred_at,offset_at,event_id,document,payload\n\
+             unique-first,value,1.0000000000,2026-08-01T00:00:00,2026-08-01T00:00:00+00:00,10000000-0000-0000-0000-000000000001,<ok/>,0x01\n\
+             auto-null,value,2.0000000000,2026-08-01T00:00:01,2026-08-01T00:00:01+00:00,10000000-0000-0000-0000-000000000002,<ok/>,0x02\n",
+        ),
+        (
+            "check",
+            "code,nullable_text,amount,occurred_at,offset_at,event_id,document,payload\n\
+             check-first,value,1.0000000000,2026-08-02T00:00:00,2026-08-02T00:00:00+00:00,20000000-0000-0000-0000-000000000001,<ok/>,0x01\n\
+             check-invalid,value,-0.0000000001,2026-08-02T00:00:01,2026-08-02T00:00:01+00:00,20000000-0000-0000-0000-000000000002,<ok/>,0x02\n",
+        ),
+        (
+            "not-null",
+            "code,nullable_text,amount,occurred_at,offset_at,event_id,document,payload\n\
+             not-null-first,value,1.0000000000,2026-08-03T00:00:00,2026-08-03T00:00:00+00:00,30000000-0000-0000-0000-000000000001,<ok/>,0x01\n\
+             ,value,2.0000000000,2026-08-03T00:00:01,2026-08-03T00:00:01+00:00,30000000-0000-0000-0000-000000000002,<ok/>,0x02\n",
+        ),
+        (
+            "decimal-overflow",
+            "code,nullable_text,amount,occurred_at,offset_at,event_id,document,payload\n\
+             decimal-first,value,1.0000000000,2026-08-04T00:00:00,2026-08-04T00:00:00+00:00,40000000-0000-0000-0000-000000000001,<ok/>,0x01\n\
+             decimal-invalid,value,10000000000000000000000000000.0000000000,2026-08-04T00:00:01,2026-08-04T00:00:01+00:00,40000000-0000-0000-0000-000000000002,<ok/>,0x02\n",
+        ),
+        (
+            "uuid",
+            "code,nullable_text,amount,occurred_at,offset_at,event_id,document,payload\n\
+             uuid-first,value,1.0000000000,2026-08-05T00:00:00,2026-08-05T00:00:00+00:00,50000000-0000-0000-0000-000000000001,<ok/>,0x01\n\
+             uuid-invalid,value,2.0000000000,2026-08-05T00:00:01,2026-08-05T00:00:01+00:00,not-a-uuid,<ok/>,0x02\n",
+        ),
+        (
+            "xml",
+            "code,nullable_text,amount,occurred_at,offset_at,event_id,document,payload\n\
+             xml-first,value,1.0000000000,2026-08-06T00:00:00,2026-08-06T00:00:00+00:00,60000000-0000-0000-0000-000000000001,<ok/>,0x01\n\
+             xml-invalid,value,2.0000000000,2026-08-06T00:00:01,2026-08-06T00:00:01+00:00,60000000-0000-0000-0000-000000000002,<unclosed>,0x02\n",
+        ),
+    ];
+    let stable_bulk_count = live_sqlserver_table_count(&mut client, &bulk_table).await;
+    let stable_generated_count = live_sqlserver_table_count(&mut client, &generated_table).await;
+    let mut rejection_results = Vec::new();
+    for (case, csv) in invalid_cases {
+        let path = dir.join(format!("matrix-invalid-{case}.csv"));
+        std::fs::write(&path, csv).expect("write SQL Server invalid matrix CSV");
+        let request = live_sqlserver_import_request(
+            &connection_id,
+            &database,
+            &bulk_table,
+            &path,
+            live_sqlserver_matrix_mappings(false),
+            TableImportMode::Append,
+        );
+        let bulk_result = run_live_sqlserver_import(&state, &pool_key, &request).await;
+        let generated_result =
+            run_live_sqlserver_generated_insert(&mut client, &generated_table, &path, &default_options, false).await;
+        let bulk_count = live_sqlserver_table_count(&mut client, &bulk_table).await;
+        let generated_count = live_sqlserver_table_count(&mut client, &generated_table).await;
+        rejection_results.push((case, bulk_result, generated_result, bulk_count, generated_count));
+    }
+    let final_bulk_audit_count = live_sqlserver_table_count(&mut client, &bulk_audit).await;
+    let final_generated_audit_count = live_sqlserver_table_count(&mut client, &generated_audit).await;
+
+    let cleanup = format!(
+        "DROP TRIGGER IF EXISTS [dbo].[{bulk_trigger}]; \
+         DROP TRIGGER IF EXISTS [dbo].[{generated_trigger}]; \
+         DROP TABLE IF EXISTS [dbo].[{bulk_audit}]; DROP TABLE IF EXISTS [dbo].[{generated_audit}]; \
+         DROP TABLE IF EXISTS [dbo].[{bulk_table}]; DROP TABLE IF EXISTS [dbo].[{generated_table}];"
+    );
+    let _ = dbx_core::db::sqlserver::execute_batch(&mut client, &cleanup).await;
+    state.remove_connection_pools_detached(&connection_id).await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(null_bulk.rows_imported, null_generated);
+    assert_eq!(empty_bulk.rows_imported, empty_generated);
+    assert_eq!(identity_bulk.rows_imported, identity_generated);
+    assert_eq!(bulk_rows.rows, generated_rows.rows, "Bulk and generated INSERT values differ");
+    assert_eq!(bulk_rows.rows.len(), 3);
+    assert_eq!(bulk_rows.rows[0][2], serde_json::json!("<NULL>"));
+    assert_eq!(bulk_rows.rows[0][3], serde_json::json!("12345678901234567890.1234567890"));
+    assert_eq!(bulk_rows.rows[0][5], serde_json::json!("2026-07-27T04:34:56.1234567Z"));
+    assert_eq!(bulk_rows.rows[0][7], serde_json::json!("<NULL>"));
+    assert_eq!(bulk_rows.rows[0][8], serde_json::json!("<NULL>"));
+    assert_eq!(bulk_rows.rows[1][2], serde_json::json!("<>"));
+    assert_eq!(bulk_rows.rows[1][3], serde_json::json!("0.0000000001"));
+    assert_eq!(bulk_rows.rows[1][5], serde_json::json!("2026-07-28T06:32:03.0000001Z"));
+    assert_eq!(bulk_rows.rows[1][8], serde_json::json!("0x00ff10"));
+    assert_eq!(bulk_rows.rows[2][0], serde_json::json!("42"));
+    assert_eq!(bulk_rows.rows[2][3], serde_json::json!("9999999999999999999999999999.9999999999"));
+    assert_eq!(bulk_rows.rows[2][5], serde_json::json!("2026-07-29T10:14:59.9999999Z"));
+    assert!(bulk_rows.rows.iter().all(|row| row[9] == serde_json::json!("defaulted")));
+    assert_eq!(bulk_audit_rows.rows, generated_audit_rows.rows, "trigger side effects differ");
+    assert_eq!(bulk_audit_rows.rows.len(), 3);
+    assert_eq!(final_bulk_audit_count, 3, "Bulk constraint failures left trigger side effects");
+    assert_eq!(final_generated_audit_count, 3, "generated INSERT failures left trigger side effects");
+    for (case, bulk_result, generated_result, bulk_count, generated_count) in rejection_results {
+        assert!(bulk_result.is_err(), "Bulk path unexpectedly accepted {case} case");
+        assert!(generated_result.is_err(), "generated INSERT unexpectedly accepted {case} case");
+        assert_eq!(bulk_count, stable_bulk_count, "Bulk path partially wrote {case} case");
+        assert_eq!(generated_count, stable_generated_count, "generated INSERT partially wrote {case} case");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DBX_LIVE_SQLSERVER_HOST/PORT/USER/PASSWORD pointing at a writable SQL Server database"]
+async fn live_sqlserver_bulk_imports_zero_fraction_xlsx_numbers_into_bigint() {
+    let database = std::env::var("DBX_LIVE_SQLSERVER_DATABASE").unwrap_or_else(|_| "tempdb".to_string());
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let connection_id = format!("live-sqlserver-xlsx-integer-{suffix}");
+    let table = format!("dbx_bulk_xlsx_integer_{suffix}");
+    let mut client = dbx_core::db::sqlserver::connect(
+        &std::env::var("DBX_LIVE_SQLSERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        std::env::var("DBX_LIVE_SQLSERVER_PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(1433),
+        &std::env::var("DBX_LIVE_SQLSERVER_USER").unwrap_or_else(|_| "sa".to_string()),
+        &std::env::var("DBX_LIVE_SQLSERVER_PASSWORD").expect("DBX_LIVE_SQLSERVER_PASSWORD"),
+        Some(&database),
+        None,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("connect SQL Server");
+    dbx_core::db::sqlserver::execute_batch(
+        &mut client,
+        &format!("CREATE TABLE [dbo].[{table}] ([id] BIGINT NOT NULL, [label] NVARCHAR(40) NOT NULL)"),
+    )
+    .await
+    .expect("create SQL Server XLSX integer table");
+
+    let (state, pool_key, dir) = live_sqlserver_import_state(&connection_id, &database, &suffix).await;
+    let xlsx = build_xlsx_workbook(&XlsxWorksheetData {
+        sheet_name: Some("Numbers".to_string()),
+        columns: vec!["id".to_string(), "label".to_string()],
+        column_types: Vec::new(),
+        rows: vec![vec![serde_json::json!(1.0), serde_json::json!("xlsx")]],
+        numeric_column_right_align: false,
+    })
+    .expect("build SQL Server XLSX integer fixture");
+    let path = dir.join("zero-fraction-integer.xlsx");
+    std::fs::write(&path, xlsx).expect("write SQL Server XLSX integer fixture");
+    let mut request = live_sqlserver_import_request(
+        &connection_id,
+        &database,
+        &table,
+        &path,
+        vec![live_sqlserver_import_mapping("id", "id"), live_sqlserver_import_mapping("label", "label")],
+        TableImportMode::Append,
+    );
+    request.source_format = Some(TableImportSourceFormat::Excel);
+    let result = run_live_sqlserver_import(&state, &pool_key, &request).await;
+    let rows =
+        dbx_core::db::sqlserver::execute_query(&mut client, &format!("SELECT [id], [label] FROM [dbo].[{table}]"))
+            .await
+            .expect("query SQL Server XLSX integer row");
+
+    let _ = dbx_core::db::sqlserver::execute_batch(&mut client, &format!("DROP TABLE IF EXISTS [dbo].[{table}]")).await;
+    state.remove_connection_pools_detached(&connection_id).await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(result.expect("bulk import SQL Server XLSX integer row").rows_imported, 1);
+    assert_eq!(rows.rows, vec![vec![serde_json::json!(1), serde_json::json!("xlsx")]]);
 }
 
 #[tokio::test]
