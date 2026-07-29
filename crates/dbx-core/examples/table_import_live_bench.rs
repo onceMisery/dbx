@@ -19,6 +19,7 @@ use sysinfo::{get_current_pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKin
 
 #[derive(Debug, Clone, Copy)]
 enum BenchDatabase {
+    Mysql,
     Postgres,
     SqlServer,
 }
@@ -26,6 +27,7 @@ enum BenchDatabase {
 impl BenchDatabase {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
+            "mysql" => Ok(Self::Mysql),
             "postgres" => Ok(Self::Postgres),
             "sqlserver" => Ok(Self::SqlServer),
             _ => Err(format!("Unsupported database: {value}")),
@@ -34,6 +36,7 @@ impl BenchDatabase {
 
     fn db_type(self) -> DatabaseType {
         match self {
+            Self::Mysql => DatabaseType::Mysql,
             Self::Postgres => DatabaseType::Postgres,
             Self::SqlServer => DatabaseType::SqlServer,
         }
@@ -41,6 +44,7 @@ impl BenchDatabase {
 
     fn label(self) -> &'static str {
         match self {
+            Self::Mysql => "mysql",
             Self::Postgres => "postgres",
             Self::SqlServer => "sqlserver",
         }
@@ -48,6 +52,7 @@ impl BenchDatabase {
 
     fn default_port(self) -> u16 {
         match self {
+            Self::Mysql => 3306,
             Self::Postgres => 5432,
             Self::SqlServer => 1433,
         }
@@ -90,6 +95,7 @@ struct Options {
     rows: usize,
     columns: usize,
     batch_size: usize,
+    text_bytes: usize,
 }
 
 fn print_help() {
@@ -97,11 +103,12 @@ fn print_help() {
         "Live table import benchmark\n\n\
 Usage:\n  cargo run -p dbx-core --example table_import_live_bench --release -- [options]\n\n\
 Options:\n\
-  --database=postgres   postgres or sqlserver\n\
+  --database=postgres   mysql, postgres, or sqlserver\n\
   --format=csv          csv or xlsx\n\
   --rows=200000         Number of data rows\n\
   --columns=12          Number of columns\n\
-  --batch-size=500      Import batch size\n\n\
+  --batch-size=500      Import batch size\n\
+  --text-bytes=0        Exact text value bytes; 0 keeps the default values\n\n\
 Connection environment:\n\
   DBX_BENCH_HOST, DBX_BENCH_PORT, DBX_BENCH_USER, DBX_BENCH_PASSWORD,\n\
   DBX_BENCH_DATABASE, DBX_BENCH_SCHEMA, DBX_BENCH_SSL"
@@ -114,6 +121,7 @@ fn parse_options() -> Result<Options, String> {
     let mut rows = 200_000;
     let mut columns = 12;
     let mut batch_size = 500;
+    let mut text_bytes = 0;
     for argument in std::env::args().skip(1) {
         if matches!(argument.as_str(), "--help" | "-h") {
             print_help();
@@ -126,13 +134,14 @@ fn parse_options() -> Result<Options, String> {
             "--rows" => rows = value.parse().map_err(|_| format!("Invalid row count: {value}"))?,
             "--columns" => columns = value.parse().map_err(|_| format!("Invalid column count: {value}"))?,
             "--batch-size" => batch_size = value.parse().map_err(|_| format!("Invalid batch size: {value}"))?,
+            "--text-bytes" => text_bytes = value.parse().map_err(|_| format!("Invalid text byte count: {value}"))?,
             _ => return Err(format!("Unknown option: {key}")),
         }
     }
     if rows == 0 || columns < 2 || batch_size == 0 {
         return Err("rows and batch-size must be positive; columns must be at least 2".to_string());
     }
-    Ok(Options { database, format, rows, columns, batch_size })
+    Ok(Options { database, format, rows, columns, batch_size, text_bytes })
 }
 
 fn env_required(name: &str) -> Result<String, String> {
@@ -160,6 +169,7 @@ fn connection_config(id: &str, database: BenchDatabase) -> Result<ConnectionConf
         database: Some(database_name),
         visible_databases: None,
         visible_schemas: None,
+        show_system_schemas: false,
         attached_databases: Vec::new(),
         init_script: None,
         color: None,
@@ -202,26 +212,33 @@ fn columns(count: usize) -> Vec<String> {
     (0..count).map(|index| format!("column_{}", index + 1)).collect()
 }
 
-fn row(row_index: usize, column_count: usize) -> Vec<serde_json::Value> {
+fn row(row_index: usize, column_count: usize, text_bytes: usize) -> Vec<serde_json::Value> {
     (0..column_count)
         .map(|column_index| {
             if column_index == 0 {
                 json!(row_index + 1)
             } else {
-                json!(format!("value-{row_index:08}-{column_index:02}"))
+                let value = format!("value-{row_index:08}-{column_index:02}");
+                if text_bytes == 0 {
+                    json!(value)
+                } else if value.len() >= text_bytes {
+                    json!(&value[..text_bytes])
+                } else {
+                    json!(format!("{value}{}", "x".repeat(text_bytes - value.len())))
+                }
             }
         })
         .collect()
 }
 
-fn write_csv(path: &Path, row_count: usize, column_count: usize) -> Result<(), String> {
+fn write_csv(path: &Path, row_count: usize, column_count: usize, text_bytes: usize) -> Result<(), String> {
     let mut writer = BufWriter::new(File::create(path).map_err(|error| error.to_string())?);
     writeln!(writer, "{}", columns(column_count).join(",")).map_err(|error| error.to_string())?;
     for row_index in 0..row_count {
         writeln!(
             writer,
             "{}",
-            row(row_index, column_count)
+            row(row_index, column_count, text_bytes)
                 .into_iter()
                 .map(|value| value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()))
                 .collect::<Vec<_>>()
@@ -232,12 +249,12 @@ fn write_csv(path: &Path, row_count: usize, column_count: usize) -> Result<(), S
     writer.flush().map_err(|error| error.to_string())
 }
 
-fn write_xlsx(path: &Path, row_count: usize, column_count: usize) -> Result<(), String> {
+fn write_xlsx(path: &Path, row_count: usize, column_count: usize, text_bytes: usize) -> Result<(), String> {
     let workbook = build_xlsx_workbook(&XlsxWorksheetData {
         sheet_name: Some("Benchmark".to_string()),
         columns: columns(column_count),
         column_types: Vec::new(),
-        rows: (0..row_count).map(|row_index| row(row_index, column_count)).collect(),
+        rows: (0..row_count).map(|row_index| row(row_index, column_count, text_bytes)).collect(),
         numeric_column_right_align: false,
     })?;
     fs::write(path, workbook).map_err(|error| error.to_string())
@@ -304,6 +321,7 @@ impl Drop for PeakRssSampler {
 
 fn qualified_table(database: BenchDatabase, schema: &str, table: &str) -> String {
     match database {
+        BenchDatabase::Mysql => format!("`{schema}`.`{table}`"),
         BenchDatabase::Postgres => format!("\"{schema}\".\"{table}\""),
         BenchDatabase::SqlServer => format!("[{schema}].[{table}]"),
     }
@@ -325,6 +343,8 @@ fn create_table_sql(database: BenchDatabase, schema: &str, table: &str, column_c
         .into_iter()
         .enumerate()
         .map(|(index, column)| match database {
+            BenchDatabase::Mysql if index == 0 => format!("`{column}` BIGINT NOT NULL"),
+            BenchDatabase::Mysql => format!("`{column}` TEXT NULL"),
             BenchDatabase::Postgres if index == 0 => format!("\"{column}\" BIGINT NOT NULL"),
             BenchDatabase::Postgres => format!("\"{column}\" TEXT NULL"),
             BenchDatabase::SqlServer if index == 0 => format!("[{column}] BIGINT NOT NULL"),
@@ -390,8 +410,8 @@ async fn run() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let source_path = temp_dir.path().join(format!("benchmark.{}", options.format.extension()));
     match options.format {
-        BenchFormat::Csv => write_csv(&source_path, options.rows, options.columns)?,
-        BenchFormat::Xlsx => write_xlsx(&source_path, options.rows, options.columns)?,
+        BenchFormat::Csv => write_csv(&source_path, options.rows, options.columns, options.text_bytes)?,
+        BenchFormat::Xlsx => write_xlsx(&source_path, options.rows, options.columns, options.text_bytes)?,
     }
     let file_bytes = fs::metadata(&source_path).map_err(|error| error.to_string())?.len();
 
@@ -426,6 +446,12 @@ async fn run() -> Result<(), String> {
         .await?;
         let throughput_elapsed = throughput_started.elapsed();
         let (baseline_rss_bytes, peak_rss_bytes) = rss.stop();
+        if throughput_summary.rows_imported != options.rows {
+            return Err(format!(
+                "Import row count mismatch: expected {}, imported {}",
+                options.rows, throughput_summary.rows_imported
+            ));
+        }
 
         execute_sql(
             &state,
@@ -478,6 +504,7 @@ async fn run() -> Result<(), String> {
             return Err(format!("Expected cancelled import, got: {cancel_result:?}"));
         }
 
+        let rows_imported = throughput_summary.rows_imported;
         let elapsed_seconds = throughput_elapsed.as_secs_f64();
         Ok(json!({
             "database": options.database.label(),
@@ -486,9 +513,10 @@ async fn run() -> Result<(), String> {
             "rows": options.rows,
             "columns": options.columns,
             "batchSize": options.batch_size,
-            "rowsImported": throughput_summary.rows_imported,
+            "textBytes": options.text_bytes,
+            "rowsImported": rows_imported,
             "elapsedMs": throughput_elapsed.as_secs_f64() * 1000.0,
-            "rowsPerSecond": options.rows as f64 / elapsed_seconds,
+            "rowsPerSecond": rows_imported as f64 / elapsed_seconds,
             "baselineRssBytes": baseline_rss_bytes,
             "peakRssBytes": peak_rss_bytes,
             "peakRssDeltaBytes": peak_rss_bytes.saturating_sub(baseline_rss_bytes),

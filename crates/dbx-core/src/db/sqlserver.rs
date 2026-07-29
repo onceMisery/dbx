@@ -2095,31 +2095,37 @@ fn sqlserver_bulk_token_row(values: Vec<Option<String>>) -> TokenRow<'static> {
     row
 }
 
-pub async fn bulk_insert_text_rows(
+pub async fn bulk_insert_text_rows<T, F>(
     client: &mut SqlServerClient,
     staging_table: &str,
-    rows: Vec<Vec<Option<String>>>,
-) -> Result<u64, String> {
-    let Some(column_count) = rows.first().map(Vec::len) else {
+    rows: &[T],
+    column_count: usize,
+    mut convert_row: F,
+) -> Result<u64, String>
+where
+    F: FnMut(usize, &T) -> Result<Vec<Option<String>>, String>,
+{
+    if rows.is_empty() {
         return Ok(0);
-    };
+    }
     if column_count == 0 {
         return Err("SQL Server bulk load requires at least one mapped column".to_string());
-    }
-    if let Some((row_index, row)) = rows.iter().enumerate().find(|(_, row)| row.len() != column_count) {
-        return Err(format!(
-            "SQL Server bulk row {} has {} columns; expected {}",
-            row_index + 1,
-            row.len(),
-            column_count
-        ));
     }
 
     let mut request = client
         .bulk_insert(staging_table)
         .await
         .map_err(|error| format!("SQL Server bulk load initialization failed: {error}"))?;
-    for row in rows {
+    for (row_index, source_row) in rows.iter().enumerate() {
+        let row = convert_row(row_index, source_row)?;
+        if row.len() != column_count {
+            return Err(format!(
+                "SQL Server bulk row {} has {} columns; expected {}",
+                row_index + 1,
+                row.len(),
+                column_count
+            ));
+        }
         request
             .send(sqlserver_bulk_token_row(row))
             .await

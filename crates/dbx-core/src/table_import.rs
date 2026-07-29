@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read as IoRead, Seek, SeekFrom, Write as IoWrite};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -35,10 +36,16 @@ const MAX_IN_MEMORY_XLSX_SHARED_STRINGS_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_XLSX_SHARED_STRINGS_BYTES: u64 = 1024 * 1024 * 1024;
 const XLSX_SHARED_STRING_CACHE_ENTRIES: usize = 4096;
 const XLSX_SHARED_STRING_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const XLSX_CANCELLABLE_READ_CHUNK_BYTES: usize = 64 * 1024;
+const XLSX_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 // INSERT ALL has a practical statement-size limit on Oracle, even when the requested batch is larger.
 const MAX_ORACLE_IMPORT_BATCH_ROWS: usize = 500;
 const POSTGRES_COPY_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const POSTGRES_COPY_MAX_ROWS: usize = 50_000;
+// Bound the additional memory used while converting one source row into owned
+// NVARCHAR staging values. The source JSON batch remains owned by the parser;
+// the bulk path must never add a second, batch-sized string matrix beside it.
+const SQLSERVER_BULK_ROW_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn table_import_client_session_id(import_id: &str) -> String {
     task_client_session_id("table-import", import_id)
@@ -1691,7 +1698,37 @@ fn create_xlsx_spill_file() -> std::io::Result<File> {
     Ok(file)
 }
 
+#[cfg(test)]
 fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) -> Result<XlsxSharedStrings, String> {
+    open_xlsx_shared_strings_with_control(zip, memory_limit, &|| false, &mut |_| Ok(()))
+}
+
+struct XlsxCancellableReader<'a, R> {
+    inner: R,
+    is_cancelled: &'a dyn Fn() -> bool,
+    on_progress: &'a mut dyn FnMut(u64) -> std::io::Result<()>,
+    bytes_read: u64,
+}
+
+impl<R: IoRead> IoRead for XlsxCancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if (self.is_cancelled)() {
+            return Err(std::io::Error::other("Import cancelled"));
+        }
+        let read_len = buffer.len().min(XLSX_CANCELLABLE_READ_CHUNK_BYTES);
+        let bytes_read = self.inner.read(&mut buffer[..read_len])?;
+        self.bytes_read = self.bytes_read.saturating_add(bytes_read as u64);
+        (self.on_progress)(self.bytes_read)?;
+        Ok(bytes_read)
+    }
+}
+
+fn open_xlsx_shared_strings_with_control(
+    zip: &mut zip::ZipArchive<File>,
+    memory_limit: u64,
+    is_cancelled: &dyn Fn() -> bool,
+    on_progress: &mut dyn FnMut(u64) -> std::io::Result<()>,
+) -> Result<XlsxSharedStrings, String> {
     let uncompressed_size = match zip.by_name("xl/sharedStrings.xml") {
         Ok(file) => file.size(),
         Err(zip::result::ZipError::FileNotFound) => return Ok(XlsxSharedStrings::Memory(Vec::new())),
@@ -1715,7 +1752,8 @@ fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) 
     };
 
     let file = zip.by_name("xl/sharedStrings.xml").map_err(|error| error.to_string())?;
-    let mut reader = XmlReader::from_reader(BufReader::new(file));
+    let controlled = XlsxCancellableReader { inner: file, is_cancelled, on_progress, bytes_read: 0 };
+    let mut reader = XmlReader::from_reader(BufReader::new(controlled));
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut in_item = false;
@@ -1723,6 +1761,9 @@ fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) 
     let mut phonetic_depth = 0usize;
     let mut current = String::new();
     loop {
+        if is_cancelled() {
+            return Err("Import cancelled".to_string());
+        }
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"si") => {
                 in_item = true;
@@ -1749,7 +1790,9 @@ fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) 
                 phonetic_depth = 0;
             }
             Ok(Event::Eof) => break,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                return Err(if is_cancelled() { "Import cancelled".to_string() } else { error.to_string() });
+            }
             _ => {}
         }
         buffer.clear();
@@ -2419,6 +2462,7 @@ impl XlsxStreamRowsState {
     }
 }
 
+#[cfg(test)]
 fn stream_xlsx_rows_to_channel(
     path: &str,
     options: &TableImportParseOptions,
@@ -2427,6 +2471,29 @@ fn stream_xlsx_rows_to_channel(
     text_source_columns: HashSet<String>,
     scan_full_worksheet: bool,
     sender: tokio::sync::mpsc::Sender<Result<XlsxStreamMessage, String>>,
+) -> Result<(), String> {
+    stream_xlsx_rows_to_channel_with_control(
+        path,
+        options,
+        batch_size,
+        expected_columns,
+        text_source_columns,
+        scan_full_worksheet,
+        sender,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_xlsx_rows_to_channel_with_control(
+    path: &str,
+    options: &TableImportParseOptions,
+    batch_size: usize,
+    expected_columns: Option<Vec<String>>,
+    text_source_columns: HashSet<String>,
+    scan_full_worksheet: bool,
+    sender: tokio::sync::mpsc::Sender<Result<XlsxStreamMessage, String>>,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<(), String> {
     // This producer runs on a blocking thread and communicates in bounded batches. The small
     // channel capacity applies backpressure when database writes are slower than XML parsing.
@@ -2452,7 +2519,35 @@ fn stream_xlsx_rows_to_channel(
     let date_1904 = xlsx_workbook_uses_1904_date_system(&workbook_xml);
     let sheet_path = xlsx_sheet_path_for_name(&workbook_xml, &rels_xml, &sheet_name)
         .ok_or_else(|| format!("Workbook sheet not found: {sheet_name}"))?;
-    let mut shared_strings = open_xlsx_shared_strings(&mut zip, MAX_IN_MEMORY_XLSX_SHARED_STRINGS_BYTES)?;
+    let shared_strings_bytes = match zip.by_name("xl/sharedStrings.xml") {
+        Ok(file) => file.size(),
+        Err(zip::result::ZipError::FileNotFound) => 0,
+        Err(error) => return Err(error.to_string()),
+    };
+    let shared_progress_end = if shared_strings_bytes > 0 { total_bytes / 2 } else { 0 };
+    let progress_sender = sender.clone();
+    let mut last_shared_progress = Instant::now() - IMPORT_PROGRESS_INTERVAL;
+    let mut on_shared_progress = |bytes_read: u64| {
+        let progress = bytes_read
+            .saturating_mul(shared_progress_end)
+            .checked_div(shared_strings_bytes.max(1))
+            .unwrap_or_default()
+            .min(shared_progress_end);
+        if last_shared_progress.elapsed() >= IMPORT_PROGRESS_INTERVAL || bytes_read >= shared_strings_bytes {
+            progress_sender
+                .blocking_send(Ok(XlsxStreamMessage::Progress(progress)))
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Excel import consumer closed"))?;
+            last_shared_progress = Instant::now();
+        }
+        Ok(())
+    };
+    let is_cancelled = || cancelled.load(Ordering::Acquire);
+    let mut shared_strings = open_xlsx_shared_strings_with_control(
+        &mut zip,
+        MAX_IN_MEMORY_XLSX_SHARED_STRINGS_BYTES,
+        &is_cancelled,
+        &mut on_shared_progress,
+    )?;
     let row_range = effective_import_row_range(options)?;
     let sheet = zip.by_name(&sheet_path).map_err(|error| error.to_string())?;
     let uncompressed_sheet_bytes = sheet.size().max(1);
@@ -2470,12 +2565,17 @@ fn stream_xlsx_rows_to_channel(
     loop {
         // Convert the uncompressed worksheet offset into an approximate archive-byte offset so
         // progress remains monotonic without scanning the ZIP twice.
-        let progress = reader
-            .buffer_position()
-            .saturating_mul(total_bytes)
-            .checked_div(uncompressed_sheet_bytes)
-            .unwrap_or_default()
-            .min(total_bytes);
+        if cancelled.load(Ordering::Acquire) {
+            return Err("Import cancelled".to_string());
+        }
+        let progress = shared_progress_end.saturating_add(
+            reader
+                .buffer_position()
+                .saturating_mul(total_bytes.saturating_sub(shared_progress_end))
+                .checked_div(uncompressed_sheet_bytes)
+                .unwrap_or_default()
+                .min(total_bytes.saturating_sub(shared_progress_end)),
+        );
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(element)) | Ok(Event::Empty(element))
                 if xml_local_name_eq(element.name().as_ref(), b"dimension") =>
@@ -2553,17 +2653,53 @@ fn stream_xlsx_rows_to_channel(
     rows.finish(total_bytes)
 }
 
+async fn receive_xlsx_stream_message(
+    receiver: &mut tokio::sync::mpsc::Receiver<Result<XlsxStreamMessage, String>>,
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    producer_cancelled: &AtomicBool,
+) -> Result<Option<Result<XlsxStreamMessage, String>>, ()> {
+    loop {
+        if is_cancelled(import_id).await {
+            producer_cancelled.store(true, Ordering::Release);
+            return Err(());
+        }
+        if let Ok(message) = tokio::time::timeout(XLSX_CANCEL_POLL_INTERVAL, receiver.recv()).await {
+            return Ok(message);
+        }
+    }
+}
+
+fn xlsx_import_pass_progress(bytes_read: u64, total_bytes: u64, second_pass: bool) -> u64 {
+    let bytes_read = bytes_read.min(total_bytes);
+    let first_pass_bytes = total_bytes / 2;
+    if !second_pass {
+        return bytes_read.saturating_mul(first_pass_bytes).checked_div(total_bytes.max(1)).unwrap_or_default();
+    }
+    first_pass_bytes.saturating_add(
+        bytes_read
+            .saturating_mul(total_bytes.saturating_sub(first_pass_bytes))
+            .checked_div(total_bytes.max(1))
+            .unwrap_or_default(),
+    )
+}
+
 async fn validate_xlsx_worksheet_for_import(
     path: String,
     options: TableImportParseOptions,
     expected_columns: Option<Vec<String>>,
     text_source_columns: HashSet<String>,
-) -> Result<(), String> {
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    mut on_progress: impl FnMut(u64),
+) -> Result<Vec<String>, String> {
     // Drain bounded row batches without writing. Full-sheet mode keeps parsing through the
     // worksheet EOF even when the selected import range ends earlier.
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<XlsxStreamMessage, String>>(2);
+    let producer_cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_for_producer = producer_cancelled.clone();
     let validation = tokio::task::spawn_blocking(move || {
-        stream_xlsx_rows_to_channel(
+        stream_xlsx_rows_to_channel_with_control(
             &path,
             &options,
             DEFAULT_BATCH_SIZE,
@@ -2571,18 +2707,37 @@ async fn validate_xlsx_worksheet_for_import(
             text_source_columns,
             true,
             sender,
+            cancelled_for_producer,
         )
     });
 
-    while let Some(message) = receiver.recv().await {
-        if let Err(error) = message {
-            drop(receiver);
-            let _ = validation.await;
-            return Err(error);
+    let mut columns = None;
+    loop {
+        let message =
+            match receive_xlsx_stream_message(&mut receiver, import_id, is_cancelled, &producer_cancelled).await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(()) => {
+                    drop(receiver);
+                    let _ = validation.await;
+                    return Err("Import cancelled".to_string());
+                }
+            };
+        match message {
+            Ok(XlsxStreamMessage::Header(header)) => columns = Some(header),
+            Ok(XlsxStreamMessage::Progress(bytes_read)) => on_progress(bytes_read),
+            Ok(XlsxStreamMessage::Rows(_) | XlsxStreamMessage::Done) => {}
+            Err(error) => {
+                producer_cancelled.store(true, Ordering::Release);
+                drop(receiver);
+                let _ = validation.await;
+                return Err(error);
+            }
         }
     }
 
-    validation.await.map_err(|error| error.to_string())?
+    validation.await.map_err(|error| error.to_string())??;
+    columns.ok_or_else(|| "Excel stream ended before providing a header".to_string())
 }
 
 fn parse_xlsx_range<T, Label, Value, TextValue, IsNumeric>(
@@ -4616,29 +4771,74 @@ fn sqlserver_bulk_conversion_expression(index: usize, data_type: &str) -> String
     }
 }
 
-fn sqlserver_bulk_text_rows(
-    rows: &[Vec<serde_json::Value>],
+fn sqlserver_bulk_text_row(
+    row: &[serde_json::Value],
     plan: &CompiledImportPlan,
     date_time_format: Option<&str>,
-) -> Result<Vec<Vec<Option<String>>>, String> {
-    rows.iter()
-        .enumerate()
-        .map(|(row_index, row)| {
-            map_import_row_with_plan(row, plan, &DatabaseType::SqlServer, false, date_time_format)
-                .into_iter()
-                .map(|value| match value {
-                    serde_json::Value::Null => Ok(None),
-                    serde_json::Value::Bool(value) => Ok(Some(if value { "1" } else { "0" }.to_string())),
-                    serde_json::Value::Number(value) => Ok(Some(value.to_string())),
-                    serde_json::Value::String(value) => Ok(Some(value)),
-                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(format!(
-                        "SQL Server bulk row {} contains a structured value; using SQL fallback is required",
-                        row_index + 1
-                    )),
-                })
-                .collect()
-        })
-        .collect()
+    row_index: usize,
+    memory_limit: usize,
+) -> Result<Vec<Option<String>>, String> {
+    let memory_limit = memory_limit.max(1);
+    let mut memory_bytes = plan.mapped_source_indexes.len().saturating_mul(std::mem::size_of::<Option<String>>());
+    if memory_bytes > memory_limit {
+        return Err(sqlserver_bulk_row_memory_error(row_index, memory_bytes, memory_limit));
+    }
+    let mut values = Vec::with_capacity(plan.mapped_source_indexes.len());
+    for (target_index, source_index) in plan.mapped_source_indexes.iter().enumerate() {
+        let source_value = row.get(*source_index).unwrap_or(&serde_json::Value::Null);
+        if let serde_json::Value::String(value) = source_value {
+            // Check before cloning so a single oversized source cell cannot create an
+            // unbounded duplicate allocation merely to discover that it is too large.
+            let projected = memory_bytes.saturating_add(sqlserver_bulk_str_memory_bytes(value));
+            if projected > memory_limit {
+                return Err(sqlserver_bulk_row_memory_error(row_index, projected, memory_limit));
+            }
+        }
+        let normalized = normalize_import_value(
+            source_value,
+            plan.column_types.get(target_index).and_then(|data_type| data_type.as_deref()),
+            &DatabaseType::SqlServer,
+            false,
+            date_time_format,
+        );
+        let value = match normalized {
+            serde_json::Value::Null => None,
+            serde_json::Value::Bool(value) => Some(if value { "1" } else { "0" }.to_string()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            serde_json::Value::String(value) => Some(value),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                return Err(format!(
+                    "SQL Server bulk row {} contains a structured value; using SQL fallback is required",
+                    row_index + 1
+                ))
+            }
+        };
+        if let Some(value) = value.as_ref() {
+            memory_bytes = memory_bytes.saturating_add(sqlserver_bulk_owned_string_memory_bytes(value));
+            if memory_bytes > memory_limit {
+                return Err(sqlserver_bulk_row_memory_error(row_index, memory_bytes, memory_limit));
+            }
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn sqlserver_bulk_str_memory_bytes(value: &str) -> usize {
+    // Count both the owned UTF-8 staging String and its UTF-16 TDS payload.
+    // Tiberius may retain either representation while encoding a TokenRow.
+    value.len().saturating_add(value.encode_utf16().count().saturating_mul(2))
+}
+
+fn sqlserver_bulk_owned_string_memory_bytes(value: &String) -> usize {
+    value.capacity().saturating_add(value.encode_utf16().count().saturating_mul(2))
+}
+
+fn sqlserver_bulk_row_memory_error(row_index: usize, actual_bytes: usize, memory_limit: usize) -> String {
+    format!(
+        "SQL Server bulk row {} requires {actual_bytes} converted bytes and exceeds the {memory_limit} byte row memory limit",
+        row_index + 1
+    )
 }
 
 async fn invalidate_sqlserver_pool_after_staging_cleanup_failure<T>(
@@ -4684,8 +4884,6 @@ async fn execute_sqlserver_bulk_rows_batch(
     statement_count: &mut usize,
 ) -> Result<usize, ImportRowsBatchError> {
     ensure_import_write_allowed(import_id, is_cancelled, 0).await?;
-    let bulk_rows =
-        sqlserver_bulk_text_rows(rows, import_plan, date_time_format).map_err(ImportRowsBatchError::before_write)?;
     let staging_name = format!("#dbx_import_{}", uuid::Uuid::new_v4().simple());
     let quoted_staging = quote_identifier(&staging_name, &DatabaseType::SqlServer);
     let sql = bulk_plan.batch_sql(&staging_name, truncate_target);
@@ -4713,7 +4911,17 @@ async fn execute_sqlserver_bulk_rows_batch(
     }
 
     *statement_count += 1;
-    let bulk_count = match crate::db::sqlserver::bulk_insert_text_rows(&mut client, &quoted_staging, bulk_rows).await {
+    let bulk_count = match crate::db::sqlserver::bulk_insert_text_rows(
+        &mut client,
+        &quoted_staging,
+        rows,
+        import_plan.target_columns.len(),
+        |row_index, row| {
+            sqlserver_bulk_text_row(row, import_plan, date_time_format, row_index, SQLSERVER_BULK_ROW_MEMORY_BYTES)
+        },
+    )
+    .await
+    {
         Ok(count) => count,
         Err(error) => {
             drop(client);
@@ -5317,18 +5525,8 @@ where
             None,
         ));
         let effective_batch_size = effective_import_batch_size(db_type, batch_size);
-        let expected_columns = if let Some(source) = create_table_sample.as_ref().or(prepared_source.as_ref()) {
-            Some(source.columns.clone())
-        } else {
-            match parse_import_preview_file_with_options(&request.file_path, source_format, &import_parse_options, 1)
-                .await
-            {
-                Ok((parsed, _, _)) => Some(parsed.columns),
-                Err(error) => {
-                    return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
-                }
-            }
-        };
+        let expected_columns =
+            create_table_sample.as_ref().or(prepared_source.as_ref()).map(|source| source.columns.clone());
         let mut target_column_types = get_columns_for_transfer(
             state,
             pool_key,
@@ -5347,16 +5545,54 @@ where
         }
         let text_source_columns = textual_source_columns_for_import(&request.mappings, &target_column_types);
         // No truncate, INSERT, or COPY may run until the selected worksheet parses to EOF.
-        if let Err(error) = validate_xlsx_worksheet_for_import(
+        let mut last_xlsx_read_bytes = 0u64;
+        let validated_columns = match validate_xlsx_worksheet_for_import(
             request.file_path.clone(),
             request.parse_options.clone(),
             expected_columns.clone(),
             text_source_columns.clone(),
+            &request.import_id,
+            &is_cancelled,
+            |bytes_read| {
+                last_xlsx_read_bytes =
+                    last_xlsx_read_bytes.max(xlsx_import_pass_progress(bytes_read, total_bytes, false));
+                progress_callback(import_progress_with_details(
+                    &request.import_id,
+                    TableImportStatus::Running,
+                    TableImportPhase::Reading,
+                    0,
+                    0,
+                    false,
+                    last_xlsx_read_bytes,
+                    total_bytes,
+                    started_at,
+                    None,
+                ));
+            },
         )
         .await
         {
-            return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
-        }
+            Ok(columns) => columns,
+            Err(error) if error == "Import cancelled" => {
+                progress_callback(import_progress_with_details(
+                    &request.import_id,
+                    TableImportStatus::Cancelled,
+                    TableImportPhase::Done,
+                    0,
+                    0,
+                    false,
+                    last_xlsx_read_bytes,
+                    total_bytes,
+                    started_at,
+                    None,
+                ));
+                return Err(error);
+            }
+            Err(error) => {
+                return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+            }
+        };
+        let expected_columns = Some(validated_columns);
         // Full-sheet validation can take long enough for the user to cancel. Recheck before
         // starting the producer or executing a non-transactional truncate.
         if is_cancelled(&request.import_id).await {
@@ -5367,7 +5603,7 @@ where
                 0,
                 0,
                 false,
-                total_bytes,
+                last_xlsx_read_bytes,
                 total_bytes,
                 started_at,
                 None,
@@ -5375,10 +5611,12 @@ where
             return Err("Import cancelled".to_string());
         }
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<XlsxStreamMessage, String>>(2);
+        let producer_cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_producer = producer_cancelled.clone();
         let path = request.file_path.clone();
         let options = request.parse_options.clone();
         let producer = tokio::task::spawn_blocking(move || {
-            stream_xlsx_rows_to_channel(
+            stream_xlsx_rows_to_channel_with_control(
                 &path,
                 &options,
                 effective_batch_size,
@@ -5386,36 +5624,86 @@ where
                 text_source_columns,
                 false,
                 sender,
+                cancelled_for_producer,
             )
         });
-        let columns = match receiver.recv().await {
-            Some(Ok(XlsxStreamMessage::Header(columns))) => columns,
-            Some(Ok(_)) => {
-                drop(receiver);
-                let _ = producer.await;
-                return Err(emit_import_error(
-                    &mut progress_callback,
-                    request,
-                    0,
-                    0,
-                    started_at,
-                    "Excel stream did not provide a header before data rows",
-                ));
-            }
-            Some(Err(error)) => {
-                let _ = producer.await;
-                return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
-            }
-            None => {
-                let error = producer
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .err()
-                    .unwrap_or_else(|| "Excel stream ended before providing a header".to_string());
-                return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+        let columns = loop {
+            let message = match receive_xlsx_stream_message(
+                &mut receiver,
+                &request.import_id,
+                &is_cancelled,
+                &producer_cancelled,
+            )
+            .await
+            {
+                Ok(Some(message)) => message,
+                Ok(None) => {
+                    let error = producer
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .err()
+                        .unwrap_or_else(|| "Excel stream ended before providing a header".to_string());
+                    return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+                }
+                Err(()) => {
+                    drop(receiver);
+                    let _ = producer.await;
+                    progress_callback(import_progress_with_details(
+                        &request.import_id,
+                        TableImportStatus::Cancelled,
+                        TableImportPhase::Done,
+                        0,
+                        0,
+                        false,
+                        last_xlsx_read_bytes,
+                        total_bytes,
+                        started_at,
+                        None,
+                    ));
+                    return Err("Import cancelled".to_string());
+                }
+            };
+            match message {
+                Ok(XlsxStreamMessage::Header(columns)) => break columns,
+                Ok(XlsxStreamMessage::Progress(bytes_read)) => {
+                    last_xlsx_read_bytes =
+                        last_xlsx_read_bytes.max(xlsx_import_pass_progress(bytes_read, total_bytes, true));
+                    progress_callback(import_progress_with_details(
+                        &request.import_id,
+                        TableImportStatus::Running,
+                        TableImportPhase::Reading,
+                        0,
+                        0,
+                        false,
+                        last_xlsx_read_bytes,
+                        total_bytes,
+                        started_at,
+                        None,
+                    ));
+                }
+                Ok(_) => {
+                    producer_cancelled.store(true, Ordering::Release);
+                    drop(receiver);
+                    let _ = producer.await;
+                    return Err(emit_import_error(
+                        &mut progress_callback,
+                        request,
+                        0,
+                        0,
+                        started_at,
+                        "Excel stream did not provide a header before data rows",
+                    ));
+                }
+                Err(error) => {
+                    producer_cancelled.store(true, Ordering::Release);
+                    drop(receiver);
+                    let _ = producer.await;
+                    return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+                }
             }
         };
         if columns.is_empty() {
+            producer_cancelled.store(true, Ordering::Release);
             drop(receiver);
             let _ = producer.await;
             return Err(emit_import_error(
@@ -5428,6 +5716,7 @@ where
             ));
         }
         if let Err(error) = mapping_indexes_for_columns(&columns, &request.mappings) {
+            producer_cancelled.store(true, Ordering::Release);
             drop(receiver);
             let _ = producer.await;
             return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
@@ -5438,6 +5727,7 @@ where
             match compile_import_plan(&columns, &request.mappings, &target_column_types) {
                 Ok(plan) => Some(plan),
                 Err(error) => {
+                    producer_cancelled.store(true, Ordering::Release);
                     drop(receiver);
                     let _ = producer.await;
                     return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
@@ -5468,6 +5758,7 @@ where
             if let Err(error) =
                 execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
             {
+                producer_cancelled.store(true, Ordering::Release);
                 drop(receiver);
                 let _ = producer.await;
                 return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
@@ -5475,14 +5766,39 @@ where
         }
         let mut rows_imported = 0usize;
         loop {
-            let message = match receiver.recv().await {
-                Some(message) => message,
-                None => break,
+            let message = match receive_xlsx_stream_message(
+                &mut receiver,
+                &request.import_id,
+                &is_cancelled,
+                &producer_cancelled,
+            )
+            .await
+            {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(()) => {
+                    drop(receiver);
+                    let _ = producer.await;
+                    progress_callback(import_progress_with_details(
+                        &request.import_id,
+                        TableImportStatus::Cancelled,
+                        TableImportPhase::Done,
+                        rows_imported,
+                        0,
+                        false,
+                        last_xlsx_read_bytes,
+                        total_bytes,
+                        started_at,
+                        None,
+                    ));
+                    return Err("Import cancelled".to_string());
+                }
             };
             match message {
                 Ok(XlsxStreamMessage::Header(_)) => {}
                 Ok(XlsxStreamMessage::Rows(rows)) => {
                     if is_cancelled(&request.import_id).await {
+                        producer_cancelled.store(true, Ordering::Release);
                         drop(receiver);
                         let _ = producer.await;
                         progress_callback(import_progress_with_details(
@@ -5492,7 +5808,7 @@ where
                             rows_imported,
                             0,
                             false,
-                            0,
+                            last_xlsx_read_bytes,
                             total_bytes,
                             started_at,
                             None,
@@ -5528,6 +5844,7 @@ where
                     {
                         Ok(row_count) => row_count,
                         Err(error) => {
+                            producer_cancelled.store(true, Ordering::Release);
                             drop(receiver);
                             let _ = producer.await;
                             rows_imported = rows_imported.saturating_add(error.rows_imported);
@@ -5572,6 +5889,8 @@ where
                     ));
                 }
                 Ok(XlsxStreamMessage::Progress(bytes_read)) => {
+                    last_xlsx_read_bytes =
+                        last_xlsx_read_bytes.max(xlsx_import_pass_progress(bytes_read, total_bytes, true));
                     progress_callback(import_progress_with_details(
                         &request.import_id,
                         TableImportStatus::Running,
@@ -5579,7 +5898,7 @@ where
                         rows_imported,
                         0,
                         false,
-                        bytes_read.min(total_bytes),
+                        last_xlsx_read_bytes,
                         total_bytes,
                         started_at,
                         None,
@@ -5587,6 +5906,7 @@ where
                 }
                 Ok(XlsxStreamMessage::Done) => break,
                 Err(error) => {
+                    producer_cancelled.store(true, Ordering::Release);
                     drop(receiver);
                     let _ = producer.await;
                     return Err(emit_import_error(
@@ -6834,6 +7154,63 @@ mod tests {
         drop(strings);
         drop(zip);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn xlsx_shared_strings_validation_reports_progress_and_cancels_before_header() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-shared-cancel-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A2"/>
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row><row r="2"><c r="A2" t="s"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let shared_items =
+            (0..8192).map(|index| format!("<si><t>{index:04}-{}</t></si>", "x".repeat(512))).collect::<String>();
+        let shared_strings_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="8193" uniqueCount="8193">
+  <si><t>name</t></si>{shared_items}
+</sst>"#
+        );
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, Some(&shared_strings_xml))).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_check = cancelled.clone();
+        let cancelled_on_progress = cancelled.clone();
+        let mut progress = Vec::new();
+        let started = Instant::now();
+
+        let error = validate_xlsx_worksheet_for_import(
+            path.to_string_lossy().to_string(),
+            TableImportParseOptions::default(),
+            None,
+            HashSet::new(),
+            "shared-strings-cancel",
+            &move |_| {
+                let cancelled = cancelled_for_check.clone();
+                Box::pin(async move { cancelled.load(Ordering::Acquire) })
+            },
+            |bytes_read| {
+                progress.push(bytes_read);
+                cancelled_on_progress.store(true, Ordering::Release);
+            },
+        )
+        .await
+        .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert_eq!(error, "Import cancelled");
+        assert!(!progress.is_empty(), "shared strings preprocessing must report progress before the header");
+        assert!(progress.windows(2).all(|window| window[0] <= window[1]));
+        assert!(elapsed < Duration::from_secs(2), "cancellation took {elapsed:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xlsx_two_pass_progress_is_monotonic_and_reserves_half_for_each_pass() {
+        assert_eq!(xlsx_import_pass_progress(0, 101, false), 0);
+        assert_eq!(xlsx_import_pass_progress(101, 101, false), 50);
+        assert_eq!(xlsx_import_pass_progress(0, 101, true), 50);
+        assert_eq!(xlsx_import_pass_progress(101, 101, true), 101);
     }
 
     #[test]
@@ -8309,12 +8686,14 @@ mod tests {
         let rows = vec![vec![serde_json::json!(true), serde_json::json!("12.3400"), serde_json::Value::Null]];
 
         assert_eq!(
-            sqlserver_bulk_text_rows(&rows, &import_plan, None).unwrap(),
-            vec![vec![Some("1".to_string()), Some("12.3400".to_string()), None]]
+            sqlserver_bulk_text_row(&rows[0], &import_plan, None, 0, SQLSERVER_BULK_ROW_MEMORY_BYTES).unwrap(),
+            vec![Some("1".to_string()), Some("12.3400".to_string()), None]
         );
 
         let structured = vec![vec![serde_json::json!({"nested": true}), serde_json::json!(1), serde_json::json!("x")]];
-        assert!(sqlserver_bulk_text_rows(&structured, &import_plan, None).unwrap_err().contains("structured"));
+        assert!(sqlserver_bulk_text_row(&structured[0], &import_plan, None, 0, SQLSERVER_BULK_ROW_MEMORY_BYTES)
+            .unwrap_err()
+            .contains("structured"));
     }
 
     #[test]
@@ -8326,14 +8705,52 @@ mod tests {
         };
 
         assert_eq!(
-            sqlserver_bulk_text_rows(
-                &[vec![serde_json::json!(1.0), serde_json::json!(0.0), serde_json::json!(3.0)]],
+            sqlserver_bulk_text_row(
+                &[serde_json::json!(1.0), serde_json::json!(0.0), serde_json::json!(3.0)],
                 &plan,
                 None,
+                0,
+                SQLSERVER_BULK_ROW_MEMORY_BYTES,
             )
             .unwrap(),
-            vec![vec![Some("1".to_string()), Some("0".to_string()), Some("3.0".to_string())]]
+            vec![Some("1".to_string()), Some("0".to_string()), Some("3.0".to_string())]
         );
+    }
+
+    #[test]
+    fn sqlserver_bulk_converts_wide_large_batches_one_row_at_a_time() {
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["payload".to_string()],
+            column_types: vec![Some("nvarchar(max)".to_string())],
+        };
+        let wide_value = "x".repeat(1024 * 1024);
+        let rows = (0..32).map(|_| vec![serde_json::json!(&wide_value)]).collect::<Vec<_>>();
+
+        for (row_index, row) in rows.iter().enumerate() {
+            let converted =
+                sqlserver_bulk_text_row(row, &plan, None, row_index, SQLSERVER_BULK_ROW_MEMORY_BYTES).unwrap();
+            assert_eq!(converted[0].as_deref(), Some(wide_value.as_str()));
+            drop(converted);
+        }
+    }
+
+    #[test]
+    fn sqlserver_bulk_rejects_a_single_row_over_the_converted_memory_limit_before_cloning() {
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["payload".to_string()],
+            column_types: vec![Some("nvarchar(max)".to_string())],
+        };
+        let value = "x".repeat(SQLSERVER_BULK_ROW_MEMORY_BYTES / 3 + 1);
+
+        let error =
+            sqlserver_bulk_text_row(&[serde_json::json!(value)], &plan, None, 6, SQLSERVER_BULK_ROW_MEMORY_BYTES)
+                .unwrap_err();
+
+        assert!(error.contains("row 7"));
+        assert!(error.contains("converted bytes"));
+        assert!(error.contains(&SQLSERVER_BULK_ROW_MEMORY_BYTES.to_string()));
     }
 
     #[test]
