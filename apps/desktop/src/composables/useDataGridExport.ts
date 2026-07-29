@@ -6,6 +6,7 @@ import * as api from "@/lib/backend/api";
 import { type CellSelectionMatrix, type CellSelectionRange, type SelectionData } from "@/lib/dataGrid/gridSelection";
 import type { DataGridExtractorOptions } from "@/lib/dataGrid/dataGridCopyExtractor";
 import { useToast } from "@/composables/useToast";
+import { useExportTracker } from "@/composables/useExportTracker";
 import { displayCellValue, type CellValue } from "@/lib/dataGrid/cellValue";
 import { tryStartExclusiveActivation, type ActionActivationGuard } from "@/lib/connection/actionActivation";
 import { copyToClipboard } from "@/lib/common/clipboard";
@@ -22,6 +23,7 @@ import type { QueryResultExportRequest } from "@/lib/backend/api";
 import { usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { buildXlsxSqlWorksheet } from "@/lib/export/xlsxSqlSheet";
 import { formatTemporalRowsForExport } from "@/lib/dataGrid/columnFormatter";
+import { translateBackendError } from "@/i18n/backend-errors";
 
 /**
  * Format metadata for backend table exports. Each entry maps a format key
@@ -78,6 +80,7 @@ export interface UseDataGridExportOptions {
   sourceColumns: ComputedRef<Array<string | undefined> | undefined>;
   mongoDocuments?: ComputedRef<unknown[] | undefined>;
   columnTypes: ComputedRef<Array<string | undefined> | undefined>;
+  allColumnTypes?: ComputedRef<Array<string | undefined> | undefined>;
   whereInput: ComputedRef<string | undefined>;
   orderBy: ComputedRef<string | undefined>;
   exportBatchSize: ComputedRef<number>;
@@ -92,7 +95,7 @@ export interface UseDataGridExportOptions {
   selectedRowIds: Ref<Set<number>> | ComputedRef<Set<number>>;
   hasRowSelection: ComputedRef<boolean>;
   fullExportResult?: (onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => Promise<QueryResult | undefined>;
-  queryResultExportRequest?: (options: { exportId: string; filePath: string; format: "csv" | "xlsx" | "txt"; includeSqlSheet?: boolean }) => Promise<QueryResultExportRequest | undefined>;
+  queryResultExportRequest?: (options: { exportId: string; filePath: string; format: "csv" | "xlsx" | "txt" | "sql"; includeSqlSheet?: boolean; exportTableName?: string; exportColumnTypes?: Array<string | null | undefined> }) => Promise<QueryResultExportRequest | undefined>;
   /**
    * True when the in-memory result already holds the complete result set —
    * i.e. the query ran without server-side pagination, was not truncated, and
@@ -125,6 +128,7 @@ export interface UseDataGridExportOptions {
     filePath: string | null;
   }>;
   exportCancelHandler?: Ref<(() => Promise<void>) | null>;
+  exportCanMinimize?: Ref<boolean>;
 }
 
 interface CopyInsertData {
@@ -137,7 +141,9 @@ interface CopyInsertData {
 export function useDataGridExport(options: UseDataGridExportOptions) {
   const { t } = useI18n();
   const { toast } = useToast();
+  const tracker = useExportTracker();
   const exportGuard: ActionActivationGuard = {};
+  const { addTask, updateTableExportTask, registerTaskCancelHandler, unregisterTaskCancelHandler, removeTask } = useExportTracker();
 
   const {
     columns,
@@ -159,6 +165,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     whereInput,
     orderBy,
     columnTypes,
+    allColumnTypes: allColumnTypesOption,
     exportBatchSize,
     hasCellSelection,
     hasColumnSelection: hasColumnSelectionOption,
@@ -180,11 +187,13 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     exportProgressDialog,
     exportProgressState,
     exportCancelHandler,
+    exportCanMinimize,
   } = options;
   const selectedCellMatrix = selectedCellMatrixOption;
   const allColumns = allColumnsOption ?? columns;
   const allDisplayItems = allDisplayItemsOption ?? displayItems;
   const allSourceColumns = allSourceColumnsOption ?? sourceColumns;
+  const allColumnTypes = computed(() => allColumnTypesOption?.value ?? columnTypes.value);
   const visibleColumnIndexes = visibleColumnIndexesOption ?? computed(() => columns.value.map((_, index) => index));
   const hasColumnSelection = hasColumnSelectionOption ?? computed(() => false);
 
@@ -566,7 +575,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
             errorMessage: e?.message || String(e),
           };
         }
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -588,7 +597,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await api.exportQueryResultCsv(outputPath, result.columns, result.rows);
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -612,7 +621,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await api.exportQueryResultJson(outputPath, result.columns, result.rows);
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -634,7 +643,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await api.exportQueryResultJson(outputPath, result.columns, result.rows);
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -658,7 +667,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await api.exportQueryResultMarkdown(outputPath, result.columns, result.rows);
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -680,7 +689,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await api.exportQueryResultMarkdown(outputPath, result.columns, result.rows);
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -695,7 +704,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await saveTextFile(content, exportFileName(tableMeta.value?.tableName || "export", "txt", { preferFallback: true }), "Text", "txt");
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -708,7 +717,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await saveTextFile(content, exportFileName("export-page", "txt", { page: true }), "Text", "txt");
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -779,7 +788,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
             errorMessage: e?.message || String(e),
           };
         }
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -809,7 +818,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await writeXlsxResult(outputPath, result, includeSqlSheet);
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -852,7 +861,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await api.exportQueryResultsXlsx(outputPath, sqlWorksheet ? [...worksheets, sqlWorksheet] : worksheets);
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -900,11 +909,14 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       };
     }
     if (exportProgressDialog) exportProgressDialog.value = true;
+    if (exportCanMinimize) exportCanMinimize.value = true;
 
-    const exportId = uuid();
+    const task = tracker.addTask(meta.tableName, format, outputPath);
+    const exportId = task.exportId;
     if (exportCancelHandler) {
       exportCancelHandler.value = () => api.cancelTableExport(exportId);
     }
+    tracker.registerTaskCancelHandler(exportId, () => api.cancelTableExport(exportId));
     const editorSettings = useSettingsStore().editorSettings;
     const rowLimit = editorSettings.exportRowLimitEnabled ? editorSettings.exportRowLimit : null;
 
@@ -940,6 +952,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
               errorMessage: progress.errorMessage || null,
             };
           }
+          tracker.updateTableExportTask(exportId, progress);
         },
       );
       if (progress.status === "Done") {
@@ -947,6 +960,8 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       }
     } finally {
       if (exportCancelHandler) exportCancelHandler.value = null;
+      tracker.unregisterTaskCancelHandler(exportId);
+      if (exportCanMinimize) exportCanMinimize.value = false;
     }
     return true;
   }
@@ -991,9 +1006,12 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
       };
     }
     if (exportProgressDialog) exportProgressDialog.value = true;
+    if (exportCanMinimize) exportCanMinimize.value = true;
+    tracker.addTask("Query Result", format, outputPath, exportId);
     if (exportCancelHandler) {
       exportCancelHandler.value = () => api.cancelQueryResultExport(exportId, request.executionId);
     }
+    tracker.registerTaskCancelHandler(exportId, () => api.cancelQueryResultExport(exportId, request.executionId));
 
     try {
       const terminalProgress = await api.startQueryResultExport(request, (progress) => {
@@ -1008,12 +1026,82 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
             errorMessage: progress.errorMessage || null,
           };
         }
+        tracker.updateTableExportTask(exportId, progress);
       });
       if (terminalProgress.status === "Done") {
         toast(t("grid.exported"));
       }
     } finally {
       if (exportCancelHandler) exportCancelHandler.value = null;
+      tracker.unregisterTaskCancelHandler(exportId);
+      if (exportCanMinimize) exportCanMinimize.value = false;
+    }
+    return true;
+  }
+
+  async function exportQueryResultSqlViaBackend(rowIds?: number[]): Promise<boolean> {
+    // Guard: only for query-result context without complete local result, desktop only
+    if (rowIds !== undefined || context.value !== "results" || !queryResultExportRequest) return false;
+    if (hasCompleteLocalResult?.value) return false;
+    if (!isTauriRuntime()) return false; // Web → local export fallback
+
+    // 1. Save dialog FIRST (immediate user feedback)
+    let outputPath = exportFileName("query-result", "sql");
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const path = await save({
+      defaultPath: outputPath,
+      filters: [{ name: "SQL", extensions: ["sql"] }],
+    });
+    if (!path) return true;
+    outputPath = path as string;
+
+    // 2. Register background task FIRST so its exportId drives the request.
+    //    addTask generates its own ID — capture it so progress callbacks match.
+    const task = addTask(tableMeta.value?.tableName || "Query Result", "sql", outputPath);
+    const taskExportId = task.exportId;
+
+    let request: api.QueryResultExportRequest;
+    try {
+      const built = await queryResultExportRequest({
+        exportId: taskExportId,
+        filePath: outputPath,
+        format: "sql",
+        exportTableName: tableMeta.value?.tableName,
+        exportColumnTypes: allColumnTypes.value?.map((t) => t ?? null) as Array<string | null | undefined> | undefined,
+      });
+      if (!built) {
+        // builder declined — clean up the task we just registered
+        removeTask(taskExportId);
+        return false;
+      }
+      request = built;
+    } catch {
+      removeTask(taskExportId);
+      return false;
+    }
+
+    registerTaskCancelHandler(taskExportId, () => api.cancelQueryResultExport(taskExportId, request.executionId));
+
+    try {
+      await api.startQueryResultExport(request, (progress) => {
+        updateTableExportTask(taskExportId, progress);
+        if (progress.status === "Done") {
+          toast(t("grid.exported"));
+        }
+      });
+    } catch (e) {
+      // 4. Startup rejection → mark task Error (fixes stuck-Running bug)
+      updateTableExportTask(taskExportId, {
+        exportId: taskExportId,
+        tableName: tableMeta.value?.tableName || "Query Result",
+        rowsExported: 0,
+        totalRows: null,
+        status: "Error" as const,
+        errorMessage: (e as Error)?.message || String(e),
+      });
+      throw e;
+    } finally {
+      unregisterTaskCancelHandler(taskExportId);
     }
     return true;
   }
@@ -1021,8 +1109,13 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
   async function exportSql(rowIds?: number[]) {
     await runExclusiveExport(async () => {
       try {
+        // Step 1: table-data context — existing backend table export
         if (await exportFullTableDataViaBackend("sql", rowIds)) return;
 
+        // Step 2: query-result context — NEW backend streaming with background task
+        if (await exportQueryResultSqlViaBackend(rowIds)) return;
+
+        // Step 3: fallback — local export (Web and edge-case scenarios)
         const result = await resultToExport(rowIds, undefined, true, false);
         const exportData = sqlInsertExportData(result);
         const content = await formatSqlInsert({
@@ -1036,7 +1129,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await saveTextFile(content, exportFileName(tableMeta.value?.tableName || "export", "sql", { preferFallback: true }), "SQL", "sql");
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }
@@ -1057,7 +1150,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         await saveTextFile(content, exportFileName("export-page", "sql", { page: true }), "SQL", "sql");
         toast(t("grid.exported"));
       } catch (e: any) {
-        toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
+        toast(t("grid.exportFailed", { message: translateBackendError(t, e) }), 5000);
       }
     });
   }

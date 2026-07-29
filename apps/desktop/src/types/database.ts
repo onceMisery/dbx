@@ -12,6 +12,7 @@ export type DatabaseType =
   | "mongodb"
   | "oracle"
   | "elasticsearch"
+  | "hbase"
   | "qdrant"
   | "milvus"
   | "weaviate"
@@ -105,6 +106,7 @@ export interface CompletionAssistantCandidate {
   parent_name?: string | null;
   comment?: string | null;
   data_type?: string | null;
+  signature?: string | null;
 }
 
 export interface CompletionAssistantResponse {
@@ -129,6 +131,7 @@ export interface ConnectionConfig {
   database?: string;
   visible_databases?: string[];
   visible_schemas?: Record<string, string[]>;
+  show_system_schemas?: boolean;
   attached_databases?: AttachedDatabaseConfig[];
   init_script?: string;
   color?: string;
@@ -637,6 +640,26 @@ export interface QueryResultRun {
   tableMeta?: QueryTab["tableMeta"];
 }
 
+export interface ParticipantInfo {
+  id: string;
+  name: string;
+  role: string;
+}
+
+export interface TransactionLog {
+  transaction_id: string;
+  status: string;
+  participants: ParticipantInfo[];
+  created_at: string;
+  updated_at: string;
+  metadata: unknown;
+  /** camelCase fields from SchemaDiffDeployResult */
+  transactionId?: string;
+  executedCount?: number;
+  statementCount?: number;
+  error?: string;
+}
+
 export interface SqlTextSpan {
   start_line: number;
   start_column: number;
@@ -906,7 +929,31 @@ export interface QueryTab {
   explainClientSessionId?: string;
   /** Invalidates tab-scoped completion metadata after session context changes. */
   completionContextVersion?: number;
-  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "etcd-dashboard" | "zookeeper" | "mq" | "nacos" | "nacos-dashboard" | "objects" | "structure" | "users" | "dameng-jobs" | "processlist" | "mysql-dashboard" | "postgres-dashboard";
+  mode:
+    | "data"
+    | "query"
+    | "redis"
+    | "redis-dashboard"
+    | "mongo"
+    | "mongo-gridfs"
+    | "mongo-bucket"
+    | "vector"
+    | "hbase"
+    | "etcd"
+    | "etcd-dashboard"
+    | "zookeeper"
+    | "mq"
+    | "nacos"
+    | "nacos-dashboard"
+    | "objects"
+    | "structure"
+    | "users"
+    | "dameng-jobs"
+    | "processlist"
+    | "mysql-dashboard"
+    | "postgres-dashboard";
+  /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
+  hbaseCreateTableOnOpen?: boolean;
   mqTenant?: string;
   mqInitialTab?: "topics";
   nacosNamespace?: string;
