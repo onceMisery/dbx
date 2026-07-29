@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-cli"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "async-trait",
  "dbx-core",
@@ -1920,6 +1920,7 @@ dependencies = [
  "flate2",
  "font-kit",
  "futures",
+ "httpdate",
  "iana-time-zone",
  "insta",
  "json5",
@@ -1970,7 +1971,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-mcp"
-version = "0.4.44"
+version = "0.4.45"
 dependencies = [
  "async-trait",
  "dbx-core",
