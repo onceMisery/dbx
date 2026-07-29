@@ -8683,15 +8683,15 @@ mod tests {
             target_columns: vec!["enabled", "amount", "name"].into_iter().map(str::to_string).collect(),
             column_types: vec![Some("bit".to_string()), Some("decimal(38,10)".to_string()), None],
         };
-        let rows = vec![vec![serde_json::json!(true), serde_json::json!("12.3400"), serde_json::Value::Null]];
+        let row = vec![serde_json::json!(true), serde_json::json!("12.3400"), serde_json::Value::Null];
 
         assert_eq!(
-            sqlserver_bulk_text_row(&rows[0], &import_plan, None, 0, SQLSERVER_BULK_ROW_MEMORY_BYTES).unwrap(),
+            sqlserver_bulk_text_row(&row, &import_plan, None, 0, SQLSERVER_BULK_ROW_MEMORY_BYTES).unwrap(),
             vec![Some("1".to_string()), Some("12.3400".to_string()), None]
         );
 
-        let structured = vec![vec![serde_json::json!({"nested": true}), serde_json::json!(1), serde_json::json!("x")]];
-        assert!(sqlserver_bulk_text_row(&structured[0], &import_plan, None, 0, SQLSERVER_BULK_ROW_MEMORY_BYTES)
+        let structured = vec![serde_json::json!({"nested": true}), serde_json::json!(1), serde_json::json!("x")];
+        assert!(sqlserver_bulk_text_row(&structured, &import_plan, None, 0, SQLSERVER_BULK_ROW_MEMORY_BYTES)
             .unwrap_err()
             .contains("structured"));
     }
