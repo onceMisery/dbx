@@ -7177,8 +7177,9 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_for_check = cancelled.clone();
         let cancelled_on_progress = cancelled.clone();
+        let cancel_requested_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let cancel_requested_on_progress = cancel_requested_at.clone();
         let mut progress = Vec::new();
-        let started = Instant::now();
 
         let error = validate_xlsx_worksheet_for_import(
             path.to_string_lossy().to_string(),
@@ -7192,17 +7193,26 @@ mod tests {
             },
             |bytes_read| {
                 progress.push(bytes_read);
+                let mut requested_at = cancel_requested_on_progress.lock().unwrap();
+                if requested_at.is_none() {
+                    *requested_at = Some(Instant::now());
+                }
                 cancelled_on_progress.store(true, Ordering::Release);
             },
         )
         .await
         .unwrap_err();
-        let elapsed = started.elapsed();
+        let cancel_latency = cancel_requested_at
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("cancellation must be requested during shared strings preprocessing")
+            .elapsed();
 
         assert_eq!(error, "Import cancelled");
         assert!(!progress.is_empty(), "shared strings preprocessing must report progress before the header");
         assert!(progress.windows(2).all(|window| window[0] <= window[1]));
-        assert!(elapsed < Duration::from_secs(2), "cancellation took {elapsed:?}");
+        assert!(cancel_latency < Duration::from_secs(1), "cancellation took {cancel_latency:?} after the request");
         let _ = std::fs::remove_file(path);
     }
 
