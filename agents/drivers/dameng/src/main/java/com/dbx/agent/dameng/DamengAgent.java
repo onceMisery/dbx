@@ -1,6 +1,7 @@
 package com.dbx.agent.dameng;
 
 import com.dbx.agent.BaseDatabaseAgent;
+import com.dbx.agent.AgentOutput;
 import com.dbx.agent.ColumnInfo;
 import com.dbx.agent.ConnectParams;
 import com.dbx.agent.DatabaseInfo;
@@ -18,19 +19,19 @@ import com.dbx.agent.QueryPageResult;
 import com.dbx.agent.QueryResult;
 import com.dbx.agent.TableInfo;
 import com.dbx.agent.TriggerInfo;
+import com.dbx.agent.jdbc.ConnectionLease;
+import com.dbx.agent.jdbc.ConnectionProvider;
+import com.dbx.agent.jdbc.LeaseInvalidationCause;
+import com.dbx.agent.jdbc.SingleConnectionProvider;
 import java.io.PrintStream;
 import java.io.Reader;
 import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLXML;
-import java.sql.Statement;
 import java.sql.Types;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -39,6 +40,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class DamengAgent extends BaseDatabaseAgent {
     private static final String AGENT_VERSION = "9999.06.04.1-fix-default";
@@ -72,12 +74,16 @@ public final class DamengAgent extends BaseDatabaseAgent {
               ON schema_object.OBJECT_ID = m.SCHID AND schema_object.OBJECT_TYPE = 'SCH'
         ) mv ON mv.OWNER = o.OWNER AND mv.MVIEW_NAME = o.OBJECT_NAME
         """.stripIndent().trim();
-    private Connection connection;
+    private volatile ConnectionProvider connectionProvider;
+    private final ThreadLocal<ConnectionLease> operationLease = new ThreadLocal<>();
+    private final Map<String, ConnectionLease> cursorLeases = new ConcurrentHashMap<>();
+    private final DamengMetadataRepository metadataRepository = new DamengMetadataRepository(this::requireConnected);
     private String connectedUsername;
 
     @Override
     public Connection getConnection() {
-        return connection;
+        ConnectionLease lease = operationLease.get();
+        return lease == null ? null : lease.connection();
     }
 
     @Override
@@ -85,10 +91,71 @@ public final class DamengAgent extends BaseDatabaseAgent {
         uncheckedVoid(() -> {
             withSuppressedStdout(() -> {
                 Class.forName("dm.jdbc.driver.DmDriver");
-                connection = DriverManager.getConnection(buildUrl(params), params.getUsername(), params.getPassword());
+                ConnectionProvider provider = DamengConnectionProviderFactory.create(buildUrl(params), params);
+                try {
+                    try (ConnectionLease lease = provider.acquire(java.time.Duration.ofSeconds(30))) {
+                        if (!lease.connection().isValid(5)) throw new IllegalStateException("Connection is not valid");
+                    }
+                } catch (Exception error) {
+                    provider.close();
+                    throw error;
+                }
+                ConnectionProvider previous = connectionProvider;
+                connectionProvider = provider;
+                if (previous != null) previous.close();
                 connectedUsername = params.getUsername();
             });
         });
+    }
+
+    // Package-private test seam keeps mock JDBC tests on the same lease contract as production.
+    void setConnectionForTest(Connection connection) {
+        ConnectionLease previousLease = operationLease.get();
+        operationLease.remove();
+        if (previousLease != null) previousLease.close();
+        ConnectionProvider previous = connectionProvider;
+        if (previous != null) previous.close();
+        ConnectionProvider provider = new SingleConnectionProvider(() -> connection);
+        try {
+            operationLease.set(provider.acquire(java.time.Duration.ofSeconds(1)));
+            connectionProvider = provider;
+        } catch (Exception error) {
+            provider.close();
+            throw new IllegalStateException("Unable to install test connection", error);
+        }
+    }
+
+    @Override
+    public void beginOperation() {
+        ConnectionProvider provider = connectionProvider;
+        if (provider == null || operationLease.get() != null) return;
+        try {
+            operationLease.set(provider.acquire(java.time.Duration.ofSeconds(30)));
+        } catch (Exception error) {
+            throw new IllegalStateException("Dameng connection checkout failed", error);
+        }
+    }
+
+    @Override
+    public void endOperation() {
+        releaseOrphanedCursorLeases();
+        ConnectionLease lease = operationLease.get();
+        operationLease.remove();
+        if (lease != null) lease.close();
+    }
+
+    @Override
+    public void quarantineSession() {
+        ConnectionLease lease = operationLease.get();
+        if (lease != null) lease.invalidate(LeaseInvalidationCause.SESSION_QUARANTINED);
+        ConnectionProvider provider = connectionProvider;
+        connectionProvider = null;
+        if (provider != null) provider.close();
+        for (ConnectionLease cursorLease : cursorLeases.values()) {
+            cursorLease.invalidate(LeaseInvalidationCause.SESSION_QUARANTINED);
+            cursorLease.close();
+        }
+        cursorLeases.clear();
     }
 
     @Override
@@ -96,8 +163,13 @@ public final class DamengAgent extends BaseDatabaseAgent {
         return unchecked(() -> {
             return withSuppressedStdout(() -> {
                 Class.forName("dm.jdbc.driver.DmDriver");
-                try (Connection conn = DriverManager.getConnection(buildUrl(params), params.getUsername(), params.getPassword())) {
-                    return conn.isValid(5);
+                ConnectionProvider provider = DamengConnectionProviderFactory.create(buildUrl(params), params);
+                try {
+                    try (ConnectionLease lease = provider.acquire(java.time.Duration.ofSeconds(30))) {
+                        return lease.connection().isValid(5);
+                    }
+                } finally {
+                    provider.close();
                 }
             });
         });
@@ -110,22 +182,26 @@ public final class DamengAgent extends BaseDatabaseAgent {
      * to {@code System.err} so driver output lands on stderr instead.
      */
     private static <T> T withSuppressedStdout(ThrowingSupplier<T> action) throws Exception {
-        PrintStream originalOut = System.out;
-        try {
-            System.setOut(System.err);
-            return action.get();
-        } finally {
-            System.setOut(originalOut);
+        synchronized (AgentOutput.LOCK) {
+            PrintStream originalOut = System.out;
+            try {
+                System.setOut(System.err);
+                return action.get();
+            } finally {
+                System.setOut(originalOut);
+            }
         }
     }
 
     private static void withSuppressedStdout(ThrowingRunnable action) throws Exception {
-        PrintStream originalOut = System.out;
-        try {
-            System.setOut(System.err);
-            action.run();
-        } finally {
-            System.setOut(originalOut);
+        synchronized (AgentOutput.LOCK) {
+            PrintStream originalOut = System.out;
+            try {
+                System.setOut(System.err);
+                action.run();
+            } finally {
+                System.setOut(originalOut);
+            }
         }
     }
 
@@ -139,7 +215,7 @@ public final class DamengAgent extends BaseDatabaseAgent {
         return unchecked(() -> {
             try {
                 return listVisibleSchemas();
-            } catch (SQLException catalogError) {
+            } catch (RuntimeException catalogError) {
                 try {
                     return listVisibleUsers();
                 } catch (Exception fallbackError) {
@@ -151,29 +227,13 @@ public final class DamengAgent extends BaseDatabaseAgent {
     }
 
     private List<String> listVisibleUsers() throws Exception {
-        List<String> result = new ArrayList<>();
         String sql = "SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME";
-        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    result.add(rs.getString(1));
-                }
-            }
-        }
-        return result;
+        return metadataRepository.query(sql, rs -> rs.getString(1));
     }
 
     private List<String> listVisibleSchemas() throws Exception {
-        List<String> result = new ArrayList<>();
         String sql = "SELECT NAME FROM SYS.SYSOBJECTS WHERE TYPE$ = 'SCH' ORDER BY NAME";
-        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    result.add(rs.getString(1));
-                }
-            }
-        }
-        return result;
+        return metadataRepository.query(sql, rs -> rs.getString(1));
     }
 
     @Override
@@ -223,18 +283,12 @@ public final class DamengAgent extends BaseDatabaseAgent {
     }
 
     private List<TableInfo> executeConstrainedTables(MetadataQuery query, MetadataListConstraints constraints) {
-        return unchecked(() -> {
-            List<TableInfo> result = new ArrayList<>();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(query.sql())) {
-                bind(stmt, query.args());
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        result.add(new TableInfo(rs.getString("TABLE_NAME"), normalizeObjectType(rs.getString("TABLE_TYPE")), rs.getString("COMMENTS")));
-                    }
-                }
-            }
-            return constraints.withoutPaging().filterTables(result);
-        });
+        List<TableInfo> result = metadataRepository.query(query.sql(), query.args(), rs -> new TableInfo(
+            rs.getString("TABLE_NAME"),
+            normalizeObjectType(rs.getString("TABLE_TYPE")),
+            rs.getString("COMMENTS")
+        ));
+        return constraints.withoutPaging().filterTables(result);
     }
 
     private List<TableInfo> executeRawConstrainedTables(String schema, MetadataListConstraints constraints) {
@@ -428,19 +482,6 @@ public final class DamengAgent extends BaseDatabaseAgent {
         return String.join(", ", java.util.Collections.nCopies(count, "?"));
     }
 
-    private static void bind(PreparedStatement stmt, List<Object> args) throws Exception {
-        for (int index = 0; index < args.size(); index += 1) {
-            Object arg = args.get(index);
-            if (arg instanceof Integer) {
-                stmt.setInt(index + 1, (Integer) arg);
-            } else if (arg == null) {
-                stmt.setObject(index + 1, null);
-            } else {
-                stmt.setString(index + 1, String.valueOf(arg));
-            }
-        }
-    }
-
     static final class MetadataQuery {
         private final String sql;
         private final List<Object> args;
@@ -521,23 +562,13 @@ public final class DamengAgent extends BaseDatabaseAgent {
         MetadataQuery query,
         MetadataListConstraints constraints
     ) {
-        return unchecked(() -> {
-            List<ObjectInfo> result = new ArrayList<>();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(query.sql())) {
-                bind(stmt, query.args());
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        result.add(new ObjectInfo(
-                            rs.getString("OBJECT_NAME"),
-                            normalizeObjectType(rs.getString("OBJECT_TYPE")),
-                            schema,
-                            rs.getString("COMMENTS")
-                        ));
-                    }
-                }
-            }
-            return constraints.withoutPaging().filterObjects(result);
-        });
+        List<ObjectInfo> result = metadataRepository.query(query.sql(), query.args(), rs -> new ObjectInfo(
+            rs.getString("OBJECT_NAME"),
+            normalizeObjectType(rs.getString("OBJECT_TYPE")),
+            schema,
+            rs.getString("COMMENTS")
+        ));
+        return constraints.withoutPaging().filterObjects(result);
     }
 
     private List<ObjectInfo> executeRawConstrainedObjects(String schema, MetadataListConstraints constraints) {
@@ -621,16 +652,14 @@ public final class DamengAgent extends BaseDatabaseAgent {
     public ObjectSource getObjectSource(String schema, String name, String objectType) {
         return unchecked(() -> {
             String dbmsType = damengDdlObjectType(objectType);
-            String source;
             String sql = "SELECT /*+ PARALLEL(1) */ DBMS_METADATA.GET_DDL(?, ?, ?) FROM DUAL";
-            try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-                stmt.setString(1, dbmsType);
-                stmt.setString(2, name);
-                stmt.setString(3, schema);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    source = rs.next() ? coalesce(readTextColumn(rs, 1)) : "";
-                }
-            }
+            String source = metadataRepository.queryOne(
+                sql,
+                rs -> coalesce(readTextColumn(rs, 1)),
+                dbmsType,
+                name,
+                schema
+            ).orElse("");
             return new ObjectSource(name, objectType, schema, source);
         });
     }
@@ -651,17 +680,13 @@ public final class DamengAgent extends BaseDatabaseAgent {
     public String getTableDdl(String schema, String table) {
         return unchecked(() -> {
             String sql = "SELECT /*+ PARALLEL(1) */ DBMS_METADATA.GET_DDL(?, ?, ?) FROM DUAL";
-            String ddl = null;
-            try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-                stmt.setString(1, "TABLE");
-                stmt.setString(2, table);
-                stmt.setString(3, schema);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    if (rs.next()) {
-                        ddl = coalesce(readTextColumn(rs, 1));
-                    }
-                }
-            }
+            String ddl = metadataRepository.queryOne(
+                sql,
+                rs -> coalesce(readTextColumn(rs, 1)),
+                "TABLE",
+                table,
+                schema
+            ).orElse(null);
             if (ddl != null) {
                 ddl = appendTableAndColumnComments(ddl, schema, table);
                 return appendIndependentIndexDdl(ddl, schema, table);
@@ -673,24 +698,16 @@ public final class DamengAgent extends BaseDatabaseAgent {
     @Override
     public List<ColumnInfo> getColumns(String schema, String table) {
         return unchecked(() -> {
-            Set<String> pkColumns = new java.util.HashSet<>();
             String pkSql = """
                 SELECT /*+ PARALLEL(1) */ cols.COLUMN_NAME FROM ALL_CONS_COLUMNS cols
                 JOIN ALL_CONSTRAINTS cons ON cols.CONSTRAINT_NAME = cons.CONSTRAINT_NAME AND cols.OWNER = cons.OWNER
                 WHERE cons.CONSTRAINT_TYPE = 'P' AND cons.OWNER = ? AND cons.TABLE_NAME = ?
                 """.stripIndent().trim();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(pkSql)) {
-                stmt.setString(1, schema);
-                stmt.setString(2, table);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        pkColumns.add(rs.getString(1));
-                    }
-                }
-            }
+            Set<String> pkColumns = new java.util.HashSet<>(
+                metadataRepository.query(pkSql, rs -> rs.getString(1), schema, table)
+            );
 
             Set<String> identityColumns = identityColumns(schema, table);
-            List<ColumnInfo> result = new ArrayList<>();
             // DATA_DEFAULT is a LONG column — it must be selected first and read first
             // in JDBC, otherwise the data is truncated.
             String colSql = """
@@ -712,44 +729,36 @@ public final class DamengAgent extends BaseDatabaseAgent {
                 WHERE c.OWNER = ? AND c.TABLE_NAME = ?
                 ORDER BY c.COLUMN_ID
                 """.stripIndent().trim();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(colSql)) {
-                stmt.setString(1, schema);
-                stmt.setString(2, table);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        // DATA_DEFAULT is a LONG — must be read first, before all other columns.
-                        String dataDefault = readLongColumn(rs, "DATA_DEFAULT");
-                        String name = rs.getString("COLUMN_NAME");
-                        String baseType = rs.getString("DATA_TYPE");
-                        Integer numPrec = intObject(rs, "DATA_PRECISION");
-                        Integer numScale = intObject(rs, "DATA_SCALE");
-                        Integer dataLen = intObject(rs, "DATA_LENGTH");
-                        Integer charLen = intObject(rs, "CHAR_LENGTH");
-                        String charUsed = rs.getString("CHAR_USED");
-                        String dataType = formatDataType(baseType, numPrec, numScale, dataLen, charLen, charUsed);
-
-                        result.add(new ColumnInfo(
-                            name,
-                            dataType,
-                            "Y".equals(rs.getString("NULLABLE")),
-                            dataDefault,
-                            pkColumns.contains(name),
-                            identityColumns.contains(name) ? "identity" : null,
-                            rs.getString("COMMENTS"),
-                            numPrec,
-                            numScale,
-                            charLen
-                        ));
-                    }
-                }
-            }
+            List<ColumnInfo> result = metadataRepository.query(colSql, rs -> {
+                // DATA_DEFAULT is a LONG and must be consumed before other columns.
+                String dataDefault = readLongColumn(rs, "DATA_DEFAULT");
+                String name = rs.getString("COLUMN_NAME");
+                String baseType = rs.getString("DATA_TYPE");
+                Integer numPrec = intObject(rs, "DATA_PRECISION");
+                Integer numScale = intObject(rs, "DATA_SCALE");
+                Integer dataLen = intObject(rs, "DATA_LENGTH");
+                Integer charLen = intObject(rs, "CHAR_LENGTH");
+                String charUsed = rs.getString("CHAR_USED");
+                String dataType = formatDataType(baseType, numPrec, numScale, dataLen, charLen, charUsed);
+                return new ColumnInfo(
+                    name,
+                    dataType,
+                    "Y".equals(rs.getString("NULLABLE")),
+                    dataDefault,
+                    pkColumns.contains(name),
+                    identityColumns.contains(name) ? "identity" : null,
+                    rs.getString("COMMENTS"),
+                    numPrec,
+                    numScale,
+                    charLen
+                );
+            }, schema, table);
             fillMissingColumnComments(schema, table, result);
             return result;
         });
     }
 
     private Set<String> identityColumns(String schema, String table) {
-        Set<String> result = new java.util.HashSet<>();
         String sql = """
             SELECT /*+ PARALLEL(1) */ c.NAME
             FROM SYS.SYSCOLUMNS c
@@ -757,27 +766,22 @@ public final class DamengAgent extends BaseDatabaseAgent {
             JOIN SYS.SYSOBJECTS s ON t.SCHID = s.ID
             WHERE s.NAME = ? AND t.NAME = ? AND (c.INFO2 & 0x01) = 0x01
             """.stripIndent().trim();
-        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-            stmt.setString(1, schema);
-            stmt.setString(2, table);
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    String column = rs.getString(1);
-                    if (notBlank(column)) {
-                        result.add(column);
-                    }
-                }
-            }
+        try {
+            return new java.util.HashSet<>(metadataRepository.query(
+                sql,
+                rs -> rs.getString(1),
+                schema,
+                table
+            ).stream().filter(DamengAgent::notBlank).toList());
         } catch (Exception ignored) {
             // Some Dameng versions or users do not expose SYS.SYSCOLUMNS.
+            return Set.of();
         }
-        return result;
     }
 
     @Override
     public List<IndexInfo> listIndexes(String schema, String table) {
         return unchecked(() -> {
-            List<IndexInfo> result = new ArrayList<>();
             String sql = """
                 SELECT /*+ PARALLEL(1) */ i.INDEX_NAME,
                     LISTAGG(ic.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY ic.COLUMN_POSITION) AS COLUMNS,
@@ -792,32 +796,22 @@ public final class DamengAgent extends BaseDatabaseAgent {
                 GROUP BY i.INDEX_NAME, i.UNIQUENESS, c.CONSTRAINT_TYPE, i.INDEX_TYPE
                 ORDER BY i.INDEX_NAME
                 """.stripIndent().trim();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-                stmt.setString(1, schema);
-                stmt.setString(2, table);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        result.add(new IndexInfo(
-                            rs.getString(1),
-                            splitNonEmpty(coalesce(rs.getString(2)), ","),
-                            "UNIQUE".equals(rs.getString(3)),
-                            "1".equals(rs.getString(4)),
-                            null,
-                            rs.getString(5),
-                            null,
-                            null
-                        ));
-                    }
-                }
-            }
-            return result;
+            return metadataRepository.query(sql, rs -> new IndexInfo(
+                rs.getString(1),
+                splitNonEmpty(coalesce(rs.getString(2)), ","),
+                "UNIQUE".equals(rs.getString(3)),
+                "1".equals(rs.getString(4)),
+                null,
+                rs.getString(5),
+                null,
+                null
+            ), schema, table);
         });
     }
 
     @Override
     public List<ForeignKeyInfo> listForeignKeys(String schema, String table) {
         return unchecked(() -> {
-            List<ForeignKeyInfo> result = new ArrayList<>();
             String sql = """
                 SELECT c.CONSTRAINT_NAME, cc.COLUMN_NAME, rc.TABLE_NAME, rcc.COLUMN_NAME
                 FROM ALL_CONSTRAINTS c
@@ -827,44 +821,30 @@ public final class DamengAgent extends BaseDatabaseAgent {
                 WHERE c.CONSTRAINT_TYPE = 'R' AND c.OWNER = ? AND c.TABLE_NAME = ?
                 ORDER BY c.CONSTRAINT_NAME
                 """.stripIndent().trim();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-                stmt.setString(1, schema);
-                stmt.setString(2, table);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        result.add(new ForeignKeyInfo(
-                            rs.getString(1),
-                            rs.getString(2),
-                            rs.getString(3),
-                            rs.getString(4)
-                        ));
-                    }
-                }
-            }
-            return result;
+            return metadataRepository.query(sql, rs -> new ForeignKeyInfo(
+                rs.getString(1),
+                rs.getString(2),
+                rs.getString(3),
+                rs.getString(4)
+            ), schema, table);
         });
     }
 
     @Override
     public List<TriggerInfo> listTriggers(String schema, String table) {
         return unchecked(() -> {
-            List<TriggerInfo> result = new ArrayList<>();
             String sql = """
                 SELECT TRIGGER_NAME, TRIGGERING_EVENT, '' AS TRIGGER_TYPE
                 FROM ALL_TRIGGERS
                 WHERE OWNER = ? AND TABLE_NAME = ?
                 ORDER BY TRIGGER_NAME
                 """.stripIndent().trim();
-            try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-                stmt.setString(1, schema);
-                stmt.setString(2, table);
-                try (ResultSet rs = stmt.executeQuery()) {
-                    while (rs.next()) {
-                        result.add(new TriggerInfo(rs.getString(1), rs.getString(2), rs.getString(3)));
-                    }
-                }
-            }
-            return result;
+            return metadataRepository.query(
+                sql,
+                rs -> new TriggerInfo(rs.getString(1), rs.getString(2), rs.getString(3)),
+                schema,
+                table
+            );
         });
     }
 
@@ -973,7 +953,7 @@ public final class DamengAgent extends BaseDatabaseAgent {
                 false
             );
         }
-        return JdbcExecutor.current().executePage(
+        QueryPageResult result = JdbcExecutor.current().executePage(
             requireConnected(),
             sql,
             schema,
@@ -981,11 +961,13 @@ public final class DamengAgent extends BaseDatabaseAgent {
             options,
             this::stringResultValue
         );
+        retainCursorLease(result);
+        return result;
     }
 
     @Override
     public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
-        return JdbcExecutor.current().startTableRead(
+        QueryPageResult result = JdbcExecutor.current().startTableRead(
             requireConnected(),
             sql,
             schema,
@@ -993,6 +975,74 @@ public final class DamengAgent extends BaseDatabaseAgent {
             options,
             this::stringResultValue
         );
+        retainCursorLease(result);
+        return result;
+    }
+
+    @Override
+    public QueryPageResult fetchQueryPage(String sessionId, int pageSize) {
+        releaseTransientOperationLease();
+        QueryPageResult result = JdbcExecutor.current().fetchPage(sessionId, pageSize);
+        if (!result.getHas_more()) closeCursorLease(sessionId);
+        return result;
+    }
+
+    @Override
+    public boolean closeQuerySession(String sessionId) {
+        releaseTransientOperationLease();
+        try {
+            return JdbcExecutor.current().closeQuerySession(sessionId);
+        } finally {
+            closeCursorLease(sessionId);
+        }
+    }
+
+    @Override
+    public QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
+        releaseTransientOperationLease();
+        QueryPageResult result = JdbcExecutor.current().fetchTableReadPage(sessionId, pageSize);
+        if (!result.getHas_more()) closeCursorLease(sessionId);
+        return result;
+    }
+
+    @Override
+    public boolean closeTableReadSession(String sessionId) {
+        releaseTransientOperationLease();
+        try {
+            return JdbcExecutor.current().closeTableReadSession(sessionId);
+        } finally {
+            closeCursorLease(sessionId);
+        }
+    }
+
+    private void retainCursorLease(QueryPageResult result) {
+        if (result.getSession_id() == null || !result.getHas_more()) return;
+        ConnectionLease lease = operationLease.get();
+        if (lease == null) throw new IllegalStateException("Cursor was created without a connection lease");
+        operationLease.remove();
+        ConnectionLease replaced = cursorLeases.put(result.getSession_id(), lease);
+        if (replaced != null) {
+            replaced.invalidate(LeaseInvalidationCause.QUERY_STATE_UNKNOWN);
+            replaced.close();
+        }
+    }
+
+    private void releaseTransientOperationLease() {
+        ConnectionLease lease = operationLease.get();
+        operationLease.remove();
+        if (lease != null) lease.close();
+    }
+
+    private void closeCursorLease(String sessionId) {
+        ConnectionLease lease = cursorLeases.remove(sessionId);
+        if (lease != null) lease.close();
+    }
+
+    private void releaseOrphanedCursorLeases() {
+        JdbcExecutor executor = JdbcExecutor.current();
+        for (String sessionId : new ArrayList<>(cursorLeases.keySet())) {
+            if (!executor.hasCursorSession(sessionId)) closeCursorLease(sessionId);
+        }
     }
 
     @Override
@@ -1002,12 +1052,12 @@ public final class DamengAgent extends BaseDatabaseAgent {
 
     @Override
     public void disconnect() {
-        uncheckedVoid(() -> {
-            if (connection != null) {
-                connection.close();
-            }
-            connection = null;
-        });
+        endOperation();
+        ConnectionProvider provider = connectionProvider;
+        connectionProvider = null;
+        if (provider != null) provider.close();
+        for (ConnectionLease cursorLease : cursorLeases.values()) cursorLease.close();
+        cursorLeases.clear();
     }
 
     private Object stringResultValue(ResultSet rs, int index, int sqlType) {
@@ -1229,17 +1279,14 @@ public final class DamengAgent extends BaseDatabaseAgent {
     }
 
     private void queryColumnComments(Map<String, String> comments, String sql, String... params) {
-        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-            for (int i = 0; i < params.length; i++) {
-                stmt.setString(i + 1, params[i]);
-            }
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    String column = rs.getString(1);
-                    String comment = rs.getString(2);
-                    if (notBlank(column) && notBlank(comment)) {
-                        comments.putIfAbsent(column.toUpperCase(Locale.ROOT), comment);
-                    }
+        try {
+            for (ColumnComment row : metadataRepository.query(
+                sql,
+                rs -> new ColumnComment(rs.getString(1), rs.getString(2)),
+                (Object[]) params
+            )) {
+                if (notBlank(row.column()) && notBlank(row.comment())) {
+                    comments.putIfAbsent(row.column().toUpperCase(Locale.ROOT), row.comment());
                 }
             }
         } catch (Exception ignored) {
@@ -1279,7 +1326,6 @@ public final class DamengAgent extends BaseDatabaseAgent {
     }
 
     private List<IndexInfo> independentIndexes(String schema, String table) throws Exception {
-        List<IndexInfo> result = new ArrayList<>();
         // Primary-key and unique-constraint backing indexes are already represented in table DDL.
         String sql = """
             SELECT /*+ PARALLEL(1) */ i.INDEX_NAME,
@@ -1300,28 +1346,16 @@ public final class DamengAgent extends BaseDatabaseAgent {
             GROUP BY i.INDEX_NAME, i.UNIQUENESS, i.INDEX_TYPE
             ORDER BY i.INDEX_NAME
             """.stripIndent().trim();
-        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-            stmt.setString(1, schema);
-            stmt.setString(2, table);
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    String indexName = rs.getString(1);
-                    if (notBlank(indexName)) {
-                        result.add(new IndexInfo(
-                            indexName,
-                            splitNonEmpty(coalesce(rs.getString(2)), ","),
-                            "UNIQUE".equals(rs.getString(3)),
-                            false,
-                            null,
-                            rs.getString(4),
-                            null,
-                            null
-                        ));
-                    }
-                }
-            }
-        }
-        return result;
+        return metadataRepository.query(sql, rs -> new IndexInfo(
+            rs.getString(1),
+            splitNonEmpty(coalesce(rs.getString(2)), ","),
+            "UNIQUE".equals(rs.getString(3)),
+            false,
+            null,
+            rs.getString(4),
+            null,
+            null
+        ), schema, table).stream().filter(index -> notBlank(index.getName())).toList();
     }
 
     static String indexDdl(String schema, String table, IndexInfo index) {
@@ -1358,14 +1392,10 @@ public final class DamengAgent extends BaseDatabaseAgent {
             FROM ALL_TAB_COMMENTS
             WHERE OWNER = ? AND TABLE_NAME = ?
             """.stripIndent().trim();
-        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
-            stmt.setString(1, schema);
-            stmt.setString(2, table);
-            try (ResultSet rs = stmt.executeQuery()) {
-                return rs.next() ? rs.getString(1) : null;
-            }
-        }
+        return metadataRepository.queryOne(sql, rs -> rs.getString(1), schema, table).orElse(null);
     }
+
+    private record ColumnComment(String column, String comment) {}
 
     private static void appendCommentStatement(StringBuilder ddl, String statement) {
         appendDdlStatement(ddl, statement);
@@ -1436,71 +1466,47 @@ public final class DamengAgent extends BaseDatabaseAgent {
     @Override
     public String getExplainInfo(String sql, String database, String schema, int timeoutSecs, String mode) {
         return unchecked(() -> {
-            Connection conn = requireConnected();
+            int timeout = effectiveTimeout(timeoutSecs);
             if (schema != null && !schema.trim().isEmpty()) {
-                try (Statement schemaStmt = conn.createStatement()) {
-                    schemaStmt.execute(setSchemaSQL(schema));
-                }
+                metadataRepository.execute(setSchemaSQL(schema), timeout);
             }
             boolean autotrace = "autotrace".equalsIgnoreCase(mode);
             String planText = null;
 
             if (autotrace) {
                 boolean monitorEnabled = false;
-                try (Statement s = conn.createStatement()) {
-                    s.execute("SF_SET_SESSION_PARA_VALUE('MONITOR_SQL_EXEC', 1)");
+                try {
+                    metadataRepository.execute("SF_SET_SESSION_PARA_VALUE('MONITOR_SQL_EXEC', 1)", timeout);
                     monitorEnabled = true;
                 } catch (Exception ignored) {}
 
-                try (Statement stmt = conn.createStatement()) {
-                    if (timeoutSecs >= 0) {
-                        try { stmt.setQueryTimeout(timeoutSecs); } catch (Exception ignored) {}
-                    }
-                    boolean hasResultSet = stmt.execute(sql);
-                    if (hasResultSet) {
-                        try (ResultSet rs = stmt.getResultSet()) {
-                            while (rs.next()) { /* consume all rows */ }
-                        }
-                    }
-                    try {
-                        Class<?> dmConnClass = Class.forName("dm.jdbc.driver.DmdbConnection");
-                        if (dmConnClass.isInstance(conn)) {
-                            Method m = dmConnClass.getMethod("getExplainInfo", Statement.class);
-                            planText = (String) m.invoke(dmConnClass.cast(conn), stmt);
-                        }
-                    } catch (Exception ignored) {}
+                try {
+                    planText = metadataRepository.tracePlan(sql, timeout);
                 } finally {
                     if (monitorEnabled) {
-                        try (Statement s = conn.createStatement()) {
-                            s.execute("SF_SET_SESSION_PARA_VALUE('MONITOR_SQL_EXEC', 0)");
-                        } catch (Exception ignored) {}
+                        try {
+                            metadataRepository.execute("SF_SET_SESSION_PARA_VALUE('MONITOR_SQL_EXEC', 0)", timeout);
+                        } catch (Exception ignored) { }
                     }
                 }
             } else {
-                try {
-                    Class<?> dmConnClass = Class.forName("dm.jdbc.driver.DmdbConnection");
-                    if (dmConnClass.isInstance(conn)) {
-                        Method m = dmConnClass.getMethod("getExplainInfo", String.class);
-                        planText = (String) m.invoke(dmConnClass.cast(conn), sql);
-                    }
-                } catch (Exception ignored) {}
+                planText = metadataRepository.driverPlan(sql);
             }
 
             if (planText == null || planText.trim().isEmpty()) {
-                try (Statement explainStmt = conn.createStatement();
-                     ResultSet rs = explainStmt.executeQuery("EXPLAIN " + sql)) {
-                    StringBuilder sb = new StringBuilder();
-                    while (rs.next()) {
-                        sb.append(rs.getString(1)).append("\n");
-                    }
-                    planText = sb.toString().trim();
-                } catch (Exception ignored) {}
+                try {
+                    planText = metadataRepository.fallbackPlan(sql).trim();
+                } catch (Exception ignored) { }
             }
             return planText != null ? planText : "";
         });
     }
 
+    private static int effectiveTimeout(int timeoutSecs) {
+        return timeoutSecs > 0 ? timeoutSecs : 60;
+    }
+
     public static void main(String[] args) {
-        new MultiSessionJsonRpcServer(DamengAgent::new).run();
+        new MultiSessionJsonRpcServer(DamengAgent::new, true).run();
     }
 }

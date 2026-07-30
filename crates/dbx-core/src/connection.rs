@@ -109,7 +109,7 @@ pub enum PoolKind {
     HBase(db::hbase_driver::HBaseClient),
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
-    Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
+    Agent(Arc<db::agent_pool::AgentConnectionPool>),
     ExternalTabular(ExternalTabularHandle),
     ExternalDriver {
         driver_id: String,
@@ -124,7 +124,7 @@ pub enum PoolKind {
 }
 
 enum ConnectionDatabaseInfoSource {
-    Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
+    Agent(Arc<db::agent_pool::AgentConnectionPool>),
     ExternalDriver { config: Arc<ConnectionConfig>, session: Arc<PluginDriverSession> },
     NativeMysql(db::mysql::MySqlPool),
     NativeHBase(db::hbase_driver::HBaseClient),
@@ -846,7 +846,7 @@ impl AppState {
                 )
                 .await
                 .map_err(|err| sqlserver_legacy_driver_error(&err))?;
-            return Ok(PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client))));
+            return Ok(PoolKind::Agent(db::agent_pool::AgentConnectionPool::new(client)));
         }
 
         let client = db::sqlserver::connect_with_port_explicit(
@@ -1135,7 +1135,7 @@ impl AppState {
         database: Option<&str>,
         attempt: u64,
     ) -> Result<String, String> {
-        self.get_or_create_pool_for_session_inner(connection_id, database, None, Some(attempt)).await
+        self.get_or_create_pool_for_session_inner(connection_id, database, None, Some(attempt), None).await
     }
 
     pub async fn get_or_create_pool_for_session(
@@ -1144,7 +1144,7 @@ impl AppState {
         database: Option<&str>,
         client_session_id: Option<&str>,
     ) -> Result<String, String> {
-        self.get_or_create_pool_for_session_inner(connection_id, database, client_session_id, None).await
+        self.get_or_create_pool_for_session_inner(connection_id, database, client_session_id, None, None).await
     }
 
     async fn get_or_create_pool_for_session_inner(
@@ -1153,6 +1153,7 @@ impl AppState {
         database: Option<&str>,
         client_session_id: Option<&str>,
         connection_attempt: Option<u64>,
+        pool_key_override: Option<String>,
     ) -> Result<String, String> {
         let config = {
             let configs = self.configs.read().await;
@@ -1163,7 +1164,8 @@ impl AppState {
         let validate_existing_pool = should_validate_existing_pool_before_reuse(config.db_type);
 
         let base_pool_key = base_pool_key_for(db_type, connection_id, database, false);
-        let pool_key = session_scoped_pool_key_for(Some(&config), base_pool_key.clone(), client_session_id);
+        let pool_key = pool_key_override
+            .unwrap_or_else(|| session_scoped_pool_key_for(Some(&config), base_pool_key.clone(), client_session_id));
 
         loop {
             self.wait_for_pool_drain(&pool_key).await;
@@ -1327,7 +1329,7 @@ impl AppState {
                     let connect_params = serde_json::json!({ "connection": agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or("")) });
                     let mut client = self.agent_manager.spawn(&DatabaseType::MongoDb, Some("mongodb-legacy")).await?;
                     client.connect(connect_params).await.map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
-                    PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
+                    PoolKind::Agent(db::agent_pool::AgentConnectionPool::new(client))
                 } else {
                     let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                         Ok(client) => match db::mongo_driver::test_connection(
@@ -1374,7 +1376,7 @@ impl AppState {
                                 mongo_legacy_error_with_auth_hint(&err)
                             )
                         })?;
-                        PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
+                        PoolKind::Agent(db::agent_pool::AgentConnectionPool::new(client))
                     } else {
                         return Err(native_err);
                     }
@@ -1454,6 +1456,11 @@ impl AppState {
                     agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or(""));
                 if db_config.db_type != DatabaseType::Etcd && db_config.db_type != DatabaseType::ZooKeeper {
                     let agent_session_id = uuid::Uuid::new_v4().simple().to_string();
+                    let agent_lane = if normalize_client_session_id(client_session_id).is_some() {
+                        db::agent_driver::AgentLane::Workload
+                    } else {
+                        db::agent_driver::AgentLane::Metadata
+                    };
                     let mut initial_result = self
                         .agent_manager
                         .spawn_shared_connection_client(
@@ -1463,6 +1470,7 @@ impl AppState {
                             agent_session_id.clone(),
                             connect_params,
                             agent_connect_timeout(&db_config),
+                            agent_lane,
                         )
                         .await;
                     if initial_result.as_ref().is_err_and(|err| {
@@ -1489,6 +1497,7 @@ impl AppState {
                                         db_config.effective_database().unwrap_or(""),
                                     ),
                                     agent_connect_timeout(&db_config),
+                                    agent_lane,
                                 )
                                 .await;
                             if !initial_result.as_ref().is_err_and(|err| is_connection_slot_exhausted_error(err)) {
@@ -1550,6 +1559,7 @@ impl AppState {
                                             agent_session_id.clone(),
                                             alternate_params,
                                             agent_connect_timeout(&alternate_config),
+                                            agent_lane,
                                         )
                                         .await
                                     {
@@ -1569,7 +1579,7 @@ impl AppState {
                             }
                         }
                     };
-                    PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
+                    PoolKind::Agent(db::agent_pool::AgentConnectionPool::new(client))
                 } else {
                     // Kerberos JVM properties are connection-scoped; shared agent daemons must not inherit them.
                     let mut client = self
@@ -1636,7 +1646,7 @@ impl AppState {
                             return Err(oracle_error_with_driver_hint(&db_config, &err));
                         }
                     }
-                    PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
+                    PoolKind::Agent(db::agent_pool::AgentConnectionPool::new(client))
                 }
             }
             DatabaseType::PrestoSql => {
@@ -2325,7 +2335,7 @@ impl AppState {
                 PoolKind::Agent(client) => {
                     let client = client.clone();
                     drop(connections);
-                    let mut agent = client.lock().await;
+                    let mut agent = client.metadata().await;
                     let timeout = crate::db::connection_timeout();
                     match agent.validate_connection(Some(timeout)).await {
                         Ok(_) => false,
@@ -2384,7 +2394,23 @@ impl AppState {
         let db_type = config.as_ref().map(|config| config.db_type);
         let base_pool_key = base_pool_key_for(db_type, connection_id, database, true);
         let pool_key = session_scoped_pool_key_for(config.as_ref(), base_pool_key, client_session_id);
-        if self.uses_forwarded_transport(connection_id).await {
+        let Some(_drain) = self.begin_pool_drain(&pool_key) else {
+            self.wait_for_pool_drain(&pool_key).await;
+            return self.get_or_create_pool_for_session(connection_id, database, client_session_id).await;
+        };
+        let uses_forwarded_transport = self.uses_forwarded_transport(connection_id).await;
+        if db_type == Some(DatabaseType::Dameng) && !uses_forwarded_transport {
+            return self
+                .replace_dameng_pool_atomically(
+                    connection_id,
+                    database,
+                    client_session_id,
+                    pool_key,
+                    config.expect("checked above"),
+                )
+                .await;
+        }
+        if uses_forwarded_transport {
             self.remove_connection_pools(connection_id).await;
             self.reset_connection_transport(connection_id).await;
         } else {
@@ -2393,10 +2419,59 @@ impl AppState {
             self.postgres_cancel_contexts.write().await.remove(&pool_key);
             let removed = self.connections.write().await.remove(&pool_key);
             if let Some(pool) = removed {
-                close_pool_kind_with_timeout(pool_key.clone(), pool).await;
+                if matches!(pool, PoolKind::Agent(_)) {
+                    close_removed_pools_in_background(&self.task_supervisor, vec![(pool_key.clone(), pool)]);
+                } else {
+                    close_pool_kind_with_timeout(pool_key.clone(), pool).await;
+                }
             }
         }
         self.get_or_create_pool_for_session(connection_id, database, client_session_id).await
+    }
+
+    async fn replace_dameng_pool_atomically(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: Option<&str>,
+        pool_key: String,
+        config: ConnectionConfig,
+    ) -> Result<String, String> {
+        let replacement_key = format!("{pool_key}:replacement:{}", uuid::Uuid::new_v4().simple());
+        self.get_or_create_pool_for_session_inner(
+            connection_id,
+            database,
+            client_session_id,
+            None,
+            Some(replacement_key.clone()),
+        )
+        .await?;
+
+        self.stop_keepalive_task(&replacement_key).await;
+        self.pool_activity.write().await.remove(&replacement_key);
+        let replacement = self
+            .connections
+            .write()
+            .await
+            .remove(&replacement_key)
+            .ok_or_else(|| "Validated Dameng replacement pool disappeared before activation".to_string())?;
+        if !matches!(replacement, PoolKind::Agent(_)) {
+            close_pool_kind_with_timeout(replacement_key, replacement).await;
+            return Err("Validated Dameng replacement is not an Agent pool".to_string());
+        }
+
+        self.stop_keepalive_task(&pool_key).await;
+        self.postgres_cancel_contexts.write().await.remove(&pool_key);
+        let retired = self.connections.write().await.insert(pool_key.clone(), replacement);
+        self.pool_activity.write().await.insert(pool_key.clone(), PoolActivity::now());
+        let active = self.connections.read().await.get(&pool_key).map(clone_pool_kind);
+        if let Some(active) = active.as_ref() {
+            self.start_keepalive_task(&pool_key, active, &config).await;
+        }
+        if let Some(retired) = retired {
+            close_removed_pools_in_background(&self.task_supervisor, vec![(pool_key.clone(), retired)]);
+        }
+        Ok(pool_key)
     }
 
     pub async fn close_client_session_pool(
@@ -2468,6 +2543,27 @@ impl AppState {
         }
     }
 
+    /// Removes a failed Agent generation from routing before starting cleanup.
+    /// A wedged JDBC close must never delay creation of the replacement session.
+    pub async fn quarantine_agent_pool_by_key(&self, pool_key: &str) -> bool {
+        self.stop_keepalive_task(pool_key).await;
+        self.pool_activity.write().await.remove(pool_key);
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
+        let removed = {
+            let mut connections = self.connections.write().await;
+            match connections.get(pool_key) {
+                Some(PoolKind::Agent(_)) => connections.remove(pool_key),
+                _ => None,
+            }
+        };
+        if let Some(pool) = removed {
+            close_removed_pools_in_background(&self.task_supervisor, vec![(pool_key.to_string(), pool)]);
+            true
+        } else {
+            false
+        }
+    }
+
     async fn reclaim_idle_base_pool_for_session(&self, connection_id: &str, preferred_base_pool_key: &str) -> bool {
         let pool_prefix = format!("{connection_id}:");
         let activity = self.pool_activity.read().await;
@@ -2515,7 +2611,7 @@ impl AppState {
         let removed = {
             let mut connections = self.connections.write().await;
             let exclusively_idle = match connections.get(pool_key) {
-                Some(PoolKind::Agent(client)) => Arc::strong_count(client) == 1 && client.try_lock().is_ok(),
+                Some(PoolKind::Agent(client)) => Arc::strong_count(client) == 1 && client.try_control().is_ok(),
                 _ => false,
             };
             exclusively_idle.then(|| connections.remove(pool_key)).flatten()
@@ -2797,7 +2893,7 @@ impl AppState {
                 _ => return Ok(None),
             }
         };
-        let mut agent = client.lock().await;
+        let mut agent = client.metadata().await;
         let info = agent.connection_info(Some(db::connection_timeout())).await?;
         Ok(Some(info.identifier_quote))
     }
@@ -2833,7 +2929,7 @@ impl AppState {
 
         match source {
             Some(ConnectionDatabaseInfoSource::Agent(client)) => {
-                let mut agent = client.lock().await;
+                let mut agent = client.metadata().await;
                 Ok(agent.connection_info(Some(db::connection_timeout())).await?.database_info)
             }
             Some(ConnectionDatabaseInfoSource::ExternalDriver { config, session }) => {
@@ -3071,7 +3167,7 @@ impl AppState {
                     }
                 }
                 PoolKind::Agent(client) => {
-                    let mut agent = client.lock().await;
+                    let mut agent = client.control().await;
                     match agent.test_connection(serde_json::json!({})).await {
                         Ok(_) => true,
                         Err(e) => {
@@ -3277,7 +3373,7 @@ enum KeepaliveTarget {
     HBase(db::hbase_driver::HBaseClient),
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
-    Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
+    Agent(Arc<db::agent_pool::AgentConnectionPool>),
 }
 
 fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Option<KeepaliveTarget> {
@@ -3328,7 +3424,7 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
         KeepaliveTarget::VectorDb(client) => db::vector_driver::test_connection(client, timeout).await,
         KeepaliveTarget::InfluxDb(client) => db::influxdb_driver::test_connection(client, timeout).await,
         KeepaliveTarget::Agent(client) => {
-            let Ok(mut client) = client.try_lock() else {
+            let Ok(mut client) = client.try_control() else {
                 return Ok(());
             };
             match client.validate_connection(Some(timeout)).await {
@@ -3581,7 +3677,7 @@ pub async fn close_pool_kind(pool: PoolKind) {
             drop(client);
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.control().await;
             let _ = client.disconnect().await;
         }
         PoolKind::ExternalTabular(_) => {}
@@ -3599,7 +3695,7 @@ async fn close_reclaimed_agent_pool(pool: PoolKind) -> Result<(), (PoolKind, Str
         pool => return Err((pool, "Only Agent pools can be reclaimed after connection slot exhaustion".to_string())),
     };
     let result = {
-        let mut client = client.lock().await;
+        let mut client = client.control().await;
         client.disconnect().await.map(|_| ())
     };
     match result {
@@ -4380,9 +4476,9 @@ mod tests {
     }
 
     fn agent_pool_stub() -> PoolKind {
-        PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(
+        PoolKind::Agent(crate::db::agent_pool::AgentConnectionPool::new(
             crate::db::agent_driver::AgentDriverClient::test_stub(),
-        )))
+        ))
     }
 
     #[tokio::test]
@@ -5313,15 +5409,15 @@ for line in sys.stdin:
         .await
         .unwrap();
         runtime.increment_session_count();
-        let client = std::sync::Arc::new(tokio::sync::Mutex::new(
+        let client = crate::db::agent_pool::AgentConnectionPool::new(
             crate::db::agent_driver::AgentDriverClient::shared_session(runtime.clone(), "metadata-session".to_string()),
-        ));
+        );
         state.connections.write().await.insert("conn:analytics".to_string(), PoolKind::Agent(client.clone()));
 
         let metadata_client = client.clone();
         drop(client);
         let metadata = tokio::spawn(async move {
-            metadata_client.lock().await.list_databases::<Vec<String>>(Some(Duration::from_secs(6))).await
+            metadata_client.metadata().await.list_databases::<Vec<String>>(Some(Duration::from_secs(6))).await
         });
         for _ in 0..100 {
             if metadata_started_path.exists() {

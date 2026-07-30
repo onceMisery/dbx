@@ -34,7 +34,8 @@ public final class BatchExecutor {
             applySchema(conn, schema, setSchemaSql, resetSchemaSql);
             long totalAffected = 0;
             int statementCount = 0;
-            try (Statement stmt = conn.createStatement()) {
+            try (Statement stmt = conn.createStatement();
+                 AutoCloseable ignored = JdbcExecutor.current().registerExternalStatement(stmt, 0)) {
                 for (String statement : statements) {
                     String trimmed = JdbcExecutor.trimSql(statement);
                     if (trimmed.isEmpty()) {

@@ -45,7 +45,7 @@ pub async fn get_agent_explain_info_core(
         "timeoutSecs": timeout_secs as i64,
         "mode": mode,
     });
-    let mut client = client.lock().await;
+    let mut client = client.workload().await;
     let result: Value = client.get_explain_info(params).await?;
     decode_agent_explain_result(result)
 }

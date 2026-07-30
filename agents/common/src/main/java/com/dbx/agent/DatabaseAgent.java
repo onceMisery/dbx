@@ -217,6 +217,12 @@ public interface DatabaseAgent {
 
     void disconnect();
 
+    default void beginOperation() { }
+
+    default void endOperation() { }
+
+    default void quarantineSession() { }
+
     Connection getConnection();
 
     default QueryResult executeTransaction(List<String> statements, String schema) {

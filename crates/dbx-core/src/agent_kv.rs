@@ -1239,7 +1239,7 @@ pub async fn kv_supports_ttl_core(state: &AppState, connection_id: &str) -> Resu
     let connections = state.connections.read().await;
     let pool = connections.get(connection_id).ok_or("Connection not found")?;
     match pool {
-        PoolKind::Agent(client) => Ok(client.lock().await.supports_capability(AgentCapability::KvTtl)),
+        PoolKind::Agent(client) => Ok(client.compatibility().await.supports_capability(AgentCapability::KvTtl)),
         _ => Err("Not an agent key-value connection".to_string()),
     }
 }
@@ -1265,7 +1265,7 @@ async fn call_agent_kv<T: serde::de::DeserializeOwned + Send + 'static>(
     let pool = connections.get(connection_id).ok_or("Connection not found")?;
     match pool {
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             if !client.supports_capability(AgentCapability::Kv) {
                 return Err("Agent does not support key-value operations".to_string());
             }

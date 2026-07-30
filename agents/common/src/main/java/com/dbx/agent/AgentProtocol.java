@@ -7,6 +7,7 @@ import java.util.List;
 public final class AgentProtocol {
     public static final int PROTOCOL_VERSION = 1;
     public static final int MULTI_SESSION_PROTOCOL_VERSION = 2;
+    public static final int RECOVERABLE_SESSION_PROTOCOL_VERSION = 3;
 
     public static final String METHOD_HANDSHAKE = "handshake";
     public static final String METHOD_CONNECT = "connect";
@@ -14,6 +15,9 @@ public final class AgentProtocol {
     public static final String METHOD_CLOSE_SESSION = "close_session";
     public static final String METHOD_VALIDATE_SESSION = "validate_session";
     public static final String METHOD_CANCEL_SESSION = "cancel_session";
+    public static final String METHOD_CANCEL_OPERATION = "cancel_operation";
+    public static final String METHOD_QUARANTINE_SESSION = "quarantine_session";
+    public static final String METHOD_SESSION_STATUS = "session_status";
     public static final String METHOD_TEST_CONNECTION = "test_connection";
     public static final String METHOD_VALIDATE_CONNECTION = "validate_connection";
     public static final String METHOD_CONNECTION_INFO = "connection_info";
@@ -85,6 +89,10 @@ public final class AgentProtocol {
     public static final String CAPABILITY_KV_STATUS = "kv_status";
     public static final String CAPABILITY_KV_HISTORY = "kv_history";
     public static final String CAPABILITY_MULTI_SESSION = "multi_session";
+    public static final String CAPABILITY_OPERATION_CONTROL = "operation_control";
+    public static final String CAPABILITY_SESSION_GENERATION = "session_generation";
+    public static final String CAPABILITY_LANE_ISOLATION = "lane_isolation";
+    public static final String CAPABILITY_STRUCTURED_AGENT_ERRORS = "structured_agent_errors";
 
     public static final List<String> CAPABILITIES = Collections.unmodifiableList(Arrays.asList(
         CAPABILITY_CONNECT,
@@ -148,6 +156,8 @@ public final class AgentProtocol {
     ));
 
     public static final List<String> MULTI_SESSION_METHODS;
+    public static final List<String> RECOVERABLE_SESSION_METHODS;
+    public static final List<String> RECOVERABLE_SESSION_CAPABILITIES;
 
     static {
         List<String> methods = new java.util.ArrayList<>(COMMON_METHODS);
@@ -159,6 +169,23 @@ public final class AgentProtocol {
             METHOD_CANCEL_SESSION
         ));
         MULTI_SESSION_METHODS = Collections.unmodifiableList(methods);
+
+        List<String> recoverableMethods = new java.util.ArrayList<>(methods);
+        int controlInsertAt = recoverableMethods.indexOf(METHOD_CANCEL_SESSION) + 1;
+        recoverableMethods.addAll(controlInsertAt, Arrays.asList(
+            METHOD_CANCEL_OPERATION,
+            METHOD_QUARANTINE_SESSION,
+            METHOD_SESSION_STATUS
+        ));
+        RECOVERABLE_SESSION_METHODS = Collections.unmodifiableList(recoverableMethods);
+
+        List<String> recoverableCapabilities = new java.util.ArrayList<>(CAPABILITIES);
+        recoverableCapabilities.add(CAPABILITY_MULTI_SESSION);
+        recoverableCapabilities.add(CAPABILITY_OPERATION_CONTROL);
+        recoverableCapabilities.add(CAPABILITY_SESSION_GENERATION);
+        recoverableCapabilities.add(CAPABILITY_LANE_ISOLATION);
+        recoverableCapabilities.add(CAPABILITY_STRUCTURED_AGENT_ERRORS);
+        RECOVERABLE_SESSION_CAPABILITIES = Collections.unmodifiableList(recoverableCapabilities);
     }
 
     public static final List<String> MONGO_LEGACY_METHODS = Collections.unmodifiableList(Arrays.asList(
@@ -199,6 +226,14 @@ public final class AgentProtocol {
         List<String> capabilities = new java.util.ArrayList<>(CAPABILITIES);
         capabilities.add(CAPABILITY_MULTI_SESSION);
         return new HandshakeResult(MULTI_SESSION_PROTOCOL_VERSION, MULTI_SESSION_PROTOCOL_VERSION, capabilities);
+    }
+
+    public static HandshakeResult recoverableSessionHandshakeResult() {
+        return new HandshakeResult(
+            RECOVERABLE_SESSION_PROTOCOL_VERSION,
+            RECOVERABLE_SESSION_PROTOCOL_VERSION,
+            RECOVERABLE_SESSION_CAPABILITIES
+        );
     }
 
     public static final class HandshakeResult {

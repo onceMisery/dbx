@@ -405,7 +405,7 @@ async fn fetch_table_export_batch(
                 };
                 let client = client.clone();
                 drop(connections);
-                let mut client = client.lock().await;
+                let mut client = client.workload().await;
                 match client.start_table_read::<QueryResult>(params).await {
                     Ok(result) => {
                         *cursor_session = result.session_id.clone().map(TableExportCursorSession::Agent);
@@ -458,7 +458,7 @@ async fn fetch_table_export_batch(
                 };
                 let client = client.clone();
                 drop(connections);
-                let mut client = client.lock().await;
+                let mut client = client.workload().await;
                 match client.fetch_table_read_page::<QueryResult>(&session_id, active_batch_size).await {
                     Ok(result) => {
                         *cursor_session =
@@ -571,7 +571,7 @@ async fn close_table_export_cursor_if_open(
             };
             let client = client.clone();
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.workload().await;
             let _ = client.close_table_read_session::<bool>(&session_id).await;
         }
         TableExportCursorSession::ExternalDriver(session_id) => {

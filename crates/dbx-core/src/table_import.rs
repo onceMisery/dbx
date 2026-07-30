@@ -4096,7 +4096,7 @@ async fn kingbase_oracle_compatibility_mode(state: &AppState, pool_key: &str, db
             _ => return false,
         }
     };
-    let mut agent = client.lock().await;
+    let mut agent = client.workload().await;
     agent
         .connection_info(Some(crate::db::connection_timeout()))
         .await

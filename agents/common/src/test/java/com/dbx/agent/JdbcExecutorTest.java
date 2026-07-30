@@ -1,11 +1,13 @@
 package com.dbx.agent;
 
+import com.dbx.agent.jdbc.PreparedQuery;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -17,12 +19,45 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.sql.rowset.serial.SerialBlob;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class JdbcExecutorTest {
+    @Test
+    void preparedQueryRegistersBeforeDriverExecutionAndUnregistersAfterwards() {
+        JdbcExecutor executor = new JdbcExecutor();
+        AtomicInteger cancelCalls = new AtomicInteger();
+        AtomicBoolean firstRow = new AtomicBoolean(true);
+        ResultSet resultSet = proxy(ResultSet.class, (method, args) -> switch (method.getName()) {
+            case "next" -> firstRow.getAndSet(false);
+            case "getString" -> "APP";
+            default -> defaultValue(method.getReturnType());
+        });
+        PreparedStatement statement = proxy(PreparedStatement.class, (method, args) -> switch (method.getName()) {
+            case "executeQuery" -> {
+                executor.cancelActiveStatements();
+                yield resultSet;
+            }
+            case "cancel" -> {
+                cancelCalls.incrementAndGet();
+                yield null;
+            }
+            default -> defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (method, args) ->
+            "prepareStatement".equals(method.getName()) ? statement : defaultValue(method.getReturnType())
+        );
+
+        List<String> rows = executor.query(connection, PreparedQuery.of("SELECT NAME FROM TEST"), 5, rs -> rs.getString(1));
+        executor.cancelActiveStatements();
+
+        assertEquals(List.of("APP"), rows);
+        assertEquals(1, cancelCalls.get());
+    }
+
     @Test
     void stringResultValueFormatsBlobWithoutUsingStringConversion() throws Exception {
         ResultSet rs = resultSet(
@@ -357,6 +392,19 @@ class JdbcExecutorTest {
             return '\0';
         }
         return null;
+    }
+
+    private static <T> T proxy(Class<T> type, MethodHandler handler) {
+        return type.cast(Proxy.newProxyInstance(
+            type.getClassLoader(),
+            new Class<?>[]{type},
+            (unused, method, args) -> handler.invoke(method, args)
+        ));
+    }
+
+    @FunctionalInterface
+    private interface MethodHandler {
+        Object invoke(Method method, Object[] args) throws Throwable;
     }
 
     private interface StringSupplier {

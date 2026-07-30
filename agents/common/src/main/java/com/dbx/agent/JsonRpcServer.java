@@ -20,6 +20,8 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import com.dbx.agent.runtime.OperationContext;
+import com.dbx.agent.runtime.OperationRegistry;
 
 public final class JsonRpcServer {
     private static final long CONNECTION_VALIDATION_INTERVAL_MILLIS = 5_000L;
@@ -92,9 +94,37 @@ public final class JsonRpcServer {
         return AgentExecutionContext.withJdbcExecutor(jdbcExecutor, () -> dispatch(method, params));
     }
 
+    Object dispatchForRuntime(
+        String method,
+        JsonObject params,
+        OperationContext operationContext,
+        OperationRegistry operationRegistry
+    ) throws Exception {
+        return AgentExecutionContext.withJdbcExecutor(
+            jdbcExecutor,
+            operationContext,
+            operationRegistry,
+            () -> dispatch(method, params)
+        );
+    }
+
     void cancelActiveStatements() {
         jdbcExecutor.cancelActiveStatements();
     }
+
+    void beginOperation(String method) {
+        if (AgentProtocol.METHOD_FETCH_QUERY_PAGE.equals(method)
+            || AgentProtocol.METHOD_CLOSE_QUERY_SESSION.equals(method)
+            || AgentProtocol.METHOD_FETCH_TABLE_READ_PAGE.equals(method)
+            || AgentProtocol.METHOD_CLOSE_TABLE_READ_SESSION.equals(method)) {
+            return;
+        }
+        AgentExecutionContext.runWithJdbcExecutor(jdbcExecutor, agent::beginOperation);
+    }
+    void endOperation() {
+        AgentExecutionContext.runWithJdbcExecutor(jdbcExecutor, agent::endOperation);
+    }
+    void quarantineSession() { agent.quarantineSession(); }
 
     private Object dispatch(String method, JsonObject params) throws Exception {
         if (AgentProtocol.METHOD_HANDSHAKE.equals(method)) {

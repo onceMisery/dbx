@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::connection::{AppState, PoolKind, TransactionSession, TxnConnection};
 use crate::database_capabilities;
 use crate::db;
+use crate::db::agent_driver::{AgentConnectionDisposition, AgentMethod, AgentRpcError};
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query_execution_sql::is_write_sql;
 #[cfg(feature = "duckdb-bundled")]
@@ -961,6 +962,25 @@ fn should_discard_agent_pool_after_error(err: &str) -> bool {
         || lower.contains("failed to write to agent stdin")
         || lower.contains("failed to flush agent stdin")
         || lower.contains("agent rpc task failed")
+        || lower.contains("agent runtime is unavailable")
+        || lower.contains("agent runtime terminated")
+        || lower.contains("agent response channel closed")
+}
+
+fn should_discard_agent_rpc_error(err: &AgentRpcError) -> bool {
+    match err.connection_disposition() {
+        Some(AgentConnectionDisposition::Reusable) => false,
+        Some(
+            AgentConnectionDisposition::InvalidateLease
+            | AgentConnectionDisposition::QuarantineSession
+            | AgentConnectionDisposition::ReplaceProcess,
+        ) => true,
+        None => should_discard_agent_pool_after_error(&err.to_string()),
+    }
+}
+
+pub fn is_agent_recovery_error(err: &str) -> bool {
+    should_discard_agent_pool_after_error(err)
 }
 
 pub fn pool_error_action(db_type: Option<DatabaseType>, err: &str) -> PoolErrorAction {
@@ -1653,16 +1673,43 @@ pub async fn do_execute(
                 return Err(canceled_error());
             }
             let cancel_for_agent = cancel_token.clone();
-            let result = async move {
+            let concurrent_handle = {
+                let client = client.workload().await;
+                client.concurrent_session_handle()
+            };
+            let uses_concurrent_handle = concurrent_handle.is_some();
+            let result = if let Some(handle) = concurrent_handle {
+                let (method, params) = if let Some(session_id) = options.result_session_id.as_deref() {
+                    (
+                        AgentMethod::FetchQueryPage,
+                        agent_fetch_query_page_params(session_id, options.page_size.unwrap_or(MAX_ROWS)),
+                    )
+                } else if options.page_size.is_some() {
+                    (
+                        AgentMethod::ExecuteQueryPage,
+                        agent_execute_query_page_params(&sql, database.as_deref(), schema.as_deref(), options),
+                    )
+                } else {
+                    (
+                        AgentMethod::ExecuteQuery,
+                        agent_execute_query_params(&sql, database.as_deref(), schema.as_deref(), options),
+                    )
+                };
+                let result = handle.call(method, params, rpc_timeout, cancel_for_agent.clone()).await;
+                if matches!(result.as_ref(), Err(error) if should_discard_agent_rpc_error(error)) {
+                    state.quarantine_agent_pool_by_key(pool_key).await;
+                }
+                result.map_err(|error| error.to_string())
+            } else {
                 let mut client = match cancel_for_agent.as_ref() {
                     Some(token) => {
                         tokio::select! {
                             biased;
                             _ = token.cancelled() => return Err(canceled_error()),
-                            guard = client.lock() => guard,
+                            guard = client.workload() => guard,
                         }
                     }
-                    None => client.lock().await,
+                    None => client.workload().await,
                 };
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = agent_fetch_query_page_params(session_id, options.page_size.unwrap_or(MAX_ROWS));
@@ -1676,16 +1723,12 @@ pub async fn do_execute(
                     let params = agent_execute_query_params(&sql, database.as_deref(), schema.as_deref(), options);
                     client.execute_query_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone()).await
                 }
+            };
+            let discard_legacy = matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED || should_discard_pool_after_error(pool_db_type, err));
+            if !uses_concurrent_handle && discard_legacy {
+                state.quarantine_agent_pool_by_key(pool_key).await;
             }
-            .await
-            .map(|result| truncate_result_with_max_rows(result, max_rows));
-            if matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED) {
-                state.remove_pool_by_key(pool_key).await;
-            }
-            if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
-                state.remove_pool_by_key(pool_key).await;
-            }
-            result
+            result.map(|result| truncate_result_with_max_rows(result, max_rows))
         }
         #[cfg(feature = "duckdb-bundled")]
         PoolKind::ExternalTabular(ext_pool) => {
@@ -1998,7 +2041,7 @@ pub async fn close_query_session(
         PoolKind::Agent(client) => {
             let client = client.clone();
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.workload().await;
             client.close_query_session(session_id).await
         }
         PoolKind::ExternalDriver { config, session, .. } => {
@@ -2559,7 +2602,7 @@ pub async fn execute_statements(
         } else {
             statements
         };
-        let mut client = client.lock().await;
+        let mut client = client.workload().await;
         let database = if database.trim().is_empty() { None } else { Some(database) };
         let timeout_duration = timeout_secs.map(Duration::from_secs);
         let result: Result<db::QueryResult, String> =
@@ -3258,7 +3301,7 @@ async fn exec_tx_explicit_inner(
         } else {
             statements
         };
-        let mut client = client.lock().await;
+        let mut client = client.workload().await;
         let result: db::QueryResult = client.execute_transaction(database, statements, execution_schema).await?;
         return Ok(db::QueryResult { execution_time_ms: start.elapsed().as_millis(), ..result });
     }

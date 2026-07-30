@@ -1,10 +1,13 @@
 use serde::de::DeserializeOwned;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::agent_manager::{AgentManager, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
-use crate::db::agent_driver::{AgentDriverClient, AgentMethod, AgentRuntimeClient};
+use crate::db::agent_driver::{AgentDriverClient, AgentLane, AgentMethod, AgentRuntimeClient};
 use crate::models::connection::DatabaseType;
+
+static NEXT_AGENT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub fn db_type_to_agent_key(db_type: &DatabaseType, driver_profile: Option<&str>) -> Option<&'static str> {
     database_capabilities::agent_key(db_type, driver_profile)
@@ -64,6 +67,7 @@ pub async fn spawn_shared_connection_client(
     agent_session_id: String,
     connect_params: serde_json::Value,
     connect_timeout: Duration,
+    lane: AgentLane,
 ) -> Result<AgentDriverClient, String> {
     let keys = runtime_agent_key_candidates(db_type, driver_profile)
         .ok_or_else(|| format!("{:?} is not an agent-driven database type", db_type))?;
@@ -73,10 +77,6 @@ pub async fn spawn_shared_connection_client(
     let launch = manager.resolve_agent_launch_spec_with_extra_args(&state, key, jre_key, extra_java_args)?;
     let runtime_key = shared_runtime_key(key, &launch);
     let mut session_params = connect_params;
-    session_params
-        .as_object_mut()
-        .ok_or_else(|| "Agent connect parameters must be an object".to_string())?
-        .insert("agentSessionId".to_string(), serde_json::Value::String(agent_session_id.clone()));
 
     let (runtime_cell, runtime) = loop {
         let runtime_cell = {
@@ -99,14 +99,34 @@ pub async fn spawn_shared_connection_client(
             break (runtime_cell, runtime);
         }
     };
+    if *db_type == DatabaseType::Dameng && !runtime.handshake().supports_recovery_protocol() {
+        forget_unused_runtime_after_failed_open(manager, &runtime_key, &runtime_cell, &runtime).await;
+        return Err(
+            "Dameng Agent does not provide the required protocol v3 timeout-recovery capabilities; update the Dameng driver bundle"
+                .to_string(),
+        );
+    }
+    let generation = if runtime.handshake().supports_recovery_protocol() {
+        NEXT_AGENT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
+    let object =
+        session_params.as_object_mut().ok_or_else(|| "Agent connect parameters must be an object".to_string())?;
+    object.insert("agentSessionId".to_string(), serde_json::Value::String(agent_session_id.clone()));
+    if generation > 0 {
+        object.insert("generation".to_string(), serde_json::Value::from(generation));
+        object.insert("operationId".to_string(), serde_json::Value::String(uuid::Uuid::new_v4().to_string()));
+        object.insert("lane".to_string(), serde_json::Value::String(lane.as_str().to_string()));
+    }
     if let Err(err) = runtime
         .call::<serde_json::Value>(AgentMethod::OpenSession.as_str(), session_params, Some(connect_timeout), None)
         .await
     {
         forget_unused_runtime_after_failed_open(manager, &runtime_key, &runtime_cell, &runtime).await;
-        return Err(err);
+        return Err(err.to_string());
     }
-    Ok(AgentDriverClient::shared_session(runtime, agent_session_id))
+    Ok(AgentDriverClient::shared_session_with_context(runtime, agent_session_id, generation, lane))
 }
 
 async fn forget_unused_runtime_after_failed_open(
@@ -418,7 +438,7 @@ for line in sys.stdin:
         assert!(runtime.is_failed());
         let call_result =
             runtime.call::<serde_json::Value>("ping", serde_json::json!({}), Some(Duration::from_secs(1)), None).await;
-        assert_eq!(call_result.unwrap_err(), "Agent runtime is unavailable");
+        assert_eq!(call_result.unwrap_err().to_string(), "Agent runtime is unavailable");
         let _ = std::fs::remove_file(script_path);
     }
 }

@@ -67,6 +67,43 @@ class CommonJavaCompatibilityTest {
     }
 
     @Test
+    void recoverableSessionProtocolMatchesV3ContractResource() {
+        JsonObject contract = protocolContract("/agent-protocol-v3.json");
+
+        assertEquals(AgentProtocol.RECOVERABLE_SESSION_PROTOCOL_VERSION, contract.get("protocolVersion").getAsInt());
+        assertEquals(AgentProtocol.RECOVERABLE_SESSION_CAPABILITIES, strings(contract.getAsJsonArray("capabilities")));
+        assertEquals(
+            Arrays.asList("cancel_operation", "quarantine_session", "session_status", "close_session"),
+            strings(contract.getAsJsonArray("controlMethods"))
+        );
+        assertEquals(
+            Arrays.asList("agentSessionId", "generation", "operationId", "lane"),
+            strings(contract.getAsJsonArray("requiredRequestFields"))
+        );
+    }
+
+    @Test
+    void recoverableSessionHandshakeIsOptIn() {
+        MultiSessionJsonRpcServer legacy = new MultiSessionJsonRpcServer(MinimalAgent::new);
+        MultiSessionJsonRpcServer recoverable = new MultiSessionJsonRpcServer(MinimalAgent::new, true);
+
+        JsonObject legacyHandshake = JsonParser.parseString(legacy.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"handshake\",\"params\":{}}"
+        )).getAsJsonObject().getAsJsonObject("result");
+        JsonObject recoverableHandshake = JsonParser.parseString(recoverable.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"handshake\",\"params\":{}}"
+        )).getAsJsonObject().getAsJsonObject("result");
+
+        assertEquals(2, legacyHandshake.get("protocolVersion").getAsInt());
+        assertFalse(containsCapability(legacyHandshake.getAsJsonArray("capabilities"), "operation_control"));
+        assertEquals(3, recoverableHandshake.get("protocolVersion").getAsInt());
+        assertTrue(containsCapability(recoverableHandshake.getAsJsonArray("capabilities"), "operation_control"));
+        assertTrue(containsCapability(recoverableHandshake.getAsJsonArray("capabilities"), "session_generation"));
+        assertTrue(containsCapability(recoverableHandshake.getAsJsonArray("capabilities"), "lane_isolation"));
+        assertTrue(containsCapability(recoverableHandshake.getAsJsonArray("capabilities"), "structured_agent_errors"));
+    }
+
+    @Test
     void jsonRpcServerExposesProtocolHandshake() {
         JsonRpcServer server = new JsonRpcServer(new MinimalAgent());
 
@@ -189,6 +226,71 @@ class CommonJavaCompatibilityTest {
     }
 
     @Test
+    void recoverableControlPlaneCancelsBlockedOperationWithoutWaitingForDataLock() throws Exception {
+        CancelTrackingAgent agent = new CancelTrackingAgent();
+        MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(() -> agent, true);
+        server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"open_session\",\"params\":{\"agentSessionId\":\"workload\",\"generation\":1,\"operationId\":\"open-workload\",\"lane\":\"WORKLOAD\"}}"
+        );
+        Thread query = new Thread(() -> server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"execute_query\",\"params\":{\"agentSessionId\":\"workload\",\"generation\":1,\"operationId\":\"op-1\",\"lane\":\"WORKLOAD\",\"sql\":\"SELECT 1\"}}"
+        ));
+        query.start();
+        assertTrue(agent.statementStarted.await(5, TimeUnit.SECONDS));
+
+        long started = System.nanoTime();
+        JsonObject result = JsonParser.parseString(server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"cancel_operation\",\"params\":{\"agentSessionId\":\"workload\",\"generation\":1,\"operationId\":\"op-1\"}}"
+        )).getAsJsonObject().getAsJsonObject("result");
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertTrue(result.get("accepted").getAsBoolean());
+        assertTrue(elapsedMillis < 1_000L, "control request must not wait for the data lock");
+        assertTrue(agent.release.await(1, TimeUnit.SECONDS), "cancel worker should reach the driver");
+        assertTrue(agent.canceled.get());
+        query.join(5_000L);
+        assertFalse(query.isAlive());
+    }
+
+    @Test
+    void recoverableSessionRejectsLaneChanges() {
+        MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(MinimalAgent::new, true);
+        server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"open_session\",\"params\":{\"agentSessionId\":\"shared\",\"generation\":1,\"operationId\":\"open-shared\",\"lane\":\"WORKLOAD\"}}"
+        );
+        JsonObject response = JsonParser.parseString(server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"execute_query\",\"params\":{\"agentSessionId\":\"shared\",\"generation\":1,\"operationId\":\"meta\",\"lane\":\"METADATA\",\"sql\":\"SELECT 1\"}}"
+        )).getAsJsonObject();
+
+        assertTrue(response.has("error"));
+        assertTrue(response.getAsJsonObject("error").get("message").getAsString().contains("lane mismatch"));
+    }
+
+    @Test
+    void quarantinedRecoverableSessionRejectsNewDataRequests() {
+        MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(MinimalAgent::new, true);
+        server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"open_session\",\"params\":{\"agentSessionId\":\"metadata\",\"generation\":4,\"operationId\":\"open-metadata\",\"lane\":\"METADATA\"}}"
+        );
+        server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"quarantine_session\",\"params\":{\"agentSessionId\":\"metadata\",\"generation\":4,\"reason\":\"timeout\"}}"
+        );
+        JsonObject response = JsonParser.parseString(server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"list_schemas\",\"params\":{\"agentSessionId\":\"metadata\",\"generation\":4,\"operationId\":\"late\",\"lane\":\"METADATA\"}}"
+        )).getAsJsonObject();
+
+        assertTrue(response.has("error"));
+        JsonObject error = response.getAsJsonObject("error");
+        assertTrue(error.get("message").getAsString().contains("quarantined"));
+        JsonObject data = error.getAsJsonObject("data");
+        assertEquals("SESSION_QUARANTINED", data.get("category").getAsString());
+        assertEquals("QUARANTINE_SESSION", data.get("connectionDisposition").getAsString());
+        assertEquals("late", data.get("operationId").getAsString());
+        assertEquals("metadata", data.get("agentSessionId").getAsString());
+        assertEquals(4L, data.get("generation").getAsLong());
+    }
+
+    @Test
     void cancelActiveStatementsClosesOnlyThatExecutorPagedSessions() {
         JdbcExecutor target = new JdbcExecutor();
         JdbcExecutor other = new JdbcExecutor();
@@ -219,6 +321,25 @@ class CommonJavaCompatibilityTest {
         assertTrue(targetCalls.contains("resultSet.close"));
         assertTrue(targetCalls.contains("statement.close"));
         assertFalse(otherCalls.contains("resultSet.close"));
+    }
+
+    @Test
+    void operationLifecycleUsesTheSessionJdbcExecutor() {
+        LifecycleContextAgent agent = new LifecycleContextAgent();
+        JsonRpcServer server = new JsonRpcServer(agent);
+
+        server.beginOperation(AgentProtocol.METHOD_EXECUTE_QUERY);
+        try {
+            server.dispatchForRuntime(AgentProtocol.METHOD_EXECUTE_QUERY, JsonParser.parseString(
+                "{\"sql\":\"SELECT 1\",\"maxRows\":1,\"timeoutSecs\":1}"
+            ).getAsJsonObject());
+        } catch (Exception error) {
+            throw new AssertionError(error);
+        } finally {
+            server.endOperation();
+        }
+
+        assertTrue(agent.lifecycleSharedExecutor.get());
     }
 
     @Test
@@ -697,6 +818,27 @@ class CommonJavaCompatibilityTest {
         @Override
         public Connection getConnection() {
             return connection;
+        }
+    }
+
+    private static final class LifecycleContextAgent extends MinimalAgent {
+        private JdbcExecutor operationExecutor;
+        private final AtomicBoolean lifecycleSharedExecutor = new AtomicBoolean();
+
+        @Override
+        public void beginOperation() {
+            operationExecutor = JdbcExecutor.current();
+        }
+
+        @Override
+        public QueryResult executeQuery(String sql, String schema, ExecuteQueryOptions options) {
+            assertTrue(operationExecutor == JdbcExecutor.current());
+            return new QueryResult(Collections.emptyList(), Collections.emptyList(), 0L, 0L);
+        }
+
+        @Override
+        public void endOperation() {
+            lifecycleSharedExecutor.set(operationExecutor == JdbcExecutor.current());
         }
     }
 

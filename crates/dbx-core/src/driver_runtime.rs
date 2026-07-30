@@ -159,7 +159,7 @@ async fn collect_runtime_seeds(state: &AppState) -> Vec<RuntimeSeed> {
                     config.driver_profile.as_deref(),
                 )
                 .unwrap_or("agent");
-                let client = client.lock().await;
+                let client = client.compatibility().await;
                 let last_error = non_empty(client.stderr_tail_snapshot());
                 let protocol_mode = client.protocol_mode();
                 let runtime_id = if protocol_mode == "multi_session" {

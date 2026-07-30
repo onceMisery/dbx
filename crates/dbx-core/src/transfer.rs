@@ -2918,7 +2918,7 @@ async fn execute_on_pool_once(
             let database = database_from_pool_key(pool_key).map(str::to_string);
             let sql = sql.to_string();
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.workload().await;
             let params = agent_execute_query_params(
                 &sql,
                 database.as_deref(),
@@ -3096,7 +3096,7 @@ pub async fn get_columns_for_transfer(
         let schema = schema.to_string();
         let table = table.to_string();
         drop(connections);
-        let mut client = client.lock().await;
+        let mut client = client.workload().await;
         return client.get_columns(&database, &schema, &table, None).await;
     }
     let pool = connections.get(pool_key).ok_or("Pool not found")?;

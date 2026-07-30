@@ -86,7 +86,8 @@ public final class TransactionExecutor {
         applySchema(conn, schema, setSchemaSql, resetSchemaSql);
         long totalAffected = 0;
         for (String statement : statements) {
-            try (Statement stmt = conn.createStatement()) {
+            try (Statement stmt = conn.createStatement();
+                 AutoCloseable ignored = JdbcExecutor.current().registerExternalStatement(stmt, 0)) {
                 totalAffected += runner.run(stmt, JdbcExecutor.trimSql(statement));
             }
         }

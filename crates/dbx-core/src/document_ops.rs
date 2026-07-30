@@ -57,7 +57,7 @@ pub async fn list_databases_core(state: &AppState, connection_id: &str) -> Resul
         PoolKind::Elasticsearch(_) => Ok(vec!["default".to_string()]),
         PoolKind::VectorDb(client) => vector_driver::list_databases(client).await,
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             match client.mongo_list_databases::<Vec<serde_json::Value>>().await {
                 Ok(result) => {
                     Ok(sort_names(result.iter().filter_map(|v| v.get("name")?.as_str().map(String::from)).collect()))
@@ -228,7 +228,7 @@ pub async fn list_collections_core(
         }
         PoolKind::VectorDb(client) => vector_driver::list_collections_with_db(client, database).await,
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let names = sort_names(client.mongo_list_collections(database).await?);
             let mut infos = mongo_bucket_infos(&names);
             // Legacy agent returns names only; treat every entry as a plain collection.
@@ -401,7 +401,7 @@ pub async fn find_documents_core(
             vector_driver::find_documents(&client, database, collection, skip, limit).await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let mut params = serde_json::json!({
                 "database": database,
                 "collection": collection,
@@ -466,7 +466,7 @@ pub async fn insert_document_core(
             elasticsearch_driver::insert_document(&client, collection, doc_json, routing).await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let result: serde_json::Value = client
                 .mongo_insert_document(serde_json::json!({
                     "database": database,
@@ -501,7 +501,7 @@ pub async fn update_document_core(
             elasticsearch_driver::update_document(&client, collection, id, doc_json, routing).await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let result: serde_json::Value = client
                 .mongo_update_document(serde_json::json!({
                     "database": database,
@@ -536,7 +536,7 @@ pub async fn delete_document_core(
             elasticsearch_driver::delete_document(&client, collection, id, routing).await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let result: serde_json::Value =
                 client.mongo_delete_document(mongo_document_id_params(database, collection, id)).await?;
             Ok(result.get("deleted_count").and_then(|v| v.as_u64()).unwrap_or(0))

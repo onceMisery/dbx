@@ -886,6 +886,7 @@ impl AgentManager {
         agent_session_id: String,
         connect_params: serde_json::Value,
         connect_timeout: std::time::Duration,
+        lane: crate::db::agent_driver::AgentLane,
     ) -> Result<AgentDriverClient, String> {
         crate::agent_runtime::spawn_shared_connection_client(
             self,
@@ -895,6 +896,7 @@ impl AgentManager {
             agent_session_id,
             connect_params,
             connect_timeout,
+            lane,
         )
         .await
     }

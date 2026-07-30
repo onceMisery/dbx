@@ -1,0 +1,11 @@
+{
+  "protocolVersion": 3,
+  "handshakeMethod": "handshake",
+  "handshakeResponseFields": ["protocolVersion", "agentProtocolVersion", "capabilities"],
+  "capabilities": ["connect", "test_connection", "metadata", "query", "paged_query", "transaction", "ddl", "multi_session", "operation_control", "session_generation", "lane_isolation", "structured_agent_errors"],
+  "controlMethods": ["cancel_operation", "quarantine_session", "session_status", "close_session"],
+  "requiredRequestFields": ["agentSessionId", "generation", "operationId", "lane"],
+  "errorDataFields": ["category", "retryable", "connectionDisposition", "operationId", "agentSessionId", "generation", "driverCode"],
+  "errorCategories": ["QUERY_TIMEOUT", "CANCELLED", "CONNECTION_BROKEN", "SESSION_QUARANTINED", "STALE_GENERATION", "CHECKOUT_TIMEOUT", "AGENT_OVERLOADED", "AGENT_UNAVAILABLE", "DATABASE_ERROR"],
+  "connectionDispositions": ["REUSABLE", "INVALIDATE_LEASE", "QUARANTINE_SESSION", "REPLACE_PROCESS"]
+}

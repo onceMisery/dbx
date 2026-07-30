@@ -17,6 +17,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -29,6 +30,31 @@ class DamengAgentTest extends JdbcFakeExecutionBehaviorTest {
     @Override
     protected String resultSetSql() {
         return "CALL SP_SAMPLE()";
+    }
+
+    @Test
+    void testConnectionSeamKeepsProviderAvailableAcrossOperationBoundaries() {
+        DamengAgent agent = new DamengAgent();
+        java.sql.Connection connection = JdbcAgentFake.connection();
+        TestSupport.setPrivateConnection(agent, connection);
+
+        agent.endOperation();
+        agent.beginOperation();
+
+        assertSame(connection, agent.getConnection());
+        agent.disconnect();
+    }
+
+    @Test
+    void testConnectionSeamCanReplaceAnActiveLease() {
+        DamengAgent agent = new DamengAgent();
+        java.sql.Connection replacement = JdbcAgentFake.connection();
+        TestSupport.setPrivateConnection(agent, JdbcAgentFake.connection());
+
+        TestSupport.setPrivateConnection(agent, replacement);
+
+        assertSame(replacement, agent.getConnection());
+        agent.disconnect();
     }
 
     @Test

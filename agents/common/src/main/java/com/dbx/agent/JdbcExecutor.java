@@ -1,10 +1,15 @@
 package com.dbx.agent;
 
+import com.dbx.agent.jdbc.PreparedQuery;
+import com.dbx.agent.jdbc.ExecutedStatementMapper;
+import com.dbx.agent.jdbc.RowMapper;
+import com.dbx.agent.jdbc.StatementRegistration;
 import java.sql.Connection;
 import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.SQLWarning;
 import java.sql.SQLXML;
@@ -35,6 +40,72 @@ public final class JdbcExecutor {
 
     public static JdbcExecutor current() {
         return AgentExecutionContext.jdbcExecutor();
+    }
+
+    /**
+     * Executes a parameterized read through the same timeout and cancellation
+     * boundary as user SQL. Registration happens before the driver can block.
+     */
+    public <T> List<T> query(Connection connection, PreparedQuery query, int timeoutSecs, RowMapper<T> mapper) {
+        return unchecked(() -> {
+            try (PreparedStatement statement = connection.prepareStatement(query.sql());
+                 StatementRegistration ignored = register(statement, timeoutSecs)) {
+                bind(statement, query.arguments());
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    List<T> rows = new ArrayList<>();
+                    while (resultSet.next()) {
+                        rows.add(mapper.map(resultSet));
+                    }
+                    return rows;
+                }
+            }
+        });
+    }
+
+    public <T> List<T> queryStatement(Connection connection, String sql, int timeoutSecs, RowMapper<T> mapper) {
+        return unchecked(() -> {
+            try (Statement statement = connection.createStatement();
+                 StatementRegistration ignored = register(statement, timeoutSecs);
+                 ResultSet resultSet = statement.executeQuery(sql)) {
+                List<T> rows = new ArrayList<>();
+                while (resultSet.next()) {
+                    rows.add(mapper.map(resultSet));
+                }
+                return rows;
+            }
+        });
+    }
+
+    public void executeStatement(Connection connection, String sql, int timeoutSecs) {
+        unchecked(() -> {
+            try (Statement statement = connection.createStatement();
+                 StatementRegistration ignored = register(statement, timeoutSecs)) {
+                statement.execute(sql);
+                return null;
+            }
+        });
+    }
+
+    public <T> T executeObserved(
+        Connection connection,
+        String sql,
+        int timeoutSecs,
+        ExecutedStatementMapper<T> mapper
+    ) {
+        return unchecked(() -> {
+            try (Statement statement = connection.createStatement();
+                 StatementRegistration ignored = register(statement, timeoutSecs)) {
+                boolean hasResultSet = statement.execute(sql);
+                if (hasResultSet) {
+                    try (ResultSet resultSet = statement.getResultSet()) {
+                        while (resultSet.next()) {
+                            // Fully consume autotrace results before asking the driver for its plan.
+                        }
+                    }
+                }
+                return mapper.map(connection, statement);
+            }
+        });
     }
 
     public QueryResult execute(Connection conn, String sql, String schema, Function<String, String> setSchemaSql) {
@@ -96,6 +167,7 @@ public final class JdbcExecutor {
 
             try (Statement stmt = conn.createStatement()) {
                 activeStatements.add(stmt);
+                AutoCloseable operationRegistration = AgentExecutionContext.registerStatement(stmt);
                 try {
                 int effectiveMaxRows = Math.max(maxRows, 1);
                 stmt.setMaxRows(effectiveMaxRows + 1);
@@ -125,6 +197,7 @@ public final class JdbcExecutor {
                 return withStatementWarnings(result, stmt);
                 } finally {
                     activeStatements.remove(stmt);
+                    closeRegistration(operationRegistration);
                 }
             }
         });
@@ -255,6 +328,7 @@ public final class JdbcExecutor {
 
             Statement stmt = conn.createStatement();
             activeStatements.add(stmt);
+            AutoCloseable operationRegistration = AgentExecutionContext.registerStatement(stmt);
             try {
                 applyQueryTimeout(stmt, options.getTimeoutSecs());
                 if (options.getFetchSize() != null && options.getFetchSize() > 0) {
@@ -267,6 +341,7 @@ public final class JdbcExecutor {
                 if (!hasResultSet) {
                     int updateCount = stmt.getUpdateCount();
                     activeStatements.remove(stmt);
+                    closeRegistration(operationRegistration);
                     stmt.close();
                     return new QueryPageResult(
                         Collections.emptyList(),
@@ -301,12 +376,14 @@ public final class JdbcExecutor {
                     sqlTypeByIndex,
                     typeNameByIndex,
                     Math.max(options.getMaxRows(), 1),
-                    valueReader
+                    valueReader,
+                    operationRegistration
                 );
                 targetSessions.put(sessionId, session);
                 return readSessionPage(targetSessions, session, options.getPageSize(), elapsed);
             } catch (Exception e) {
                 activeStatements.remove(stmt);
+                closeRegistration(operationRegistration);
                 try {
                     stmt.close();
                 } catch (Exception ignored) {
@@ -323,6 +400,10 @@ public final class JdbcExecutor {
 
     public boolean closeQuerySession(String sessionId) {
         return closeSession(sessions, sessionId);
+    }
+
+    public boolean hasCursorSession(String sessionId) {
+        return sessions.containsKey(sessionId) || tableReadSessions.containsKey(sessionId);
     }
 
     public QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
@@ -354,6 +435,38 @@ public final class JdbcExecutor {
         // session-owned cursors as part of the same cancellation boundary.
         closeAllQuerySessions();
         closeAllTableReadSessions();
+    }
+
+    /** Registers driver-specific metadata statements with the same cancellation boundary. */
+    public StatementRegistration registerExternalStatement(Statement statement, int timeoutSecs) throws SQLException {
+        return register(statement, timeoutSecs);
+    }
+
+    private StatementRegistration register(Statement statement, int timeoutSecs) throws SQLException {
+        applyQueryTimeout(statement, timeoutSecs);
+        activeStatements.add(statement);
+        AutoCloseable operationRegistration = AgentExecutionContext.registerStatement(statement);
+        return new StatementRegistration(() -> {
+            activeStatements.remove(statement);
+            closeRegistration(operationRegistration);
+        });
+    }
+
+    private static void bind(PreparedStatement statement, List<?> arguments) throws SQLException {
+        for (int index = 0; index < arguments.size(); index++) {
+            Object argument = arguments.get(index);
+            if (argument instanceof Integer value) {
+                statement.setInt(index + 1, value);
+            } else if (argument == null) {
+                statement.setObject(index + 1, null);
+            } else {
+                statement.setString(index + 1, String.valueOf(argument));
+            }
+        }
+    }
+
+    private static void closeRegistration(AutoCloseable registration) {
+        try { registration.close(); } catch (Exception ignored) { }
     }
 
     public int expireIdleQuerySessions() {
@@ -585,6 +698,7 @@ public final class JdbcExecutor {
                 session.statement.close();
             } catch (Exception ignored) {
             }
+            closeRegistration(session.operationRegistration);
         }
         return true;
     }
@@ -787,6 +901,7 @@ public final class JdbcExecutor {
         private final String[] typeNameByIndex;
         private final int maxRows;
         private final ResultValueReader valueReader;
+        private final AutoCloseable operationRegistration;
         private int rowsRead;
         private List<Object> pendingRow;
         private long lastAccessedAtMillis;
@@ -800,7 +915,8 @@ public final class JdbcExecutor {
             int[] sqlTypeByIndex,
             String[] typeNameByIndex,
             int maxRows,
-            ResultValueReader valueReader
+            ResultValueReader valueReader,
+            AutoCloseable operationRegistration
         ) {
             this.id = id;
             this.statement = statement;
@@ -811,6 +927,7 @@ public final class JdbcExecutor {
             this.typeNameByIndex = typeNameByIndex;
             this.maxRows = maxRows;
             this.valueReader = valueReader;
+            this.operationRegistration = operationRegistration;
             this.lastAccessedAtMillis = System.currentTimeMillis();
         }
     }

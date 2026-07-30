@@ -1109,7 +1109,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
                 return Ok(dbs.into_iter().map(|name| db::DatabaseInfo { name }).collect());
             }
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             return client.list_databases(agent_metadata_timeout(db_config.as_ref())).await;
         }
     }
@@ -1217,7 +1217,7 @@ pub async fn list_data_types_core(
         }
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             return client
                 .list_data_types::<Vec<String>>(database, agent_metadata_timeout(db_config.as_ref()))
                 .await
@@ -1273,7 +1273,7 @@ async fn list_schemas_once(
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             let fallback_config = db_config.clone();
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             match client
                 .list_schemas_filtered::<Vec<String>>(
                     database,
@@ -1460,7 +1460,7 @@ pub async fn get_table_comment_core(
                     let sql = oracle_table_comment_sql(schema, table);
                     let timeout = agent_metadata_timeout(db_config.as_ref());
                     drop(connections);
-                    let mut client = client.lock().await;
+                    let mut client = client.metadata().await;
                     let result = client
                         .execute_query_with_timeout::<db::QueryResult>(
                             agent_execute_query_params(
@@ -1477,7 +1477,7 @@ pub async fn get_table_comment_core(
                 if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
                     let timeout = agent_metadata_timeout(db_config.as_ref());
                     drop(connections);
-                    let mut client = client.lock().await;
+                    let mut client = client.metadata().await;
                     return client.get_table_comment::<Option<String>>(database, schema, table, timeout).await;
                 }
                 if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Tdengine) {
@@ -1485,7 +1485,7 @@ pub async fn get_table_comment_core(
                     let sql = tdengine_table_comment_sql(metadata_database, table);
                     let timeout = agent_metadata_timeout(db_config.as_ref());
                     drop(connections);
-                    let mut client = client.lock().await;
+                    let mut client = client.metadata().await;
                     let result = client
                         .execute_query_with_timeout::<db::QueryResult>(
                             agent_execute_query_params(
@@ -2145,12 +2145,12 @@ async fn load_oracle_table_comments_for_objects(
 }
 
 async fn oracle_agent_list_object_statistics(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     schema: &str,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ObjectStatistics>, String> {
-    let mut client = client.lock().await;
+    let mut client = client.metadata().await;
     let queries = [
         ("all-segments", oracle_object_statistics_sql(schema), true),
         ("dba-segments", oracle_object_statistics_dba_segments_sql(schema), true),
@@ -2185,12 +2185,12 @@ async fn oracle_agent_list_object_statistics(
 }
 
 async fn dameng_agent_list_object_statistics(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     schema: &str,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ObjectStatistics>, String> {
-    let mut client = client.lock().await;
+    let mut client = client.metadata().await;
     let queries = [
         ("dba-segments", dameng_object_statistics_dba_segments_sql(schema), true),
         ("user-segments", dameng_object_statistics_user_segments_sql(schema), false),
@@ -2224,13 +2224,13 @@ async fn dameng_agent_list_object_statistics(
 }
 
 async fn agent_list_object_statistics(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     schema: &str,
     sql: String,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ObjectStatistics>, String> {
-    let mut client = client.lock().await;
+    let mut client = client.metadata().await;
     let result = agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await?;
     Ok(oracle_object_statistics_from_query_result(result))
 }
@@ -2389,7 +2389,7 @@ async fn list_tables_once(
             let timeout_duration = agent_metadata_timeout(db_config.as_ref());
             let fallback_config = db_config.clone();
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             let agent_filter = if filter_locally_after_comments { None } else { filter };
             let force_local_table_name_filter = table_name_filter.is_some_and(|filter| !filter.is_empty());
             let agent_limit = if filter_locally_after_comments || force_local_table_name_filter {
@@ -3138,6 +3138,8 @@ mod tests {
         assert!(is_retryable_metadata_error("Pool not found"));
         assert!(is_retryable_metadata_error("connection reset by peer"));
         assert!(is_retryable_metadata_error("Agent RPC error (-1): dm.jdbc.driver.DMException: 网络通信异常"));
+        assert!(is_retryable_metadata_error("Agent RPC call timed out (30s)"));
+        assert!(is_retryable_metadata_error("Agent RPC error (-1): stale [SESSION_QUARANTINED:QUARANTINE_SESSION]"));
         assert!(!is_retryable_metadata_error("Unknown column 'email' in 'field list'"));
         assert!(!is_retryable_metadata_error("Access denied for user"));
     }
@@ -4453,7 +4455,7 @@ pub async fn completion_assistant_search_core(
             if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
                 let db_config = connection_config(state, &request.connection_id).await;
                 drop(connections);
-                let mut client = client.lock().await;
+                let mut client = client.metadata().await;
                 match client
                     .completion_assistant_search::<db::CompletionAssistantResponse>(
                         &request,
@@ -4805,7 +4807,7 @@ async fn list_objects_once(
                     .await
                     .map(unpaged_object_list);
             }
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             let agent_filter = if filter_locally_after_oracle_comments { None } else { filter };
             let agent_limit = if filter_locally_after_oracle_comments {
                 None
@@ -4967,7 +4969,7 @@ async fn list_completion_objects_once(
         let objects = if is_oracle {
             oracle_agent_list_objects(client, database, schema, agent_metadata_timeout(db_config.as_ref())).await?
         } else {
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             match client
                 .list_objects::<Vec<db::ObjectInfo>>(database, schema, agent_metadata_timeout(db_config.as_ref()))
                 .await
@@ -5112,7 +5114,9 @@ where
 }
 
 fn is_retryable_metadata_error(error: &str) -> bool {
-    error == "Pool not found" || crate::query::is_connection_error(error)
+    error == "Pool not found"
+        || crate::query::is_connection_error(error)
+        || crate::query::is_agent_recovery_error(error)
 }
 
 pub async fn get_columns_core(
@@ -5275,7 +5279,7 @@ pub async fn get_columns_core_for_session(
             if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
                 let fallback_config = db_config.clone();
                 drop(connections);
-                let mut client = client.lock().await;
+                let mut client = client.metadata().await;
                 let oracle_sql_config = fallback_config.as_ref().filter(|config| {
                     should_query_oracle_columns_via_sql_first(&config.db_type, schema, client_session_id)
                 });
@@ -5508,7 +5512,7 @@ pub async fn list_indexes_core(
             try_sqlserver!(connections, &pool_key, list_indexes, schema, table);
             if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
                 drop(connections);
-                let mut client = client.lock().await;
+                let mut client = client.metadata().await;
                 return client.list_indexes(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
             }
         }
@@ -5564,7 +5568,7 @@ pub async fn list_foreign_keys_core(
             try_sqlserver!(connections, &pool_key, list_foreign_keys, schema, table);
             if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
                 drop(connections);
-                let mut client = client.lock().await;
+                let mut client = client.metadata().await;
                 return client
                     .list_foreign_keys(database, schema, table, agent_metadata_timeout(db_config.as_ref()))
                     .await;
@@ -5611,7 +5615,7 @@ pub async fn list_triggers_core(
             try_sqlserver!(connections, &pool_key, list_triggers, schema, table);
             if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
                 drop(connections);
-                let mut client = client.lock().await;
+                let mut client = client.metadata().await;
                 return client.list_triggers(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
             }
         }
@@ -5653,7 +5657,7 @@ pub async fn list_constraints_core(
         let connections = state.connections.read().await;
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             return client.list_constraints(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
         }
         Ok(vec![])
@@ -5674,7 +5678,7 @@ pub async fn list_partitions_core(
         let connections = state.connections.read().await;
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             return client.list_partitions(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
         }
         Ok(vec![])
@@ -5695,7 +5699,7 @@ pub async fn list_subpartitions_core(
         let connections = state.connections.read().await;
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             return client
                 .list_subpartitions(database, schema, table, agent_metadata_timeout(db_config.as_ref()))
                 .await;
@@ -6008,7 +6012,7 @@ async fn get_table_ddl_core_with_options(
                 )
                 .await;
             }
-            let mut client = client.lock().await;
+            let mut client = client.metadata().await;
             return client.get_table_ddl(database, schema, table, agent_metadata_timeout(db_config.as_ref())).await;
         }
     }
@@ -6664,7 +6668,7 @@ async fn get_object_source_once(
                 )
                 .await?
             } else {
-                let mut client = client.lock().await;
+                let mut client = client.metadata().await;
                 let result: db::ObjectSource = client
                     .get_object_source(database, schema, name, &object_type, agent_metadata_timeout(db_config.as_ref()))
                     .await?;
@@ -6788,7 +6792,7 @@ pub fn oracle_list_objects_sql(schema: &str) -> String {
 }
 
 async fn oracle_agent_list_objects(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     schema: &str,
     timeout_duration: Option<Duration>,
@@ -6800,7 +6804,7 @@ async fn oracle_agent_list_objects(
         if schema.is_empty() { None } else { Some(schema) },
         QueryExecutionOptions { max_rows: Some(10_000), ..Default::default() },
     );
-    let mut client = client.lock().await;
+    let mut client = client.metadata().await;
     let result: db::QueryResult = client.execute_query_with_timeout(params, timeout_duration).await?;
     let mut objects: Vec<db::ObjectInfo> = result
         .rows
@@ -6828,7 +6832,7 @@ async fn oracle_agent_list_objects(
 }
 
 async fn oracle_agent_object_source(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     schema: &str,
     name: &str,
@@ -6842,19 +6846,19 @@ async fn oracle_agent_object_source(
         if schema.is_empty() { None } else { Some(schema) },
         QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
     );
-    let mut client = client.lock().await;
+    let mut client = client.metadata().await;
     let result: db::QueryResult = client.execute_query_with_timeout(params, timeout_duration).await?;
     first_string_cell(result)
 }
 
 async fn oracle_agent_table_ddl(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     schema: &str,
     table: &str,
     timeout_duration: Option<Duration>,
 ) -> Result<String, String> {
-    let mut client = client.lock().await;
+    let mut client = client.metadata().await;
     let ddl = client.get_table_ddl::<String>(database, schema, table, timeout_duration).await?;
     match append_oracle_table_comment_ddl(&mut client, database, schema, table, &ddl, timeout_duration).await {
         Ok(ddl) => Ok(ddl),
@@ -6929,13 +6933,13 @@ fn append_oracle_comments_to_ddl(
 }
 
 async fn db2_agent_table_ddl(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     schema: &str,
     table: &str,
     timeout_duration: Option<Duration>,
 ) -> Result<String, String> {
-    let mut client = client.lock().await;
+    let mut client = client.metadata().await;
     let ddl = client.get_table_ddl::<String>(database, schema, table, timeout_duration).await?;
     match append_db2_comments_to_ddl(&mut client, database, schema, table, &ddl, timeout_duration).await {
         Ok(ddl) => Ok(ddl),

@@ -71,7 +71,7 @@ fn list_available_extensions_sql(catalog: ExtensionCatalog) -> String {
 }
 
 async fn query_result(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     sql: &str,
     max_rows: usize,
@@ -83,12 +83,12 @@ async fn query_result(
         None,
         QueryExecutionOptions { max_rows: Some(max_rows), ..Default::default() },
     );
-    let mut client = client.lock().await;
+    let mut client = client.metadata().await;
     client.execute_query_with_timeout(params, timeout_duration).await
 }
 
 async fn query_result_with_catalog_fallback(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     sys_sql: String,
     pg_sql: String,
@@ -104,7 +104,7 @@ async fn query_result_with_catalog_fallback(
 }
 
 pub(super) async fn list_extensions(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     schema: Option<&str>,
     timeout_duration: Option<Duration>,
@@ -122,7 +122,7 @@ pub(super) async fn list_extensions(
 }
 
 pub(super) async fn list_available_extensions(
-    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    client: Arc<db::agent_pool::AgentConnectionPool>,
     database: &str,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ExtensionInfo>, String> {

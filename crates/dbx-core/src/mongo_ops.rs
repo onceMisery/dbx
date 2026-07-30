@@ -49,7 +49,7 @@ pub async fn mongo_drop_collection_core(
     match connections.get(connection_id).ok_or("Not found")? {
         PoolKind::MongoDb(client) => mongo_driver::drop_collection(client, database, collection).await,
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let _: serde_json::Value = client
                 .mongo_drop_collection(serde_json::json!({
                     "database": database,
@@ -88,7 +88,7 @@ pub async fn mongo_server_version_core(
     match connections.get(connection_id).ok_or("Not found")? {
         PoolKind::MongoDb(client) => mongo_driver::server_version(client, database).await,
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             client.mongo_server_version(database).await
         }
         _ => Err("Not a MongoDB connection".to_string()),
@@ -174,7 +174,7 @@ pub async fn mongo_count_documents_core(
             mongo_driver::count_documents(client, database, collection, filter, accurate).await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let params = serde_json::json!({
                 "database": database,
                 "collection": collection,
@@ -225,7 +225,7 @@ pub async fn mongo_find_documents_extended_json_core(
             .await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let mut params = serde_json::json!({
                 "database": database,
                 "collection": collection,
@@ -307,7 +307,7 @@ pub async fn mongo_create_index_core(
             mongo_driver::create_index(client, database, collection, keys_json, options_json).await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let result: serde_json::Value = client
                 .mongo_create_index(serde_json::json!({
                     "database": database,
@@ -337,7 +337,7 @@ pub async fn mongo_drop_indexes_core(
             mongo_driver::drop_indexes(client, database, collection, indexes_json, single).await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             client
                 .mongo_drop_indexes(serde_json::json!({
                     "database": database,
@@ -425,7 +425,7 @@ pub async fn mongo_update_documents_core(
                 .await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let result: serde_json::Value = client
                 .mongo_update_documents(serde_json::json!({
                     "database": database,
@@ -468,7 +468,7 @@ pub async fn mongo_delete_documents_core(
             mongo_driver::delete_documents(client, database, collection, filter_json, many).await
         }
         PoolKind::Agent(client) => {
-            let mut client = client.lock().await;
+            let mut client = client.compatibility().await;
             let result: serde_json::Value = client
                 .mongo_delete_documents(serde_json::json!({
                     "database": database,
