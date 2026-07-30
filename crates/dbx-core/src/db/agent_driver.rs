@@ -285,13 +285,49 @@ impl AgentRuntimeClient {
 
 fn decode_agent_response<T: DeserializeOwned>(response: Value) -> Result<T, String> {
     if let Some(err) = response.get("error") {
-        let message = err.get("message").and_then(Value::as_str).unwrap_or("Unknown agent error");
-        let code = err.get("code").and_then(Value::as_i64).unwrap_or(-1);
-        return Err(format!("Agent RPC error ({code}): {message}"));
+        return Err(format_agent_rpc_error(err));
     }
     let result =
         response.get("result").ok_or_else(|| "Agent response missing both 'result' and 'error'".to_string())?;
     serde_json::from_value(result.clone()).map_err(|e| format!("Failed to deserialize agent result: {e}"))
+}
+
+const AGENT_RPC_ERROR_DATA_MARKER: &str = "\nDBX_AGENT_ERROR_DATA:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSessionDisposition {
+    Keep,
+    Quarantine,
+    ReplaceRuntime,
+}
+
+pub fn agent_rpc_error_category(error: &str) -> Option<String> {
+    agent_rpc_error_data(error)?.get("category")?.as_str().map(str::to_string)
+}
+
+pub fn agent_session_disposition(error: &str) -> Option<AgentSessionDisposition> {
+    match agent_rpc_error_data(error)?.get("sessionDisposition")?.as_str()? {
+        "keep" => Some(AgentSessionDisposition::Keep),
+        "quarantine" => Some(AgentSessionDisposition::Quarantine),
+        "replace_runtime" => Some(AgentSessionDisposition::ReplaceRuntime),
+        _ => None,
+    }
+}
+
+fn format_agent_rpc_error(error: &Value) -> String {
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("Unknown agent error");
+    let code = error.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    let mut formatted = format!("Agent RPC error ({code}): {message}");
+    if let Some(data) = error.get("data").filter(|data| data.is_object()) {
+        formatted.push_str(AGENT_RPC_ERROR_DATA_MARKER);
+        formatted.push_str(&data.to_string());
+    }
+    formatted
+}
+
+fn agent_rpc_error_data(error: &str) -> Option<Value> {
+    let (_, data) = error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER)?;
+    serde_json::from_str(data).ok()
 }
 
 fn deserialize_cached_agent_result<T: DeserializeOwned>(result: Result<Value, String>) -> Result<T, String> {
@@ -902,9 +938,7 @@ impl AgentDriverClient {
             };
 
             let result = if let Some(err) = resp.get("error") {
-                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown agent error");
-                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-                Err(format!("Agent RPC error ({code}): {msg}"))
+                Err(format_agent_rpc_error(err))
             } else if let Some(result_val) = resp.get("result") {
                 serde_json::from_value::<T>(result_val.clone())
                     .map_err(|e| format!("Failed to deserialize agent result: {e}"))
@@ -1036,6 +1070,14 @@ impl AgentDriverClient {
             let session_id = self.agent_session_id.as_ref().ok_or("Shared Agent session id is missing")?.clone();
             let result =
                 self.call_method(AgentMethod::CloseSession, serde_json::json!({ "agentSessionId": session_id })).await;
+            if result
+                .as_ref()
+                .is_err_and(|error| agent_session_disposition(error) == Some(AgentSessionDisposition::ReplaceRuntime))
+            {
+                // The Java runtime could not accept bounded cleanup work. Killing the shared
+                // process is the only reliable boundary for sessions that can no longer be cleaned.
+                self.kill();
+            }
             if result.is_ok() {
                 if let Some(runtime) = &self.shared_runtime {
                     AgentRuntimeClient::decrement_session_count(runtime);
@@ -2082,14 +2124,14 @@ impl Drop for AgentDriverClient {
 mod tests {
     use super::{
         agent_close_query_session_params, agent_handshake_params, agent_java_args, agent_java_args_with_extra,
-        agent_java_args_with_extra_opts, agent_object_source_params, agent_proxy_env_vars, agent_schema_params,
-        agent_schema_table_params, agent_supports_capability, agent_transaction_params, format_agent_process_error,
-        format_agent_startup_error, is_agent_rpc_response_error, is_unsupported_handshake_error,
-        mongo_collection_params, mongo_database_params, mongo_document_id_params, parse_agent_java_opts,
-        read_agent_line, start_stderr_collector, validate_dameng_java_system_properties, AgentCapability,
-        AgentDriverClient, AgentHandshake, AgentKvMethod, AgentLaunchSpec, AgentMethod, AgentRuntimeClient,
-        AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail,
-        AGENT_PROTOCOL_VERSION,
+        agent_java_args_with_extra_opts, agent_object_source_params, agent_proxy_env_vars, agent_rpc_error_category,
+        agent_schema_params, agent_schema_table_params, agent_session_disposition, agent_supports_capability,
+        agent_transaction_params, decode_agent_response, format_agent_process_error, format_agent_startup_error,
+        is_agent_rpc_response_error, is_unsupported_handshake_error, mongo_collection_params, mongo_database_params,
+        mongo_document_id_params, parse_agent_java_opts, read_agent_line, start_stderr_collector,
+        validate_dameng_java_system_properties, AgentCapability, AgentDriverClient, AgentHandshake, AgentKvMethod,
+        AgentLaunchSpec, AgentMethod, AgentRuntimeClient, AgentSessionDisposition, AgentTableReadCloseParams,
+        AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
     };
     use std::io::Cursor;
     use std::io::Write;
@@ -2097,6 +2139,28 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn structured_agent_error_data_survives_legacy_string_boundary() {
+        let response = serde_json::json!({
+            "error": {
+                "code": -1,
+                "message": "connection lost",
+                "data": {
+                    "category": "connection",
+                    "retryable": true,
+                    "sessionDisposition": "quarantine",
+                    "stage": "execute"
+                }
+            }
+        });
+
+        let error = decode_agent_response::<serde_json::Value>(response).unwrap_err();
+
+        assert!(error.starts_with("Agent RPC error (-1): connection lost"));
+        assert_eq!(agent_rpc_error_category(&error).as_deref(), Some("connection"));
+        assert_eq!(agent_session_disposition(&error), Some(AgentSessionDisposition::Quarantine));
+    }
 
     #[test]
     fn agent_java_args_include_oracle_network_compatibility_flags() {
@@ -2677,6 +2741,62 @@ for line in sys.stdin:
         };
 
         assert_eq!(error, "Agent runtime does not support multi_session protocol v2");
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn disconnect_replaces_runtime_when_agent_cleanup_is_saturated() {
+        let script_path =
+            std::env::temp_dir().join(format!("dbx-agent-runtime-cleanup-saturation-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'handshake':
+        response = {
+            'jsonrpc': '2.0',
+            'id': req['id'],
+            'result': {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']}
+        }
+    elif req['method'] == 'close_session':
+        response = {
+            'jsonrpc': '2.0',
+            'id': req['id'],
+            'error': {
+                'code': -1,
+                'message': 'Agent runtime resource limit reached',
+                'data': {
+                    'category': 'resource',
+                    'retryable': False,
+                    'sessionDisposition': 'replace_runtime',
+                    'stage': 'close'
+                }
+            }
+        }
+    else:
+        response = {'jsonrpc': '2.0', 'id': req['id'], 'result': {}}
+    print(json.dumps(response), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let runtime = AgentRuntimeClient::spawn(
+            AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]),
+            "test",
+        )
+        .await
+        .unwrap();
+        runtime.increment_session_count();
+        let mut client = AgentDriverClient::shared_session(runtime.clone(), "session-1".to_string());
+
+        let error = client.disconnect().await.unwrap_err();
+
+        assert_eq!(agent_session_disposition(&error), Some(AgentSessionDisposition::ReplaceRuntime));
+        assert!(runtime.is_failed());
+        drop(client);
         let _ = std::fs::remove_file(script_path);
     }
 

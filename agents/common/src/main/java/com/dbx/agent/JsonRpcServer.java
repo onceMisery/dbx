@@ -121,6 +121,13 @@ public final class JsonRpcServer {
         }
     }
 
+    void quarantine() {
+        AbstractJdbcAgent jdbcAgent = pooledJdbcAgent();
+        if (jdbcAgent != null) {
+            jdbcAgent.quarantinePooledConnection();
+        }
+    }
+
     void expireIdleResources() {
         jdbcExecutor.expireIdleResources();
         releaseIdlePooledConnection();

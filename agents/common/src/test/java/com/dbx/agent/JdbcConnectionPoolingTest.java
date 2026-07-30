@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Test;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.sql.Statement;
 import java.util.Collections;
 import java.util.List;
@@ -18,6 +20,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -116,12 +119,12 @@ class JdbcConnectionPoolingTest {
     }
 
     @Test
-    void registrySurfacesInitialPhysicalConnectionFailureWithoutWaitingForBorrowTimeout() {
+    void registryBoundsInitialPhysicalConnectionFailureByBorrowTimeout() {
         JdbcConnectionPoolRegistry.PoolSettings settings = new JdbcConnectionPoolRegistry.PoolSettings(
             1,
             0,
-            5_000L,
-            1_000L,
+            250L,
+            250L,
             10_000L,
             30_000L,
             60_000L
@@ -135,8 +138,38 @@ class JdbcConnectionPoolingTest {
                 })
             );
             long elapsedMillis = System.currentTimeMillis() - startedAtMillis;
-            assertTrue(elapsedMillis < 1_000L, () -> "initial failure took " + elapsedMillis + "ms");
-            assertTrue(error.getMessage().contains("auth failed"), error::toString);
+            assertTrue(elapsedMillis < 1_500L, () -> "initial failure took " + elapsedMillis + "ms");
+            assertTrue(throwableText(error).contains("auth failed"), error::toString);
+        }
+    }
+
+    @Test
+    void registryBorrowTimeoutBoundsBlockedPhysicalConnect() throws Exception {
+        CountDownLatch connectStarted = new CountDownLatch(1);
+        CountDownLatch releaseConnect = new CountDownLatch(1);
+        JdbcConnectionPoolRegistry.PoolSettings settings = new JdbcConnectionPoolRegistry.PoolSettings(
+            1,
+            0,
+            250L,
+            250L,
+            10_000L,
+            30_000L,
+            60_000L
+        );
+        JdbcConnectionPoolRegistry registry = new JdbcConnectionPoolRegistry(settings);
+        long startedAtMillis = System.currentTimeMillis();
+        try {
+            assertThrows(SQLException.class, () -> registry.borrow("blocked-connect", () -> {
+                connectStarted.countDown();
+                awaitUninterruptibly(releaseConnect);
+                throw new SQLException("late connect");
+            }));
+            long elapsedMillis = System.currentTimeMillis() - startedAtMillis;
+            assertTrue(connectStarted.await(1, TimeUnit.SECONDS));
+            assertTrue(elapsedMillis < 1_500L, () -> "blocked connect took " + elapsedMillis + "ms");
+        } finally {
+            releaseConnect.countDown();
+            registry.close();
         }
     }
 
@@ -336,6 +369,150 @@ class JdbcConnectionPoolingTest {
             releaseRequest.countDown();
             workers.shutdownNow();
         }
+    }
+
+    @Test
+    void closingBusySessionDetachesImmediatelyAndPoisonsItsLease() throws Exception {
+        AtomicInteger physicalOpens = new AtomicInteger();
+        AtomicInteger physicalCloses = new AtomicInteger();
+        AtomicInteger requestIds = new AtomicInteger();
+        AtomicBoolean blockNextMetadataCall = new AtomicBoolean(true);
+        CountDownLatch requestStarted = new CountDownLatch(1);
+        CountDownLatch releaseRequest = new CountDownLatch(1);
+        ExecutorService workers = Executors.newSingleThreadExecutor();
+        String url = h2Url("quarantine_busy_session");
+        try (MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(
+            () -> new H2TestAgent(url, physicalOpens) {
+                @Override
+                protected Connection openConnection(ConnectParams params) throws Exception {
+                    return trackedConnection(openH2(url, physicalOpens), physicalCloses);
+                }
+
+                @Override
+                public List<DatabaseInfo> listDatabases() {
+                    if (blockNextMetadataCall.compareAndSet(true, false)) {
+                        requestStarted.countDown();
+                        awaitUninterruptibly(releaseRequest);
+                    }
+                    return Collections.emptyList();
+                }
+            },
+            poolSettings(2)
+        )) {
+            openSession(server, requestIds, "blocked");
+            Future<JsonObject> blocked = workers.submit(() -> request(
+                server,
+                requestIds,
+                AgentProtocol.METHOD_LIST_DATABASES,
+                sessionParams("blocked")
+            ));
+            assertTrue(requestStarted.await(2, TimeUnit.SECONDS));
+
+            long closeStarted = System.currentTimeMillis();
+            closeSession(server, requestIds, "blocked");
+            assertTrue(System.currentTimeMillis() - closeStarted < 500L);
+
+            JsonObject staleResponse = rawRequest(
+                server,
+                requestIds,
+                AgentProtocol.METHOD_LIST_DATABASES,
+                sessionParams("blocked")
+            );
+            assertTrue(staleResponse.has("error"), staleResponse::toString);
+
+            openSession(server, requestIds, "replacement");
+            JsonObject replacement = query(server, requestIds, "replacement", "SELECT 1", null);
+            assertEquals(1, replacement.getAsJsonArray("rows").get(0).getAsJsonArray().get(0).getAsInt());
+            assertEquals(2, physicalOpens.get());
+
+            releaseRequest.countDown();
+            blocked.get(2, TimeUnit.SECONDS);
+            awaitCount(physicalCloses, 1);
+        } finally {
+            releaseRequest.countDown();
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    void cleanupSaturationReturnsStructuredRuntimeReplacementError() throws Exception {
+        AtomicInteger physicalOpens = new AtomicInteger();
+        AtomicInteger requestIds = new AtomicInteger();
+        CountDownLatch requestsStarted = new CountDownLatch(2);
+        CountDownLatch releaseRequests = new CountDownLatch(1);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        String url = h2Url("cleanup_saturation");
+        try (MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(
+            () -> new H2TestAgent(url, physicalOpens) {
+                @Override
+                public List<DatabaseInfo> listDatabases() {
+                    requestsStarted.countDown();
+                    awaitUninterruptibly(releaseRequests);
+                    return Collections.emptyList();
+                }
+            },
+            poolSettings(2),
+            new MultiSessionJsonRpcServer.RuntimeLimits(4, 1)
+        )) {
+            openSession(server, requestIds, "first");
+            openSession(server, requestIds, "second");
+            Future<JsonObject> first = workers.submit(() -> request(
+                server,
+                requestIds,
+                AgentProtocol.METHOD_LIST_DATABASES,
+                sessionParams("first")
+            ));
+            Future<JsonObject> second = workers.submit(() -> request(
+                server,
+                requestIds,
+                AgentProtocol.METHOD_LIST_DATABASES,
+                sessionParams("second")
+            ));
+            assertTrue(requestsStarted.await(2, TimeUnit.SECONDS));
+
+            closeSession(server, requestIds, "first");
+            JsonObject saturated = rawRequest(
+                server,
+                requestIds,
+                AgentProtocol.METHOD_CLOSE_SESSION,
+                sessionParams("second")
+            );
+            JsonObject data = saturated.getAsJsonObject("error").getAsJsonObject("data");
+            assertEquals("resource", data.get("category").getAsString());
+            assertEquals("replace_runtime", data.get("sessionDisposition").getAsString());
+
+            releaseRequests.countDown();
+            first.get(2, TimeUnit.SECONDS);
+            second.get(2, TimeUnit.SECONDS);
+        } finally {
+            releaseRequests.countDown();
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    void jdbcConnectionErrorsCarryStructuredQuarantineData() {
+        JsonObject error = AgentRpcError.toJson(
+            new RuntimeException(new SQLException("connection lost", "08006")),
+            AgentProtocol.METHOD_EXECUTE_QUERY,
+            "session-1"
+        );
+        JsonObject data = error.getAsJsonObject("data");
+        assertEquals("connection", data.get("category").getAsString());
+        assertFalse(data.get("retryable").getAsBoolean());
+        assertEquals("quarantine", data.get("sessionDisposition").getAsString());
+        assertEquals("session-1", data.get("agentSessionId").getAsString());
+    }
+
+    @Test
+    void jdbcConnectErrorsRemainRetryableAfterRuntimeRecovery() {
+        JsonObject error = AgentRpcError.toJson(
+            new RuntimeException(new SQLException("connection refused", "08001")),
+            AgentProtocol.METHOD_OPEN_SESSION,
+            "session-1"
+        );
+
+        assertTrue(error.getAsJsonObject("data").get("retryable").getAsBoolean());
     }
 
     @Test
@@ -543,14 +720,23 @@ class JdbcConnectionPoolingTest {
         String method,
         JsonObject params
     ) {
+        JsonObject response = rawRequest(server, requestIds, method, params);
+        assertFalse(response.has("error"), () -> response.toString());
+        return response;
+    }
+
+    private static JsonObject rawRequest(
+        MultiSessionJsonRpcServer server,
+        AtomicInteger requestIds,
+        String method,
+        JsonObject params
+    ) {
         JsonObject request = new JsonObject();
         request.addProperty("jsonrpc", "2.0");
         request.addProperty("id", requestIds.incrementAndGet());
         request.addProperty("method", method);
         request.add("params", params);
-        JsonObject response = JsonParser.parseString(server.handleRequest(GSON.toJson(request))).getAsJsonObject();
-        assertFalse(response.has("error"), () -> response.toString());
-        return response;
+        return JsonParser.parseString(server.handleRequest(GSON.toJson(request))).getAsJsonObject();
     }
 
     private static JsonObject result(JsonObject response) {
@@ -579,6 +765,57 @@ class JdbcConnectionPoolingTest {
     private static Connection openH2(String url, AtomicInteger physicalOpens) throws Exception {
         physicalOpens.incrementAndGet();
         return DriverManager.getConnection(url, "sa", "");
+    }
+
+    private static Connection trackedConnection(Connection delegate, AtomicInteger closeCount) {
+        AtomicBoolean closed = new AtomicBoolean();
+        return (Connection) Proxy.newProxyInstance(
+            Connection.class.getClassLoader(),
+            new Class<?>[] {Connection.class},
+            (proxy, method, args) -> {
+                if ("close".equals(method.getName()) && closed.compareAndSet(false, true)) {
+                    closeCount.incrementAndGet();
+                }
+                try {
+                    return method.invoke(delegate, args);
+                } catch (InvocationTargetException error) {
+                    throw error.getCause();
+                }
+            }
+        );
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void awaitCount(AtomicInteger counter, int expected) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (counter.get() < expected && System.nanoTime() < deadline) {
+            Thread.sleep(10L);
+        }
+        assertTrue(counter.get() >= expected, () -> "counter remained at " + counter.get());
+    }
+
+    private static String throwableText(Throwable error) {
+        StringBuilder text = new StringBuilder();
+        Throwable current = error;
+        while (current != null) {
+            text.append(current).append('\n');
+            current = current.getCause();
+        }
+        return text.toString();
     }
 
     private static String h2Url(String prefix) {

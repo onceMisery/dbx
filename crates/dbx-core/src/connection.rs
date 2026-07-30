@@ -2535,7 +2535,11 @@ impl AppState {
             self.postgres_cancel_contexts.write().await.remove(&pool_key);
             let removed = self.connections.write().await.remove(&pool_key);
             if let Some(pool) = removed {
-                close_pool_kind_with_timeout(pool_key.clone(), pool).await;
+                if matches!(&pool, PoolKind::Agent(_)) {
+                    close_removed_pools_in_background(&self.task_supervisor, vec![(pool_key.clone(), pool)]);
+                } else {
+                    close_pool_kind_with_timeout(pool_key.clone(), pool).await;
+                }
             }
         }
         self.get_or_create_pool_for_session_with_catalog(connection_id, database, catalog, client_session_id).await
@@ -2594,6 +2598,24 @@ impl AppState {
         };
         close_removed_pools_in_background(&self.task_supervisor, vec![removed]);
         Ok(true)
+    }
+
+    /// Detaches a pool before cleanup so a stuck Agent close cannot delay replacement.
+    pub async fn detach_pool_by_key(&self, pool_key: &str, replace_agent_runtime: bool) -> bool {
+        self.stop_keepalive_task(pool_key).await;
+        self.pool_activity.write().await.remove(pool_key);
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
+        let removed = self.connections.write().await.remove(pool_key);
+        let Some(pool) = removed else {
+            return false;
+        };
+        if replace_agent_runtime {
+            if let PoolKind::Agent(client) = &pool {
+                client.lock().await.kill();
+            }
+        }
+        close_removed_pools_in_background(&self.task_supervisor, vec![(pool_key.to_string(), pool)]);
+        true
     }
 
     async fn take_client_session_pool(
@@ -5526,6 +5548,29 @@ for line in sys.stdin:
         assert!(state.detach_client_session_pool("conn", None, "import-1").await.unwrap());
         assert!(!state.connections.read().await.contains_key(pool_key));
         assert!(!state.pool_activity.read().await.contains_key(pool_key));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn detach_pool_by_key_removes_routing_before_background_close() {
+        let (state, dir) = test_app_state().await;
+        let pool_key = "conn:session:timeout";
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Sqlite(pool));
+        state.pool_activity.write().await.insert(pool_key.to_string(), super::PoolActivity::now());
+
+        assert!(state.detach_pool_by_key(pool_key, false).await);
+        assert!(!state.connections.read().await.contains_key(pool_key));
+        assert!(!state.pool_activity.read().await.contains_key(pool_key));
+
+        for _ in 0..100 {
+            if state.supervised_task_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.supervised_task_count(), 0);
 
         let _ = std::fs::remove_dir_all(dir);
     }

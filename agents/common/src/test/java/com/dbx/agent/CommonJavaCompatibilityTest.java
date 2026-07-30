@@ -132,7 +132,7 @@ class CommonJavaCompatibilityTest {
     }
 
     @Test
-    void multiSessionServerCreatesAndClosesIndependentAgents() {
+    void multiSessionServerCreatesAndClosesIndependentAgents() throws Exception {
         java.util.List<TrackingAgent> created = new java.util.ArrayList<>();
         MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(() -> {
             TrackingAgent agent = new TrackingAgent();
@@ -153,6 +153,7 @@ class CommonJavaCompatibilityTest {
         assertEquals(1, created.get(1).connectCount);
 
         server.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"close_session\",\"params\":{\"agentSessionId\":\"a\"}}");
+        awaitCondition(() -> created.get(0).disconnectCount == 1);
         assertEquals(1, created.get(0).disconnectCount);
         assertEquals(0, created.get(1).disconnectCount);
     }
@@ -672,7 +673,7 @@ class CommonJavaCompatibilityTest {
 
     private static final class TrackingAgent extends MinimalAgent {
         private int connectCount;
-        private int disconnectCount;
+        private volatile int disconnectCount;
 
         @Override
         public void connect(ConnectParams params) {
@@ -1057,6 +1058,14 @@ class CommonJavaCompatibilityTest {
             }
         }
         return false;
+    }
+
+    private static void awaitCondition(java.util.function.BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+            Thread.sleep(10L);
+        }
+        assertTrue(condition.getAsBoolean());
     }
 
     private static JsonObject protocolContract(String resourcePath) {

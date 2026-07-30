@@ -29,6 +29,7 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     private boolean requestActive;
     private boolean leasePinnedAtRequestStart;
     private boolean sessionAffinity;
+    private boolean pooledConnectionPoisoned;
 
     @Override
     public final Connection getConnection() {
@@ -47,6 +48,7 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
             sessionAffinity = false;
             requestActive = false;
             leasePinnedAtRequestStart = false;
+            pooledConnectionPoisoned = false;
             loadDriver(params);
             configuredDatabase = params.getDatabase();
             connectParams = params;
@@ -256,6 +258,7 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
             sessionAffinity = false;
             requestActive = false;
             leasePinnedAtRequestStart = false;
+            pooledConnectionPoisoned = false;
             identifierQuote = "";
         });
     }
@@ -269,6 +272,10 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     final synchronized boolean usesConnectionPool() {
         return poolRegistry != null;
+    }
+
+    final synchronized void quarantinePooledConnection() {
+        pooledConnectionPoisoned = true;
     }
 
     final synchronized void beginPooledRequest() throws Exception {
@@ -301,6 +308,10 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
             return;
         }
         requestActive = false;
+        if (pooledConnectionPoisoned) {
+            releasePooledConnection(true);
+            return;
+        }
         if (succeeded && requiresSessionAffinity) {
             sessionAffinity = true;
             JdbcSchemaSwitcher.forget(connection);
@@ -322,7 +333,14 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
     }
 
     final synchronized void releaseIdlePooledConnection(JdbcExecutor executor) {
-        if (poolRegistry == null || requestActive || sessionAffinity || pooledLease == null) {
+        if (poolRegistry == null || requestActive || pooledLease == null) {
+            return;
+        }
+        if (pooledConnectionPoisoned) {
+            releasePooledConnection(true);
+            return;
+        }
+        if (sessionAffinity) {
             return;
         }
         if (executor.hasOpenSessions() || executor.hasActiveStatements()) {
@@ -514,7 +532,7 @@ public abstract class AbstractJdbcAgent extends BaseDatabaseAgent {
 
     private void closeCurrentConnection() throws Exception {
         if (pooledLease != null) {
-            boolean evict = sessionAffinity || !preparePooledConnectionForReturn();
+            boolean evict = pooledConnectionPoisoned || sessionAffinity || !preparePooledConnectionForReturn();
             releasePooledConnection(evict);
         } else if (connection != null) {
             connection.close();

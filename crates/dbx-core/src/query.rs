@@ -545,6 +545,9 @@ pub fn agent_close_query_session_params(session_id: &str) -> serde_json::Value {
 }
 
 pub fn is_connection_error(err: &str) -> bool {
+    if crate::db::agent_driver::agent_rpc_error_category(err).as_deref() == Some("connection") {
+        return true;
+    }
     let lower = err.to_lowercase();
     if is_dbx_query_timeout_error(&lower) || is_agent_rpc_timeout_error(&lower) {
         return false;
@@ -590,6 +593,15 @@ fn is_schema_reset_cleanup_error(lower: &str) -> bool {
 }
 
 fn should_discard_agent_pool_after_error(err: &str) -> bool {
+    if matches!(
+        crate::db::agent_driver::agent_session_disposition(err),
+        Some(
+            crate::db::agent_driver::AgentSessionDisposition::Quarantine
+                | crate::db::agent_driver::AgentSessionDisposition::ReplaceRuntime
+        )
+    ) {
+        return true;
+    }
     let lower = err.to_lowercase();
     is_dbx_query_timeout_error(&lower)
         || is_agent_rpc_timeout_error(&lower)
@@ -601,6 +613,19 @@ fn should_discard_agent_pool_after_error(err: &str) -> bool {
 }
 
 pub fn pool_error_action(db_type: Option<DatabaseType>, err: &str) -> PoolErrorAction {
+    if db_type.is_some_and(|db_type| database_capabilities::is_agent_type(&db_type))
+        && matches!(
+            crate::db::agent_driver::agent_session_disposition(err),
+            Some(
+                crate::db::agent_driver::AgentSessionDisposition::Quarantine
+                    | crate::db::agent_driver::AgentSessionDisposition::ReplaceRuntime
+            )
+        )
+    {
+        // The connection may be replaced, but the result of the user operation is unknown.
+        // Discard the session without replaying SQL, DDL, writes, or transactions.
+        return PoolErrorAction::Discard;
+    }
     let lower = err.to_lowercase();
     if db::sqlserver::is_driver_panic_error(err)
         || (is_dbx_query_timeout_error(&lower) && should_discard_pool_after_query_timeout(db_type))
@@ -1474,7 +1499,15 @@ pub async fn execute_sql_statement_with_options(
             )
         }
         Some(PoolErrorAction::Discard) => {
-            state.remove_pool_by_key(&pool_key).await;
+            let replace_runtime = matches!(
+                result.as_ref().err().and_then(|error| crate::db::agent_driver::agent_session_disposition(error)),
+                Some(crate::db::agent_driver::AgentSessionDisposition::ReplaceRuntime)
+            );
+            if db_type.is_some_and(|db_type| database_capabilities::is_agent_type(&db_type)) {
+                state.detach_pool_by_key(&pool_key, replace_runtime).await;
+            } else {
+                state.remove_pool_by_key(&pool_key).await;
+            }
             with_sql_context(result)
         }
         _ => with_sql_context(result),
@@ -4809,6 +4842,18 @@ mod tests {
             pool_error_action(Some(DatabaseType::Oracle), "Agent RPC call timed out (30s)"),
             PoolErrorAction::Discard
         );
+    }
+
+    #[test]
+    fn structured_agent_disposition_controls_pool_recovery() {
+        let quarantined = "Agent RPC error (-1): lost\nDBX_AGENT_ERROR_DATA:{\"category\":\"connection\",\"sessionDisposition\":\"quarantine\"}";
+        let replace_runtime = "Agent RPC error (-1): saturated\nDBX_AGENT_ERROR_DATA:{\"category\":\"resource\",\"sessionDisposition\":\"replace_runtime\"}";
+
+        assert!(should_discard_agent_pool_after_error(quarantined));
+        assert!(should_discard_agent_pool_after_error(replace_runtime));
+        assert!(is_connection_error(quarantined));
+        assert_eq!(pool_error_action(Some(DatabaseType::Oracle), quarantined), PoolErrorAction::Discard);
+        assert_eq!(pool_error_action(Some(DatabaseType::Oracle), replace_runtime), PoolErrorAction::Discard);
     }
 
     #[test]
