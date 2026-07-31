@@ -39,6 +39,17 @@ final class AgentRpcError extends RuntimeException {
         );
     }
 
+    static AgentRpcError backpressure(String stage, Throwable cause) {
+        return new AgentRpcError(
+            "Agent request capacity is temporarily exhausted",
+            "resource",
+            true,
+            "keep",
+            stage,
+            cause
+        );
+    }
+
     static JsonObject toJson(Throwable error, String method, String agentSessionId) {
         AgentRpcError classified = classify(error, method);
         JsonObject rpcError = new JsonObject();
@@ -71,11 +82,12 @@ final class AgentRpcError extends RuntimeException {
                 || sqlError instanceof SQLTransientConnectionException
                 || (sqlState != null && sqlState.toUpperCase(Locale.ROOT).startsWith("08"));
             boolean operationRetryable = connectionError && ("connect".equals(stage) || "validate".equals(stage));
+            String disposition = connectionError && !"connect".equals(stage) ? "quarantine" : "keep";
             return new AgentRpcError(
                 message(error),
                 connectionError ? "connection" : "sql",
                 operationRetryable,
-                connectionError ? "quarantine" : "keep",
+                disposition,
                 stage,
                 error
             );

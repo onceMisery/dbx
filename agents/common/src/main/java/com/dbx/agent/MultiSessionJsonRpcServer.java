@@ -172,7 +172,13 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
     private Object closeSession(String sessionId) {
         Session session = sessions.remove(sessionId);
         if (session != null) {
-            session.quarantineAndClose(cleanup);
+            boolean replaceRuntime = session.quarantineAndClose(cleanup);
+            if (replaceRuntime) {
+                throw AgentRpcError.resource(
+                    "close",
+                    new IllegalStateException("JDBC quarantine operation limit reached")
+                );
+            }
         }
         return Collections.singletonMap("ok", true);
     }
@@ -345,17 +351,18 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
             }
         }
 
-        private void quarantineAndClose(ExecutorService cleanup) {
+        private boolean quarantineAndClose(ExecutorService cleanup) {
             state.compareAndSet(State.ACTIVE, State.QUARANTINED);
-            server.quarantine();
+            boolean replaceRuntime = server.quarantine();
             if (!cleanupScheduled.compareAndSet(false, true)) {
-                return;
+                return replaceRuntime;
             }
             try {
                 cleanup.execute(this::closeWhenIdle);
             } catch (RejectedExecutionException error) {
                 throw AgentRpcError.resource("close", error);
             }
+            return replaceRuntime;
         }
 
         private void closeWhenIdle() {

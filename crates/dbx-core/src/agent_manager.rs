@@ -894,7 +894,7 @@ impl AgentManager {
         agent_session_id: String,
         connect_params: serde_json::Value,
         connect_timeout: std::time::Duration,
-    ) -> Result<AgentDriverClient, String> {
+    ) -> Result<AgentDriverClient, crate::agent_runtime::SharedConnectionOpenError> {
         crate::agent_runtime::spawn_shared_connection_client(
             self,
             db_type,

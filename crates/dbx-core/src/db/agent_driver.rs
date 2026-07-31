@@ -305,6 +305,10 @@ pub fn agent_rpc_error_category(error: &str) -> Option<String> {
     agent_rpc_error_data(error)?.get("category")?.as_str().map(str::to_string)
 }
 
+pub fn agent_rpc_error_session_id(error: &str) -> Option<String> {
+    agent_rpc_error_data(error)?.get("agentSessionId")?.as_str().map(str::to_string)
+}
+
 pub fn agent_session_disposition(error: &str) -> Option<AgentSessionDisposition> {
     match agent_rpc_error_data(error)?.get("sessionDisposition")?.as_str()? {
         "keep" => Some(AgentSessionDisposition::Keep),
@@ -363,6 +367,66 @@ pub struct AgentDriverClient {
     shared_runtime: Option<Arc<AgentRuntimeClient>>,
     agent_session_id: Option<String>,
     cached_query: Option<CachedAgentQuery>,
+}
+
+/// Keeps serialized session RPC access separate from the process-level fail-stop handle.
+/// A stuck RPC may hold `client` indefinitely, but it must never prevent terminating the
+/// shared Agent runtime after the pool has been removed from routing.
+pub struct PooledAgentClient {
+    client: tokio::sync::Mutex<AgentDriverClient>,
+    shared_runtime: Option<Arc<AgentRuntimeClient>>,
+    agent_session_id: Option<String>,
+}
+
+impl PooledAgentClient {
+    pub fn new(client: AgentDriverClient) -> Self {
+        let shared_runtime = client.shared_runtime.clone();
+        let agent_session_id = client.agent_session_id.clone();
+        Self { client: tokio::sync::Mutex::new(client), shared_runtime, agent_session_id }
+    }
+
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, AgentDriverClient> {
+        self.client.lock().await
+    }
+
+    pub fn try_lock(&self) -> Result<tokio::sync::MutexGuard<'_, AgentDriverClient>, tokio::sync::TryLockError> {
+        self.client.try_lock()
+    }
+
+    pub fn shares_runtime_with(&self, other: &Self) -> bool {
+        match (&self.shared_runtime, &other.shared_runtime) {
+            (Some(runtime), Some(other_runtime)) => Arc::ptr_eq(runtime, other_runtime),
+            _ => false,
+        }
+    }
+
+    pub fn uses_runtime(&self, runtime: &Arc<AgentRuntimeClient>) -> bool {
+        self.shared_runtime.as_ref().is_some_and(|current| Arc::ptr_eq(current, runtime))
+    }
+
+    pub fn matches_session_id(&self, session_id: &str) -> bool {
+        self.agent_session_id.as_deref() == Some(session_id)
+    }
+
+    pub fn is_runtime_available(&self) -> bool {
+        self.shared_runtime.as_ref().is_none_or(|runtime| !runtime.is_failed())
+    }
+
+    /// Terminates a protocol-v2 shared runtime without waiting for the logical session lock.
+    /// Legacy single-session clients can only be killed immediately when they are not busy.
+    pub fn fail_stop(&self) -> bool {
+        if let Some(runtime) = &self.shared_runtime {
+            runtime.kill();
+            return true;
+        }
+        match self.client.try_lock() {
+            Ok(mut client) => {
+                client.kill();
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1070,14 +1134,6 @@ impl AgentDriverClient {
             let session_id = self.agent_session_id.as_ref().ok_or("Shared Agent session id is missing")?.clone();
             let result =
                 self.call_method(AgentMethod::CloseSession, serde_json::json!({ "agentSessionId": session_id })).await;
-            if result
-                .as_ref()
-                .is_err_and(|error| agent_session_disposition(error) == Some(AgentSessionDisposition::ReplaceRuntime))
-            {
-                // The Java runtime could not accept bounded cleanup work. Killing the shared
-                // process is the only reliable boundary for sessions that can no longer be cleaned.
-                self.kill();
-            }
             if result.is_ok() {
                 if let Some(runtime) = &self.shared_runtime {
                     AgentRuntimeClient::decrement_session_count(runtime);
@@ -2125,13 +2181,14 @@ mod tests {
     use super::{
         agent_close_query_session_params, agent_handshake_params, agent_java_args, agent_java_args_with_extra,
         agent_java_args_with_extra_opts, agent_object_source_params, agent_proxy_env_vars, agent_rpc_error_category,
-        agent_schema_params, agent_schema_table_params, agent_session_disposition, agent_supports_capability,
-        agent_transaction_params, decode_agent_response, format_agent_process_error, format_agent_startup_error,
-        is_agent_rpc_response_error, is_unsupported_handshake_error, mongo_collection_params, mongo_database_params,
-        mongo_document_id_params, parse_agent_java_opts, read_agent_line, start_stderr_collector,
-        validate_dameng_java_system_properties, AgentCapability, AgentDriverClient, AgentHandshake, AgentKvMethod,
-        AgentLaunchSpec, AgentMethod, AgentRuntimeClient, AgentSessionDisposition, AgentTableReadCloseParams,
-        AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
+        agent_rpc_error_session_id, agent_schema_params, agent_schema_table_params, agent_session_disposition,
+        agent_supports_capability, agent_transaction_params, decode_agent_response, format_agent_process_error,
+        format_agent_startup_error, is_agent_rpc_response_error, is_unsupported_handshake_error,
+        mongo_collection_params, mongo_database_params, mongo_document_id_params, parse_agent_java_opts,
+        read_agent_line, start_stderr_collector, validate_dameng_java_system_properties, AgentCapability,
+        AgentDriverClient, AgentHandshake, AgentKvMethod, AgentLaunchSpec, AgentMethod, AgentRuntimeClient,
+        AgentSessionDisposition, AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams,
+        MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
     };
     use std::io::Cursor;
     use std::io::Write;
@@ -2150,6 +2207,7 @@ mod tests {
                     "category": "connection",
                     "retryable": true,
                     "sessionDisposition": "quarantine",
+                    "agentSessionId": "session-generation-1",
                     "stage": "execute"
                 }
             }
@@ -2159,6 +2217,7 @@ mod tests {
 
         assert!(error.starts_with("Agent RPC error (-1): connection lost"));
         assert_eq!(agent_rpc_error_category(&error).as_deref(), Some("connection"));
+        assert_eq!(agent_rpc_error_session_id(&error).as_deref(), Some("session-generation-1"));
         assert_eq!(agent_session_disposition(&error), Some(AgentSessionDisposition::Quarantine));
     }
 
@@ -2745,7 +2804,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn disconnect_replaces_runtime_when_agent_cleanup_is_saturated() {
+    async fn disconnect_reports_runtime_replacement_without_owning_runtime_routing() {
         let script_path =
             std::env::temp_dir().join(format!("dbx-agent-runtime-cleanup-saturation-{}.py", uuid::Uuid::new_v4()));
         std::fs::write(
@@ -2795,7 +2854,8 @@ for line in sys.stdin:
         let error = client.disconnect().await.unwrap_err();
 
         assert_eq!(agent_session_disposition(&error), Some(AgentSessionDisposition::ReplaceRuntime));
-        assert!(runtime.is_failed());
+        assert!(!runtime.is_failed());
+        runtime.kill();
         drop(client);
         let _ = std::fs::remove_file(script_path);
     }
