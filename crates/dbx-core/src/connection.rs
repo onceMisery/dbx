@@ -119,7 +119,7 @@ pub enum PoolKind {
 }
 
 impl PoolKind {
-    pub(crate) fn agent(client: db::agent_driver::AgentDriverClient) -> Self {
+    pub fn agent(client: db::agent_driver::AgentDriverClient) -> Self {
         Self::Agent(Arc::new(db::agent_driver::PooledAgentClient::new(client)))
     }
 
