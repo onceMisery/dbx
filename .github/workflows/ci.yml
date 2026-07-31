@@ -557,13 +557,20 @@ jobs:
           set -euo pipefail
           for version in 3.13 4.3; do
             name="dbx-rabbitmq-${version//./-}"
+            cookie="dbx-ci-${GITHUB_RUN_ID:-local}-${version//./-}"
+            # RabbitMQ is disposable in CI. Keep its data on a fresh tmpfs so
+            # Docker volume ownership cannot make .erlang.cookie unreadable.
+            docker rm -fv "$name" >/dev/null 2>&1 || true
             docker run -d --name "$name" \
+              --user root \
+              --tmpfs /var/lib/rabbitmq:rw,exec,mode=700 \
               -e RABBITMQ_DEFAULT_USER=dbx \
               -e RABBITMQ_DEFAULT_PASS=dbx-password \
+              -e RABBITMQ_ERLANG_COOKIE="$cookie" \
               -p 5672:5672 -p 15672:15672 \
               "rabbitmq:${version}-management"
             cleanup() {
-              docker rm -f "$name" >/dev/null 2>&1 || true
+              docker rm -fv "$name" >/dev/null 2>&1 || true
             }
             trap cleanup EXIT
             ready=false
@@ -575,6 +582,7 @@ jobs:
               sleep 2
             done
             if [ "$ready" != "true" ]; then
+              docker inspect "$name" --format 'image={{.Config.Image}} user={{.Config.User}} status={{.State.Status}} exit={{.State.ExitCode}}' || true
               docker logs "$name"
               exit 1
             fi
