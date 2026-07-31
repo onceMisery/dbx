@@ -20,6 +20,7 @@ import { insertValueHintColumnNames } from "@/lib/sql/insertValueHintColumns";
 import { formatSqlText, compressSqlText, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { enabledSqlParameterSyntaxes, resolveSqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
 import { blankLineDeletionChanges, replaceSelectedEditorText } from "@/lib/editor/queryEditorTextEdits";
+import { createSqlSignatureTooltipDom } from "@/lib/editor/sqlSignatureTooltip";
 import { buildSqlInConditionFromPasteSource, insertTextForSqlInCondition } from "@/lib/sql/sqlInListPaste";
 import { resolveSqlSingleQuoteKeyAction } from "@/lib/sql/sqlQuoteCaret";
 import { formatMongoShellText } from "@/lib/mongo/mongoFormatter";
@@ -84,6 +85,7 @@ import { loadTableMetadata, type TableMetadataLoadResult } from "@/lib/metadata/
 import { queryContextObjectActions, queryContextObjectRoute, queryTableCandidateAtSqlPosition, resolveQueryContextCandidateDatabase, resolveQueryContextObjectTarget, type QueryContextObjectAction } from "@/lib/sql/queryCursorTableTarget";
 import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isMacOS } from "@/lib/backend/platform";
 import {
   areSqlSemanticDiagnosticsEqual,
   buildSqlParserErrorDiagnostic,
@@ -863,6 +865,9 @@ function registerEditorScrollbarPointerGuard(currentView: EditorViewType) {
     if (!isEditorScrollbarPointerEvent(currentView, event)) return;
     clearTableNavigationHover();
     event.stopPropagation();
+    if (isTauriRuntime() && isMacOS() && !currentView.contentDOM.contains(event.target as Node | null)) {
+      event.preventDefault();
+    }
   };
   currentView.scrollDOM.addEventListener("mousedown", onPointerDown, true);
   editorScrollbarPointerCleanup = () => {
@@ -1823,41 +1828,6 @@ function createHoverDom(title: string, detail: string, sqlContent?: string, rows
     rowNode.textContent = row;
     dom.appendChild(rowNode);
   }
-
-  return dom;
-}
-
-function createSignatureDom(signature: ReturnType<typeof getSqlFunctionSignatureHelp>) {
-  const dom = document.createElement("div");
-  dom.className = "rounded-md border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md";
-  if (!signature) return dom;
-
-  const signatureNode = document.createElement("div");
-  signatureNode.className = "font-mono";
-
-  const nameNode = document.createElement("span");
-  nameNode.className = "text-muted-foreground";
-  nameNode.textContent = `${signature.name}(`;
-  signatureNode.appendChild(nameNode);
-
-  signature.parameters.forEach((parameter, index) => {
-    if (index > 0) {
-      const comma = document.createElement("span");
-      comma.className = "text-muted-foreground";
-      comma.textContent = ", ";
-      signatureNode.appendChild(comma);
-    }
-    const parameterNode = document.createElement("span");
-    parameterNode.className = index === signature.activeParameter ? "font-semibold text-foreground" : "text-muted-foreground";
-    parameterNode.textContent = parameter;
-    signatureNode.appendChild(parameterNode);
-  });
-
-  const closeNode = document.createElement("span");
-  closeNode.className = "text-muted-foreground";
-  closeNode.textContent = ")";
-  signatureNode.appendChild(closeNode);
-  dom.appendChild(signatureNode);
 
   return dom;
 }
@@ -3469,7 +3439,7 @@ onMounted(async () => {
   })();
 
   const [
-    { EditorView, keymap, rectangularSelection, hoverTooltip, showTooltip, closeHoverTooltips, Decoration, gutter, GutterMarker, lineNumberMarkers, lineNumbers, highlightActiveLineGutter, highlightSpecialChars, drawSelection, dropCursor, crosshairCursor, scrollPastEnd, ViewPlugin },
+    { EditorView, keymap, rectangularSelection, hoverTooltip, showTooltip, closeHoverTooltips, Decoration, tooltips, gutter, GutterMarker, lineNumberMarkers, lineNumbers, highlightActiveLineGutter, highlightSpecialChars, drawSelection, dropCursor, crosshairCursor, scrollPastEnd, ViewPlugin },
     { EditorState, EditorSelection, Compartment, Prec, RangeSet, StateEffect, StateField },
     langSql,
     { autocompletion, startCompletion, acceptCompletion, closeBrackets, closeBracketsKeymap, snippetCompletion, completionStatus, completionKeymap, insertCompletionText, nextSnippetField },
@@ -3729,7 +3699,7 @@ onMounted(async () => {
         pos: currentState.selection.main.head,
         above: false,
         clip: false,
-        create: () => ({ dom: createSignatureDom(signature) }),
+        create: () => ({ dom: createSqlSignatureTooltipDom(signature) }),
       };
     });
 
@@ -3884,6 +3854,7 @@ onMounted(async () => {
     { decorations: (v) => v.decorations },
   );
 
+  const tooltipParent = editorRef.value.closest<HTMLElement>("#root") ?? editorRef.value;
   const state = EditorState.create({
     doc: props.modelValue,
     selection: normalizedEditorSelection(props.initialSelection, props.modelValue.length),
@@ -3932,6 +3903,7 @@ onMounted(async () => {
       keymap.of([...defaultKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap, ...completionKeymap]),
       sqlLanguageComp.of(buildSqlLanguageExtension()),
       sqlSemanticHighlightComp.of(buildSqlSemanticHighlightExtension()),
+      tooltips({ parent: tooltipParent }),
       completionComp.of(buildSqlCompletionExtension()),
       sqlCompletionTheme(EditorView),
       codeMirrorTheme.of(theme),

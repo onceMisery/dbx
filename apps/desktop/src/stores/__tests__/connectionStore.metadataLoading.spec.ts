@@ -777,7 +777,7 @@ describe("connectionStore metadata loading", () => {
     expect(databaseNode.children).toEqual([previousSchema]);
     expect(databaseNode.isExpanded).toBe(true);
     expect(store.connectionErrors[connection.id]).toBe("Agent RPC call timed out (5s)");
-    expect(deleteSchemaCachePrefix).not.toHaveBeenCalled();
+    expect(deleteSchemaCachePrefix).toHaveBeenCalledWith("pg-1:app:");
   });
 
   it("does not let an older refresh resume after a newer refresh succeeds", async () => {

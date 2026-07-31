@@ -1,5 +1,6 @@
 use crate::connection::{
-    connection_url_for_endpoint, database_connection_config, task_client_session_id, AppState, MysqlMode, PoolKind,
+    connection_url_for_endpoint, database_connection_config, gaussdb_uses_m_jdbc_driver, task_client_session_id,
+    AppState, MysqlMode, PoolKind,
 };
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
@@ -1829,6 +1830,7 @@ async fn list_tables_once(
         }
         try_sqlserver!(connections, &pool_key, list_tables, schema, filter, limit, offset);
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+            let use_mongodb_collection_listing = uses_mongodb_agent_collection_listing(db_config.as_ref());
             let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
             let is_tdengine = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Tdengine);
             let use_agent_table_paging = db_config.as_ref().is_some_and(supports_agent_table_paging);
@@ -1842,6 +1844,17 @@ async fn list_tables_once(
             let fallback_config = db_config.clone();
             drop(connections);
             let mut client = client.lock().await;
+            if use_mongodb_collection_listing {
+                let collection_names = client.mongo_list_collections::<Vec<String>>(database).await?;
+                return Ok(filter_mongodb_agent_collections(
+                    collection_names,
+                    filter,
+                    limit,
+                    offset,
+                    object_types,
+                    table_name_filter,
+                ));
+            }
             let agent_filter = if filter_locally_after_comments { None } else { filter };
             let force_local_table_name_filter = table_name_filter.is_some_and(|filter| !filter.is_empty());
             let agent_limit = if filter_locally_after_comments || force_local_table_name_filter {
@@ -2090,6 +2103,24 @@ fn collection_names_to_tables(names: Vec<String>, table_type: &str) -> Vec<db::T
         .collect()
 }
 
+fn filter_mongodb_agent_collections(
+    names: Vec<String>,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<&[String]>,
+    table_name_filter: Option<&TableNameFilter>,
+) -> Vec<db::TableInfo> {
+    filter_table_infos(
+        collection_names_to_tables(names, "COLLECTION"),
+        filter,
+        limit,
+        offset,
+        object_types,
+        table_name_filter,
+    )
+}
+
 fn filter_table_infos(
     tables: Vec<db::TableInfo>,
     filter: Option<&str>,
@@ -2193,6 +2224,10 @@ fn normalize_table_info_object_type(value: &str) -> String {
 
 fn uses_presto_like_information_schema_tables(db_type: &DatabaseType) -> bool {
     matches!(db_type, DatabaseType::PrestoSql | DatabaseType::Trino)
+}
+
+fn uses_mongodb_agent_collection_listing(config: Option<&ConnectionConfig>) -> bool {
+    config.is_some_and(|config| config.db_type == DatabaseType::MongoDb)
 }
 
 async fn external_driver_presto_like_tables(
@@ -2439,20 +2474,22 @@ mod tests {
     use super::{
         clickhouse_metadata_database, dameng_object_statistics_dba_segments_sql,
         dameng_object_statistics_rows_only_sql, dameng_object_statistics_user_segments_sql, deduplicate_column_infos,
-        ephemeral_agent_metadata_session_id, filter_mysql_system_databases_for_config, filter_object_infos,
-        filter_table_infos, filter_visible_schema_names, gbase8a_object_statistics_sql,
-        is_agent_postgres_metadata_fallback_config, is_retryable_metadata_error, metadata_error_action,
-        metadata_name_or_comment_matches, mysql_object_source_ddl_column_index, mysql_object_source_sql,
-        mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_columns_from_query_result,
-        oracle_columns_sql, oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
+        ephemeral_agent_metadata_session_id, external_driver_uses_mysql_ddl, filter_mongodb_agent_collections,
+        filter_mysql_system_databases_for_config, filter_object_infos, filter_table_infos, filter_visible_schema_names,
+        gbase8a_object_statistics_sql, is_agent_postgres_metadata_fallback_config, is_mysql_external_driver_config,
+        is_retryable_metadata_error, metadata_error_action, metadata_name_or_comment_matches,
+        mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
+        mysql_object_source_ddl_column_index, mysql_object_source_sql, mysql_table_metadata_catalog,
+        normalize_information_schema_table_type, oracle_columns_from_query_result, oracle_columns_sql,
+        oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
         oracle_object_statistics_rows_only_sql, oracle_object_statistics_sql,
         oracle_object_statistics_user_segments_sql, oracle_table_comment_from_query_result, oracle_table_comment_sql,
         oracle_table_comments_sql, presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
         presto_like_information_schema_tables_sql, presto_like_tables_from_query_result, replace_metadata_runtime,
         should_query_oracle_columns_via_sql_first, table_comments_from_query_result, table_name_filter_matches,
         tdengine_table_comment_like_pattern, tdengine_table_comment_sql, tdengine_table_comments_sql,
-        visible_schema_filter, MetadataErrorAction, TableNameFilter, TDENGINE_COMMENT_SEARCH_TIMEOUT,
-        TDENGINE_LIKE_PATTERN_MAX_BYTES,
+        uses_mongodb_agent_collection_listing, visible_schema_filter, MetadataErrorAction, TableNameFilter,
+        TDENGINE_COMMENT_SEARCH_TIMEOUT, TDENGINE_LIKE_PATTERN_MAX_BYTES,
     };
     use crate::models::connection::{ConnectionConfig, DatabaseType};
     use std::collections::HashMap;
@@ -2549,6 +2586,94 @@ mod tests {
     fn mysql_table_child_metadata_prefers_schema_when_present() {
         assert_eq!(mysql_table_metadata_catalog("app_db", ""), "app_db");
         assert_eq!(mysql_table_metadata_catalog("app_db", "tenant_db"), "tenant_db");
+    }
+
+    #[test]
+    fn mysql_external_driver_detection_only_accepts_standard_jdbc_signals() {
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.connection_string = Some(" jdbc:mysql://127.0.0.1:3306/demo ".to_string());
+        assert!(is_mysql_external_driver_config(&config));
+
+        config.connection_string = Some("jdbc:mariadb://127.0.0.1:3306/demo".to_string());
+        config.jdbc_driver_class = Some("com.mysql.cj.jdbc.Driver".to_string());
+        assert!(!is_mysql_external_driver_config(&config));
+
+        config.connection_string = None;
+        assert!(is_mysql_external_driver_config(&config));
+
+        config.jdbc_driver_class = Some("org.mariadb.jdbc.Driver".to_string());
+        assert!(!is_mysql_external_driver_config(&config));
+    }
+
+    #[test]
+    fn gaussdb_m_external_driver_uses_mysql_style_ddl() {
+        let mut config = test_connection_config(DatabaseType::Gaussdb);
+        config.driver_profile = Some("gaussdb-m".to_string());
+        config.jdbc_driver_class = Some("com.huawei.gaussdb.jdbc.Driver".to_string());
+
+        assert!(external_driver_uses_mysql_ddl(&config));
+        assert_eq!(
+            mysql_external_driver_ddl_sql("app", "app_schema", "order"),
+            "SHOW CREATE TABLE `app_schema`.`order`"
+        );
+
+        config.driver_profile = Some("gaussdb".to_string());
+        assert!(!external_driver_uses_mysql_ddl(&config));
+    }
+
+    #[test]
+    fn mysql_external_driver_ddl_sql_uses_catalog_and_escaped_identifiers() {
+        assert_eq!(
+            mysql_external_driver_ddl_sql("app_db", "tenant`db", "user`events"),
+            "SHOW CREATE TABLE `tenant``db`.`user``events`"
+        );
+        assert_eq!(
+            mysql_external_driver_ddl_sql("app`db", "", "user`events"),
+            "SHOW CREATE TABLE `app``db`.`user``events`"
+        );
+    }
+
+    #[test]
+    fn mysql_external_driver_ddl_reads_named_column_case_insensitively() {
+        let result = db::QueryResult {
+            columns: vec!["Table".to_string(), "Extra".to_string(), "CREATE TABLE".to_string()],
+            column_types: Vec::new(),
+            column_sortables: Vec::new(),
+            rows: vec![vec![
+                serde_json::json!("users"),
+                serde_json::json!("ignored"),
+                serde_json::json!("CREATE TABLE `users` (`id` bigint)"),
+            ]],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+        };
+
+        assert_eq!(mysql_external_driver_ddl_from_query_result(result).unwrap(), "CREATE TABLE `users` (`id` bigint);");
+    }
+
+    #[test]
+    fn mysql_external_driver_ddl_falls_back_to_second_column() {
+        let result = db::QueryResult {
+            columns: vec!["name".to_string(), "definition".to_string()],
+            column_types: Vec::new(),
+            column_sortables: Vec::new(),
+            rows: vec![vec![serde_json::json!("users"), serde_json::json!("CREATE TABLE `users` (`id` bigint);\n")]],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+        };
+
+        assert_eq!(
+            mysql_external_driver_ddl_from_query_result(result).unwrap(),
+            "CREATE TABLE `users` (`id` bigint);\n"
+        );
     }
 
     #[test]
@@ -2939,6 +3064,40 @@ for line in sys.stdin:
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "audit_record");
+    }
+
+    #[test]
+    fn mongodb_agent_collection_listing_only_applies_to_mongodb() {
+        let mongodb = test_connection_config(DatabaseType::MongoDb);
+        let postgres = test_connection_config(DatabaseType::Postgres);
+
+        assert!(uses_mongodb_agent_collection_listing(Some(&mongodb)));
+        assert!(!uses_mongodb_agent_collection_listing(Some(&postgres)));
+        assert!(!uses_mongodb_agent_collection_listing(None));
+    }
+
+    #[test]
+    fn mongodb_agent_collections_preserve_table_list_constraints() {
+        let collection_types = vec!["COLLECTION".to_string()];
+        let names = vec!["audit_log".to_string(), "users".to_string(), "audit_record".to_string()];
+
+        let filtered = filter_mongodb_agent_collections(
+            names.clone(),
+            Some("audit"),
+            Some(1),
+            Some(1),
+            Some(&collection_types),
+            None,
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "audit_record");
+        assert_eq!(filtered[0].table_type, "COLLECTION");
+
+        let table_types = vec!["TABLE".to_string()];
+        let filtered = filter_mongodb_agent_collections(names, None, None, None, Some(&table_types), None);
+
+        assert!(filtered.is_empty());
     }
 
     #[test]
@@ -5585,6 +5744,14 @@ async fn get_table_ddl_once(
 
     {
         let connections = state.connections.read().await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+            if external_driver_uses_mysql_ddl(config.as_ref()) {
+                let config = config.clone();
+                let session = session.clone();
+                drop(connections);
+                return external_driver_mysql_ddl(session, config.as_ref(), database, schema, table).await;
+            }
+        }
         #[cfg(feature = "duckdb-sidecar")]
         if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
             let client = client.clone();
@@ -5817,6 +5984,44 @@ fn mysql_qualified_name(database: &str, name: &str) -> String {
     } else {
         format!("{}.{}", mysql_ident(database), mysql_ident(name))
     }
+}
+
+fn is_mysql_external_driver_config(config: &ConnectionConfig) -> bool {
+    if config.db_type != DatabaseType::Jdbc {
+        return false;
+    }
+
+    let connection_string = config.connection_string.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let driver_class = config.jdbc_driver_class.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let mysql_url = connection_string.map(|value| value.to_ascii_lowercase().starts_with("jdbc:mysql:"));
+    let mysql_driver = driver_class.map(|value| matches!(value, "com.mysql.cj.jdbc.Driver" | "com.mysql.jdbc.Driver"));
+
+    match (mysql_url, mysql_driver) {
+        (Some(url_matches), Some(driver_matches)) => url_matches && driver_matches,
+        (Some(url_matches), None) => url_matches,
+        (None, Some(driver_matches)) => driver_matches,
+        (None, None) => false,
+    }
+}
+
+fn external_driver_uses_mysql_ddl(config: &ConnectionConfig) -> bool {
+    is_mysql_external_driver_config(config) || gaussdb_uses_m_jdbc_driver(config)
+}
+
+fn mysql_external_driver_ddl_sql(database: &str, schema: &str, table: &str) -> String {
+    format!("SHOW CREATE TABLE {}", mysql_qualified_name(mysql_table_metadata_catalog(database, schema), table))
+}
+
+fn mysql_external_driver_ddl_from_query_result(result: db::QueryResult) -> Result<String, String> {
+    let row = result.rows.first().ok_or_else(|| "DDL not found".to_string())?;
+    let named_index = result.columns.iter().position(|column| column.trim().eq_ignore_ascii_case("Create Table"));
+    let ddl = named_index
+        .into_iter()
+        .chain(std::iter::once(1))
+        .filter_map(|index| query_result_cell_string(row, index))
+        .find(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Failed to read DDL".to_string())?;
+    Ok(ensure_display_ddl_terminated(ddl))
 }
 
 fn sqlite_object_type(kind: &db::ObjectSourceKind) -> &'static str {
@@ -7497,6 +7702,29 @@ pub async fn mysql_ddl(pool: &db::mysql::MySqlPool, database: &str, table: &str)
         })
         .ok_or_else(|| "Failed to read DDL".to_string())?;
     Ok(ensure_display_ddl_terminated(ddl))
+}
+
+async fn external_driver_mysql_ddl(
+    session: std::sync::Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String, String> {
+    let result: db::QueryResult = session
+        .invoke_with_timeout(
+            "executeQuery",
+            serde_json::json!({
+                "connection": config,
+                "database": database,
+                "schema": schema,
+                "sql": mysql_external_driver_ddl_sql(database, schema, table),
+                "maxRows": 1
+            }),
+            agent_metadata_timeout(Some(config)),
+        )
+        .await?;
+    mysql_external_driver_ddl_from_query_result(result)
 }
 
 fn ensure_display_ddl_terminated(sql: String) -> String {

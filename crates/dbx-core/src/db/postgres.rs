@@ -30,7 +30,7 @@ use crate::types::{
     OwnerInfo, QueryResult, RuleInfo, SchemaInfo, SequenceInfo, TableInfo, TriggerInfo,
 };
 
-const GAUSSDB_COMPATIBILITY_SQL: &str =
+pub(crate) const GAUSSDB_COMPATIBILITY_SQL: &str =
     "SELECT datcompatibility FROM pg_catalog.pg_database WHERE datname = current_database()";
 
 pub async fn gaussdb_identifier_quote(pool: &Pool) -> Option<String> {
@@ -41,7 +41,7 @@ pub async fn gaussdb_identifier_quote(pool: &Pool) -> Option<String> {
     gaussdb_identifier_quote_for_compatibility_mode(&compatibility_mode).map(str::to_string)
 }
 
-fn gaussdb_identifier_quote_for_compatibility_mode(compatibility_mode: &str) -> Option<&'static str> {
+pub(crate) fn gaussdb_identifier_quote_for_compatibility_mode(compatibility_mode: &str) -> Option<&'static str> {
     match compatibility_mode.trim().to_ascii_uppercase().as_str() {
         "M" | "B" | "MYSQL" => Some("`"),
         "A" | "PG" | "ORA" | "POSTGRESQL" => Some("\""),
@@ -230,6 +230,10 @@ fn pg_optional_array_to_json<T>(
     )
 }
 
+fn pg_json_array_values_to_json(values: Vec<Option<serde_json::Value>>) -> serde_json::Value {
+    pg_optional_array_to_json(values, |value| serde_json::Value::String(value.to_string()))
+}
+
 fn pg_float_number(v: f64) -> serde_json::Value {
     serde_json::Number::from_f64(v).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
 }
@@ -347,6 +351,9 @@ fn pg_bit_string_array_to_json_value(row: &Row, idx: usize) -> Option<serde_json
 }
 
 fn pg_array_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
+    if let Ok(values) = row.try_get::<_, Vec<Option<serde_json::Value>>>(idx) {
+        return Some(pg_json_array_values_to_json(values));
+    }
     if let Ok(values) = row.try_get::<_, Vec<Option<String>>>(idx) {
         return Some(pg_optional_array_to_json(values, serde_json::Value::String));
     }
@@ -4064,6 +4071,32 @@ mod tests {
     use std::time::Instant;
     use tokio_postgres::types::FromSql;
 
+    fn pg_array_binary(element_oid: u32, elements: &[Option<Vec<u8>>]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1_i32.to_be_bytes());
+        raw.extend_from_slice(&i32::from(elements.iter().any(Option::is_none)).to_be_bytes());
+        raw.extend_from_slice(&element_oid.to_be_bytes());
+        raw.extend_from_slice(&(elements.len() as i32).to_be_bytes());
+        raw.extend_from_slice(&1_i32.to_be_bytes());
+        for element in elements {
+            match element {
+                Some(bytes) => {
+                    raw.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    raw.extend_from_slice(bytes);
+                }
+                None => raw.extend_from_slice(&(-1_i32).to_be_bytes()),
+            }
+        }
+        raw
+    }
+
+    fn pg_jsonb_binary(value: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(value.len() + 1);
+        raw.push(1);
+        raw.extend_from_slice(value);
+        raw
+    }
+
     #[test]
     fn gaussdb_compatibility_mode_selects_identifier_quote() {
         for mode in ["M", "B", "mysql", " MYSQL "] {
@@ -4074,6 +4107,55 @@ mod tests {
         }
         assert_eq!(gaussdb_identifier_quote_for_compatibility_mode("C"), None);
         assert_eq!(gaussdb_identifier_quote_for_compatibility_mode(""), None);
+    }
+
+    #[test]
+    fn postgres_json_arrays_decode_elements_without_jsonb_version_bytes() {
+        let json_raw = pg_array_binary(
+            Type::JSON.oid(),
+            &[
+                Some(br#"{"kind":"json"}"#.to_vec()),
+                Some(br#""text""#.to_vec()),
+                Some(br#"[1,true,null]"#.to_vec()),
+                None,
+            ],
+        );
+        let jsonb_raw = pg_array_binary(
+            Type::JSONB.oid(),
+            &[
+                Some(pg_jsonb_binary(br#"{"port":10031,"type":"admin_web"}"#)),
+                Some(pg_jsonb_binary(br#""quoted""#)),
+                Some(pg_jsonb_binary(br#"[2,false,{"nested":true}]"#)),
+                None,
+            ],
+        );
+
+        let json_values = Vec::<Option<serde_json::Value>>::from_sql(&Type::JSON_ARRAY, &json_raw).unwrap();
+        let jsonb_values = Vec::<Option<serde_json::Value>>::from_sql(&Type::JSONB_ARRAY, &jsonb_raw).unwrap();
+
+        assert_eq!(
+            pg_json_array_values_to_json(json_values),
+            serde_json::json!([r#"{"kind":"json"}"#, r#""text""#, "[1,true,null]", null])
+        );
+        let decoded = pg_json_array_values_to_json(jsonb_values);
+        assert_eq!(
+            decoded,
+            serde_json::json!([
+                r#"{"port":10031,"type":"admin_web"}"#,
+                r#""quoted""#,
+                r#"[2,false,{"nested":true}]"#,
+                null
+            ])
+        );
+        assert!(!decoded.to_string().contains('\u{1}'));
+    }
+
+    #[test]
+    fn postgres_json_array_decoder_is_limited_to_json_element_types() {
+        assert!(Vec::<Option<serde_json::Value>>::accepts(&Type::JSON_ARRAY));
+        assert!(Vec::<Option<serde_json::Value>>::accepts(&Type::JSONB_ARRAY));
+        assert!(!Vec::<Option<serde_json::Value>>::accepts(&Type::TEXT_ARRAY));
+        assert!(!Vec::<Option<serde_json::Value>>::accepts(&Type::INT4_ARRAY));
     }
 
     fn pg_interval_bytes(microseconds: i64, days: i32, months: i32) -> [u8; 16] {

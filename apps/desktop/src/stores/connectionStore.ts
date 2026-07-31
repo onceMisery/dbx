@@ -90,7 +90,7 @@ import {
   type TableTreeLoadMoreParent,
   type DatabaseObjectTreeKind,
 } from "@/lib/table/tableTree";
-import { hasTreeNodeDatabaseContext, normalizeCataloglessDatabaseNodes } from "@/lib/sidebar/treeNodeContext";
+import { hasTreeNodeDatabaseContext, normalizeCataloglessDatabaseNodes, treeNodeSchemaCachePrefix } from "@/lib/sidebar/treeNodeContext";
 import { decodeSchemaTreeCache, encodeSchemaTreeCache } from "@/lib/metadata/schemaTreeCache";
 import { sortSidebarTreeChildrenForParent } from "@/lib/sidebar/sidebarNodeOrdering";
 import { connectionSupportsDatabaseUserAdmin } from "@/lib/database/databaseUserAdmin";
@@ -1247,14 +1247,19 @@ export const useConnectionStore = defineStore("connection", () => {
           const isExpanded = old.isExpanded;
           const isLoading = old.isLoading;
           const oldChildren = old.children;
+          const objectCount = child.objectCount ?? old.objectCount;
           Object.assign(old, child);
           old.isExpanded = isExpanded;
           old.isLoading = isLoading;
           old.children = oldChildren;
+          old.objectCount = objectCount;
           return old;
         }
         if (old?.isExpanded) {
-          return { ...child, isExpanded: true, children: old.children };
+          return { ...child, isExpanded: true, children: old.children, objectCount: child.objectCount ?? old.objectCount };
+        }
+        if (old && objectTypesForGroupNode(old.type)) {
+          return { ...child, objectCount: child.objectCount ?? old.objectCount };
         }
         // Same-id collapsed database/schema shell replace (e.g. DDL → force loadDatabases):
         // prior confirmed-empty markers belong to the discarded instance and must not skip
@@ -1307,6 +1312,13 @@ export const useConnectionStore = defineStore("connection", () => {
     const parent = findParentNode(treeNodes.value, nodeId);
     if (parent?.children) {
       parent.children = parent.children.filter((c) => c.id !== nodeId);
+      // Keep the group badge in sync with remaining real children (exclude load-more).
+      if (parent.objectCount != null) {
+        parent.objectCount = withoutLoadMoreNodes(parent.children).length;
+      }
+    }
+    if (parent?.hiddenChildren) {
+      parent.hiddenChildren = parent.hiddenChildren.filter((child) => child.id !== nodeId);
     }
     if (selectedTreeNodeId.value === nodeId) selectedTreeNodeId.value = null;
     selectedTreeNodeIds.value = selectedTreeNodeIds.value.filter((id) => id !== nodeId);
@@ -2119,6 +2131,16 @@ export const useConnectionStore = defineStore("connection", () => {
     } else {
       Promise.all([api.deleteSchemaCachePrefix(rawPrefix), api.deleteSchemaCachePrefix(encodedPrefix)]).catch(() => undefined);
     }
+  }
+
+  function schemaCachePrefixForNode(node: TreeNode): string | null {
+    return treeNodeSchemaCachePrefix(node);
+  }
+
+  async function clearPersistedTreeCacheForNode(node: TreeNode) {
+    const prefix = schemaCachePrefixForNode(node);
+    if (!prefix) return;
+    await api.deleteSchemaCachePrefix(prefix).catch(() => undefined);
   }
 
   function findParentNode(nodes: TreeNode[], id: string, parent: TreeNode | null = null): TreeNode | null {
@@ -3203,8 +3225,17 @@ export const useConnectionStore = defineStore("connection", () => {
               children: [],
             },
             {
+              id: `${connectionId}:etcd-access-control`,
+              label: "用户和角色",
+              type: "etcd-access-control" as const,
+              connectionId,
+              database: "",
+              isExpanded: false,
+              children: [],
+            },
+            {
               id: `${connectionId}:etcd-dashboard`,
-              label: "Dashboard",
+              label: "服务仪表盘",
               type: "etcd-dashboard" as const,
               connectionId,
               database: "",
@@ -5102,17 +5133,23 @@ export const useConnectionStore = defineStore("connection", () => {
     const expandedIds = collectExpandedNodeIds([node]);
     expandedIds.add(node.id);
     const previousChildren = node.children;
+    const previousHiddenChildren = node.hiddenChildren;
     const previousObjectCount = node.objectCount;
     const previousExpanded = node.isExpanded;
-    const wasLoaded = loadedTreeNodeChildrenIds.value.has(node.id);
-    const wasConfirmedEmpty = confirmedEmptyTreeNodeIds.value.has(node.id);
+    const previousLoadedIds = [...loadedTreeNodeChildrenIds.value].filter((id) => id === node.id || id.startsWith(`${node.id}:`));
+    const previousConfirmedEmptyIds = [...confirmedEmptyTreeNodeIds.value].filter((id) => id === node.id || id.startsWith(`${node.id}:`));
     const connectionRevision = node.connectionId ? connectionStateRevision(node.connectionId) : undefined;
     const refreshGeneration = ++nextTreeRefreshGeneration;
     activeTreeRefreshGenerations.set(node.id, refreshGeneration);
     const ownsRefreshGeneration = () => activeTreeRefreshGenerations.get(node.id) === refreshGeneration;
     const isCurrentRefresh = () => ownsRefreshGeneration() && (!node.connectionId || connectionStateRevision(node.connectionId) === connectionRevision);
-    clearLoadedChildrenCache(node.id, { deletePersisted: false });
     try {
+      await clearPersistedTreeCacheForNode(node);
+      if (!isCurrentRefresh()) return;
+      clearLoadedChildrenCache(node.id);
+      if (node.type !== "connection-group") {
+        node.children = [];
+      }
       await loadTreeNodeChildren(node, { force: true });
       if (isCurrentRefresh()) {
         await restoreExpandedChildren(node, expandedIds, { force: true }, isCurrentRefresh);
@@ -5123,10 +5160,12 @@ export const useConnectionStore = defineStore("connection", () => {
         const target = treeNodeInSidebarTree(node);
         if (target) {
           target.children = previousChildren;
+          target.hiddenChildren = previousHiddenChildren;
           target.objectCount = previousObjectCount;
           target.isExpanded = previousExpanded;
-          if (wasLoaded) loadedTreeNodeChildrenIds.value.add(target.id);
-          if (wasConfirmedEmpty) confirmedEmptyTreeNodeIds.value.add(target.id);
+          clearLoadedChildrenCache(target.id, { deletePersisted: false });
+          for (const id of previousLoadedIds) loadedTreeNodeChildrenIds.value.add(id);
+          for (const id of previousConfirmedEmptyIds) confirmedEmptyTreeNodeIds.value.add(id);
         }
       }
       throw error;

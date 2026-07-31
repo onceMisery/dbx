@@ -609,6 +609,10 @@ async function toggle() {
       await connectionStore.ensureConnected(node.connectionId);
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "etcd"}:dashboard`;
       queryStore.createTab(node.connectionId, "", tabTitle, "etcd-dashboard");
+    } else if (node.type === "etcd-access-control" && node.connectionId) {
+      await connectionStore.ensureConnected(node.connectionId);
+      const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "etcd"}:access-control`;
+      queryStore.createTab(node.connectionId, "", tabTitle, "etcd-access-control");
     } else if (node.type === "zookeeper-root" && node.connectionId) {
       await connectionStore.ensureConnected(node.connectionId);
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "ZooKeeper"}:keys`;
@@ -1038,7 +1042,7 @@ function activateDataTableFromDoubleClick() {
   if (node.type !== "table" || !hasNodeDatabaseContext(node)) return;
   const activation = settingsStore.editorSettings.sidebarActivation;
   const existingSameTableTab = findExistingSameTableDataTab();
-  const action = dataTableDoubleClickAction(existingSameTableTab, activation);
+  const action = dataTableDoubleClickAction(existingSameTableTab, activation, settingsStore.editorSettings.reuseDataTab);
   if (action === "none") return;
   if (action === "open") {
     openDataImmediately(node);
@@ -1079,8 +1083,8 @@ async function openSavedSqlFile() {
   if (node.type !== "saved-sql-file" || !node.savedSqlId) return;
   const file = await savedSqlStore.ensureFileContent(node.savedSqlId);
   if (!file) return;
-  queryStore.openSavedSql(file);
-  connectionStore.activeConnectionId = file.connectionId;
+  const tabId = queryStore.openSavedSql(file);
+  connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? file.connectionId;
   void savedSqlStore.recordFileUsage(file.id);
 }
 
@@ -1244,7 +1248,8 @@ async function loadTemplateContext(allowView = false) {
     }
   }
 
-  return { node, dbType, tableSchema, columns, tableType };
+  const identifierQuote = connectionStore.connectionIdentifierQuote(node.connectionId);
+  return { node, dbType, identifierQuote, tableSchema, columns, tableType };
 }
 
 function openSqlTemplateTab(connectionId: string, database: string, schema: string | undefined, catalog: string | undefined, sql: string, title?: string) {
@@ -1258,6 +1263,7 @@ async function newSelectTemplate() {
     if (!context) return;
     const sql = buildTableSelectTemplate({
       databaseType: context.dbType,
+      identifierQuote: context.identifierQuote,
       catalog: context.node.catalog,
       database: context.node.database,
       schema: context.tableSchema,
@@ -1276,6 +1282,7 @@ async function newInsertTemplate() {
     if (!context) return;
     const sql = buildTableInsertTemplate({
       databaseType: context.dbType,
+      identifierQuote: context.identifierQuote,
       catalog: context.node.catalog,
       database: context.node.database,
       schema: context.tableSchema,
@@ -1295,6 +1302,7 @@ async function newUpdateTemplate() {
     if (!context) return;
     const sql = buildTableUpdateTemplate({
       databaseType: context.dbType,
+      identifierQuote: context.identifierQuote,
       catalog: context.node.catalog,
       database: context.node.database,
       schema: context.tableSchema,
@@ -1313,6 +1321,7 @@ async function newDeleteTemplate() {
     if (!context) return;
     const sql = buildTableDeleteTemplate({
       databaseType: context.dbType,
+      identifierQuote: context.identifierQuote,
       catalog: context.node.catalog,
       database: context.node.database,
       schema: context.tableSchema,
@@ -2021,15 +2030,17 @@ async function confirmDropObject() {
     const msgKey = node.type === "view" ? "contextMenu.dropViewSuccess" : node.type === "materialized_view" ? "contextMenu.dropViewSuccess" : node.type === "procedure" ? "contextMenu.dropProcedureSuccess" : "contextMenu.dropFunctionSuccess";
     toast(t(msgKey, { name: node.label }), 3000);
     closeDroppedTableObjectTabsForNode(node);
-    // Procedure/function drops refresh their parent instead of removing this
-    // node directly, so clear their pin before the old identity can survive.
+    // Refresh the parent object list so group badges and children stay in sync.
+    // Clear the pin first — refresh rebuilds nodes and the old identity must not survive.
     connectionStore.removePinnedTreeNodes([node]);
-    if (node.type === "view" || node.type === "materialized_view") {
-      connectionStore.removeTreeNode(node.id);
-      releaseActiveNodeReference([node.id]);
-    } else {
+    try {
       await refreshTableList(node);
+    } catch (error: any) {
+      // DROP already succeeded; keep the sidebar consistent if metadata refresh fails.
+      connectionStore.removeTreeNode(node.id);
+      toast(t("contextMenu.objectDropRefreshFailed", { message: error?.message || String(error) }), 5000);
     }
+    releaseActiveNodeReference([node.id]);
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -2125,6 +2136,7 @@ async function confirmBatchDrop() {
       showBatchDropConfirm.value = false;
       return;
     }
+    const refreshScopes = new Map<string, TreeNode>();
     for (const target of targets) {
       if (!target.connectionId || !target.database) continue;
       await connectionStore.ensureConnected(target.connectionId);
@@ -2132,11 +2144,18 @@ async function confirmBatchDrop() {
       if (!sql) continue;
       await executeTreeNodeSqlWithProductionGuard(target, sql, { database: target.database, schema: target.schema });
       closeDroppedTableObjectTabsForNode(target);
+      // Remove immediately so a later failure cannot leave dropped objects in the tree.
       connectionStore.removeTreeNode(target.id);
       releaseActiveNodeReference([target.id]);
+      refreshScopes.set(`${target.connectionId}:${target.database}:${target.schema ?? ""}`, target);
     }
     toast(t("contextMenu.batchDropSuccess", { count: targets.length }), 3000);
     showBatchDropConfirm.value = false;
+    const refreshResults = await Promise.allSettled([...refreshScopes.values()].map((target) => refreshTableList(target)));
+    const refreshFailure = refreshResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (refreshFailure) {
+      toast(t("contextMenu.objectDropRefreshFailed", { message: refreshFailure.reason?.message || String(refreshFailure.reason) }), 5000);
+    }
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -3740,8 +3759,8 @@ function savedSqlHistoryScopeForNode(node: TreeNode): SavedSqlHistoryScope | nul
 async function openSavedSqlHistoryFile(fileId: string) {
   const file = await savedSqlStore.ensureFileContent(fileId);
   if (!file) return;
-  queryStore.openSavedSql(file);
-  connectionStore.activeConnectionId = file.connectionId;
+  const tabId = queryStore.openSavedSql(file);
+  connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? file.connectionId;
   void savedSqlStore.recordFileUsage(file.id);
 }
 
@@ -4091,7 +4110,7 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     return true;
   }
 
-  if (node.type === "etcd-root" || node.type === "etcd-dashboard" || node.type === "zookeeper-root") {
+  if (node.type === "etcd-root" || node.type === "etcd-dashboard" || node.type === "etcd-access-control" || node.type === "zookeeper-root") {
     items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Database });
     return true;
   }

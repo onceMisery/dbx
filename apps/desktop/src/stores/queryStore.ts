@@ -64,6 +64,7 @@ import { appendDebugLog } from "@/lib/backend/debugLog";
 import { formatError } from "@/lib/backend/errorUtils";
 import { createSavedSqlEditorPosition, initSavedSqlEditorPositions, restoreSavedSqlEditorPosition, saveSavedSqlEditorPosition } from "@/lib/app/savedSqlEditorPosition";
 import { ensureSqlExtension } from "@/lib/savedSql/savedSqlFileName";
+import { resolveSavedSqlExecutionTarget, savedSqlExecutionTargetFromTab, type SavedSqlExecutionTarget, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/backend/safeStorage";
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import type { SavedSqlFile } from "@/types/database";
@@ -93,6 +94,10 @@ interface BuildQueryResultExportRequestOptions {
   includeSqlSheet?: boolean;
   exportTableName?: string;
   exportColumnTypes?: Array<string | null | undefined>;
+}
+
+interface OpenSavedSqlOptions {
+  targetMode?: SavedSqlOpenTargetMode;
 }
 
 type DroppedTableObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW";
@@ -2437,7 +2442,26 @@ export const useQueryStore = defineStore("query", () => {
     refreshExternalSqlFileTitles();
   }
 
-  function openSavedSql(file: SavedSqlFile) {
+  function currentSavedSqlExecutionTarget(): SavedSqlExecutionTarget | undefined {
+    const activeTab = tabs.value.find((tab) => tab.id === activeTabId.value);
+    const target = savedSqlExecutionTargetFromTab(activeTab);
+    if (!target || !useConnectionStore().getConfig(target.connectionId)) return undefined;
+    return target;
+  }
+
+  function applySavedSqlExecutionTarget(tab: QueryTab, target: SavedSqlExecutionTarget) {
+    updateConnection(tab.id, target.connectionId, target.database);
+    if (tab.catalog !== target.catalog || tab.database !== target.database) {
+      if (tab.catalog !== undefined || target.catalog !== undefined) updateCatalog(tab.id, target.catalog, target.database);
+      else updateDatabase(tab.id, target.database);
+    }
+    updateSchema(tab.id, target.schema);
+  }
+
+  function openSavedSql(file: SavedSqlFile, options: OpenSavedSqlOptions = {}) {
+    const targetMode = options.targetMode ?? useSettingsStore().editorSettings.savedSqlOpenTargetMode;
+    const currentTarget = targetMode === "current" ? currentSavedSqlExecutionTarget() : undefined;
+    const target = resolveSavedSqlExecutionTarget(file, targetMode, currentTarget);
     const existing = tabs.value.find((tab) => tab.savedSqlId === file.id);
     if (existing) {
       persistSavedSqlEditorPosition(existing);
@@ -2448,6 +2472,7 @@ export const useQueryStore = defineStore("query", () => {
         existing.editorSelection = restored.selection;
         existing.editorViewport = restored.viewport;
       }
+      applySavedSqlExecutionTarget(existing, target);
       switchTab(existing.id);
       return existing.id;
     }
@@ -2458,9 +2483,10 @@ export const useQueryStore = defineStore("query", () => {
       id,
       title: file.name,
       customTitle: true,
-      connectionId: file.connectionId,
-      database: file.database,
-      schema: file.schema,
+      connectionId: target.connectionId,
+      database: target.database,
+      schema: target.schema,
+      catalog: target.catalog,
       sql: file.sql,
       savedSqlId: file.id,
       originalSql: file.sql,
@@ -2484,9 +2510,6 @@ export const useQueryStore = defineStore("query", () => {
       const file = await savedSqlStore.ensureFileContent(tab.savedSqlId!);
       if (!file) continue;
       tab.title = tab.customTitle ? tab.title : file.name;
-      tab.connectionId = file.connectionId;
-      tab.database = file.database;
-      tab.schema = file.schema;
       tab.sql = file.sql;
       tab.originalSql = file.sql;
       const restored = restoreSavedSqlEditorPosition(file.id, file.sql);
@@ -2582,22 +2605,6 @@ export const useQueryStore = defineStore("query", () => {
     tab.resultSortedSql = undefined;
     clearExplain(tab);
     tab.tableMeta = undefined;
-
-    // Sync connection change back to the saved SQL file if this tab is linked
-    if (tab.savedSqlId) {
-      const savedSqlStore = useSavedSqlStore();
-      void savedSqlStore.ensureFileContent(tab.savedSqlId).then((existing) => {
-        if (!existing) return;
-        return savedSqlStore.saveFile({
-          id: existing.id,
-          connectionId,
-          name: existing.name,
-          database,
-          schema: existing.schema,
-          sql: existing.sql,
-        });
-      });
-    }
   }
 
   function clearInvalidDataTabSortState(tab: QueryTab, columns: NonNullable<QueryTab["tableMeta"]>["columns"]): boolean {
@@ -2764,6 +2771,7 @@ export const useQueryStore = defineStore("query", () => {
     source: EditableQuerySource;
     analysis: EditableQueryInfo;
     request: TableMetadataRequest;
+    writeSchema?: string;
   };
 
   interface EditableQueryExecutionPreparation {
@@ -2787,7 +2795,11 @@ export const useQueryStore = defineStore("query", () => {
     // with a qualified source.
     const qualifiedSourceDatabase = dbType === "sqlserver" ? source.catalog : connectionUsesDatabaseObjectTreeMode(conn) ? source.schema : undefined;
     const metadataDatabase = qualifiedSourceDatabase || executionDatabase || conn?.database || tab.database;
-    let schema = source.schema || tab.schema;
+    // SQL Server does not apply the query tab's selected schema to an
+    // unqualified object reference. Resolve metadata through the login's
+    // default schema (with the driver's dbo fallback) so metadata and writes
+    // target the same object as the original SELECT.
+    let schema = source.schema || (dbType === "sqlserver" ? "" : tab.schema);
     if (!schema) {
       if (dbType === "postgres" || dbType === "kwdb") schema = "public";
       else schema = "";
@@ -2795,7 +2807,7 @@ export const useQueryStore = defineStore("query", () => {
     // Oracle-family connection databases are service names, not schemas. When
     // the query does not qualify a schema, let the driver resolve the current
     // login user's schema instead of looking up metadata under the service name.
-    const resolvedSchema = ORACLE_LIKE_METADATA_TYPES.has(dbType) && !schema ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
+    const resolvedSchema = (dbType === "sqlserver" && !source.schema) || (ORACLE_LIKE_METADATA_TYPES.has(dbType) && !schema) ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
     const metadataSchema = normalizeOracleLikeMetadataIdentifier(dbType, resolvedSchema || undefined, source.schema ? source.schemaQuoted : false) || "";
     const metadataTableName = normalizeOracleLikeMetadataIdentifier(dbType, source.tableName, source.tableNameQuoted)!;
     const metadataCatalog = normalizeOracleLikeMetadataIdentifier(dbType, source.catalog, source.catalogQuoted);
@@ -2805,10 +2817,14 @@ export const useQueryStore = defineStore("query", () => {
       schema: metadataSchema || undefined,
       tableName: metadataTableName,
     };
+    // Keep SQL Server writes unqualified unless the SELECT source explicitly
+    // named a schema, so SELECT and UPDATE resolve the same object.
+    const writeSchema = dbType === "sqlserver" && !source.schema ? undefined : metadataSchema || undefined;
     const knownTableType = tab.tableMeta?.tableName.toLowerCase() === metadataTableName.toLowerCase() && normalizeOptionalSchema(tab.tableMeta.schema) === normalizeOptionalSchema(metadataSchema) ? tab.tableMeta.tableType : undefined;
     return {
       source: metadataSource,
       analysis: normalizeOracleLikeQueryAnalysis(dbType, cloneAnalysisForSource(analysis, metadataSource), metadataSchema || undefined, metadataTableName),
+      writeSchema,
       request: {
         connectionId: tab.connectionId!,
         database: metadataDatabase,
@@ -2829,7 +2845,7 @@ export const useQueryStore = defineStore("query", () => {
       tableMeta: {
         catalog: target.request.catalog,
         database: target.request.database,
-        schema: target.request.schema || undefined,
+        schema: target.writeSchema,
         tableName: target.request.tableName,
         tableType: metadata.tableType,
         columns: metadata.columns,
@@ -3817,7 +3833,10 @@ export const useQueryStore = defineStore("query", () => {
       if (tab.mode === "query") {
         const prepared = await prepareEditableQueryExecution(tab, sqlToExecute, conn, effectiveDbType, executionDatabase, traceId, elapsed);
         sqlToExecute = prepared.sql;
-        queryMetadataSql = prepared.metadataSql;
+        // Database sorting executes a generated wrapper around the user's query.
+        // Keep editability metadata anchored to the original query so the wrapper
+        // does not turn an otherwise editable result into a complex read-only one.
+        queryMetadataSql = options?.resultSortedSql && !options?.querySort ? queryBaseSql : prepared.metadataSql;
         hiddenPrimaryKeys = prepared.hiddenPrimaryKeys;
         if (options?.querySort) {
           const sorted = await api.buildSortedQuerySql({
@@ -3847,6 +3866,21 @@ export const useQueryStore = defineStore("query", () => {
         pageOffset = plan.pageOffset;
         countSql = plan.countSql;
         useAgentResultSession = plan.useAgentResultSession;
+        const hasBoundedPagination = typeof pageLimit === "number" && typeof pageOffset === "number";
+        if (options?.appendResult && !hasBoundedPagination && !useAgentResultSession) {
+          const current = tabs.value.find((item) => item.id === id);
+          if (current?.executionId === executionId && current.result) {
+            current.result.has_more = false;
+            const activeResultIndex = current.activeResultIndex;
+            if (Array.isArray(current.results) && typeof activeResultIndex === "number" && activeResultIndex >= 0 && activeResultIndex < current.results.length) {
+              current.results[activeResultIndex]!.has_more = false;
+            }
+            touchResult(current);
+            syncDisplayedResultRun(current, queryBaseSql, openInNewResultTab);
+          }
+          queryExecutionLog("info", "append-result:pagination-unsupported", { traceId, elapsed: elapsed() });
+          return false;
+        }
       } else if (tab.mode === "data") {
         pageLimit = options?.pagination?.limit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize);
         pageOffset = options?.pagination?.offset ?? 0;

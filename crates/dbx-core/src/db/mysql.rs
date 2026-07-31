@@ -142,8 +142,10 @@ fn nonblank(value: String) -> Option<String> {
 }
 
 async fn query_first_nonblank_string(conn: &mut mysql_async::Conn, sql: &str) -> Option<String> {
-    match conn.query_first::<String, _>(sql).await {
-        Ok(Some(value)) => nonblank(value),
+    // MySQL reports nullable metadata such as TABLE_COLLATION as NULL for views.
+    // Reading it as String makes mysql_async panic during row conversion.
+    match conn.query_first::<Option<String>, _>(sql).await {
+        Ok(Some(value)) => value.and_then(nonblank),
         Ok(None) => None,
         Err(error) => {
             log::debug!("Failed to read optional MySQL database information with `{sql}`: {error}");
@@ -1797,32 +1799,36 @@ pub async fn connect_bare_with_pool_limit_and_setup_database(
     result
 }
 
+const SHOW_DATABASES_SQL: &str = "SHOW DATABASES";
+const INFORMATION_SCHEMA_DATABASES_SQL: &str =
+    "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME";
+const DATABASE_LIST_QUERY_PLAN: [(&str, bool); 2] =
+    [(SHOW_DATABASES_SQL, true), (INFORMATION_SCHEMA_DATABASES_SQL, false)];
+
 pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
-    let result = match conn.query_iter("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME").await
-    {
-        Ok(result) => result,
+    let [(primary_sql, primary_catalogless), (fallback_sql, fallback_catalogless)] = DATABASE_LIST_QUERY_PLAN;
+    match list_databases_with_query(pool, primary_sql, primary_catalogless).await {
+        Ok(databases) => Ok(databases),
         Err(err) => {
-            log::debug!("Falling back to SHOW DATABASES after information_schema.SCHEMATA failed: {err}");
-            return list_databases_show(pool).await;
+            log::debug!("Falling back to information_schema.SCHEMATA after SHOW DATABASES failed: {err}");
+            list_databases_with_query(pool, fallback_sql, fallback_catalogless).await
         }
-    };
-    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
-    let databases = database_infos_from_names(rows.iter().map(|row| get_str(row, 0)), false);
-
-    if databases.is_empty() {
-        log::debug!("Falling back to SHOW DATABASES after information_schema.SCHEMATA returned no named databases");
-        return list_databases_show(pool).await;
     }
+}
 
-    Ok(databases)
+async fn list_databases_with_query(
+    pool: &MySqlPool,
+    sql: &str,
+    include_catalogless_when_blank: bool,
+) -> Result<Vec<DatabaseInfo>, String> {
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
+    let result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    Ok(database_infos_from_names(rows.iter().map(|row| get_str(row, 0)), include_catalogless_when_blank))
 }
 
 pub async fn list_databases_show(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
-    let result = conn.query_iter("SHOW DATABASES").await.map_err(|e| e.to_string())?;
-    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
-    Ok(database_infos_from_names(rows.iter().map(|row| get_str(row, 0)), true))
+    list_databases_with_query(pool, SHOW_DATABASES_SQL, true).await
 }
 
 pub(super) fn database_infos_from_names(
@@ -4829,6 +4835,17 @@ mod tests {
     }
 
     #[test]
+    fn mysql_database_listing_prefers_show_databases() {
+        assert_eq!(
+            DATABASE_LIST_QUERY_PLAN,
+            [
+                ("SHOW DATABASES", true),
+                ("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME", false),
+            ]
+        );
+    }
+
+    #[test]
     fn mysql_show_metadata_sql_supports_catalogless_services() {
         assert_eq!(show_tables_filtered_sql("", true, None, &[]), "SHOW FULL TABLES");
         assert_eq!(show_tables_filtered_sql("", false, None, &[]), "SHOW TABLES");
@@ -4934,6 +4951,14 @@ mod tests {
         assert!(sql.contains("COLUMN_TYPE"));
         assert!(!sql.contains("COLLATE"));
         assert!(!sql.contains("AS ENUM_VALUES"));
+    }
+
+    #[test]
+    fn mysql_nullable_table_collation_uses_optional_string_conversion() {
+        let collation = mysql_async::from_value_opt::<Option<String>>(mysql_async::Value::NULL)
+            .expect("Option<String> must accept NULL MySQL metadata values");
+
+        assert_eq!(collation, None);
     }
 
     #[test]

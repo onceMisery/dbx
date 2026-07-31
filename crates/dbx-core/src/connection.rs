@@ -34,6 +34,8 @@ use crate::task_supervisor::TaskSupervisor;
 pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
     "JDBC plugin is not installed. Install the optional JDBC plugin to use this connection.";
 pub const PRESTOSQL_JDBC_DRIVER_CLASS: &str = "io.prestosql.jdbc.PrestoDriver";
+pub const GAUSSDB_M_JDBC_DRIVER_PROFILE: &str = "gaussdb-m";
+pub const GAUSSDB_M_JDBC_DRIVER_CLASS: &str = "com.huawei.gaussdb.jdbc.Driver";
 const SQLSERVER_LEGACY_DRIVER_INSTALL_HINT: &str =
     "Install the SQL Server legacy compatibility component from Driver Manager, or open the connection settings and enable SQL Server legacy compatibility mode again.";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -621,6 +623,46 @@ pub fn prestosql_jdbc_config_for_endpoint(config: &ConnectionConfig, host: &str,
     if jdbc_config.jdbc_driver_class.as_deref().is_none_or(|value| value.trim().is_empty()) {
         jdbc_config.jdbc_driver_class = Some(PRESTOSQL_JDBC_DRIVER_CLASS.to_string());
     }
+    jdbc_config
+}
+
+pub fn gaussdb_uses_m_jdbc_driver(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::Gaussdb
+        && config
+            .driver_profile
+            .as_deref()
+            .is_some_and(|profile| profile.eq_ignore_ascii_case(GAUSSDB_M_JDBC_DRIVER_PROFILE))
+}
+
+pub fn gaussdb_m_jdbc_config_for_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> ConnectionConfig {
+    let mut jdbc_config = config.clone();
+    let mut jdbc_url = format!("jdbc:{}", config.redacted_connection_url_with_host(host, port));
+    let raw_params = config.url_params.as_deref().unwrap_or("").trim().trim_start_matches('?');
+    let explicit_sslmode = raw_params.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        key.trim().eq_ignore_ascii_case("sslmode").then(|| value.trim().to_ascii_lowercase())
+    });
+    let explicit_ssl = raw_params.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        key.trim().eq_ignore_ascii_case("ssl").then(|| value.trim().eq_ignore_ascii_case("true"))
+    });
+    let sslmode = explicit_sslmode.unwrap_or_else(|| {
+        if explicit_ssl == Some(false) {
+            "disable".to_string()
+        } else if config.ssl {
+            "require".to_string()
+        } else {
+            "prefer".to_string()
+        }
+    });
+    let params = upsert_connection_url_param(Some(raw_params), "sslmode", &sslmode);
+    let params = upsert_connection_url_param(Some(&params), "ssl", if sslmode == "disable" { "false" } else { "true" });
+    if !params.is_empty() {
+        jdbc_url.push('?');
+        jdbc_url.push_str(&params);
+    }
+    jdbc_config.connection_string = Some(jdbc_url);
+    jdbc_config.jdbc_driver_class = Some(GAUSSDB_M_JDBC_DRIVER_CLASS.to_string());
     jdbc_config
 }
 
@@ -1401,6 +1443,7 @@ impl AppState {
         let interval = Duration::from_secs(interval_secs.max(1));
         let timeout = Duration::from_secs(config.effective_connect_timeout_secs().max(1));
         let routing = self.pool_routing_control();
+        let connections = self.connections.clone();
         let running_queries = self.running_queries.clone();
         self.task_supervisor.spawn_replace(format!("keepalive:{pool_key}"), move |shutdown| async move {
             loop {
@@ -1419,7 +1462,17 @@ impl AppState {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
                             log::warn!("Connection keepalive failed for '{key}': {err}; invalidating pool");
-                            routing.detach_pool_by_key(&key, should_replace_agent_runtime(&err)).await;
+                            if !detach_keepalive_target_if_current(
+                                &routing,
+                                &connections,
+                                &key,
+                                target,
+                                should_replace_agent_runtime(&err),
+                            )
+                            .await
+                            {
+                                log::debug!("Skipping stale keepalive result for replaced pool '{key}'");
+                            }
                             break;
                         }
                         Err(_) => {
@@ -1427,7 +1480,9 @@ impl AppState {
                                 "Connection keepalive timed out for '{key}' after {}s; invalidating pool",
                                 timeout.as_secs()
                             );
-                            routing.detach_pool_by_key(&key, false).await;
+                            if !detach_keepalive_target_if_current(&routing, &connections, &key, target, false).await {
+                                log::debug!("Skipping stale keepalive timeout for replaced pool '{key}'");
+                            }
                             break;
                         }
                     }
@@ -1663,6 +1718,10 @@ impl AppState {
                     .await?
                 };
                 PoolKind::Mysql(pool, MysqlMode::Bare)
+            }
+            DatabaseType::Gaussdb if gaussdb_uses_m_jdbc_driver(&db_config) => {
+                let jdbc_config = gaussdb_m_jdbc_config_for_endpoint(&db_config, &host, port);
+                self.external_driver_pool("jdbc", &jdbc_config).await?
             }
             DatabaseType::Postgres
             | DatabaseType::Redshift
@@ -1900,7 +1959,7 @@ impl AppState {
                     db_config.effective_database().unwrap_or(""),
                     session_role,
                 );
-                if db_config.db_type != DatabaseType::Etcd && db_config.db_type != DatabaseType::ZooKeeper {
+                if db_config.db_type != DatabaseType::ZooKeeper {
                     let agent_session_id = uuid::Uuid::new_v4().simple().to_string();
                     let mut initial_result = self
                         .spawn_routed_shared_agent_client(
@@ -2019,7 +2078,7 @@ impl AppState {
                     };
                     PoolKind::agent(client)
                 } else {
-                    // Kerberos JVM properties are connection-scoped; shared agent daemons must not inherit them.
+                    // ZooKeeper JVM properties are connection-scoped; shared agent daemons must not inherit them.
                     let mut client = self
                         .agent_manager
                         .spawn_with_extra_java_args(
@@ -2491,6 +2550,60 @@ impl AppState {
     ) -> Result<crate::mq::config::MqAdminConfig, String> {
         let mqc = crate::mq::config::MqAdminConfig::from_connection(config)?;
         if !config.has_effective_transport_layers() {
+            return Ok(mqc);
+        }
+
+        if mqc.system_kind == crate::mq::types::MqSystemKind::RabbitMq {
+            let transport_layers = self.resolved_transport_layers(config).await?;
+            let (amqp_host, amqp_port) = crate::mq::adapters::rabbitmq::primary_amqp_endpoint(&mqc)?;
+            let management_endpoint = crate::mq::adapters::rabbitmq::management_endpoint(&mqc)?;
+            let amqp_local_port = db::transport_layer_tunnel::start_transport_layers(
+                connection_id,
+                &transport_layers,
+                &amqp_host,
+                amqp_port,
+                &self.tunnels,
+                &self.proxy_tunnels,
+                &self.http_tunnels,
+            )
+            .await?;
+            let mut mqc = mqc.with_connect_override("127.0.0.1", amqp_local_port);
+            if let Some((management_host, management_port)) = management_endpoint {
+                let management_transport_id = rabbitmq_management_transport_id(connection_id);
+                let management_local_port = match db::transport_layer_tunnel::start_transport_layers(
+                    &management_transport_id,
+                    &transport_layers,
+                    &management_host,
+                    management_port,
+                    &self.tunnels,
+                    &self.proxy_tunnels,
+                    &self.http_tunnels,
+                )
+                .await
+                {
+                    Ok(port) => port,
+                    Err(error) => {
+                        db::transport_layer_tunnel::stop_transport_layers(
+                            &management_transport_id,
+                            transport_layers.len(),
+                            &self.tunnels,
+                            &self.proxy_tunnels,
+                            &self.http_tunnels,
+                        )
+                        .await;
+                        db::transport_layer_tunnel::stop_transport_layers(
+                            connection_id,
+                            transport_layers.len(),
+                            &self.tunnels,
+                            &self.proxy_tunnels,
+                            &self.http_tunnels,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                mqc = mqc.with_management_connect_override("127.0.0.1", management_local_port);
+            }
             return Ok(mqc);
         }
 
@@ -3332,32 +3445,53 @@ impl AppState {
             .get(connection_id)
             .cloned()
             .ok_or_else(|| format!("Connection config not found: {connection_id}"))?;
-        if config.db_type == DatabaseType::Gaussdb {
-            let pool_key = self.get_or_create_pool(connection_id, database).await?;
-            let pool = {
-                let connections = self.connections.read().await;
-                match connections.get(&pool_key) {
-                    Some(PoolKind::Postgres(pool)) => pool.clone(),
-                    _ => return Ok(None),
-                }
-            };
-            return Ok(db::postgres::gaussdb_identifier_quote(&pool).await);
-        }
-        if !database_capabilities::is_agent_type(&config.db_type) {
-            return Ok(None);
-        }
-
         let pool_key = self.get_or_create_pool(connection_id, database).await?;
-        let client = {
+        enum IdentifierQuoteSource {
+            NativeGaussdb(deadpool_postgres::Pool),
+            Agent(Arc<db::agent_driver::PooledAgentClient>),
+            ExternalDriver { config: Arc<ConnectionConfig>, session: Arc<PluginDriverSession> },
+        }
+        let source = {
             let connections = self.connections.read().await;
             match connections.get(&pool_key) {
-                Some(PoolKind::Agent(client)) => client.clone(),
-                _ => return Ok(None),
+                Some(PoolKind::Postgres(pool)) if config.db_type == DatabaseType::Gaussdb => {
+                    Some(IdentifierQuoteSource::NativeGaussdb(pool.clone()))
+                }
+                Some(PoolKind::Agent(client)) if database_capabilities::is_agent_type(&config.db_type) => {
+                    Some(IdentifierQuoteSource::Agent(client.clone()))
+                }
+                Some(PoolKind::ExternalDriver { config, session, .. }) => {
+                    Some(IdentifierQuoteSource::ExternalDriver { config: config.clone(), session: session.clone() })
+                }
+                _ => None,
             }
         };
-        let mut agent = client.lock().await;
-        let info = agent.connection_info(Some(db::connection_timeout())).await?;
-        Ok(Some(info.identifier_quote))
+        match source {
+            Some(IdentifierQuoteSource::NativeGaussdb(pool)) => Ok(db::postgres::gaussdb_identifier_quote(&pool).await),
+            Some(IdentifierQuoteSource::Agent(client)) => {
+                let mut agent = client.lock().await;
+                let info = agent.connection_info(Some(db::connection_timeout())).await?;
+                Ok(Some(info.identifier_quote))
+            }
+            Some(IdentifierQuoteSource::ExternalDriver { config, session }) => {
+                let response = session
+                    .invoke_with_timeout::<db::QueryResult>(
+                        "executeQuery",
+                        serde_json::json!({
+                            "connection": config.as_ref(),
+                            "sql": db::postgres::GAUSSDB_COMPATIBILITY_SQL,
+                            "database": config.effective_database().unwrap_or(""),
+                            "schema": null,
+                            "maxRows": 1,
+                            "timeoutSecs": 5,
+                        }),
+                        Some(db::connection_timeout()),
+                    )
+                    .await;
+                Ok(response.ok().and_then(|result| gaussdb_identifier_quote_from_query_result(&result)))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn connection_database_info(
@@ -3468,6 +3602,14 @@ impl AppState {
             &self.http_tunnels,
         )
         .await;
+        db::transport_layer_tunnel::stop_transport_layers(
+            &rabbitmq_management_transport_id(connection_id),
+            layer_count,
+            &self.tunnels,
+            &self.proxy_tunnels,
+            &self.http_tunnels,
+        )
+        .await;
         self.tunnels.stop_tunnel(connection_id).await;
         self.proxy_tunnels.stop_tunnel(connection_id).await;
         self.http_tunnels.stop_tunnel(connection_id).await;
@@ -3516,8 +3658,8 @@ impl AppState {
             (checks, redis_keys)
         };
 
-        let mut dead_keys = Vec::new();
         let mut failed_agent_checks = Vec::new();
+        let mut dead_pools = Vec::new();
         let timeout = crate::db::connection_timeout();
 
         // Check cloned pools (async I/O, no lock held)
@@ -3640,10 +3782,13 @@ impl AppState {
                     }
                 }
                 PoolKind::Agent(client) => {
-                    let mut agent = client.lock().await;
+                    let Ok(mut agent) = client.try_lock() else {
+                        log::debug!("Agent connection pool '{key}' is busy; skipping resume health probe");
+                        continue;
+                    };
                     match agent.validate_connection(Some(timeout)).await {
                         Ok(_) => true,
-                        Err(e) if is_agent_validate_connection_unsupported(&e) => {
+                        Err(err) if is_agent_validate_connection_unsupported(&err) => {
                             log::debug!(
                                 "Agent connection pool '{key}' does not support validate_connection; keeping pool"
                             );
@@ -3664,7 +3809,7 @@ impl AppState {
                 PoolKind::Redis(_) => unreachable!("Redis handled separately"),
             };
             if !healthy && !matches!(pool, PoolKind::Agent(_)) {
-                dead_keys.push(key.clone());
+                dead_pools.push((key.clone(), agent_pool_identity(pool)));
             }
         }
 
@@ -3677,7 +3822,7 @@ impl AppState {
                         Ok(()) => {}
                         Err(e) => {
                             log::warn!("Redis connection pool '{key}' is unhealthy: {e}");
-                            dead_keys.push(key.clone());
+                            dead_pools.push((key.clone(), None));
                         }
                     }
                 }
@@ -3689,23 +3834,27 @@ impl AppState {
         }
 
         // Remove dead pools
-        if !dead_keys.is_empty() {
-            self.stop_keepalive_tasks(&dead_keys).await;
-            {
-                let mut activity = self.pool_activity.write().await;
-                for key in &dead_keys {
-                    activity.remove(key);
-                }
-            }
+        if !dead_pools.is_empty() {
             let mut conns = self.connections.write().await;
-            let mut removed = Vec::with_capacity(dead_keys.len());
-            for key in &dead_keys {
-                if let Some(pool) = conns.remove(key) {
-                    removed.push((key.clone(), pool));
+            let mut removed = Vec::with_capacity(dead_pools.len());
+            for (key, expected_agent) in &dead_pools {
+                let still_checked_pool = match expected_agent {
+                    Some(expected) => matches!(
+                        conns.get(key),
+                        Some(PoolKind::Agent(current)) if Arc::ptr_eq(current, expected)
+                    ),
+                    None => true,
+                };
+                if still_checked_pool {
+                    if let Some(pool) = conns.remove(key) {
+                        removed.push((key.clone(), pool));
+                    }
+                } else {
+                    log::debug!("Skipping stale Agent health result for replaced pool '{key}'");
                 }
             }
             drop(conns);
-            self.pool_routing_control().close_removed(removed).await;
+            self.pool_routing_control().finish_detach(removed).await;
         }
 
         // Re-establish SSH tunnels that have died
@@ -3727,6 +3876,14 @@ impl AppState {
     pub async fn remove_connection_pools_detached(&self, connection_id: &str) {
         let removed = self.drain_connection_pools(connection_id).await;
         self.pool_routing_control().close_removed_in_background(removed);
+    }
+
+    pub async fn invalidate_agent_pool_if_current(
+        &self,
+        pool_key: &str,
+        expected: &Arc<db::agent_driver::PooledAgentClient>,
+    ) -> bool {
+        self.detach_agent_pool_if_current(pool_key, expected, false).await
     }
 
     async fn drain_all_connection_pools(&self) -> Vec<(String, PoolKind)> {
@@ -3852,6 +4009,11 @@ impl AppState {
     }
 }
 
+fn gaussdb_identifier_quote_from_query_result(result: &db::QueryResult) -> Option<String> {
+    let compatibility_mode = result.rows.first()?.first()?.as_str()?;
+    db::postgres::gaussdb_identifier_quote_for_compatibility_mode(compatibility_mode).map(str::to_string)
+}
+
 enum KeepaliveTarget {
     Mysql(db::mysql::MySqlPool),
     Postgres(deadpool_postgres::Pool),
@@ -3866,6 +4028,49 @@ enum KeepaliveTarget {
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
     Agent(Arc<db::agent_driver::PooledAgentClient>),
+}
+
+impl KeepaliveTarget {
+    fn matches_pool(&self, pool: &PoolKind) -> bool {
+        match (self, pool) {
+            (Self::Agent(expected), PoolKind::Agent(current)) => Arc::ptr_eq(expected, current),
+            (Self::SqlServer(expected), PoolKind::SqlServer(current)) => Arc::ptr_eq(expected, current),
+            (Self::Agent(_), _) | (_, PoolKind::Agent(_)) | (Self::SqlServer(_), _) | (_, PoolKind::SqlServer(_)) => {
+                false
+            }
+            _ => true,
+        }
+    }
+}
+
+async fn remove_keepalive_pool_if_current(
+    connections: &Arc<RwLock<HashMap<String, PoolKind>>>,
+    pool_key: &str,
+    target: &KeepaliveTarget,
+) -> Option<PoolKind> {
+    let mut pools = connections.write().await;
+    if pools.get(pool_key).is_some_and(|pool| target.matches_pool(pool)) {
+        pools.remove(pool_key)
+    } else {
+        None
+    }
+}
+
+async fn detach_keepalive_target_if_current(
+    routing: &PoolRoutingControl,
+    connections: &Arc<RwLock<HashMap<String, PoolKind>>>,
+    pool_key: &str,
+    target: &KeepaliveTarget,
+    replace_agent_runtime: bool,
+) -> bool {
+    if let KeepaliveTarget::Agent(expected) = target {
+        return routing.detach_agent_pool_if_current(pool_key, expected, replace_agent_runtime).await;
+    }
+    let Some(pool) = remove_keepalive_pool_if_current(connections, pool_key, target).await else {
+        return false;
+    };
+    routing.finish_detach(vec![(pool_key.to_string(), pool)]).await;
+    true
 }
 
 fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Option<KeepaliveTarget> {
@@ -3961,6 +4166,10 @@ fn connection_remote_endpoint(config: &ConnectionConfig) -> (String, u16) {
 
 fn rnacos_console_transport_id(connection_id: &str) -> String {
     format!("{connection_id}:rnacos-console")
+}
+
+fn rabbitmq_management_transport_id(connection_id: &str) -> String {
+    format!("{connection_id}:rabbitmq-management")
 }
 
 fn parse_mq_admin_host_port(config: &ConnectionConfig) -> Option<(String, u16)> {
@@ -4281,7 +4490,14 @@ fn should_validate_existing_pool_before_reuse(db_type: DatabaseType) -> bool {
     // PostgreSQL uses deadpool's Fast recycling and the query executor's
     // ReconnectAndRetry path. An eager SELECT 1 here would add a network
     // round-trip before every query without improving recovery behavior.
-    !matches!(db_type, DatabaseType::Postgres)
+    !matches!(db_type, DatabaseType::Postgres | DatabaseType::Etcd)
+}
+
+fn agent_pool_identity(pool: &PoolKind) -> Option<Arc<db::agent_driver::PooledAgentClient>> {
+    match pool {
+        PoolKind::Agent(client) => Some(client.clone()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -4460,13 +4676,15 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
 mod tests {
     use super::{
         agent_connect_timeout, connection_remote_endpoint, connection_url_for_endpoint, database_connection_config,
-        database_connection_config_with_catalog, metadata_connection_config, mysql_metadata_fallback_url,
-        mysql_pool_setup_queries, oceanbase_mysql_query_timeout_sql, oceanbase_mysql_setup_queries,
-        prestosql_jdbc_config_for_endpoint, redacted_connection_url_for_endpoint, redis_sentinel_transport_id,
-        redis_sentinel_transport_prefix, sqlserver_legacy_agent_config, sqlserver_legacy_driver_error,
-        sqlserver_uses_legacy_driver, task_client_session_id, upsert_connection_url_param, uses_bare_mysql_pool,
-        uses_tcp_probe, validate_connection_url_params, validate_h2_database_path, AppState, MysqlMode, PoolKind,
-        PRESTOSQL_JDBC_DRIVER_CLASS,
+        database_connection_config_with_catalog, gaussdb_identifier_quote_from_query_result,
+        gaussdb_m_jdbc_config_for_endpoint, gaussdb_uses_m_jdbc_driver, metadata_connection_config,
+        mysql_metadata_fallback_url, mysql_pool_setup_queries, oceanbase_mysql_query_timeout_sql,
+        oceanbase_mysql_setup_queries, prestosql_jdbc_config_for_endpoint, redacted_connection_url_for_endpoint,
+        redis_sentinel_transport_id, redis_sentinel_transport_prefix, sqlserver_legacy_agent_config,
+        sqlserver_legacy_driver_error, sqlserver_uses_legacy_driver, task_client_session_id,
+        upsert_connection_url_param, uses_bare_mysql_pool, uses_tcp_probe, validate_connection_url_params,
+        validate_h2_database_path, AppState, MysqlMode, PoolKind, GAUSSDB_M_JDBC_DRIVER_CLASS,
+        GAUSSDB_M_JDBC_DRIVER_PROFILE, PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
@@ -4629,6 +4847,74 @@ mod tests {
     }
 
     #[test]
+    fn gaussdb_m_profile_uses_vendor_jdbc_url_and_driver() {
+        let mut config = mysql_config(Some("业务库"));
+        config.db_type = DatabaseType::Gaussdb;
+        config.host = "db.internal".to_string();
+        config.port = 8000;
+        config.driver_profile = Some(GAUSSDB_M_JDBC_DRIVER_PROFILE.to_string());
+        config.url_params = Some("currentSchema=app".to_string());
+
+        assert!(gaussdb_uses_m_jdbc_driver(&config));
+        let jdbc = gaussdb_m_jdbc_config_for_endpoint(&config, "127.0.0.1", 18000);
+        assert_eq!(
+            jdbc.connection_string.as_deref(),
+            Some(
+                "jdbc:gaussdb://127.0.0.1:18000/%E4%B8%9A%E5%8A%A1%E5%BA%93?currentSchema=app&sslmode=prefer&ssl=true"
+            )
+        );
+        assert_eq!(jdbc.jdbc_driver_class.as_deref(), Some(GAUSSDB_M_JDBC_DRIVER_CLASS));
+
+        config.driver_profile = Some("gaussdb".to_string());
+        assert!(!gaussdb_uses_m_jdbc_driver(&config));
+    }
+
+    #[test]
+    fn gaussdb_m_jdbc_url_normalizes_tls_parameters() {
+        let mut config = mysql_config(Some("postgres"));
+        config.db_type = DatabaseType::Gaussdb;
+        config.driver_profile = Some(GAUSSDB_M_JDBC_DRIVER_PROFILE.to_string());
+
+        config.ssl = true;
+        config.url_params = None;
+        assert_eq!(
+            gaussdb_m_jdbc_config_for_endpoint(&config, "db.internal", 8000).connection_string.as_deref(),
+            Some("jdbc:gaussdb://db.internal:8000/postgres?sslmode=require&ssl=true")
+        );
+
+        config.ssl = false;
+        config.url_params = Some("?sslmode=disable&currentSchema=app".to_string());
+        assert_eq!(
+            gaussdb_m_jdbc_config_for_endpoint(&config, "db.internal", 8000).connection_string.as_deref(),
+            Some("jdbc:gaussdb://db.internal:8000/postgres?currentSchema=app&sslmode=disable&ssl=false")
+        );
+
+        config.url_params = Some("ssl=true&currentSchema=legacy".to_string());
+        assert_eq!(
+            gaussdb_m_jdbc_config_for_endpoint(&config, "db.internal", 8000).connection_string.as_deref(),
+            Some("jdbc:gaussdb://db.internal:8000/postgres?currentSchema=legacy&sslmode=prefer&ssl=true")
+        );
+    }
+
+    #[test]
+    fn gaussdb_jdbc_compatibility_query_result_selects_identifier_quote() {
+        let result = crate::types::QueryResult {
+            columns: vec!["datcompatibility".to_string()],
+            column_types: vec!["text".to_string()],
+            column_sortables: vec![true],
+            rows: vec![vec![serde_json::json!("M")]],
+            affected_rows: 0,
+            execution_time_ms: 1,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+        };
+
+        assert_eq!(gaussdb_identifier_quote_from_query_result(&result).as_deref(), Some("`"));
+    }
+
+    #[test]
     fn sqlserver_legacy_agent_config_marks_hidden_profile() {
         let mut config = mysql_config(Some("master"));
         config.db_type = DatabaseType::SqlServer;
@@ -4700,8 +4986,9 @@ mod tests {
     }
 
     #[test]
-    fn postgres_pool_reuse_skips_eager_validation_query() {
+    fn drivers_with_internal_recovery_skip_eager_pool_validation() {
         assert!(!super::should_validate_existing_pool_before_reuse(DatabaseType::Postgres));
+        assert!(!super::should_validate_existing_pool_before_reuse(DatabaseType::Etcd));
         assert!(super::should_validate_existing_pool_before_reuse(DatabaseType::Mysql));
     }
 
@@ -6928,6 +7215,55 @@ for line in sys.stdin:
         assert_eq!(connect_override.host, "127.0.0.1");
         assert_ne!(connect_override.port, 8443);
         state.proxy_tunnels.stop_tunnel("proxied-mq:transport:0").await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn rabbitmq_transport_uses_separate_amqp_and_management_tunnels() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "proxied-rabbitmq".to_string();
+        config.db_type = DatabaseType::MessageQueue;
+        config.host = "rabbit.internal".to_string();
+        config.port = 5672;
+        config.external_config = Some(serde_json::json!({
+            "systemKind": "rabbitmq",
+            "adminUrl": "http://management.internal:15672/rmq",
+            "auth": { "kind": "none" },
+            "extra": {
+                "addresses": "rabbit.internal:5672",
+                "virtualHost": "/"
+            }
+        }));
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            profile_id: String::new(),
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 65000,
+            username: String::new(),
+            password: String::new(),
+            test_target: None,
+        })];
+
+        let mqc = state.mq_admin_config_for_connection("proxied-rabbitmq", &config).await.unwrap();
+        let amqp_override = mqc.connect_override.expect("RabbitMQ AMQP tunnel override");
+        let management_override = mqc.management_connect_override.expect("RabbitMQ Management tunnel override");
+        assert_eq!(amqp_override.host, "127.0.0.1");
+        assert_eq!(management_override.host, "127.0.0.1");
+        assert_ne!(amqp_override.port, management_override.port);
+        assert_eq!(state.proxy_tunnels.local_port("proxied-rabbitmq:transport:0").await, Some(amqp_override.port));
+        assert_eq!(
+            state.proxy_tunnels.local_port("proxied-rabbitmq:rabbitmq-management:transport:0").await,
+            Some(management_override.port)
+        );
+
+        state.reset_connection_transport_for_config("proxied-rabbitmq", &config).await;
+        assert!(state.proxy_tunnels.local_port("proxied-rabbitmq:transport:0").await.is_none());
+        assert!(state.proxy_tunnels.local_port("proxied-rabbitmq:rabbitmq-management:transport:0").await.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

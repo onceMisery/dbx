@@ -2,6 +2,8 @@ import { Cassandra, MariaSQL, MSSQL, MySQL, PLSQL, PostgreSQL, SQLite, StandardS
 import type { DatabaseType, SqlSnippet } from "@/types/database";
 import { buildMongoCompletionItemsFromContext, type MongoCompletionItem } from "@/lib/mongo/mongoCompletion";
 import { CLOUDFLARE_D1_COMMON_FUNCTION_NAMES } from "@/lib/sql/cloudflareD1";
+import { searchClickHouseFunctions } from "@/lib/sql/clickhouse/functionRegistry";
+import type { ClickHouseFunctionDefinition, ClickHouseFunctionKind } from "@/lib/sql/clickhouse/functionTypes";
 import type { SqlObjectNavigationType } from "@/lib/sql/sqlNavigation";
 import { sqlSemanticDialectFor } from "@/lib/sql/semantic/dialect";
 import { findActiveSqlStatementSpan, tokenizeSqlSemantic } from "@/lib/sql/semantic/tokens";
@@ -1253,15 +1255,26 @@ export interface SqlCompletionContext {
   oracleTableFunctionContext?: boolean;
   autoAliasTableCompletions: boolean;
   tableAliasAfterCursor?: boolean;
+  openingParenAfterCursor: boolean;
   contextKind: SqlCompletionContextKind;
   dataTypeContext: boolean;
 }
 
+export interface SqlFunctionSignatureHelpOverload {
+  signature: string;
+  parameterGroups: string[][];
+  activeGroup: number;
+  activeParameter: number;
+}
+
 export interface SqlFunctionSignatureHelp {
   name: string;
-  signature: string;
-  activeParameter: number;
-  parameters: string[];
+  overloads: SqlFunctionSignatureHelpOverload[];
+  activeOverload: number;
+  /** Legacy single-overload fields retained for non-ClickHouse callers. */
+  signature?: string;
+  activeParameter?: number;
+  parameters?: string[];
 }
 
 export interface SqlCompletionTranslations {
@@ -1346,7 +1359,7 @@ class SqlCompletionProvider {
         this.items.push(...buildSnippetItems(context.prefix, snippets, this.input.keywordCase, this.databaseType));
       }
       if (!preferReferencedColumns || context.suggestRoutines) {
-        const functionItems = context.dataTypeContext ? [] : buildFunctionSnippetItems(context.prefix, getFunctionDescriptions(this.t), this.databaseType);
+        const functionItems = context.dataTypeContext ? [] : buildFunctionSnippetItems(context.prefix, getFunctionDescriptions(this.t), this.databaseType, context.openingParenAfterCursor);
         this.items.push(...(preferReferencedColumns ? functionItems.filter((item) => item.label.toLowerCase().startsWith(context.prefix.toLowerCase())) : functionItems));
         if (isOracleLikeDatabase(this.databaseType)) {
           this.items.push(...buildOracleSystemValueItems(context.prefix, this.input.keywordCase));
@@ -1402,6 +1415,9 @@ class SqlCompletionProvider {
     if (!context.exclusiveColumnSuggestions && context.suggestTables) {
       this.items.push(...buildForeignKeyRelatedTableItems(context, this.input.tables, this.input.foreignKeysByTable, this.dialect));
       this.items.push(...buildTableItems(context, this.input.tables, this.dialect, !!this.input.autoAliasTables && context.autoAliasTableCompletions, context.referencedTables, this.databaseType, this.input.currentSchema));
+      if (this.databaseType === "clickhouse") {
+        this.items.push(...buildClickHouseFunctionItems(context.prefix, context.openingParenAfterCursor, "table"));
+      }
       if (isOracleLikeDatabase(this.databaseType)) {
         this.items.push(...buildOracleTableFunctionItems(context.prefix));
       }
@@ -1427,7 +1443,9 @@ class SqlCompletionProvider {
       for (const item of this.items) {
         // Alias snippets reuse the prefix as a label while applying alias SQL, so they are not exact name matches.
         const isAliasSnippet = item.type === "snippet" && item.apply === formatAliasCompletionApply(item.label, this.databaseType);
-        if (!isAliasSnippet && item.label.toLowerCase() === context.prefix.toLowerCase()) {
+        const isExactLabelMatch = !isAliasSnippet && item.label.toLowerCase() === context.prefix.toLowerCase();
+        const isExactSnippetPrefixMatch = item.type === "snippet" && item.filterText?.toLowerCase() === context.prefix.toLowerCase();
+        if (isExactLabelMatch || isExactSnippetPrefixMatch) {
           item.exactMatch = true;
           item.boost += EXACT_LABEL_MATCH_BOOST;
         }
@@ -1630,23 +1648,61 @@ export function getSqlCompletionResultValidFor(sql: string, cursor: number): Reg
 
 export function getSqlFunctionSignatureHelp(sql: string, cursor: number, databaseType?: DatabaseType): SqlFunctionSignatureHelp | null {
   const beforeCursor = sql.slice(0, cursor);
-  const openParenIndex = findActiveFunctionOpenParen(beforeCursor);
-  if (openParenIndex == null) return null;
+  const call = findActiveFunctionCall(beforeCursor);
+  if (!call) return null;
 
-  const beforeParen = beforeCursor.slice(0, openParenIndex).trimEnd();
-  const name = /([A-Za-z_][\w$]*)$/.exec(beforeParen)?.[1]?.toUpperCase();
-  if (!name) return null;
+  const observedParameter = countTopLevelCommas(call.groupText);
+  if (databaseType !== "clickhouse") {
+    const lookupName = call.name.toUpperCase();
+    const parameters = (databaseType ? DATABASE_FUNCTION_SIGNATURES[databaseType]?.get(lookupName) : undefined) ?? SQL_FUNCTION_SIGNATURES.get(lookupName);
+    if (!parameters) return null;
+    const activeParameter = Math.min(observedParameter, Math.max(0, parameters.length - 1));
+    const signature = `${lookupName}(${parameters.join(", ")})`;
+    const legacyHelp = { name: lookupName, signature, activeParameter, parameters };
+    Object.defineProperties(legacyHelp, {
+      overloads: {
+        value: [{ signature, parameterGroups: [parameters], activeGroup: 0, activeParameter }],
+        enumerable: false,
+      },
+      activeOverload: { value: 0, enumerable: false },
+    });
+    return legacyHelp as SqlFunctionSignatureHelp;
+  }
 
-  const parameters = (databaseType ? DATABASE_FUNCTION_SIGNATURES[databaseType]?.get(name) : undefined) ?? SQL_FUNCTION_SIGNATURES.get(name);
-  if (!parameters) return null;
+  const parameterGroups = searchClickHouseFunctions(call.name, 50)
+    .find((definition) => [definition.name, ...(definition.aliases ?? [])].some((name) => name.toLowerCase() === call.name.toLowerCase()))
+    ?.signatures.map((signature) => signature.parameterGroups);
+  if (!parameterGroups) return null;
 
-  const activeParameter = countTopLevelCommas(beforeCursor.slice(openParenIndex + 1));
+  const overloads = parameterGroups
+    .map((groups, sourceIndex) => ({ groups, sourceIndex }))
+    .filter(({ groups }) => groups[call.activeGroup] != null)
+    .sort((left, right) => {
+      const leftAccepts = functionParameterGroupAccepts(left.groups[call.activeGroup], observedParameter);
+      const rightAccepts = functionParameterGroupAccepts(right.groups[call.activeGroup], observedParameter);
+      return Number(rightAccepts) - Number(leftAccepts) || left.sourceIndex - right.sourceIndex;
+    })
+    .map(({ groups }) => {
+      const parameters = groups[call.activeGroup];
+      return {
+        signature: call.name + groups.map((group) => `(${group.join(", ")})`).join(""),
+        parameterGroups: groups,
+        activeGroup: call.activeGroup,
+        activeParameter: Math.min(observedParameter, Math.max(0, parameters.length - 1)),
+      };
+    });
+  if (overloads.length === 0) return null;
+
   return {
-    name,
-    signature: `${name}(${parameters.join(", ")})`,
-    activeParameter: Math.min(activeParameter, Math.max(0, parameters.length - 1)),
-    parameters,
+    name: call.name,
+    overloads,
+    activeOverload: 0,
   };
+}
+
+function functionParameterGroupAccepts(parameters: string[], observedParameter: number): boolean {
+  if (observedParameter < parameters.length) return true;
+  return parameters.some((parameter) => parameter.startsWith("..."));
 }
 
 function sqlCompletionStatementSpan(sql: string, cursor: number, options: SqlSemanticBuildOptions): SqlSemanticSpan {
@@ -1836,6 +1892,7 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
     oracleTableFunctionContext,
     autoAliasTableCompletions,
     tableAliasAfterCursor,
+    openingParenAfterCursor: /^\s*\(/.test(sql.slice(cursor)),
     contextKind,
     dataTypeContext,
   };
@@ -3991,7 +4048,46 @@ function activeFunctionSignatures(databaseType?: DatabaseType): Map<string, stri
   return signatures;
 }
 
-function buildFunctionSnippetItems(prefix: string, functionDescriptions: Map<string, string>, databaseType?: DatabaseType): SqlCompletionItem[] {
+function formatFunctionSignatureApply(definition: ClickHouseFunctionDefinition, omitOpeningParen: boolean): string {
+  if (omitOpeningParen) return definition.name;
+  const signature = definition.signatures[definition.preferredSignature ?? 0];
+  return (
+    definition.name +
+    signature.parameterGroups
+      .map(
+        (group) =>
+          `(${group
+            .filter((parameter) => !parameter.endsWith("?"))
+            .map((parameter) => `\${${parameter}}`)
+            .join(", ")})`,
+      )
+      .join("")
+  );
+}
+
+function clickHouseFunctionDetail(definition: ClickHouseFunctionDefinition): string {
+  const status = definition.status && definition.status !== "stable" ? ` · ${definition.status}` : "";
+  const overloads = definition.signatures.length > 1 ? ` · ${definition.signatures.length} overloads` : "";
+  return `ClickHouse · ${definition.category}${overloads}${status}`;
+}
+
+function buildClickHouseFunctionItems(prefix: string, omitOpeningParen: boolean, kind?: ClickHouseFunctionKind): SqlCompletionItem[] {
+  return searchClickHouseFunctions(prefix, 200, kind).map((definition) => {
+    const statusPenalty = definition.status === "deprecated" ? -600 : definition.status === "experimental" ? -300 : 0;
+    const generatedPenalty = definition.generated ? -75 : 0;
+    return {
+      label: definition.name,
+      type: "function" as const,
+      detail: clickHouseFunctionDetail(definition),
+      info: definition.description,
+      apply: formatFunctionSignatureApply(definition, omitOpeningParen),
+      boost: computeBoost(definition.name, prefix) + 300 + statusPenalty + generatedPenalty,
+    };
+  });
+}
+
+function buildFunctionSnippetItems(prefix: string, functionDescriptions: Map<string, string>, databaseType?: DatabaseType, omitOpeningParen = false): SqlCompletionItem[] {
+  if (databaseType === "clickhouse") return buildClickHouseFunctionItems(prefix, omitOpeningParen);
   const items: SqlCompletionItem[] = [];
 
   for (const [name, parameters] of activeFunctionSignatures(databaseType).entries()) {
@@ -4286,6 +4382,62 @@ function getTypePriorityBoost(type: SqlCompletionItem["type"]): number {
     case "keyword":
       return 0;
   }
+}
+
+interface ActiveFunctionCall {
+  name: string;
+  activeGroup: number;
+  groupText: string;
+}
+
+function findActiveFunctionCall(sqlBeforeCursor: string): ActiveFunctionCall | null {
+  const activeOpenParen = findActiveFunctionOpenParen(sqlBeforeCursor);
+  if (activeOpenParen == null) return null;
+
+  const beforeActiveGroup = sqlBeforeCursor.slice(0, activeOpenParen).trimEnd();
+  const ordinaryName = /([A-Za-z_][\w$]*)$/.exec(beforeActiveGroup)?.[1];
+  if (ordinaryName) {
+    return {
+      name: ordinaryName,
+      activeGroup: 0,
+      groupText: sqlBeforeCursor.slice(activeOpenParen + 1),
+    };
+  }
+
+  if (!beforeActiveGroup.endsWith(")")) return null;
+  const firstGroupOpenParen = findMatchingOpenParen(beforeActiveGroup, beforeActiveGroup.length - 1);
+  if (firstGroupOpenParen == null) return null;
+  const parametricName = /([A-Za-z_][\w$]*)$/.exec(beforeActiveGroup.slice(0, firstGroupOpenParen).trimEnd())?.[1];
+  if (!parametricName) return null;
+  return {
+    name: parametricName,
+    activeGroup: 1,
+    groupText: sqlBeforeCursor.slice(activeOpenParen + 1),
+  };
+}
+
+function findMatchingOpenParen(text: string, closeParenIndex: number): number | null {
+  let depth = 0;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  for (let index = closeParenIndex; index >= 0; index -= 1) {
+    const character = text[index];
+    if (character === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      continue;
+    }
+    if (character === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      continue;
+    }
+    if (inSingleQuote || inDoubleQuote) continue;
+    if (character === ")") depth += 1;
+    else if (character === "(") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return null;
 }
 
 function findActiveFunctionOpenParen(sqlBeforeCursor: string): number | null {
