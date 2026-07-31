@@ -984,14 +984,15 @@ pub async fn run_codex_agent(
 
 #[cfg(test)]
 mod tests {
+    use super::codex_process_env_with_system_proxy;
     #[cfg(not(windows))]
     use super::shell_quote;
     use super::{
         build_codex_exec_command, classify_codex_spawn_error, codex_cli_env, codex_enabled_tools,
-        codex_model_cache_key, codex_process_env_with_system_proxy, is_path_like_program, legacy_minimal_effort,
-        list_codex_models_cached, parse_codex_app_server_models, parse_codex_jsonl_event, parse_codex_models,
-        validate_codex_program, with_codex_model_discovery_timeout, CachedCodexModels, CodexModelCacheClass,
-        CodexModelDiscovery, CodexRunOptions, CODEX_MODEL_COMPATIBILITY_CACHE_TTL, CODEX_MODEL_COMPATIBILITY_TIMEOUT,
+        codex_model_cache_key, is_path_like_program, legacy_minimal_effort, list_codex_models_cached,
+        parse_codex_app_server_models, parse_codex_jsonl_event, parse_codex_models, validate_codex_program,
+        with_codex_model_discovery_timeout, CachedCodexModels, CodexModelCacheClass, CodexModelDiscovery,
+        CodexRunOptions, CODEX_MODEL_COMPATIBILITY_CACHE_TTL, CODEX_MODEL_COMPATIBILITY_TIMEOUT,
         CODEX_MODEL_DISCOVERY_TIMEOUT, CODEX_MODEL_NEGATIVE_CACHE_TTL, CODEX_MODEL_SUCCESS_CACHE_TTL,
         DEFAULT_CODEX_MODELS,
     };
