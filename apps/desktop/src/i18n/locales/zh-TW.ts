@@ -1621,6 +1621,8 @@ export default withEnglishFallback({
     importSuccess: "已匯入 {count} 個連線",
     importNavicatSuccess: "已匯入 {count} 個 Navicat 連線，若個別連線密碼為空請補填後測試連線",
     importDatagripSuccess: "已匯入 {count} 個 DataGrip 連線，已自動讀取 {filled} 個密碼（來自 macOS 鑰匙圈）",
+    importDatagripSelectFiles: "請選擇 dataSources.xml（必需），可同時選擇 dataSources.local.xml 和 db-forest-config.xml",
+    importDatagripDialogTitle: "選擇 DataGrip 設定檔",
     importDbeaverSuccess: "已匯入 {count} 個 DBeaver 連線，若個別連線密碼為空請補填後測試連線",
     importNone: "沒有新的連線需要匯入",
     importLayoutConfirm: "匯入檔案包含連線群組資訊，是否一併套用？",

@@ -451,6 +451,10 @@ fn pg_scalar_type_requires_text_protocol(oid: u32, col_type: PgColType) -> bool 
 }
 
 fn pg_type_requires_text_protocol(pg_type: &Type, col_type: PgColType) -> bool {
+    if pg_type.oid() == Type::RECORD.oid() || pg_type.oid() == Type::RECORD_ARRAY.oid() {
+        return true;
+    }
+
     match pg_type.kind() {
         Kind::Array(element_type) => element_type.oid() >= POSTGRES_FIRST_NORMAL_OBJECT_ID,
         Kind::Simple => pg_scalar_type_requires_text_protocol(pg_type.oid(), col_type),
@@ -4207,6 +4211,19 @@ mod tests {
         assert!(pg_scalar_type_requires_text_protocol(POSTGRES_FIRST_NORMAL_OBJECT_ID, PgColType::Other));
         assert!(pg_scalar_type_requires_text_protocol(98_765, PgColType::Other));
         assert!(pg_scalar_type_requires_text_protocol(98_765, PgColType::GenericArray));
+    }
+
+    #[test]
+    fn postgres_record_types_require_text_protocol() {
+        assert!(pg_type_requires_text_protocol(&Type::RECORD, PgColType::Other));
+        assert!(pg_type_requires_text_protocol(&Type::RECORD_ARRAY, PgColType::GenericArray));
+
+        let dynamic_record =
+            Type::new("record".to_string(), Type::RECORD.oid(), Kind::Simple, "pg_catalog".to_string());
+        let dynamic_record_array =
+            Type::new("_record".to_string(), Type::RECORD_ARRAY.oid(), Kind::Simple, "pg_catalog".to_string());
+        assert!(pg_type_requires_text_protocol(&dynamic_record, PgColType::Other));
+        assert!(pg_type_requires_text_protocol(&dynamic_record_array, PgColType::GenericArray));
     }
 
     #[test]

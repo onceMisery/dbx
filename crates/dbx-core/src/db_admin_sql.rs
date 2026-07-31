@@ -190,15 +190,19 @@ pub struct CopyTableDataSqlOptions {
     pub sqlserver_identity_insert: bool,
 }
 
-const MYSQL_COMPATIBLE_PROFILES: &[&str] =
-    &["mysql", "mariadb", "tidb", "oceanbase", "doris", "starrocks", "custom_mysql"];
+const MYSQL_COMPATIBLE_PROFILES: &[&str] = &["mysql", "mariadb", "tidb", "oceanbase", "custom_mysql"];
+const CREATE_DATABASE_CHARSET_UNSUPPORTED_PROFILES: &[&str] = &["doris", "selectdb", "starrocks"];
 
 pub fn supports_create_database_charset(database_type: Option<DatabaseType>, driver_profile: Option<&str>) -> bool {
     let normalized_profile = driver_profile.map(str::to_ascii_lowercase);
-    matches!(
-        database_type,
-        Some(DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::Goldendb)
-    ) || normalized_profile.as_deref().is_some_and(|profile| MYSQL_COMPATIBLE_PROFILES.contains(&profile))
+    if normalized_profile
+        .as_deref()
+        .is_some_and(|profile| CREATE_DATABASE_CHARSET_UNSUPPORTED_PROFILES.contains(&profile))
+    {
+        return false;
+    }
+    matches!(database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb))
+        || normalized_profile.as_deref().is_some_and(|profile| MYSQL_COMPATIBLE_PROFILES.contains(&profile))
 }
 
 pub fn build_create_database_sql(options: CreateDatabaseSqlOptions) -> Result<String, String> {
@@ -661,7 +665,10 @@ pub fn supports_object_rename(database_type: Option<DatabaseType>, object_type: 
     if matches!(object_type, DatabaseObjectType::Procedure | DatabaseObjectType::Function) {
         return false;
     }
-    if database_type == DatabaseType::Sqlite {
+    if matches!(
+        database_type,
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1
+    ) {
         return object_type == DatabaseObjectType::Table;
     }
     if matches!(database_type, DatabaseType::Mysql | DatabaseType::Goldendb) {
@@ -702,7 +709,10 @@ pub fn build_rename_object_sql(options: RenameObjectSqlOptions) -> Result<String
         ));
     }
 
-    if database_type == Some(DatabaseType::Sqlite) {
+    if matches!(
+        database_type,
+        Some(DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1)
+    ) {
         return Ok(format!(
             "ALTER TABLE {} RENAME TO {};",
             qualified_name(database_type, options.schema.as_deref(), &options.old_name),
@@ -873,6 +883,31 @@ mod tests {
             .unwrap(),
             "CREATE DATABASE `app_db` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
         );
+    }
+
+    #[test]
+    fn omits_create_database_charset_for_doris_family() {
+        for (database_type, driver_profile) in [
+            (DatabaseType::Doris, None),
+            (DatabaseType::StarRocks, None),
+            (DatabaseType::Mysql, Some("doris")),
+            (DatabaseType::Mysql, Some("selectdb")),
+            (DatabaseType::Mysql, Some("starrocks")),
+        ] {
+            assert_eq!(
+                build_create_database_sql(CreateDatabaseSqlOptions {
+                    database_type: Some(database_type),
+                    driver_profile: driver_profile.map(str::to_string),
+                    target: None,
+                    parent: None,
+                    name: "analytics".to_string(),
+                    charset: Some("utf8mb4".to_string()),
+                    collation: Some("utf8mb4_unicode_ci".to_string()),
+                })
+                .unwrap(),
+                "CREATE DATABASE `analytics`;"
+            );
+        }
     }
 
     #[test]
@@ -1091,8 +1126,10 @@ mod tests {
     #[test]
     fn recognizes_mysql_compatible_create_database_profiles() {
         assert!(supports_create_database_charset(Some(DatabaseType::Mysql), Some("oceanbase")));
-        assert!(supports_create_database_charset(Some(DatabaseType::Mysql), Some("doris")));
         assert!(supports_create_database_charset(Some(DatabaseType::Goldendb), Some("goldendb")));
+        assert!(!supports_create_database_charset(Some(DatabaseType::Mysql), Some("doris")));
+        assert!(!supports_create_database_charset(Some(DatabaseType::Doris), None));
+        assert!(!supports_create_database_charset(Some(DatabaseType::StarRocks), None));
         assert!(!supports_create_database_charset(Some(DatabaseType::Postgres), None));
     }
 
@@ -1613,6 +1650,32 @@ mod tests {
             .unwrap(),
             "RENAME TABLE `active_users` TO `enabled_users`;"
         );
+    }
+
+    #[test]
+    fn builds_sqlite_protocol_table_rename_sql() {
+        for database_type in
+            [DatabaseType::Sqlite, DatabaseType::Rqlite, DatabaseType::Turso, DatabaseType::CloudflareD1]
+        {
+            let expected = if database_type == DatabaseType::Sqlite {
+                "ALTER TABLE \"main\".\"users\" RENAME TO \"app users\";"
+            } else {
+                "ALTER TABLE \"users\" RENAME TO \"app users\";"
+            };
+            assert!(supports_object_rename(Some(database_type), DatabaseObjectType::Table));
+            assert!(!supports_object_rename(Some(database_type), DatabaseObjectType::View));
+            assert_eq!(
+                build_rename_object_sql(RenameObjectSqlOptions {
+                    database_type: Some(database_type),
+                    object_type: DatabaseObjectType::Table,
+                    schema: Some("main".to_string()),
+                    old_name: "users".to_string(),
+                    new_name: "app users".to_string(),
+                })
+                .unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

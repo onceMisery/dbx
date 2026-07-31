@@ -1627,6 +1627,8 @@ export default withEnglishFallback({
     importLayoutConfirm: "O arquivo importado contém grupos de conexões. Aplicá-los?",
     importLayoutTitle: "Importar Grupos",
     importLayoutApply: "Aplicar",
+    importDatagripSelectFiles: "Selecione dataSources.xml (obrigatório), você também pode selecionar dataSources.local.xml e db-forest-config.xml",
+    importDatagripDialogTitle: "Selecione o arquivo de configuração do DataGrip",
   },
   ai: {
     placeholder: "Descreva sua consulta em linguagem natural...",
