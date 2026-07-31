@@ -15,12 +15,14 @@ import java.sql.Statement;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1452,6 +1454,69 @@ class JdbcConnectionPoolingTest {
     }
 
     @Test
+    void requestExecutorBackpressureKeepsExistingSessionsAndRuntimeRoutable() throws Exception {
+        AtomicInteger physicalOpens = new AtomicInteger();
+        AtomicInteger agentIndexes = new AtomicInteger();
+        AtomicInteger requestIds = new AtomicInteger();
+        CountDownLatch holderStarted = new CountDownLatch(1);
+        CountDownLatch releaseHolder = new CountDownLatch(1);
+        BlockingQueue<JsonObject> responses = new LinkedBlockingQueue<>();
+        String url = h2Url("request_executor_backpressure");
+        try (MultiSessionJsonRpcServer server = new MultiSessionJsonRpcServer(
+            () -> {
+                int agentIndex = agentIndexes.incrementAndGet();
+                return new H2TestAgent(url, physicalOpens) {
+                    @Override
+                    public List<DatabaseInfo> listDatabases() {
+                        if (agentIndex == 1) {
+                            holderStarted.countDown();
+                            awaitUninterruptibly(releaseHolder);
+                        }
+                        return Collections.emptyList();
+                    }
+                };
+            },
+            poolSettings(2),
+            new MultiSessionJsonRpcServer.RuntimeLimits(1, 1)
+        )) {
+            openSession(server, requestIds, "holder");
+            openSession(server, requestIds, "waiting");
+
+            int holderRequestId = requestIds.incrementAndGet();
+            server.executeRequest(
+                jsonRpcRequest(holderRequestId, AgentProtocol.METHOD_LIST_DATABASES, sessionParams("holder")),
+                responses::add
+            );
+            assertTrue(holderStarted.await(2, TimeUnit.SECONDS));
+
+            int waitingRequestId = requestIds.incrementAndGet();
+            server.executeRequest(
+                jsonRpcRequest(waitingRequestId, AgentProtocol.METHOD_LIST_DATABASES, sessionParams("waiting")),
+                responses::add
+            );
+            JsonObject saturated = responses.poll(2, TimeUnit.SECONDS);
+            assertNotNull(saturated);
+            assertEquals(waitingRequestId, saturated.get("id").getAsInt());
+            JsonObject data = saturated.getAsJsonObject("error").getAsJsonObject("data");
+            assertEquals("resource", data.get("category").getAsString());
+            assertTrue(data.get("retryable").getAsBoolean());
+            assertEquals("keep", data.get("sessionDisposition").getAsString());
+
+            releaseHolder.countDown();
+            JsonObject holder = responses.poll(2, TimeUnit.SECONDS);
+            assertNotNull(holder);
+            assertEquals(holderRequestId, holder.get("id").getAsInt());
+            assertFalse(holder.has("error"), () -> holder.toString());
+
+            request(server, requestIds, AgentProtocol.METHOD_LIST_DATABASES, sessionParams("holder"));
+            request(server, requestIds, AgentProtocol.METHOD_LIST_DATABASES, sessionParams("waiting"));
+            assertEquals(2, agentIndexes.get());
+        } finally {
+            releaseHolder.countDown();
+        }
+    }
+
+    @Test
     void idleAffinityLeaseDoesNotCountAsQuarantinedOperation() throws Exception {
         AtomicInteger physicalOpens = new AtomicInteger();
         String url = h2Url("idle_affinity_quarantine");
@@ -1829,12 +1894,17 @@ class JdbcConnectionPoolingTest {
         String method,
         JsonObject params
     ) {
+        JsonObject request = jsonRpcRequest(requestIds.incrementAndGet(), method, params);
+        return JsonParser.parseString(server.handleRequest(GSON.toJson(request))).getAsJsonObject();
+    }
+
+    private static JsonObject jsonRpcRequest(int requestId, String method, JsonObject params) {
         JsonObject request = new JsonObject();
         request.addProperty("jsonrpc", "2.0");
-        request.addProperty("id", requestIds.incrementAndGet());
+        request.addProperty("id", requestId);
         request.addProperty("method", method);
         request.add("params", params);
-        return JsonParser.parseString(server.handleRequest(GSON.toJson(request))).getAsJsonObject();
+        return request;
     }
 
     private static JsonObject result(JsonObject response) {

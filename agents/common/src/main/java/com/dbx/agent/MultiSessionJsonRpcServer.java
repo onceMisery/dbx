@@ -22,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 public final class MultiSessionJsonRpcServer implements AutoCloseable {
@@ -103,11 +104,7 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
                     writeResponse(handleRequest(request));
                     return;
                 }
-                try {
-                    requests.execute(() -> writeResponse(handleRequest(request)));
-                } catch (RejectedExecutionException error) {
-                    writeResponse(errorResponse(request.get("id"), AgentRpcError.resource("request", error)));
-                }
+                executeRequest(request, this::writeResponse);
             }
         } catch (Exception e) {
             throw new RuntimeException(e);
@@ -118,6 +115,14 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
 
     String handleRequest(String line) {
         return gson.toJson(handleRequest(JsonParser.parseString(line).getAsJsonObject()));
+    }
+
+    void executeRequest(JsonObject request, Consumer<JsonObject> responseConsumer) {
+        try {
+            requests.execute(() -> responseConsumer.accept(handleRequest(request)));
+        } catch (RejectedExecutionException error) {
+            responseConsumer.accept(errorResponse(request.get("id"), AgentRpcError.backpressure("request", error)));
+        }
     }
 
     private JsonObject handleRequest(JsonObject request) {
