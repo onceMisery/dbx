@@ -781,13 +781,7 @@ class JdbcConnectionPoolingTest {
                 releaseValidation
             );
             JdbcConnectionPoolRegistry.Lease first = registry.borrow("parallel-validation", factory);
-            JdbcConnectionPoolRegistry.Lease second = registry.borrow(
-                "parallel-validation",
-                JdbcSessionRole.METADATA,
-                factory
-            );
             first.close();
-            second.close();
             Thread.sleep(600L);
 
             blockNextValidation.set(true);
@@ -805,7 +799,18 @@ class JdbcConnectionPoolingTest {
                 assertTrue(elapsedMillis < 400L, () -> "metadata checkout took " + elapsedMillis + "ms");
                 assertTrue(metadata.connection().isValid(1));
             }
-            futureFailure(blocked, AgentRpcError.class, 2, TimeUnit.SECONDS);
+            AgentRpcError timeout = futureFailure(blocked, AgentRpcError.class, 2, TimeUnit.SECONDS);
+            JsonObject timeoutData = AgentRpcError.toJson(timeout, AgentProtocol.METHOD_OPEN_SESSION, "blocked")
+                .getAsJsonObject("data");
+            assertEquals("replace_runtime", timeoutData.get("sessionDisposition").getAsString());
+
+            AgentRpcError retry = assertThrows(
+                AgentRpcError.class,
+                () -> registry.borrow("parallel-validation", factory)
+            );
+            JsonObject retryData = AgentRpcError.toJson(retry, AgentProtocol.METHOD_OPEN_SESSION, "retry")
+                .getAsJsonObject("data");
+            assertEquals("replace_runtime", retryData.get("sessionDisposition").getAsString());
         } finally {
             releaseValidation.countDown();
             worker.shutdownNow();

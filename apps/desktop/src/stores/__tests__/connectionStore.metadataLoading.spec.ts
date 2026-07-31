@@ -896,6 +896,86 @@ describe("connectionStore metadata loading", () => {
     expect(store.connectedIds.has(connection.id)).toBe(true);
   });
 
+  it("does not restore a pre-disconnect snapshot into a same-id reconnected node", async () => {
+    let rejectMetadata!: (reason: Error) => void;
+    const pendingMetadata = new Promise<Array<{ name: string; comment: null }>>((_, reject) => {
+      rejectMetadata = reject;
+    });
+    const listSchemaInfos = vi.fn().mockReturnValue(pendingMetadata);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      disconnectDb: vi.fn().mockResolvedValue(undefined),
+      listInstalledAgents: vi.fn().mockResolvedValue([]),
+      listSchemaInfos,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = postgresConnection();
+    const databaseId = `${connection.id}:app`;
+    const staleSchema: TreeNode = {
+      id: `${databaseId}:stale`,
+      label: "stale",
+      type: "schema",
+      connectionId: connection.id,
+      database: "app",
+      schema: "stale",
+      children: [],
+    };
+    const databaseNode: TreeNode = {
+      id: databaseId,
+      label: "app",
+      type: "database",
+      connectionId: connection.id,
+      database: "app",
+      isExpanded: true,
+      children: [staleSchema],
+    };
+    const connectionNode: TreeNode = {
+      id: connection.id,
+      label: connection.name,
+      type: "connection",
+      connectionId: connection.id,
+      isExpanded: true,
+      children: [databaseNode],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [connectionNode];
+
+    const staleRefresh = store.refreshTreeNode(databaseNode);
+    await vi.waitFor(() => expect(listSchemaInfos).toHaveBeenCalledTimes(1));
+    await store.disconnect(connection.id);
+
+    const freshSchema: TreeNode = {
+      id: `${databaseId}:fresh`,
+      label: "fresh",
+      type: "schema",
+      connectionId: connection.id,
+      database: "app",
+      schema: "fresh",
+      children: [],
+    };
+    const reconnectedDatabaseNode: TreeNode = {
+      ...databaseNode,
+      children: [freshSchema],
+    };
+    connectionNode.children = [reconnectedDatabaseNode];
+    store.connectedIds.add(connection.id);
+
+    rejectMetadata(new Error("disconnected refresh"));
+    await expect(staleRefresh).rejects.toThrow("disconnected refresh");
+
+    expect(reconnectedDatabaseNode.children?.map((child) => child.label)).toEqual(["fresh"]);
+  });
+
   it.each(["opengauss", "kingbase"] as const)("reloads %s sidebar schemas when system visibility changes", async (dbType) => {
     const listSchemaInfos = vi.fn().mockResolvedValue([
       { name: "information_schema", comment: null },

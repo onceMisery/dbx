@@ -1156,10 +1156,10 @@ final class JdbcConnectionPoolRegistry implements AutoCloseable {
                 try {
                     return outcome.get(deadline.remainingNanos(), TimeUnit.NANOSECONDS);
                 } catch (TimeoutException error) {
-                    return abandonCheckout(outcome, factoryDataSource, attemptBaseline, deadline, error);
+                    return abandonCheckout(outcome, factoryDataSource, error);
                 } catch (InterruptedException error) {
                     Thread.currentThread().interrupt();
-                    return abandonCheckout(outcome, factoryDataSource, attemptBaseline, deadline, error);
+                    return abandonCheckout(outcome, factoryDataSource, error);
                 } catch (ExecutionException error) {
                     throwCheckoutFailure(error.getCause());
                     throw new IllegalStateException("unreachable");
@@ -1197,18 +1197,17 @@ final class JdbcConnectionPoolRegistry implements AutoCloseable {
         private static Connection abandonCheckout(
             CompletableFuture<Connection> outcome,
             ConnectionFactoryDataSource factoryDataSource,
-            long attemptBaseline,
-            OperationDeadline deadline,
             Exception cause
         ) throws SQLException {
             SQLException causalFailure = factoryDataSource.causalFailure();
-            Throwable failure = causalFailure == null
-                ? factoryDataSource.classifyCheckoutFailure(
-                    new SQLTransientConnectionException("JDBC checkout deadline elapsed", cause),
-                    attemptBaseline,
-                    deadline
-                )
-                : AgentRpcError.resource("checkout", causalFailure);
+            Throwable failure;
+            if (causalFailure == null) {
+                SQLException abandonedFailure = new PhysicalConnectionStateUnknownException(cause);
+                factoryDataSource.poison(abandonedFailure);
+                failure = AgentRpcError.resource("checkout", abandonedFailure);
+            } else {
+                failure = AgentRpcError.resource("checkout", causalFailure);
+            }
             if (outcome.completeExceptionally(failure)) {
                 throwCheckoutFailure(failure);
                 throw new IllegalStateException("unreachable");

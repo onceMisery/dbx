@@ -5106,21 +5106,21 @@ export const useConnectionStore = defineStore("connection", () => {
     const previousExpanded = node.isExpanded;
     const wasLoaded = loadedTreeNodeChildrenIds.value.has(node.id);
     const wasConfirmedEmpty = confirmedEmptyTreeNodeIds.value.has(node.id);
+    const connectionRevision = node.connectionId ? connectionStateRevision(node.connectionId) : undefined;
     const refreshGeneration = ++nextTreeRefreshGeneration;
     activeTreeRefreshGenerations.set(node.id, refreshGeneration);
-    const isCurrentRefresh = () => activeTreeRefreshGenerations.get(node.id) === refreshGeneration;
+    const ownsRefreshGeneration = () => activeTreeRefreshGenerations.get(node.id) === refreshGeneration;
+    const isCurrentRefresh = () => ownsRefreshGeneration() && (!node.connectionId || connectionStateRevision(node.connectionId) === connectionRevision);
     clearLoadedChildrenCache(node.id, { deletePersisted: false });
     try {
       await loadTreeNodeChildren(node, { force: true });
-      if (!isCurrentRefresh()) return;
-      await restoreExpandedChildren(node, expandedIds, { force: true }, isCurrentRefresh);
       if (isCurrentRefresh()) {
-        activeTreeRefreshGenerations.delete(node.id);
+        await restoreExpandedChildren(node, expandedIds, { force: true }, isCurrentRefresh);
       }
     } catch (error) {
-      const target = treeNodeInSidebarTree(node);
       // A stale failure must never overwrite a newer successful (including empty) result.
-      if (activeTreeRefreshGenerations.get(node.id) === refreshGeneration) {
+      if (isCurrentRefresh()) {
+        const target = treeNodeInSidebarTree(node);
         if (target) {
           target.children = previousChildren;
           target.objectCount = previousObjectCount;
@@ -5128,9 +5128,12 @@ export const useConnectionStore = defineStore("connection", () => {
           if (wasLoaded) loadedTreeNodeChildrenIds.value.add(target.id);
           if (wasConfirmedEmpty) confirmedEmptyTreeNodeIds.value.add(target.id);
         }
-        activeTreeRefreshGenerations.delete(node.id);
       }
       throw error;
+    } finally {
+      if (ownsRefreshGeneration()) {
+        activeTreeRefreshGenerations.delete(node.id);
+      }
     }
   }
 

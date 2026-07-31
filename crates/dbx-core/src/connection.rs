@@ -385,29 +385,34 @@ impl PoolRoutingControl {
                 connections.get(pool_key),
                 Some(PoolKind::Agent(current)) if Arc::ptr_eq(current, expected_client)
             );
-            if !is_current {
-                if replace_agent_runtime {
-                    expected_client.fail_stop();
-                }
+            if !is_current && !replace_agent_runtime {
                 return false;
             }
-
-            let pool = connections.remove(pool_key).expect("current Agent pool must still exist");
-            let mut removed = vec![(pool_key.to_string(), pool)];
             if replace_agent_runtime {
-                let sibling_keys = shared_runtime_sibling_keys(&connections, &removed[0].1);
-                for key in sibling_keys {
-                    if let Some(pool) = connections.remove(&key) {
-                        removed.push((key, pool));
-                    }
+                let runtime_keys = connections
+                    .iter()
+                    .filter_map(|(key, pool)| match pool {
+                        PoolKind::Agent(client) if expected_client.shares_runtime_with(client) => Some(key.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let removed = runtime_keys
+                    .into_iter()
+                    .filter_map(|key| connections.remove(&key).map(|pool| (key, pool)))
+                    .collect::<Vec<_>>();
+                if !expected_client.fail_stop() {
+                    log::warn!("Failed to terminate the shared Agent runtime while detaching pool '{pool_key}'");
                 }
-                fail_stop_removed_agent_pool(pool_key, &removed[0].1);
+                removed
+            } else {
+                let pool = connections.remove(pool_key).expect("current Agent pool must still exist");
+                vec![(pool_key.to_string(), pool)]
             }
-            removed
         };
 
+        let detached = !removed.is_empty();
         self.finish_detach(removed).await;
-        true
+        detached
     }
 
     async fn finish_detach(&self, removed: Vec<(String, PoolKind)>) {
@@ -3512,7 +3517,7 @@ impl AppState {
         };
 
         let mut dead_keys = Vec::new();
-        let mut runtime_replacement_keys = Vec::new();
+        let mut failed_agent_checks = Vec::new();
         let timeout = crate::db::connection_timeout();
 
         // Check cloned pools (async I/O, no lock held)
@@ -3636,13 +3641,17 @@ impl AppState {
                 }
                 PoolKind::Agent(client) => {
                     let mut agent = client.lock().await;
-                    match agent.test_connection(serde_json::json!({})).await {
+                    match agent.validate_connection(Some(timeout)).await {
                         Ok(_) => true,
+                        Err(e) if is_agent_validate_connection_unsupported(&e) => {
+                            log::debug!(
+                                "Agent connection pool '{key}' does not support validate_connection; keeping pool"
+                            );
+                            true
+                        }
                         Err(e) => {
                             log::warn!("Agent connection pool '{key}' is unhealthy: {e}");
-                            if should_replace_agent_runtime(&e) {
-                                runtime_replacement_keys.push(key.clone());
-                            }
+                            failed_agent_checks.push((key.clone(), client.clone(), should_replace_agent_runtime(&e)));
                             false
                         }
                     }
@@ -3654,7 +3663,7 @@ impl AppState {
                 | PoolKind::Nacos => true,
                 PoolKind::Redis(_) => unreachable!("Redis handled separately"),
             };
-            if !healthy {
+            if !healthy && !matches!(pool, PoolKind::Agent(_)) {
                 dead_keys.push(key.clone());
             }
         }
@@ -3675,8 +3684,8 @@ impl AppState {
             }
         }
 
-        for key in runtime_replacement_keys {
-            self.detach_pool_by_key(&key, true).await;
+        for (key, client, replace_runtime) in failed_agent_checks {
+            self.detach_agent_pool_if_current(&key, &client, replace_runtime).await;
         }
 
         // Remove dead pools
@@ -6418,9 +6427,10 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn global_health_replace_runtime_fail_stops_shared_runtime() {
+    async fn global_health_validates_current_session_and_fail_stops_shared_runtime() {
         let (state, dir) = test_app_state().await;
-        let (runtime, target_client, sibling_client) = replace_runtime_on_error_clients(&dir, "test_connection").await;
+        let (runtime, target_client, sibling_client) =
+            replace_runtime_on_error_clients(&dir, "validate_connection").await;
         {
             let mut connections = state.connections.write().await;
             connections.insert("conn:analytics".to_string(), PoolKind::Agent(target_client));
@@ -6455,6 +6465,26 @@ for line in sys.stdin:
         assert!(stale_runtime.is_failed());
         assert!(!current_runtime.is_failed());
         current_runtime.kill();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn stale_agent_failure_detaches_current_routes_on_the_same_runtime() {
+        let (state, dir) = test_app_state().await;
+        let (runtime, stale_client, current_client) = replace_runtime_on_error_clients(&dir, "unused").await;
+        let pool_key = "conn:analytics";
+        let sibling_pool_key = "conn:billing";
+        {
+            let mut connections = state.connections.write().await;
+            connections.insert(pool_key.to_string(), PoolKind::Agent(current_client.clone()));
+            connections.insert(sibling_pool_key.to_string(), PoolKind::Agent(current_client));
+        }
+
+        assert!(state.detach_agent_pool_if_current(pool_key, &stale_client, true).await);
+
+        assert!(!state.connections.read().await.contains_key(pool_key));
+        assert!(!state.connections.read().await.contains_key(sibling_pool_key));
+        assert!(runtime.is_failed());
         let _ = std::fs::remove_dir_all(dir);
     }
 

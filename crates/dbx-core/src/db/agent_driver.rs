@@ -334,6 +334,29 @@ fn agent_rpc_error_data(error: &str) -> Option<Value> {
     serde_json::from_str(data).ok()
 }
 
+fn with_agent_rpc_error_session_id(error: String, agent_session_id: Option<&str>) -> String {
+    let Some(agent_session_id) = agent_session_id else {
+        return error;
+    };
+    let Some((message, data)) = error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER) else {
+        return format!(
+            "{error}{AGENT_RPC_ERROR_DATA_MARKER}{}",
+            serde_json::json!({ "agentSessionId": agent_session_id })
+        );
+    };
+    let Ok(mut data) = serde_json::from_str::<Value>(data) else {
+        return format!(
+            "{error}{AGENT_RPC_ERROR_DATA_MARKER}{}",
+            serde_json::json!({ "agentSessionId": agent_session_id })
+        );
+    };
+    let Some(data) = data.as_object_mut() else {
+        return error;
+    };
+    data.insert("agentSessionId".to_string(), Value::String(agent_session_id.to_string()));
+    format!("{message}{AGENT_RPC_ERROR_DATA_MARKER}{}", Value::Object(data.clone()))
+}
+
 fn deserialize_cached_agent_result<T: DeserializeOwned>(result: Result<Value, String>) -> Result<T, String> {
     result
         .and_then(|value| serde_json::from_value(value).map_err(|e| format!("Failed to deserialize agent result: {e}")))
@@ -945,18 +968,22 @@ impl AgentDriverClient {
         cancel_token: Option<CancellationToken>,
     ) -> Result<T, String> {
         if let Some(runtime) = &self.shared_runtime {
+            let agent_session_id = self.agent_session_id.clone();
             let mut params = params;
             if method != AgentMethod::Handshake.as_str()
                 && method != AgentMethod::TestConnection.as_str()
                 && method != AgentMethod::Shutdown.as_str()
             {
-                let session_id = self.agent_session_id.as_ref().ok_or("Shared Agent session id is missing")?;
+                let session_id = agent_session_id.as_ref().ok_or("Shared Agent session id is missing")?;
                 params
                     .as_object_mut()
                     .ok_or_else(|| "Agent RPC parameters must be an object".to_string())?
                     .insert("agentSessionId".to_string(), Value::String(session_id.clone()));
             }
-            return runtime.call(method, params, timeout_duration, cancel_token).await;
+            return runtime
+                .call(method, params, timeout_duration, cancel_token)
+                .await
+                .map_err(|error| with_agent_rpc_error_session_id(error, agent_session_id.as_deref()));
         }
         self.next_id += 1;
         let id = self.next_id;
@@ -2521,8 +2548,9 @@ for line in sys.stdin:
 "#,
         )
         .unwrap();
+        let python = if cfg!(windows) { "python" } else { "python3" };
         let runtime = AgentRuntimeClient::spawn(
-            AgentLaunchSpec::new("python3").with_args([script_path.to_string_lossy().to_string()]),
+            AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]),
             "test",
         )
         .await
@@ -2547,6 +2575,7 @@ for line in sys.stdin:
             .await
             .unwrap_err();
         assert!(error.contains("Agent RPC call timed out"));
+        assert_eq!(agent_rpc_error_session_id(&error).as_deref(), Some("timeout-session"));
         let started = Instant::now();
         client
             .call_with_timeout::<serde_json::Value>("probe", serde_json::json!({}), Some(Duration::from_millis(500)))
@@ -2563,6 +2592,7 @@ for line in sys.stdin:
             .await
             .unwrap_err();
         assert!(error.contains("Agent RPC call timed out"));
+        assert_eq!(agent_rpc_error_session_id(&error).as_deref(), Some("timeout-session"));
         let started = Instant::now();
         client
             .call_with_timeout::<serde_json::Value>("probe", serde_json::json!({}), Some(Duration::from_millis(500)))
