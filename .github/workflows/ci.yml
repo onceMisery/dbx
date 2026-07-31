@@ -558,12 +558,12 @@ jobs:
           for version in 3.13 4.3; do
             name="dbx-rabbitmq-${version//./-}"
             cookie="dbx-ci-${GITHUB_RUN_ID:-local}-${version//./-}"
-            # RabbitMQ is disposable in CI. Keep its data on a fresh tmpfs so
-            # Docker volume ownership cannot make .erlang.cookie unreadable.
+            # RabbitMQ is disposable in CI. Keep its data on a fresh tmpfs
+            # owned by the image's rabbitmq user so .erlang.cookie is readable.
             docker rm -fv "$name" >/dev/null 2>&1 || true
             docker run -d --name "$name" \
-              --user root \
-              --tmpfs /var/lib/rabbitmq:rw,exec,mode=700 \
+              --user 999:999 \
+              --tmpfs /var/lib/rabbitmq:rw,exec,uid=999,gid=999,mode=700 \
               -e RABBITMQ_DEFAULT_USER=dbx \
               -e RABBITMQ_DEFAULT_PASS=dbx-password \
               -e RABBITMQ_ERLANG_COOKIE="$cookie" \
@@ -575,7 +575,9 @@ jobs:
             trap cleanup EXIT
             ready=false
             for _ in $(seq 1 60); do
-              if docker exec "$name" rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
+              if docker exec "$name" rabbitmq-diagnostics -q check_running >/dev/null 2>&1 \
+                && curl --fail --silent --noproxy '*' --user dbx:dbx-password \
+                  http://127.0.0.1:15672/api/overview >/dev/null; then
                 ready=true
                 break
               fi
