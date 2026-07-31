@@ -361,6 +361,20 @@ function isSapHanaSetSchemaStatement(statement: string | undefined): boolean {
   return /^SET\s+SCHEMA\s+(?:"(?:[^"]|"")*"|[A-Za-z_][\w$#]*)\s*;?\s*$/i.test(sqlStatementWithoutLeadingComments(statement));
 }
 
+function sqlServerUseDatabaseFromStatement(statement: string | undefined): string | undefined {
+  const match = /^USE\s+(?:\[((?:[^\]]|\]\])*)\]|"((?:[^"]|"")*)"|([A-Za-z_][\w@$#]*))\s*;?\s*$/i.exec(sqlStatementWithoutLeadingComments(statement));
+  if (!match) return undefined;
+  if (match[1] !== undefined) return match[1].replaceAll("]]", "]");
+  if (match[2] !== undefined) return match[2].replaceAll('""', '"');
+  return match[3];
+}
+
+function isSqlServerBatchErrorResult(result: QueryResult): boolean {
+  // SQL Server batch errors can arrive without execution_error metadata.
+  // A standalone USE statement cannot legitimately return an Error column.
+  return result.execution_error === true || (result.columns.length === 1 && result.columns[0] === "Error" && result.rows.length > 0);
+}
+
 function sapHanaCurrentSchemaFromResult(result: QueryResult): string | undefined {
   const schema = result.rows[0]?.[0];
   return typeof schema === "string" && schema.trim() ? schema.trim() : undefined;
@@ -3952,6 +3966,7 @@ export const useQueryStore = defineStore("query", () => {
       reconcileBatchSqlResults(tab, executionId, results);
       const successfulOracleSchemaChanges = effectiveDbType === "oracle" ? results.filter((result) => result.execution_error !== true && isOracleCurrentSchemaStatement(result.sourceStatement)).length : 0;
       const successfulSapHanaSchemaChanges = effectiveDbType === "saphana" ? results.filter((result) => result.execution_error !== true && isSapHanaSetSchemaStatement(result.sourceStatement)).length : 0;
+      const sqlServerUseDatabase = effectiveDbType === "sqlserver" && !results.some(isSqlServerBatchErrorResult) ? sqlServerUseDatabaseFromStatement(sql) : undefined;
       if (hiddenPrimaryKeys.length > 0 && results.length === 1) {
         const hiddenIndexes = hiddenResultColumnIndexes(results[0]!.columns, hiddenPrimaryKeys);
         if (hiddenIndexes.length > 0) results[0]!.hidden_column_indexes = hiddenIndexes;
@@ -3987,6 +4002,12 @@ export const useQueryStore = defineStore("query", () => {
         if (resolvedSapHanaSchema) {
           current.schema = resolvedSapHanaSchema;
           current.completionContextVersion = (current.completionContextVersion ?? 0) + successfulSapHanaSchemaChanges;
+        }
+        if (sqlServerUseDatabase && current.database !== sqlServerUseDatabase) {
+          rollbackTabTransaction(current);
+          void closeClientConnectionSession(current);
+          current.database = sqlServerUseDatabase;
+          current.schema = undefined;
         }
         const activeGroupIndex = current.activeResultIndex;
         const activeGroupResults = current.results;
