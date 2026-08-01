@@ -72,7 +72,7 @@ class CommonJavaCompatibilityTest {
             strings(contract.getAsJsonArray("handshakeResponseFields"))
         );
         assertEquals(
-            AgentProtocol.MULTI_SESSION_ALL_CAPABILITIES,
+            AgentProtocol.MULTI_SESSION_JDBC_ALL_CAPABILITIES,
             strings(contract.getAsJsonArray("allCapabilities"))
         );
         assertEquals(
@@ -80,7 +80,7 @@ class CommonJavaCompatibilityTest {
             strings(contract.getAsJsonArray("capabilities"))
         );
         assertEquals(
-            AgentProtocol.MULTI_SESSION_CAPABILITIES,
+            AgentProtocol.MULTI_SESSION_JDBC_CAPABILITIES,
             strings(contract.getAsJsonArray("defaultSqlCapabilities"))
         );
         assertEquals(AgentProtocol.MULTI_SESSION_METHODS, strings(contract.getAsJsonArray("commonMethods")));
@@ -164,6 +164,7 @@ class CommonJavaCompatibilityTest {
         )).getAsJsonObject().getAsJsonObject("result");
         assertEquals(2, handshake.get("protocolVersion").getAsInt());
         assertTrue(containsCapability(handshake.getAsJsonArray("capabilities"), "multi_session"));
+        assertTrue(containsCapability(handshake.getAsJsonArray("capabilities"), "structured_error_v1"));
 
         server.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"open_session\",\"params\":{\"agentSessionId\":\"a\"}}");
         server.handleRequest("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"open_session\",\"params\":{\"agentSessionId\":\"b\"}}");
@@ -175,6 +176,32 @@ class CommonJavaCompatibilityTest {
         awaitCondition(() -> created.get(0).disconnectCount == 1);
         assertEquals(1, created.get(0).disconnectCount);
         assertEquals(0, created.get(1).disconnectCount);
+    }
+
+    @Test
+    void customSessionHandlersDoNotImplicitlyAdvertiseStructuredErrors() {
+        MultiSessionJsonRpcServer server = MultiSessionJsonRpcServer.forSessionHandlers(() -> new SessionRpcHandler() {
+            @Override
+            public Object connect(JsonObject params) {
+                return Collections.singletonMap("ok", true);
+            }
+
+            @Override
+            public Object handle(String method, JsonObject params) {
+                return Collections.singletonMap("ok", true);
+            }
+
+            @Override
+            public void close() {
+            }
+        });
+
+        JsonObject handshake = JsonParser.parseString(server.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"handshake\",\"params\":{}}"
+        )).getAsJsonObject().getAsJsonObject("result");
+
+        assertTrue(containsCapability(handshake.getAsJsonArray("capabilities"), "multi_session"));
+        assertFalse(containsCapability(handshake.getAsJsonArray("capabilities"), "structured_error_v1"));
     }
 
     @Test

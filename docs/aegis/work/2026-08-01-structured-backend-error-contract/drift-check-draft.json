@@ -3,22 +3,11 @@
   "taskId": "2026-08-01-structured-backend-error-contract",
   "taskIntentRef": "docs/aegis/work/2026-08-01-structured-backend-error-contract/task-intent-draft.json",
   "baselineRefs": [
-    "docs/aegis/specs/2026-07-31-structured-backend-error-contract-design.md",
-    "agents/common/src/main/java/com/dbx/agent/AgentProtocol.java",
-    "agents/common/src/main/java/com/dbx/agent/AgentRpcError.java",
-    "crates/dbx-core/src/db/agent_driver.rs",
-    "crates/dbx-core/src/query.rs",
-    "crates/dbx-core/src/schema.rs",
-    "crates/dbx-core/src/connection.rs",
-    "src-tauri/src/commands/query.rs",
-    "crates/dbx-web/src/error.rs",
-    "apps/desktop/src/i18n/backend-errors.ts"
+    "docs/aegis/specs/2026-07-31-structured-backend-error-contract-design.md"
   ],
-  "scopeStatus": "not-yet-verified",
-  "compatStatus": "not-yet-verified",
-  "retirementStatus": "not-yet-verified",
-  "newRiskSignals": [
-    "共享 Agent runtime 恢复、旧字符串兼容、Tauri/HTTP wire shape 和多语句结果兼容"
-  ],
-  "decision": "needs-baseline-readback"
+  "scopeStatus": "Slice 1 stayed within Agent v2 and typed Rust corridor",
+  "compatStatus": "protocolVersion remains 2; structured_error_v1 is explicit JDBC opt-in; legacy call wrappers remain",
+  "retirementStatus": "marker consumers remain intentionally deferred to Slice 2 compatibility adapter migration",
+  "newRiskSignals": [],
+  "decision": "continue"
 }

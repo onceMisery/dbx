@@ -137,7 +137,7 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
         try {
             Object result;
             if (AgentProtocol.METHOD_HANDSHAKE.equals(method)) {
-                result = sessionHandlerFactory == null ? AgentProtocol.multiSessionHandshakeResult() : customHandshake();
+                result = sessionHandlerFactory == null ? AgentProtocol.multiSessionJdbcHandshakeResult() : customHandshake();
             } else if (AgentProtocol.METHOD_OPEN_SESSION.equals(method)) {
                 result = openSession(requiredSessionId(params), params);
             } else if (AgentProtocol.METHOD_CLOSE_SESSION.equals(method)) {

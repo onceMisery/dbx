@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "slice1-rust-agent-corridor",
+  "type": "test",
+  "source": "cargo test -p dbx-core --no-default-features db::agent_driver::tests",
+  "summary": "49 Agent driver tests passed, including strict v1, legacy, timeout, cancel and runtime failure cases",
+  "verifier": "Cargo exit code 0"
+}
