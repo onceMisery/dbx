@@ -5857,6 +5857,7 @@ test("failed schema session reset blocks query and Oracle explain execution", as
     const queryTab = store.tabs.find((tab) => tab.id === queryTabId)!;
     assert.equal(executeRequests, 0);
     assert.equal(queryTab.result?.execution_error, true);
+    assert.equal(queryTab.result?.error?.detail, "reset failed");
     assert.match(String(queryTab.result?.rows[0]?.[0]), /reset failed/i);
 
     store.updateSchema(explainTabId, undefined);

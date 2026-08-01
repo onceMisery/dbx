@@ -122,8 +122,9 @@ function backendErrorMessage(error: unknown): string {
 
 function translateStructuredBackendError(t: BackendErrorTranslate, error: BackendError): string {
   const translated = t(error.messageKey, error.messageParams);
-  if (translated !== error.messageKey) return translated;
-  return t("backendErrors.unknown");
+  const summary = translated !== error.messageKey ? translated : t("backendErrors.unknown");
+  const detail = error.detail?.trim();
+  return detail && detail !== summary ? `${summary}\n\n${detail}` : summary;
 }
 
 export function translateBackendError(t: BackendErrorTranslate, error: unknown): string {

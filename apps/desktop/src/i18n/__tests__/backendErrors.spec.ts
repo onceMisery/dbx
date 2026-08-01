@@ -189,11 +189,28 @@ describe("backend error translation", () => {
       messageParams: { stage: "execute" },
       source: "jdbcAgent",
       operationOutcome: "unknown",
+      detail: "relation dbx_table_that_does_not_exist does not exist",
     } as const;
 
     expect(normalizeBackendError(error)).toEqual(error);
-    expect(translateBackendError(t, error)).toBe(t(error.messageKey, error.messageParams));
-    expect(translateBackendError(t, new BackendErrorException(error))).toBe(t(error.messageKey, error.messageParams));
+    const expected = `${t(error.messageKey, error.messageParams)}\n\n${error.detail}`;
+    expect(translateBackendError(t, error)).toBe(expected);
+    expect(translateBackendError(t, new BackendErrorException(error))).toBe(expected);
+  });
+
+  test("shows the database detail after an unclassified Agent summary", () => {
+    const t = translatorFor("zh-CN");
+    const error = {
+      version: 1,
+      code: "DBX-JDBC-9001",
+      messageKey: "backendErrors.jdbc.legacyFailure",
+      messageParams: {},
+      source: "jdbcAgentLegacy",
+      operationOutcome: "unknown",
+      detail: "Table dbx_table_that_does_not_exist does not exist",
+    } as const;
+
+    expect(translateBackendError(t, error)).toBe(`${t(error.messageKey)}\n\n${error.detail}`);
   });
 
   test.each([
@@ -220,7 +237,7 @@ describe("backend error translation", () => {
     const t = translatorFor("zh-CN");
     const error = new BackendErrorException("legacy backend failure");
     expect(error.backendError.code).toBe("DBX-LEGACY-0001");
-    expect(translateBackendError(t, error)).toBe(t("backendErrors.legacy"));
+    expect(translateBackendError(t, error)).toBe(`${t("backendErrors.legacy")}\n\nlegacy backend failure`);
   });
 });
 
