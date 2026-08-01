@@ -1,3 +1,5 @@
+import { normalizeBackendError, type BackendError } from "@/lib/backend/errorUtils";
+
 /**
  * Minimal shape of a translate function, satisfied by both `useI18n().t` inside
  * components and `i18n.global.t` in stores and composables. Using the full
@@ -157,4 +159,3 @@ export function translateBackendError(t: BackendErrorTranslate, error: unknown):
   }
   return message;
 }
-import { normalizeBackendError, type BackendError } from "@/lib/backend/errorUtils";
