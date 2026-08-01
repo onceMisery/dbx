@@ -33,6 +33,27 @@
 - Blocked on: none
 - Next step: Commit Slice 1, then migrate recovery consumers to AgentCallError
 
+## Checkpoint Update
+
+- Current todo: Slice 2 complete; prepare commit and continue with transport/UI migration
+- Active slice: Slice 2 verified; typed recovery policy, BackendError catalog, and Agent consumer migration are complete
+- Completed todos:
+- `RecoveryPolicy` moved to the dedicated `agent_recovery` module
+- `BackendError v1` catalog and safe diagnostics added
+- query/schema/connection/keepalive Agent recovery paths use typed decisions or the single compatibility adapter
+- metadata retry remains read-only and at-most-once; user operations are never replayed
+- static boundary test confirms retired marker parser consumers are absent from business modules
+- Evidence refs:
+- `cargo test -j 1 -p dbx-core --no-default-features --lib query::tests` (90 passed)
+- `cargo test -j 1 -p dbx-core --no-default-features --lib schema::tests` (78 passed)
+- `cargo test -j 1 -p dbx-core --no-default-features --lib connection::tests` (288 passed, 4 ignored)
+- `cargo test -j 1 -p dbx-core --no-default-features --lib db::agent_driver::tests` (51 passed)
+- `cargo test -j 1 -p dbx-core --no-default-features --lib backend_error::tests` (5 passed)
+- `cargo test -j 1 -p dbx-core --no-default-features --lib agent_recovery::tests` (1 passed)
+- `cargo check -j 1 -p dbx-core --no-default-features` and `cargo fmt --all -- --check` (exit 0)
+- Blocked on: none
+- Next step: Commit Slice 2, then implement Tauri/HTTP and frontend structured error transport
+
 ## DriftCheckDraft
 
 - Scope status: Slice 1 stayed within Agent v2 and typed Rust corridor

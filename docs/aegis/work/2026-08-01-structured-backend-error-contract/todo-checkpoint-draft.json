@@ -1,17 +1,19 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-01-structured-backend-error-contract",
-  "currentTodo": "Slice 2: implement typed recovery policy and BackendError catalog",
+  "currentTodo": "Slice 3: migrate Tauri/HTTP, multi-result progress, and frontend structured errors",
   "completedTodos": [
-    "Slice 1: v2 capability and Agent/Rust typed error corridor"
+    "Slice 1: v2 capability and Agent/Rust typed error corridor",
+    "Slice 2: typed recovery policy, BackendError catalog, and core consumer migration"
   ],
-  "activeSlice": "Slice 1 verified and ready to commit",
+  "activeSlice": "Slice 2 verified and ready to commit",
   "evidenceRefs": [
     "agents: .\\gradlew.bat :common:test --tests *Agent* (BUILD SUCCESSFUL)",
     "dbx-core: cargo test -p dbx-core --no-default-features db::agent_driver::tests (49 passed)",
-    "cargo fmt --all -- --check and cargo check -p dbx-core --no-default-features (exit 0)"
+    "cargo fmt --all -- --check and cargo check -j 1 -p dbx-core --no-default-features (exit 0)",
+    "query/schema/connection/agent_driver/backend_error/agent_recovery targeted tests (all passed)"
   ],
   "blockedOn": null,
-  "nextStep": "Commit Slice 1, then migrate recovery consumers to AgentCallError",
+  "nextStep": "Commit Slice 2, then migrate Tauri/HTTP and frontend structured error transport",
   "updatedAt": "2026-08-01"
 }

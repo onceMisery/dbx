@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
 use crate::models::connection::DatabaseConnectionInfo;
 
 type PendingAgentResponse = tokio::sync::oneshot::Sender<Result<Value, String>>;
@@ -335,7 +336,7 @@ fn decode_agent_response<T: DeserializeOwned>(
 
 const AGENT_RPC_ERROR_DATA_MARKER: &str = "\nDBX_AGENT_ERROR_DATA:";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSessionDisposition {
     Keep,
@@ -353,7 +354,7 @@ impl AgentSessionDisposition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentErrorCategory {
     Connection,
@@ -364,7 +365,7 @@ pub enum AgentErrorCategory {
     Canceled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentErrorStage {
     Request,
@@ -405,11 +406,11 @@ pub struct AgentErrorContext {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LegacyAgentHints {
-    pub category: Option<String>,
+    pub category: Option<AgentErrorCategory>,
     pub retryable: Option<bool>,
     pub session_disposition: Option<AgentSessionDisposition>,
-    pub stage: Option<String>,
-    pub operation_outcome: Option<String>,
+    pub stage: Option<AgentErrorStage>,
+    pub operation_outcome: Option<AgentOperationOutcome>,
     pub agent_session_id: Option<String>,
 }
 
@@ -434,6 +435,49 @@ pub enum AgentCallError {
     Canceled { stage: AgentErrorStage, operation_outcome: AgentOperationOutcome },
 }
 
+/// Decode an already-stringified Agent failure at the compatibility boundary.
+///
+/// Business modules must use this adapter instead of inspecting the legacy
+/// `DBX_AGENT_ERROR_DATA` marker themselves. Callers must only use it after the
+/// owning pool has been identified as an Agent pool.
+pub(crate) fn agent_error_from_legacy(error: &str, expected_session_id: Option<&str>) -> AgentCallError {
+    if error == "Query canceled" {
+        return AgentCallError::Canceled {
+            stage: AgentErrorStage::Cancel,
+            operation_outcome: AgentOperationOutcome::Unknown,
+        };
+    }
+    let lower = error.to_ascii_lowercase();
+    if lower.starts_with("agent rpc call timed out") {
+        return AgentCallError::Timeout {
+            stage: AgentErrorStage::Execute,
+            operation_outcome: AgentOperationOutcome::Unknown,
+        };
+    }
+    legacy_agent_call_error(error.to_string(), expected_session_id)
+}
+
+/// Returns a typed error only when a mixed legacy path can prove the string
+/// originated from the Agent call corridor.
+pub(crate) fn try_agent_error_from_legacy(error: &str) -> Option<AgentCallError> {
+    let lower = error.to_ascii_lowercase();
+    let is_local_agent_failure = error == "Query canceled"
+        || lower.starts_with("agent rpc call timed out")
+        || lower.contains("agent stdin not available")
+        || lower.contains("agent stdout not available")
+        || lower.contains("agent runtime terminated")
+        || lower.contains("agent runtime is unavailable")
+        || lower.contains("agent runtime unavailable")
+        || lower.contains("failed to write to agent stdin")
+        || lower.contains("failed to flush agent stdin")
+        || lower.contains("agent rpc task failed");
+    (is_agent_rpc_response_error(error) || is_local_agent_failure).then(|| agent_error_from_legacy(error, None))
+}
+
+pub(crate) fn agent_recovery_decision(error: &str, scope: RecoveryScope) -> RecoveryDecision {
+    RecoveryPolicy::decide(&agent_error_from_legacy(error, None), scope)
+}
+
 impl AgentCallError {
     pub fn into_legacy_string(self) -> String {
         match self {
@@ -454,11 +498,11 @@ impl AgentCallError {
             }
             Self::Legacy { rpc_code, message, hints } => {
                 let data = serde_json::json!({
-                    "category": hints.category,
+                    "category": hints.category.map(category_name),
                     "retryable": hints.retryable,
                     "sessionDisposition": hints.session_disposition.map(|value| value.as_str()),
-                    "stage": hints.stage,
-                    "operationOutcome": hints.operation_outcome,
+                    "stage": hints.stage.map(stage_name),
+                    "operationOutcome": hints.operation_outcome.map(outcome_name),
                     "agentSessionId": hints.agent_session_id,
                 });
                 format_agent_rpc_error_parts(rpc_code.unwrap_or(-1), &message, Some(&data))
@@ -497,6 +541,25 @@ impl AgentCallError {
             Self::Structured { context, .. } => Some(context.session_disposition),
             Self::Legacy { hints, .. } => hints.session_disposition,
             _ => None,
+        }
+    }
+
+    pub fn category(&self) -> Option<AgentErrorCategory> {
+        match self {
+            Self::Structured { context, .. } => Some(context.category),
+            Self::Legacy { hints, .. } => hints.category,
+            Self::Timeout { .. } => Some(AgentErrorCategory::Timeout),
+            Self::Canceled { .. } => Some(AgentErrorCategory::Canceled),
+            Self::ContractViolation { .. } | Self::Transport { .. } => None,
+        }
+    }
+
+    pub fn operation_outcome(&self) -> AgentOperationOutcome {
+        match self {
+            Self::Structured { context, .. } => context.operation_outcome,
+            Self::Legacy { hints, .. } => hints.operation_outcome.unwrap_or(AgentOperationOutcome::Unknown),
+            Self::Timeout { operation_outcome, .. } | Self::Canceled { operation_outcome, .. } => *operation_outcome,
+            Self::ContractViolation { .. } | Self::Transport { .. } => AgentOperationOutcome::Unknown,
         }
     }
 
@@ -619,7 +682,7 @@ fn parse_agent_call_error(
 
 fn legacy_agent_hints(data: &Value) -> LegacyAgentHints {
     LegacyAgentHints {
-        category: data.get("category").and_then(Value::as_str).map(str::to_string),
+        category: data.get("category").and_then(|value| serde_json::from_value(value.clone()).ok()),
         retryable: data.get("retryable").and_then(Value::as_bool),
         session_disposition: match data.get("sessionDisposition").and_then(Value::as_str) {
             Some("keep") => Some(AgentSessionDisposition::Keep),
@@ -627,13 +690,13 @@ fn legacy_agent_hints(data: &Value) -> LegacyAgentHints {
             Some("replace_runtime") => Some(AgentSessionDisposition::ReplaceRuntime),
             _ => None,
         },
-        stage: data.get("stage").and_then(Value::as_str).map(str::to_string),
-        operation_outcome: data.get("operationOutcome").and_then(Value::as_str).map(str::to_string),
+        stage: data.get("stage").and_then(|value| serde_json::from_value(value.clone()).ok()),
+        operation_outcome: data.get("operationOutcome").and_then(|value| serde_json::from_value(value.clone()).ok()),
         agent_session_id: data.get("agentSessionId").and_then(Value::as_str).map(str::to_string),
     }
 }
 
-fn valid_agent_error_combination(context: &AgentErrorContext) -> bool {
+pub(crate) fn valid_agent_error_combination(context: &AgentErrorContext) -> bool {
     let expected_outcome = match context.stage {
         AgentErrorStage::Request | AgentErrorStage::Checkout | AgentErrorStage::Connect | AgentErrorStage::Validate => {
             AgentOperationOutcome::NotStarted
@@ -664,7 +727,7 @@ fn valid_agent_error_combination(context: &AgentErrorContext) -> bool {
     true
 }
 
-fn category_name(category: AgentErrorCategory) -> &'static str {
+pub(crate) fn category_name(category: AgentErrorCategory) -> &'static str {
     match category {
         AgentErrorCategory::Connection => "connection",
         AgentErrorCategory::Sql => "sql",
@@ -675,7 +738,7 @@ fn category_name(category: AgentErrorCategory) -> &'static str {
     }
 }
 
-fn stage_name(stage: AgentErrorStage) -> &'static str {
+pub(crate) fn stage_name(stage: AgentErrorStage) -> &'static str {
     match stage {
         AgentErrorStage::Request => "request",
         AgentErrorStage::Checkout => "checkout",
@@ -688,7 +751,7 @@ fn stage_name(stage: AgentErrorStage) -> &'static str {
     }
 }
 
-fn outcome_name(outcome: AgentOperationOutcome) -> &'static str {
+pub(crate) fn outcome_name(outcome: AgentOperationOutcome) -> &'static str {
     match outcome {
         AgentOperationOutcome::NotStarted => "not_started",
         AgentOperationOutcome::Unknown => "unknown",
@@ -718,23 +781,6 @@ fn agent_operation_outcome(method: &str) -> AgentOperationOutcome {
     }
 }
 
-pub fn agent_rpc_error_category(error: &str) -> Option<String> {
-    agent_rpc_error_data(error)?.get("category")?.as_str().map(str::to_string)
-}
-
-pub fn agent_rpc_error_session_id(error: &str) -> Option<String> {
-    agent_rpc_error_data(error)?.get("agentSessionId")?.as_str().map(str::to_string)
-}
-
-pub fn agent_session_disposition(error: &str) -> Option<AgentSessionDisposition> {
-    match agent_rpc_error_data(error)?.get("sessionDisposition")?.as_str()? {
-        "keep" => Some(AgentSessionDisposition::Keep),
-        "quarantine" => Some(AgentSessionDisposition::Quarantine),
-        "replace_runtime" => Some(AgentSessionDisposition::ReplaceRuntime),
-        _ => None,
-    }
-}
-
 fn format_agent_rpc_error(error: &Value) -> String {
     let message = error.get("message").and_then(Value::as_str).unwrap_or("Unknown agent error");
     let code = error.get("code").and_then(Value::as_i64).unwrap_or(-1);
@@ -748,11 +794,6 @@ fn format_agent_rpc_error_parts(code: i64, message: &str, data: Option<&Value>) 
         formatted.push_str(&data.to_string());
     }
     formatted
-}
-
-fn agent_rpc_error_data(error: &str) -> Option<Value> {
-    let (_, data) = error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER)?;
-    serde_json::from_str(data).ok()
 }
 
 fn deserialize_cached_agent_result<T: DeserializeOwned>(result: Result<Value, String>) -> Result<T, String> {
@@ -928,7 +969,7 @@ pub enum AgentCapability {
     StructuredErrorV1,
 }
 
-fn legacy_agent_call_error(error: String, agent_session_id: Option<&str>) -> AgentCallError {
+pub(crate) fn legacy_agent_call_error(error: String, agent_session_id: Option<&str>) -> AgentCallError {
     if !is_agent_rpc_response_error(&error) {
         return AgentCallError::Transport { message: error };
     }
@@ -936,8 +977,35 @@ fn legacy_agent_call_error(error: String, agent_session_id: Option<&str>) -> Age
         .rsplit_once(AGENT_RPC_ERROR_DATA_MARKER)
         .map_or((error.as_str(), None), |(header, data)| (header, serde_json::from_str::<Value>(data).ok()));
     let (rpc_code, message) = parse_agent_rpc_error_header(header);
-    AgentCallError::Legacy { rpc_code, message, hints: data.as_ref().map(legacy_agent_hints).unwrap_or_default() }
-        .with_legacy_session_id(agent_session_id)
+    let mut hints = data.as_ref().map(legacy_agent_hints).unwrap_or_default();
+    if hints.category.is_none() && is_legacy_connection_message(&message) {
+        hints.category = Some(AgentErrorCategory::Connection);
+        hints.session_disposition.get_or_insert(AgentSessionDisposition::Quarantine);
+    }
+    AgentCallError::Legacy { rpc_code, message, hints }.with_legacy_session_id(agent_session_id)
+}
+
+fn is_legacy_connection_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "connection lost",
+        "connection reset",
+        "broken pipe",
+        "communications link failure",
+        "sqlrecoverableexception",
+        "sqlnontransientconnectionexception",
+        "sqltransientconnectionexception",
+        "network communication",
+        "网络通信异常",
+        "通信异常",
+        "关闭的连接",
+        "连接已关闭",
+        "not connected",
+        "end of stream",
+        "end-of-file",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn parse_agent_rpc_error_header(header: &str) -> (Option<i64>, String) {
@@ -1653,6 +1721,14 @@ impl AgentDriverClient {
         self.call(method.as_str(), params).await
     }
 
+    pub async fn call_method_typed<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: AgentMethod,
+        params: Value,
+    ) -> Result<T, AgentCallError> {
+        self.call_typed(method.as_str(), params).await
+    }
+
     pub async fn call_method_with_timeout<T: DeserializeOwned + Send + 'static>(
         &mut self,
         method: AgentMethod,
@@ -1660,6 +1736,15 @@ impl AgentDriverClient {
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
         self.call_with_timeout(method.as_str(), params, timeout_duration).await
+    }
+
+    pub async fn call_method_typed_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: AgentMethod,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, AgentCallError> {
+        self.call_typed_with_timeout(method.as_str(), params, timeout_duration).await
     }
 
     pub async fn call_method_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
@@ -1670,6 +1755,16 @@ impl AgentDriverClient {
         cancel_token: Option<CancellationToken>,
     ) -> Result<T, String> {
         self.call_with_timeout_and_cancel(method.as_str(), params, timeout_duration, cancel_token).await
+    }
+
+    pub async fn call_method_typed_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: AgentMethod,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
+        self.call_typed_with_timeout_and_cancel(method.as_str(), params, timeout_duration, cancel_token).await
     }
 
     pub async fn connect(&mut self, params: Value) -> Result<Value, String> {
@@ -1707,6 +1802,14 @@ impl AgentDriverClient {
 
     pub async fn validate_connection(&mut self, timeout_duration: Option<Duration>) -> Result<Value, String> {
         self.call_method_with_timeout(AgentMethod::ValidateConnection, serde_json::json!({}), timeout_duration).await
+    }
+
+    pub async fn validate_connection_typed(
+        &mut self,
+        timeout_duration: Option<Duration>,
+    ) -> Result<Value, AgentCallError> {
+        self.call_method_typed_with_timeout(AgentMethod::ValidateConnection, serde_json::json!({}), timeout_duration)
+            .await
     }
 
     pub async fn connection_info(&mut self, timeout_duration: Option<Duration>) -> Result<AgentConnectionInfo, String> {
@@ -2035,6 +2138,15 @@ impl AgentDriverClient {
         self.call_method_with_timeout(AgentMethod::ExecuteQuery, params, timeout_duration).await
     }
 
+    pub async fn execute_query_typed_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed_with_timeout(AgentMethod::ExecuteQuery, params, timeout_duration).await
+    }
+
     pub async fn execute_query_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
         &mut self,
         params: Value,
@@ -2044,6 +2156,22 @@ impl AgentDriverClient {
         self.invalidate_cached_query();
         self.call_method_with_timeout_and_cancel(AgentMethod::ExecuteQuery, params, timeout_duration, cancel_token)
             .await
+    }
+
+    pub async fn execute_query_typed_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed_with_timeout_and_cancel(
+            AgentMethod::ExecuteQuery,
+            params,
+            timeout_duration,
+            cancel_token,
+        )
+        .await
     }
 
     pub async fn execute_query_cached_with_timeout<T: DeserializeOwned + Send + 'static>(
@@ -2095,6 +2223,22 @@ impl AgentDriverClient {
             .await
     }
 
+    pub async fn execute_query_page_typed_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed_with_timeout_and_cancel(
+            AgentMethod::ExecuteQueryPage,
+            params,
+            timeout_duration,
+            cancel_token,
+        )
+        .await
+    }
+
     pub async fn fetch_query_page<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
         self.call_method(AgentMethod::FetchQueryPage, params).await
     }
@@ -2115,6 +2259,21 @@ impl AgentDriverClient {
     ) -> Result<T, String> {
         self.call_method_with_timeout_and_cancel(AgentMethod::FetchQueryPage, params, timeout_duration, cancel_token)
             .await
+    }
+
+    pub async fn fetch_query_page_typed_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
+        self.call_method_typed_with_timeout_and_cancel(
+            AgentMethod::FetchQueryPage,
+            params,
+            timeout_duration,
+            cancel_token,
+        )
+        .await
     }
 
     pub async fn get_explain_info<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
@@ -2171,6 +2330,17 @@ impl AgentDriverClient {
         self.call_method(AgentMethod::ExecuteTransaction, agent_transaction_params(database, statements, schema)).await
     }
 
+    pub async fn execute_transaction_typed<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        statements: &[String],
+        schema: Option<&str>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed(AgentMethod::ExecuteTransaction, agent_transaction_params(database, statements, schema))
+            .await
+    }
+
     pub async fn execute_batch<T: DeserializeOwned + Send + 'static>(
         &mut self,
         database: Option<&str>,
@@ -2180,6 +2350,22 @@ impl AgentDriverClient {
     ) -> Result<T, String> {
         self.invalidate_cached_query();
         self.call_method_with_timeout(
+            AgentMethod::ExecuteBatch,
+            agent_transaction_params(database, statements, schema),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn execute_batch_typed<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        statements: &[String],
+        schema: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed_with_timeout(
             AgentMethod::ExecuteBatch,
             agent_transaction_params(database, statements, schema),
             timeout_duration,
@@ -2831,18 +3017,18 @@ impl Drop for AgentDriverClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_close_query_session_params, agent_handshake_params, agent_java_args, agent_java_args_with_extra,
-        agent_java_args_with_extra_opts, agent_object_source_params, agent_proxy_env_vars, agent_rpc_error_category,
-        agent_rpc_error_session_id, agent_schema_params, agent_schema_table_params, agent_session_disposition,
-        agent_supports_capability, agent_transaction_params, decode_agent_response, format_agent_process_error,
-        format_agent_startup_error, is_agent_rpc_response_error, is_unsupported_handshake_error,
-        mongo_collection_params, mongo_database_params, mongo_document_id_params, parse_agent_java_opts,
-        read_agent_line, spawn_agent_process, start_stderr_collector, validate_dameng_java_system_properties,
-        AgentCallError, AgentCapability, AgentDriverClient, AgentErrorCategory, AgentErrorStage, AgentHandshake,
-        AgentKvMethod, AgentLaunchSpec, AgentMethod, AgentOperationOutcome, AgentRuntimeClient,
-        AgentSessionDisposition, AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams,
-        MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
+        agent_close_query_session_params, agent_error_from_legacy, agent_handshake_params, agent_java_args,
+        agent_java_args_with_extra, agent_java_args_with_extra_opts, agent_object_source_params, agent_proxy_env_vars,
+        agent_schema_params, agent_schema_table_params, agent_supports_capability, agent_transaction_params,
+        decode_agent_response, format_agent_process_error, format_agent_startup_error, is_agent_rpc_response_error,
+        is_unsupported_handshake_error, legacy_agent_call_error, mongo_collection_params, mongo_database_params,
+        mongo_document_id_params, parse_agent_java_opts, read_agent_line, spawn_agent_process, start_stderr_collector,
+        validate_dameng_java_system_properties, AgentCallError, AgentCapability, AgentDriverClient, AgentErrorCategory,
+        AgentErrorContext, AgentErrorStage, AgentHandshake, AgentKvMethod, AgentLaunchSpec, AgentMethod,
+        AgentOperationOutcome, AgentRuntimeClient, AgentSessionDisposition, AgentTableReadCloseParams,
+        AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
     };
+    use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
     use std::io::Cursor;
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -2927,9 +3113,10 @@ mod tests {
         let error = decode_agent_response::<serde_json::Value>(response, false, None).unwrap_err().into_legacy_string();
 
         assert!(error.starts_with("Agent RPC error (-1): connection lost"));
-        assert_eq!(agent_rpc_error_category(&error).as_deref(), Some("connection"));
-        assert_eq!(agent_rpc_error_session_id(&error).as_deref(), Some("session-generation-1"));
-        assert_eq!(agent_session_disposition(&error), Some(AgentSessionDisposition::Quarantine));
+        let decoded = agent_error_from_legacy(&error, None);
+        assert_eq!(decoded.category(), Some(AgentErrorCategory::Connection));
+        assert_eq!(decoded.session_id(), Some("session-generation-1"));
+        assert_eq!(decoded.session_disposition(), Some(AgentSessionDisposition::Quarantine));
     }
 
     #[test]
@@ -3021,6 +3208,80 @@ mod tests {
             decode_agent_response::<serde_json::Value>(response, true, None).unwrap_err(),
             AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidCombination, .. }
         ));
+    }
+
+    #[test]
+    fn recovery_policy_never_replays_user_operations_and_retries_metadata_once() {
+        let quarantined = AgentCallError::Structured {
+            rpc_code: -1,
+            message: "connection lost".to_string(),
+            context: AgentErrorContext {
+                contract_version: 1,
+                category: AgentErrorCategory::Connection,
+                retryable: true,
+                session_disposition: AgentSessionDisposition::Quarantine,
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+                agent_session_id: Some("session-1".to_string()),
+                sql_state: Some("08006".to_string()),
+                vendor_code: None,
+                exception_class: None,
+            },
+        };
+
+        assert_eq!(
+            RecoveryPolicy::decide(&quarantined, RecoveryScope::UserOperation),
+            RecoveryDecision::QuarantineSession
+        );
+        assert_eq!(
+            RecoveryPolicy::decide(&quarantined, RecoveryScope::ReadOnlyMetadata { retried: false }),
+            RecoveryDecision::RetryReadOnlyMetadata
+        );
+        assert_eq!(
+            RecoveryPolicy::decide(&quarantined, RecoveryScope::ReadOnlyMetadata { retried: true }),
+            RecoveryDecision::QuarantineSession
+        );
+    }
+
+    #[test]
+    fn recovery_policy_is_conservative_for_runtime_local_and_legacy_failures() {
+        let replace = AgentCallError::Structured {
+            rpc_code: -1,
+            message: "runtime saturated".to_string(),
+            context: AgentErrorContext {
+                contract_version: 1,
+                category: AgentErrorCategory::Resource,
+                retryable: false,
+                session_disposition: AgentSessionDisposition::ReplaceRuntime,
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+                agent_session_id: Some("session-1".to_string()),
+                sql_state: None,
+                vendor_code: None,
+                exception_class: None,
+            },
+        };
+        assert_eq!(RecoveryPolicy::decide(&replace, RecoveryScope::Keepalive), RecoveryDecision::ReplaceRuntime);
+        assert_eq!(
+            RecoveryPolicy::decide(
+                &AgentCallError::Timeout {
+                    stage: AgentErrorStage::Connect,
+                    operation_outcome: AgentOperationOutcome::NotStarted,
+                },
+                RecoveryScope::UserOperation,
+            ),
+            RecoveryDecision::QuarantineSession
+        );
+
+        let legacy = legacy_agent_call_error(
+            "Agent RPC error (-1): SQLRecoverableException: connection lost".to_string(),
+            Some("legacy-session"),
+        );
+        assert_eq!(legacy.category(), Some(AgentErrorCategory::Connection));
+        assert_eq!(
+            RecoveryPolicy::decide(&legacy, RecoveryScope::ReadOnlyMetadata { retried: false }),
+            RecoveryDecision::RetryReadOnlyMetadata
+        );
     }
 
     #[test]
@@ -3354,7 +3615,9 @@ for line in sys.stdin:
             .await
             .unwrap_err();
         assert!(error.contains("Agent RPC call timed out"));
-        assert_eq!(agent_rpc_error_session_id(&error).as_deref(), Some("timeout-session"));
+        let typed_error = agent_error_from_legacy(&error, None);
+        assert_eq!(typed_error.category(), Some(AgentErrorCategory::Timeout));
+        assert_eq!(typed_error.operation_outcome(), AgentOperationOutcome::Unknown);
         let started = Instant::now();
         client
             .call_with_timeout::<serde_json::Value>("probe", serde_json::json!({}), Some(Duration::from_millis(500)))
@@ -3371,7 +3634,9 @@ for line in sys.stdin:
             .await
             .unwrap_err();
         assert!(error.contains("Agent RPC call timed out"));
-        assert_eq!(agent_rpc_error_session_id(&error).as_deref(), Some("timeout-session"));
+        let typed_error = agent_error_from_legacy(&error, None);
+        assert_eq!(typed_error.category(), Some(AgentErrorCategory::Timeout));
+        assert_eq!(typed_error.operation_outcome(), AgentOperationOutcome::Unknown);
         let started = Instant::now();
         client
             .call_with_timeout::<serde_json::Value>("probe", serde_json::json!({}), Some(Duration::from_millis(500)))
@@ -3662,7 +3927,10 @@ for line in sys.stdin:
 
         let error = client.disconnect().await.unwrap_err();
 
-        assert_eq!(agent_session_disposition(&error), Some(AgentSessionDisposition::ReplaceRuntime));
+        assert_eq!(
+            agent_error_from_legacy(&error, None).session_disposition(),
+            Some(AgentSessionDisposition::ReplaceRuntime)
+        );
         assert!(!runtime.is_failed());
         runtime.kill();
         drop(client);

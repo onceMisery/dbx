@@ -415,7 +415,7 @@ for line in sys.stdin:
             rpc_code: Some(-1),
             message: "capacity exhausted".to_string(),
             hints: crate::db::agent_driver::LegacyAgentHints {
-                category: Some("resource".to_string()),
+                category: Some(crate::db::agent_driver::AgentErrorCategory::Resource),
                 session_disposition: Some(AgentSessionDisposition::ReplaceRuntime),
                 ..Default::default()
             },

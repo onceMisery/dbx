@@ -17,9 +17,11 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
 use crate::connection::{AppState, PoolKind, TransactionSession, TxnConnection};
 use crate::database_capabilities;
 use crate::db;
+use crate::db::agent_driver::{AgentCallError, AgentErrorStage, AgentOperationOutcome};
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query_execution_sql::is_write_sql;
 use crate::sql::{split_sql_batches, split_sql_statements, starts_with_executable_sql_keyword};
@@ -545,9 +547,6 @@ pub fn agent_close_query_session_params(session_id: &str) -> serde_json::Value {
 }
 
 pub fn is_connection_error(err: &str) -> bool {
-    if crate::db::agent_driver::agent_rpc_error_category(err).as_deref() == Some("connection") {
-        return true;
-    }
     let lower = err.to_lowercase();
     if is_dbx_query_timeout_error(&lower) || is_agent_rpc_timeout_error(&lower) {
         return false;
@@ -596,46 +595,23 @@ fn is_schema_reset_cleanup_error(lower: &str) -> bool {
 }
 
 fn should_discard_agent_pool_after_error(err: &str) -> bool {
-    if matches!(
-        crate::db::agent_driver::agent_session_disposition(err),
-        Some(
-            crate::db::agent_driver::AgentSessionDisposition::Quarantine
-                | crate::db::agent_driver::AgentSessionDisposition::ReplaceRuntime
-        )
-    ) {
-        return true;
-    }
-    let lower = err.to_lowercase();
-    is_dbx_query_timeout_error(&lower)
-        || is_agent_rpc_timeout_error(&lower)
-        || lower.contains("agent stdin not available")
-        || lower.contains("agent stdout not available")
-        || lower.contains("failed to write to agent stdin")
-        || lower.contains("failed to flush agent stdin")
-        || lower.contains("agent rpc task failed")
+    crate::db::agent_driver::agent_recovery_decision(err, RecoveryScope::UserOperation).discards_session()
 }
 
 pub fn pool_error_action(db_type: Option<DatabaseType>, err: &str) -> PoolErrorAction {
-    if db_type.is_some_and(|db_type| database_capabilities::is_agent_type(&db_type))
-        && matches!(
-            crate::db::agent_driver::agent_session_disposition(err),
-            Some(
-                crate::db::agent_driver::AgentSessionDisposition::Quarantine
-                    | crate::db::agent_driver::AgentSessionDisposition::ReplaceRuntime
-            )
-        )
-    {
-        // The connection may be replaced, but the result of the user operation is unknown.
-        // Discard the session without replaying SQL, DDL, writes, or transactions.
-        return PoolErrorAction::Discard;
+    if db_type.is_some_and(|db_type| database_capabilities::is_agent_type(&db_type)) {
+        return if should_discard_agent_pool_after_error(err) {
+            // Agent user operations are never replayed from an error hint because
+            // the database-side outcome may be unknown.
+            PoolErrorAction::Discard
+        } else {
+            PoolErrorAction::Keep
+        };
     }
     let lower = err.to_lowercase();
     if db::sqlserver::is_driver_panic_error(err)
         || (is_dbx_query_timeout_error(&lower) && should_discard_pool_after_query_timeout(db_type))
         || is_schema_reset_cleanup_error(&lower)
-        || (db_type.is_some_and(|db_type| database_capabilities::is_agent_type(&db_type))
-            && should_discard_agent_pool_after_error(err)
-            && !is_connection_error(err))
     {
         return PoolErrorAction::Discard;
     }
@@ -714,10 +690,8 @@ async fn discard_pool_after_error(state: &AppState, pool_key: &str, db_type: Opt
         return;
     }
 
-    let replace_agent_runtime = matches!(
-        crate::db::agent_driver::agent_session_disposition(error),
-        Some(crate::db::agent_driver::AgentSessionDisposition::ReplaceRuntime)
-    );
+    let replace_agent_runtime = db_type.is_some_and(|db_type| database_capabilities::is_agent_type(&db_type))
+        && crate::db::agent_driver::agent_recovery_decision(error, RecoveryScope::UserOperation).replaces_runtime();
     if replace_agent_runtime {
         state.detach_pool_by_key(pool_key, true).await;
     } else {
@@ -725,22 +699,25 @@ async fn discard_pool_after_error(state: &AppState, pool_key: &str, db_type: Opt
     }
 }
 
-async fn discard_agent_pool_after_error(
+async fn discard_agent_pool_after_typed_error(
     state: &AppState,
     pool_key: &str,
     client: &Arc<crate::db::agent_driver::PooledAgentClient>,
-    db_type: Option<DatabaseType>,
-    error: &str,
+    error: &AgentCallError,
+    scope: RecoveryScope,
 ) {
-    let action = pool_error_action(db_type, error);
-    if !matches!(action, PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry) {
-        return;
+    discard_agent_pool_after_decision(state, pool_key, client, RecoveryPolicy::decide(error, scope)).await;
+}
+
+async fn discard_agent_pool_after_decision(
+    state: &AppState,
+    pool_key: &str,
+    client: &Arc<crate::db::agent_driver::PooledAgentClient>,
+    decision: RecoveryDecision,
+) {
+    if decision.discards_session() {
+        state.detach_agent_pool_if_current(pool_key, client, decision.replaces_runtime()).await;
     }
-    let replace_agent_runtime = matches!(
-        crate::db::agent_driver::agent_session_disposition(error),
-        Some(crate::db::agent_driver::AgentSessionDisposition::ReplaceRuntime)
-    );
-    state.detach_agent_pool_if_current(pool_key, client, replace_agent_runtime).await;
 }
 
 fn query_pool_error_action(db_type: Option<DatabaseType>, sql: &str, err: &str) -> PoolErrorAction {
@@ -1350,7 +1327,10 @@ pub async fn do_execute(
                     Some(token) => {
                         tokio::select! {
                             biased;
-                            _ = token.cancelled() => return Err(canceled_error()),
+                            _ = token.cancelled() => return Err(AgentCallError::Canceled {
+                                stage: AgentErrorStage::Cancel,
+                                operation_outcome: AgentOperationOutcome::Unknown,
+                            }),
                             guard = client.lock() => guard,
                         }
                     }
@@ -1358,28 +1338,34 @@ pub async fn do_execute(
                 };
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = agent_fetch_query_page_params(session_id, options.page_size.unwrap_or(MAX_ROWS));
-                    client.fetch_query_page_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone()).await
+                    client
+                        .fetch_query_page_typed_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone())
+                        .await
                 } else if options.page_size.is_some() {
                     let params = agent_execute_query_page_params(&sql, database.as_deref(), schema.as_deref(), options);
                     client
-                        .execute_query_page_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone())
+                        .execute_query_page_typed_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone())
                         .await
                 } else {
                     let params = agent_execute_query_params(&sql, database.as_deref(), schema.as_deref(), options);
-                    client.execute_query_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone()).await
+                    client
+                        .execute_query_typed_with_timeout_and_cancel(params, rpc_timeout, cancel_for_agent.clone())
+                        .await
                 }
             }
             .await
             .map(|result| truncate_result_with_max_rows(result, max_rows));
-            if matches!(result.as_ref(), Err(err) if err == QUERY_CANCELED) {
-                state.detach_agent_pool_if_current(pool_key, &source_client, false).await;
-            }
             if let Err(err) = result.as_ref() {
-                if err != QUERY_CANCELED {
-                    discard_agent_pool_after_error(state, pool_key, &source_client, pool_db_type, err).await;
-                }
+                discard_agent_pool_after_typed_error(
+                    state,
+                    pool_key,
+                    &source_client,
+                    err,
+                    RecoveryScope::UserOperation,
+                )
+                .await;
             }
-            result
+            result.map_err(AgentCallError::into_legacy_string)
         }
         PoolKind::ExternalDriver { config, session, .. } => {
             let config = config.clone();
@@ -2218,8 +2204,8 @@ async fn execute_multi_agent(
     statements: &[String],
     schema: Option<&str>,
     timeout_secs: Option<u64>,
-) -> Result<db::QueryResult, String> {
-    client.execute_batch(database, statements, schema, resolve_query_timeout(timeout_secs)).await
+) -> Result<db::QueryResult, AgentCallError> {
+    client.execute_batch_typed(database, statements, schema, resolve_query_timeout(timeout_secs)).await
 }
 
 pub async fn execute_statements(
@@ -2271,14 +2257,20 @@ pub async fn execute_statements(
         match result {
             Ok(result) => return Ok(db::QueryResult { execution_time_ms: start.elapsed().as_millis(), ..result }),
             Err(err) => {
-                if is_agent_execute_batch_unsupported(&err) {
+                if is_agent_execute_batch_unsupported(&err.to_string()) {
                     log::warn!(
                         "Agent does not support execute_batch; falling back to statement-by-statement execution"
                     );
                 } else {
-                    let db_type = connection_database_type(state, connection_id).await;
-                    discard_agent_pool_after_error(state, &pool_key, &source_client, db_type, &err).await;
-                    return Err(query_error_with_omitted_sql_context(&err, sql_ctx));
+                    discard_agent_pool_after_typed_error(
+                        state,
+                        &pool_key,
+                        &source_client,
+                        &err,
+                        RecoveryScope::UserOperation,
+                    )
+                    .await;
+                    return Err(query_error_with_omitted_sql_context(&err.into_legacy_string(), sql_ctx));
                 }
             }
         }
@@ -2692,9 +2684,10 @@ pub async fn execute_statements_in_transaction_on_pool(
         Some(TxPath::Agent(client)) => {
             let result = exec_tx_agent_inner(client.clone(), db_type, Some(database), statements, schema, start).await;
             if let Err(error) = result.as_ref() {
-                discard_agent_pool_after_error(state, pool_key, &client, db_type, error).await;
+                discard_agent_pool_after_typed_error(state, pool_key, &client, error, RecoveryScope::UserOperation)
+                    .await;
             }
-            return result;
+            return result.map_err(AgentCallError::into_legacy_string);
         }
         Some(TxPath::Explicit) => {
             let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
@@ -3016,7 +3009,7 @@ async fn exec_tx_agent_inner(
     statements: &[String],
     schema: Option<&str>,
     start: std::time::Instant,
-) -> Result<db::QueryResult, String> {
+) -> Result<db::QueryResult, AgentCallError> {
     let execution_schema = schema_for_execution_context(db_type, schema);
     let rewritten_statements;
     let statements = if qualifies_unqualified_agent_relations(db_type) {
@@ -3027,7 +3020,7 @@ async fn exec_tx_agent_inner(
         statements
     };
     let mut client = client.lock().await;
-    let result: db::QueryResult = client.execute_transaction(database, statements, execution_schema).await?;
+    let result: db::QueryResult = client.execute_transaction_typed(database, statements, execution_schema).await?;
     Ok(db::QueryResult { execution_time_ms: start.elapsed().as_millis(), ..result })
 }
 
@@ -4927,14 +4920,14 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn pool_error_action_reconnects_connection_errors() {
+    fn pool_error_action_reconnects_non_agent_errors_but_never_replays_agent_operations() {
         let err = "connection reset by peer";
 
         assert_eq!(pool_error_action(Some(DatabaseType::SqlServer), err), PoolErrorAction::ReconnectAndRetry);
         assert_eq!(pool_error_action(Some(DatabaseType::Postgres), err), PoolErrorAction::ReconnectAndRetry);
 
         let dameng_err = "Agent RPC error (-1): dm.jdbc.driver.DMException: 网络通信异常";
-        assert_eq!(pool_error_action(Some(DatabaseType::Dameng), dameng_err), PoolErrorAction::ReconnectAndRetry);
+        assert_eq!(pool_error_action(Some(DatabaseType::Dameng), dameng_err), PoolErrorAction::Discard);
     }
 
     #[test]
@@ -5306,13 +5299,12 @@ for line in sys.stdin:
 
         assert!(should_discard_agent_pool_after_error(quarantined));
         assert!(should_discard_agent_pool_after_error(replace_runtime));
-        assert!(is_connection_error(quarantined));
         assert_eq!(pool_error_action(Some(DatabaseType::Oracle), quarantined), PoolErrorAction::Discard);
         assert_eq!(pool_error_action(Some(DatabaseType::Oracle), replace_runtime), PoolErrorAction::Discard);
     }
 
     #[test]
-    fn unavailable_agent_pipes_are_reconnectable_errors() {
+    fn unavailable_agent_pipes_discard_without_replaying_user_operations() {
         assert!(should_discard_agent_pool_after_error("Agent stdin not available"));
         assert!(should_discard_agent_pool_after_error("Agent stdout not available"));
         assert!(is_connection_error("Agent stdin not available"));
@@ -5321,15 +5313,12 @@ for line in sys.stdin:
         assert!(is_connection_error("Agent runtime is unavailable"));
         assert_eq!(
             pool_error_action(Some(DatabaseType::Oracle), "Agent stdin not available"),
-            PoolErrorAction::ReconnectAndRetry
+            PoolErrorAction::Discard
         );
-        assert_eq!(
-            pool_error_action(Some(DatabaseType::Oracle), "Agent runtime terminated"),
-            PoolErrorAction::ReconnectAndRetry
-        );
+        assert_eq!(pool_error_action(Some(DatabaseType::Oracle), "Agent runtime terminated"), PoolErrorAction::Discard);
         assert_eq!(
             pool_error_action(Some(DatabaseType::Oracle), "Agent runtime is unavailable"),
-            PoolErrorAction::ReconnectAndRetry
+            PoolErrorAction::Discard
         );
     }
 
