@@ -50,7 +50,7 @@ pub async fn execute_query(
     });
     let cancel_token = registered_query.as_ref().map(|query| query.token());
 
-    dbx_core::query::execute_sql_statement_with_options(
+    dbx_core::query::execute_sql_statement_with_options_typed(
         &state,
         &connection_id,
         &database,
@@ -71,7 +71,7 @@ pub async fn execute_query(
         },
     )
     .await
-    .map_err(|error| BackendError::from_legacy_string(&error))
+    .map_err(dbx_core::query::QueryExecutionError::into_backend_error)
 }
 
 #[tauri::command]
@@ -117,7 +117,7 @@ pub async fn execute_multi(
                     success: progress.success,
                     execution_time_ms: progress.execution_time_ms,
                     affected_rows: progress.affected_rows,
-                    error: progress.error.as_deref().map(BackendError::from_legacy_string),
+                    error: progress.error,
                 },
             );
         }) as dbx_core::query::ExecuteMultiProgressCallback

@@ -185,6 +185,11 @@ impl BackendError {
         self.detail.as_deref()
     }
 
+    pub fn without_detail(mut self) -> Self {
+        self.detail = None;
+        self
+    }
+
     pub fn diagnostics(&self) -> Option<&BackendErrorDiagnostics> {
         self.diagnostics.as_ref()
     }
@@ -412,16 +417,10 @@ fn structured_entry(context: &AgentErrorContext) -> (&'static CatalogEntry, Back
                 CatalogCode::ContractInvalid
             }
         }
-        AgentErrorCategory::Protocol => {
-            if context.operation_outcome == AgentOperationOutcome::Unknown {
-                CatalogCode::ProtocolFailed
-            } else {
-                CatalogCode::ContractInvalid
-            }
-        }
+        AgentErrorCategory::Protocol => CatalogCode::ProtocolFailed,
     };
     let entry = catalog_entry(code);
-    let outcome = if matches!(code, CatalogCode::ProtocolFailed | CatalogCode::ContractInvalid) {
+    let outcome = if matches!(code, CatalogCode::ContractInvalid) {
         BackendOperationOutcome::Unknown
     } else {
         map_outcome(context.operation_outcome)
@@ -501,11 +500,19 @@ fn safe_detail(message: &str) -> Option<String> {
         "bearer",
         "api_key",
         "apikey",
+        "credential",
+        "auth=",
+        "key=",
         "user=",
         "username=",
         "uid=",
         "access_key",
         "private_key",
+        "agent session",
+        "agentsessionid",
+        "session id",
+        "session_id",
+        "session=",
     ];
     if sensitive_markers.iter().any(|marker| lowered.contains(marker)) {
         return None;
@@ -514,9 +521,7 @@ fn safe_detail(message: &str) -> Option<String> {
         "select", "insert", "update", "delete", "drop", "create", "alter", "truncate", "merge", "call", "with",
         "grant", "revoke", "comment", "explain", "begin", "commit", "rollback",
     ];
-    let first_word =
-        lowered.split_whitespace().next().unwrap_or_default().trim_matches(|ch: char| !ch.is_ascii_alphabetic());
-    if sql_verbs.contains(&first_word) || lowered.contains(" from ") || lowered.contains(" into ") {
+    if lowered.split(|ch: char| !ch.is_ascii_alphabetic()).any(|word| sql_verbs.contains(&word)) {
         return None;
     }
     let detail = bounded_ascii(trimmed, MAX_DETAIL_BYTES);
@@ -538,7 +543,11 @@ mod tests {
             contract_version: 1,
             category,
             retryable: true,
-            session_disposition: AgentSessionDisposition::Keep,
+            session_disposition: if matches!(category, AgentErrorCategory::Timeout | AgentErrorCategory::Canceled) {
+                AgentSessionDisposition::Quarantine
+            } else {
+                AgentSessionDisposition::Keep
+            },
             stage,
             operation_outcome: outcome,
             agent_session_id: Some("private-session".to_string()),
@@ -622,6 +631,8 @@ mod tests {
             "postgresql://host/db?user=alice&pwd=secret",
             "Bearer token-value",
             "CALL refresh_cache()",
+            "syntax error in statement [UPDATE customers SET ssn='123']",
+            "Agent session not found: 7f51e7f4-7cee-42db-bfeb-76d1199d1afe",
         ] {
             assert!(safe_detail(message).is_none(), "detail leaked: {message}");
         }
@@ -655,7 +666,7 @@ mod tests {
                 AgentErrorCategory::Protocol,
                 AgentErrorStage::Request,
                 AgentOperationOutcome::NotStarted,
-                AgentSessionDisposition::Keep,
+                AgentSessionDisposition::ReplaceRuntime,
             ),
             (
                 AgentErrorCategory::Resource,
@@ -693,5 +704,18 @@ mod tests {
         assert_eq!(legacy.code(), "DBX-JDBC-9001");
         assert_eq!(legacy.source, BackendErrorSource::JdbcAgentLegacy);
         assert_eq!(BackendError::from_legacy_backend("driver failed").code(), "DBX-LEGACY-0001");
+    }
+
+    #[test]
+    fn strict_marker_round_trip_keeps_catalog_code() {
+        let error = AgentCallError::Structured {
+            rpc_code: -1,
+            message: "connection lost".to_string(),
+            context: context(AgentErrorCategory::Connection, AgentErrorStage::Execute, AgentOperationOutcome::Unknown),
+        };
+        let legacy =
+            crate::db::agent_driver::append_legacy_error_context(&error.into_legacy_string(), "SQL text omitted");
+
+        assert_eq!(BackendError::from_legacy_string(&legacy).code(), "DBX-JDBC-1002");
     }
 }

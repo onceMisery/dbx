@@ -2,10 +2,9 @@ use serde::de::DeserializeOwned;
 use std::time::Duration;
 
 use crate::agent_manager::{AgentManager, DEFAULT_JRE_KEY};
+use crate::agent_recovery::{RecoveryPolicy, RecoveryScope};
 use crate::database_capabilities;
-use crate::db::agent_driver::{
-    AgentCallError, AgentDriverClient, AgentMethod, AgentRuntimeClient, AgentSessionDisposition,
-};
+use crate::db::agent_driver::{AgentCallError, AgentDriverClient, AgentMethod, AgentRuntimeClient};
 use crate::models::connection::DatabaseType;
 
 pub struct SharedConnectionOpenError {
@@ -127,7 +126,7 @@ fn shared_connection_open_error(
     error: AgentCallError,
     runtime: std::sync::Arc<AgentRuntimeClient>,
 ) -> SharedConnectionOpenError {
-    let runtime = (error.session_disposition() == Some(AgentSessionDisposition::ReplaceRuntime)).then_some(runtime);
+    let runtime = RecoveryPolicy::decide(&error, RecoveryScope::ConnectionOpen).replaces_runtime().then_some(runtime);
     SharedConnectionOpenError { message: error.into_legacy_string(), runtime }
 }
 
@@ -416,7 +415,7 @@ for line in sys.stdin:
             message: "capacity exhausted".to_string(),
             hints: crate::db::agent_driver::LegacyAgentHints {
                 category: Some(crate::db::agent_driver::AgentErrorCategory::Resource),
-                session_disposition: Some(AgentSessionDisposition::ReplaceRuntime),
+                session_disposition: Some(crate::db::agent_driver::AgentSessionDisposition::ReplaceRuntime),
                 ..Default::default()
             },
         };

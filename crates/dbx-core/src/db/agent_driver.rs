@@ -507,9 +507,11 @@ impl AgentCallError {
                 });
                 format_agent_rpc_error_parts(rpc_code.unwrap_or(-1), &message, Some(&data))
             }
-            Self::ContractViolation { rpc_code, message, .. } => {
-                format_agent_rpc_error_parts(rpc_code.unwrap_or(-1), &message, None)
-            }
+            Self::ContractViolation { rpc_code, message, .. } => format_agent_rpc_error_parts(
+                rpc_code.unwrap_or(-1),
+                &message,
+                Some(&serde_json::json!({ "contractVersion": 1 })),
+            ),
             Self::Transport { message } => message,
             Self::Timeout { stage, .. } => format!("Agent RPC call timed out at {}", stage_name(stage)),
             Self::Canceled { .. } => "Query canceled".to_string(),
@@ -520,10 +522,7 @@ impl AgentCallError {
         let has_session_id = self.session_id().is_some();
         let message = self.into_legacy_string();
         match (has_session_id, agent_session_id) {
-            (false, Some(agent_session_id)) => format!(
-                "{message}{AGENT_RPC_ERROR_DATA_MARKER}{}",
-                serde_json::json!({ "agentSessionId": agent_session_id })
-            ),
+            (false, Some(agent_session_id)) => append_legacy_agent_session_id(&message, agent_session_id),
             _ => message,
         }
     }
@@ -569,6 +568,18 @@ impl AgentCallError {
         }
         self
     }
+}
+
+fn append_legacy_agent_session_id(error: &str, agent_session_id: &str) -> String {
+    if let Some((header, data)) = error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER) {
+        if let Ok(mut data) = serde_json::from_str::<Value>(data) {
+            if let Some(object) = data.as_object_mut() {
+                object.insert("agentSessionId".to_string(), Value::String(agent_session_id.to_string()));
+                return format!("{header}{AGENT_RPC_ERROR_DATA_MARKER}{data}");
+            }
+        }
+    }
+    format!("{error}{AGENT_RPC_ERROR_DATA_MARKER}{}", serde_json::json!({ "agentSessionId": agent_session_id }))
 }
 
 impl fmt::Display for AgentCallError {
@@ -621,63 +632,39 @@ fn parse_agent_call_error(
             reason: ContractViolationReason::MissingContractVersion,
         };
     };
+    match parse_structured_error_context(data, expected_session_id) {
+        Ok(context) => AgentCallError::Structured { rpc_code: rpc_code.unwrap_or(-1), message, context },
+        Err(reason) => AgentCallError::ContractViolation { rpc_code, message, reason },
+    }
+}
+
+fn parse_structured_error_context(
+    data: &Value,
+    expected_session_id: Option<&str>,
+) -> Result<AgentErrorContext, ContractViolationReason> {
     let Some(contract_version_value) = data.get("contractVersion") else {
-        return AgentCallError::ContractViolation {
-            rpc_code,
-            message,
-            reason: ContractViolationReason::MissingContractVersion,
-        };
+        return Err(ContractViolationReason::MissingContractVersion);
     };
     let Some(contract_version) = contract_version_value.as_u64() else {
-        return AgentCallError::ContractViolation {
-            rpc_code,
-            message,
-            reason: ContractViolationReason::InvalidDataShape,
-        };
+        return Err(ContractViolationReason::InvalidDataShape);
     };
     if contract_version != 1 {
-        return AgentCallError::ContractViolation {
-            rpc_code,
-            message,
-            reason: ContractViolationReason::UnsupportedContractVersion,
-        };
+        return Err(ContractViolationReason::UnsupportedContractVersion);
     }
-
-    let context = match serde_json::from_value::<AgentErrorContext>(data.clone()) {
-        Ok(context) => context,
-        Err(_) => {
-            return AgentCallError::ContractViolation {
-                rpc_code,
-                message,
-                reason: ContractViolationReason::InvalidDataShape,
-            };
-        }
-    };
+    let context = serde_json::from_value::<AgentErrorContext>(data.clone())
+        .map_err(|_| ContractViolationReason::InvalidDataShape)?;
     if context.contract_version != 1 {
-        return AgentCallError::ContractViolation {
-            rpc_code,
-            message,
-            reason: ContractViolationReason::UnsupportedContractVersion,
-        };
+        return Err(ContractViolationReason::UnsupportedContractVersion);
     }
     if let Some(expected_session_id) = expected_session_id {
         if context.agent_session_id.as_deref() != Some(expected_session_id) {
-            return AgentCallError::ContractViolation {
-                rpc_code,
-                message,
-                reason: ContractViolationReason::InvalidSessionId,
-            };
+            return Err(ContractViolationReason::InvalidSessionId);
         }
     }
     if !valid_agent_error_combination(&context) {
-        return AgentCallError::ContractViolation {
-            rpc_code,
-            message,
-            reason: ContractViolationReason::InvalidCombination,
-        };
+        return Err(ContractViolationReason::InvalidCombination);
     }
-
-    AgentCallError::Structured { rpc_code: rpc_code.unwrap_or(-1), message, context }
+    Ok(context)
 }
 
 fn legacy_agent_hints(data: &Value) -> LegacyAgentHints {
@@ -708,23 +695,42 @@ pub(crate) fn valid_agent_error_combination(context: &AgentErrorContext) -> bool
     if context.operation_outcome != expected_outcome {
         return false;
     }
-    if context.category == AgentErrorCategory::Sql
-        && context.session_disposition == AgentSessionDisposition::ReplaceRuntime
-    {
+    let valid_disposition = match context.category {
+        AgentErrorCategory::Connection => context.session_disposition != AgentSessionDisposition::ReplaceRuntime,
+        AgentErrorCategory::Sql => {
+            matches!(
+                context.stage,
+                AgentErrorStage::Execute | AgentErrorStage::Fetch | AgentErrorStage::Cancel | AgentErrorStage::Close
+            ) && context.session_disposition != AgentSessionDisposition::ReplaceRuntime
+        }
+        AgentErrorCategory::Resource => {
+            context.session_disposition == AgentSessionDisposition::ReplaceRuntime
+                || context.operation_outcome == AgentOperationOutcome::NotStarted
+        }
+        AgentErrorCategory::Protocol => {
+            context.session_disposition != AgentSessionDisposition::ReplaceRuntime
+                || context.operation_outcome == AgentOperationOutcome::Unknown
+        }
+        AgentErrorCategory::Timeout | AgentErrorCategory::Canceled => {
+            context.session_disposition == AgentSessionDisposition::Quarantine
+        }
+    };
+    if !valid_disposition {
         return false;
     }
-    if context.session_disposition == AgentSessionDisposition::ReplaceRuntime
-        && !matches!(context.category, AgentErrorCategory::Resource | AgentErrorCategory::Protocol)
-    {
-        return false;
-    }
-    if context.sql_state.as_ref().is_some_and(|value| value.len() > 16)
-        || context.exception_class.as_ref().is_some_and(|value| value.len() > 160)
-        || context.agent_session_id.as_ref().is_some_and(|value| value.trim().is_empty())
-    {
-        return false;
-    }
-    true
+    valid_ascii_diagnostic(context.sql_state.as_deref(), 16)
+        && valid_ascii_diagnostic(context.exception_class.as_deref(), 160)
+        && context.agent_session_id.as_deref().map_or(true, valid_ascii_identifier)
+}
+
+fn valid_ascii_diagnostic(value: Option<&str>, max_length: usize) -> bool {
+    value.map_or(true, |value| {
+        !value.is_empty() && value.len() <= max_length && value.bytes().all(|byte| byte.is_ascii_graphic())
+    })
+}
+
+fn valid_ascii_identifier(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 pub(crate) fn category_name(category: AgentErrorCategory) -> &'static str {
@@ -977,12 +983,28 @@ pub(crate) fn legacy_agent_call_error(error: String, agent_session_id: Option<&s
         .rsplit_once(AGENT_RPC_ERROR_DATA_MARKER)
         .map_or((error.as_str(), None), |(header, data)| (header, serde_json::from_str::<Value>(data).ok()));
     let (rpc_code, message) = parse_agent_rpc_error_header(header);
+    if let Some(data) = data.as_ref().filter(|data| data.get("contractVersion").is_some()) {
+        return match parse_structured_error_context(data, agent_session_id) {
+            Ok(context) => AgentCallError::Structured { rpc_code: rpc_code.unwrap_or(-1), message, context },
+            Err(reason) => AgentCallError::ContractViolation { rpc_code, message, reason },
+        };
+    }
     let mut hints = data.as_ref().map(legacy_agent_hints).unwrap_or_default();
     if hints.category.is_none() && is_legacy_connection_message(&message) {
         hints.category = Some(AgentErrorCategory::Connection);
         hints.session_disposition.get_or_insert(AgentSessionDisposition::Quarantine);
     }
     AgentCallError::Legacy { rpc_code, message, hints }.with_legacy_session_id(agent_session_id)
+}
+
+pub(crate) fn append_legacy_error_context(error: &str, context: &str) -> String {
+    if error.contains(context) {
+        return error.to_string();
+    }
+    if let Some((header, data)) = error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER) {
+        return format!("{header}\n{context}{AGENT_RPC_ERROR_DATA_MARKER}{data}");
+    }
+    format!("{error}\n{context}")
 }
 
 fn is_legacy_connection_message(message: &str) -> bool {
@@ -3020,13 +3042,14 @@ mod tests {
         agent_close_query_session_params, agent_error_from_legacy, agent_handshake_params, agent_java_args,
         agent_java_args_with_extra, agent_java_args_with_extra_opts, agent_object_source_params, agent_proxy_env_vars,
         agent_schema_params, agent_schema_table_params, agent_supports_capability, agent_transaction_params,
-        decode_agent_response, format_agent_process_error, format_agent_startup_error, is_agent_rpc_response_error,
-        is_unsupported_handshake_error, legacy_agent_call_error, mongo_collection_params, mongo_database_params,
-        mongo_document_id_params, parse_agent_java_opts, read_agent_line, spawn_agent_process, start_stderr_collector,
-        validate_dameng_java_system_properties, AgentCallError, AgentCapability, AgentDriverClient, AgentErrorCategory,
-        AgentErrorContext, AgentErrorStage, AgentHandshake, AgentKvMethod, AgentLaunchSpec, AgentMethod,
-        AgentOperationOutcome, AgentRuntimeClient, AgentSessionDisposition, AgentTableReadCloseParams,
-        AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
+        append_legacy_error_context, decode_agent_response, format_agent_process_error, format_agent_startup_error,
+        is_agent_rpc_response_error, is_unsupported_handshake_error, legacy_agent_call_error, mongo_collection_params,
+        mongo_database_params, mongo_document_id_params, parse_agent_java_opts, read_agent_line, spawn_agent_process,
+        start_stderr_collector, validate_dameng_java_system_properties, AgentCallError, AgentCapability,
+        AgentDriverClient, AgentErrorCategory, AgentErrorContext, AgentErrorStage, AgentHandshake, AgentKvMethod,
+        AgentLaunchSpec, AgentMethod, AgentOperationOutcome, AgentRuntimeClient, AgentSessionDisposition,
+        AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail,
+        AGENT_PROTOCOL_VERSION,
     };
     use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
     use std::io::Cursor;
@@ -3156,6 +3179,47 @@ mod tests {
     }
 
     #[test]
+    fn strict_structured_error_keeps_identity_across_legacy_api_boundary() {
+        let response = serde_json::json!({
+            "error": {
+                "code": -6007,
+                "message": "connection lost",
+                "data": {
+                    "contractVersion": 1,
+                    "category": "connection",
+                    "retryable": false,
+                    "sessionDisposition": "quarantine",
+                    "stage": "execute",
+                    "operationOutcome": "unknown",
+                    "agentSessionId": "session-1"
+                }
+            }
+        });
+        let legacy = decode_agent_response::<serde_json::Value>(response, true, Some("session-1"))
+            .unwrap_err()
+            .into_legacy_string();
+        let legacy = append_legacy_error_context(&legacy, "SQL text omitted");
+
+        assert!(matches!(agent_error_from_legacy(&legacy, Some("session-1")), AgentCallError::Structured { .. }));
+    }
+
+    #[test]
+    fn contract_violation_keeps_identity_when_legacy_api_adds_session_id() {
+        let legacy = AgentCallError::ContractViolation {
+            rpc_code: Some(-6007),
+            message: "invalid strict error".to_string(),
+            reason: super::ContractViolationReason::InvalidDataShape,
+        }
+        .into_legacy_string_with_session_id(Some("session-1"));
+
+        assert!(matches!(
+            agent_error_from_legacy(&legacy, Some("session-1")),
+            AgentCallError::ContractViolation { .. }
+        ));
+        assert_eq!(crate::backend_error::BackendError::from_legacy_string(&legacy).code(), "DBX-JDBC-5002");
+    }
+
+    #[test]
     fn strict_structured_error_rejects_missing_fields_unknown_enums_and_session_mismatch() {
         let base = serde_json::json!({
             "contractVersion": 1,
@@ -3206,6 +3270,46 @@ mod tests {
 
         assert!(matches!(
             decode_agent_response::<serde_json::Value>(response, true, None).unwrap_err(),
+            AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidCombination, .. }
+        ));
+    }
+
+    #[test]
+    fn strict_structured_error_rejects_dangerous_disposition_and_invalid_diagnostics() {
+        let dangerous = serde_json::json!({
+            "error": {
+                "message": "bad",
+                "data": {
+                    "contractVersion": 1,
+                    "category": "protocol",
+                    "retryable": false,
+                    "sessionDisposition": "replace_runtime",
+                    "stage": "request",
+                    "operationOutcome": "not_started"
+                }
+            }
+        });
+        assert!(matches!(
+            decode_agent_response::<serde_json::Value>(dangerous, true, None).unwrap_err(),
+            AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidCombination, .. }
+        ));
+
+        let invalid_diagnostic = serde_json::json!({
+            "error": {
+                "message": "bad",
+                "data": {
+                    "contractVersion": 1,
+                    "category": "sql",
+                    "retryable": false,
+                    "sessionDisposition": "keep",
+                    "stage": "execute",
+                    "operationOutcome": "unknown",
+                    "sqlState": "08\n006"
+                }
+            }
+        });
+        assert!(matches!(
+            decode_agent_response::<serde_json::Value>(invalid_diagnostic, true, None).unwrap_err(),
             AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidCombination, .. }
         ));
     }
@@ -3262,6 +3366,26 @@ mod tests {
             },
         };
         assert_eq!(RecoveryPolicy::decide(&replace, RecoveryScope::Keepalive), RecoveryDecision::ReplaceRuntime);
+        let structured_timeout = AgentCallError::Structured {
+            rpc_code: -1,
+            message: "timed out".to_string(),
+            context: AgentErrorContext {
+                contract_version: 1,
+                category: AgentErrorCategory::Timeout,
+                retryable: false,
+                session_disposition: AgentSessionDisposition::Keep,
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+                agent_session_id: Some("session-1".to_string()),
+                sql_state: None,
+                vendor_code: None,
+                exception_class: None,
+            },
+        };
+        assert_eq!(
+            RecoveryPolicy::decide(&structured_timeout, RecoveryScope::UserOperation),
+            RecoveryDecision::QuarantineSession
+        );
         assert_eq!(
             RecoveryPolicy::decide(
                 &AgentCallError::Timeout {

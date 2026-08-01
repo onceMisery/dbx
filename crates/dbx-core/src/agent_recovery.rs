@@ -37,6 +37,9 @@ impl RecoveryPolicy {
             AgentCallError::Transport { .. } => RecoveryDecision::ReplaceRuntime,
             AgentCallError::Timeout { .. } | AgentCallError::Canceled { .. } => RecoveryDecision::QuarantineSession,
             AgentCallError::Structured { context, .. } => {
+                if matches!(context.category, AgentErrorCategory::Timeout | AgentErrorCategory::Canceled) {
+                    return RecoveryDecision::QuarantineSession;
+                }
                 Self::from_disposition(Some(context.session_disposition), Some(context.category), scope)
             }
             AgentCallError::Legacy { hints, .. } => {

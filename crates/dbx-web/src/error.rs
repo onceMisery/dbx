@@ -34,11 +34,15 @@ impl AppError {
         let error = BackendError::from_legacy_string(&message);
         Self { message, status, error }
     }
+
+    pub fn from_backend_error(error: BackendError) -> Self {
+        Self { message: error.code().to_string(), status: StatusCode::INTERNAL_SERVER_ERROR, error }
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.error)).into_response()
+        (self.status, Json(self.error.without_detail())).into_response()
     }
 }
 
@@ -51,6 +55,12 @@ impl From<String> for AppError {
 impl From<&str> for AppError {
     fn from(s: &str) -> Self {
         Self::internal(s)
+    }
+}
+
+impl From<BackendError> for AppError {
+    fn from(error: BackendError) -> Self {
+        Self::from_backend_error(error)
     }
 }
 
@@ -86,5 +96,6 @@ mod tests {
         assert_eq!(payload["version"], 1);
         assert_eq!(payload["code"], "DBX-LEGACY-0001");
         assert_eq!(payload["messageKey"], "backendErrors.legacy");
+        assert!(payload.get("detail").is_none());
     }
 }

@@ -344,7 +344,7 @@ pub async fn execute_query(
 
     tracing::debug!(connection_id = %req.connection_id, "execute_query");
 
-    let result = dbx_core::query::execute_sql_statement_with_options(
+    let result = dbx_core::query::execute_sql_statement_with_options_typed(
         &state.app,
         &req.connection_id,
         &req.database,
@@ -366,7 +366,7 @@ pub async fn execute_query(
         },
     )
     .await
-    .map_err(AppError::from)?;
+    .map_err(|error| AppError::from(error.into_backend_error()))?;
 
     drop(registered);
     Ok(Json(result))

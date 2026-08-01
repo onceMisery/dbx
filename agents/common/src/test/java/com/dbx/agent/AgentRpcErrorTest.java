@@ -44,6 +44,7 @@ class AgentRpcErrorTest {
         assertEquals("timeout", timeout.get("category").getAsString());
         assertEquals("unknown", timeout.get("operationOutcome").getAsString());
         assertFalse(timeout.get("retryable").getAsBoolean());
+        assertEquals("quarantine", timeout.get("sessionDisposition").getAsString());
         assertEquals("canceled", canceled.get("category").getAsString());
         assertEquals("cancel", canceled.get("stage").getAsString());
         assertEquals("unknown", canceled.get("operationOutcome").getAsString());
@@ -60,6 +61,34 @@ class AgentRpcErrorTest {
         assertEquals("not_started", data.get("operationOutcome").getAsString());
         assertEquals(16, data.get("sqlState").getAsString().length());
         assertFalse(data.has("agentSessionId"));
+    }
+
+    @Test
+    void removesNonGraphicCharactersFromStrictDiagnostics() {
+        SQLException cause = new SQLException("connect failed", "08\n006\u00e9", -7);
+
+        JsonObject data = errorData(cause, AgentProtocol.METHOD_CONNECT, null);
+
+        assertEquals("08006", data.get("sqlState").getAsString());
+    }
+
+    @Test
+    void mapsConnectionAndCloseMethodsToTheSameStagesAsTheRustDecoder() {
+        JsonObject testConnection = errorData(
+            new SQLException("connect failed", "08001", 0),
+            AgentProtocol.METHOD_TEST_CONNECTION,
+            null
+        );
+        JsonObject closeQuery = errorData(
+            new SQLException("close failed", "42000", 0),
+            AgentProtocol.METHOD_CLOSE_QUERY_SESSION,
+            "session-1"
+        );
+
+        assertEquals("connect", testConnection.get("stage").getAsString());
+        assertEquals("not_started", testConnection.get("operationOutcome").getAsString());
+        assertEquals("close", closeQuery.get("stage").getAsString());
+        assertEquals("unknown", closeQuery.get("operationOutcome").getAsString());
     }
 
     private static JsonObject errorData(Throwable error, String method, String agentSessionId) {

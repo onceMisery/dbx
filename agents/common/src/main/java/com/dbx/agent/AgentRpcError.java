@@ -126,7 +126,7 @@ final class AgentRpcError extends RuntimeException {
                 || sqlError instanceof SQLTransientConnectionException
                 || (sqlState != null && sqlState.toUpperCase(Locale.ROOT).startsWith("08"));
             boolean operationRetryable = connectionError && ("connect".equals(stage) || "validate".equals(stage));
-            String disposition = connectionError && !"connect".equals(stage) ? "quarantine" : "keep";
+            String disposition = category != null || (connectionError && !"connect".equals(stage)) ? "quarantine" : "keep";
             return new AgentRpcError(
                 message(error),
                 category == null ? (connectionError ? "connection" : "sql") : category,
@@ -158,7 +158,12 @@ final class AgentRpcError extends RuntimeException {
         if (method == null) {
             return "request";
         }
-        if (AgentProtocol.METHOD_CONNECT.equals(method) || AgentProtocol.METHOD_OPEN_SESSION.equals(method)) {
+        if (AgentProtocol.METHOD_HANDSHAKE.equals(method)) {
+            return "request";
+        }
+        if (AgentProtocol.METHOD_CONNECT.equals(method)
+            || AgentProtocol.METHOD_OPEN_SESSION.equals(method)
+            || AgentProtocol.METHOD_TEST_CONNECTION.equals(method)) {
             return "connect";
         }
         if (AgentProtocol.METHOD_VALIDATE_CONNECTION.equals(method) || AgentProtocol.METHOD_VALIDATE_SESSION.equals(method)) {
@@ -167,7 +172,11 @@ final class AgentRpcError extends RuntimeException {
         if (AgentProtocol.METHOD_CANCEL_SESSION.equals(method)) {
             return "cancel";
         }
-        if (AgentProtocol.METHOD_CLOSE_SESSION.equals(method) || AgentProtocol.METHOD_DISCONNECT.equals(method)) {
+        if (AgentProtocol.METHOD_CLOSE_SESSION.equals(method)
+            || AgentProtocol.METHOD_DISCONNECT.equals(method)
+            || AgentProtocol.METHOD_CLOSE_QUERY_SESSION.equals(method)
+            || AgentProtocol.METHOD_CLOSE_TABLE_READ_SESSION.equals(method)
+            || AgentProtocol.METHOD_SHUTDOWN.equals(method)) {
             return "close";
         }
         if (AgentProtocol.METHOD_FETCH_QUERY_PAGE.equals(method)
@@ -189,18 +198,25 @@ final class AgentRpcError extends RuntimeException {
     }
 
     private static String safeSqlState(String sqlState) {
-        return sqlState == null ? null : limit(sqlState.trim(), 16);
+        return safeDiagnostic(sqlState, 16);
     }
 
     private static String safeClassName(Throwable error) {
-        return error == null ? null : limit(error.getClass().getName(), 160);
+        return error == null ? null : safeDiagnostic(error.getClass().getName(), 160);
     }
 
-    private static String limit(String value, int maxLength) {
-        if (value.length() <= maxLength) {
-            return value;
+    private static String safeDiagnostic(String value, int maxLength) {
+        if (value == null) {
+            return null;
         }
-        return value.substring(0, maxLength);
+        StringBuilder safe = new StringBuilder(Math.min(value.length(), maxLength));
+        for (int index = 0; index < value.length() && safe.length() < maxLength; index++) {
+            char character = value.charAt(index);
+            if (character >= 0x21 && character <= 0x7e) {
+                safe.append(character);
+            }
+        }
+        return safe.isEmpty() ? null : safe.toString();
     }
 
     private static void addDiagnostic(JsonObject data, String name, String value) {
