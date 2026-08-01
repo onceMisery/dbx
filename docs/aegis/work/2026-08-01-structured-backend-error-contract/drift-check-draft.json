@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "taskId": "2026-08-01-structured-backend-error-contract",
+  "taskIntentRef": "docs/aegis/work/2026-08-01-structured-backend-error-contract/task-intent-draft.json",
+  "baselineRefs": [
+    "docs/aegis/specs/2026-07-31-structured-backend-error-contract-design.md",
+    "agents/common/src/main/java/com/dbx/agent/AgentProtocol.java",
+    "agents/common/src/main/java/com/dbx/agent/AgentRpcError.java",
+    "crates/dbx-core/src/db/agent_driver.rs",
+    "crates/dbx-core/src/query.rs",
+    "crates/dbx-core/src/schema.rs",
+    "crates/dbx-core/src/connection.rs",
+    "src-tauri/src/commands/query.rs",
+    "crates/dbx-web/src/error.rs",
+    "apps/desktop/src/i18n/backend-errors.ts"
+  ],
+  "scopeStatus": "not-yet-verified",
+  "compatStatus": "not-yet-verified",
+  "retirementStatus": "not-yet-verified",
+  "newRiskSignals": [
+    "共享 Agent runtime 恢复、旧字符串兼容、Tauri/HTTP wire shape 和多语句结果兼容"
+  ],
+  "decision": "needs-baseline-readback"
+}

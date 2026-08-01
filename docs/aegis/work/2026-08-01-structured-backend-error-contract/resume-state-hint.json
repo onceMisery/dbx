@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "taskId": "2026-08-01-structured-backend-error-contract",
+  "lastCheckpointRef": "docs/aegis/work/2026-08-01-structured-backend-error-contract/todo-checkpoint-draft.json",
+  "resumeInstruction": "Read 20-checkpoint.md, then inspect AgentProtocol/AgentRpcError/agent_driver tests before editing",
+  "knownPartialWork": [
+    "Re-read approved Spec and current code baseline",
+    "Create implementation plan and work lifecycle"
+  ],
+  "mustReadBeforeContinuing": [
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/10-intent.md",
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/20-checkpoint.md",
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/todo-checkpoint-draft.json"
+  ],
+  "unsafeToAssume": [
+    "Do not assume every Java or native Agent can advertise structured_error_v1; verify handshake ownership first"
+  ]
+}

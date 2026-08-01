@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "affectedLayers": [
+    "Java Agent protocol",
+    "Rust Agent/query/schema/connection",
+    "Tauri/HTTP transport",
+    "TypeScript frontend"
+  ],
+  "owners": [
+    "Agent facts: Java AgentRpcError; recovery/catalog: Rust; copy: frontend i18n; compatibility: one adapter"
+  ],
+  "invariants": [
+    "protocolVersion remains 2; unknown operation outcome is never auto-replayed; current result flatten shape remains"
+  ],
+  "compatBoundary": "new v2 capability is opt-in; old Agent and non-Agent strings enter one legacy adapter",
+  "nonGoals": [
+    "Agent Protocol v3, full non-Agent migration, automatic SQL replay, complex help site"
+  ]
+}

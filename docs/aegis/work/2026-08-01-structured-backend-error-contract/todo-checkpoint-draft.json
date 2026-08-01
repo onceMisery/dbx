@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "taskId": "2026-08-01-structured-backend-error-contract",
+  "currentTodo": "Slice 1: implement v2 capability and typed Agent/Rust error corridor",
+  "completedTodos": [
+    "Re-read approved Spec and current code baseline",
+    "Create implementation plan and work lifecycle"
+  ],
+  "activeSlice": "Slice 1 planning complete; inspect exact test/build APIs before edits",
+  "evidenceRefs": [
+    "docs/aegis/specs/2026-07-31-structured-backend-error-contract-design.md",
+    "docs/aegis/plans/2026-08-01-structured-backend-error-contract.md",
+    "git status on enhance/exception-alert preserves unrelated user changes"
+  ],
+  "blockedOn": null,
+  "nextStep": "Inspect protocol tests and implement capability/error data plus Rust decode types",
+  "updatedAt": "2026-08-01"
+}
