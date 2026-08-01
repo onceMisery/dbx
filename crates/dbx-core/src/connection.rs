@@ -681,10 +681,10 @@ pub fn sqlserver_uses_legacy_driver(config: &ConnectionConfig) -> bool {
 }
 
 pub fn sqlserver_legacy_driver_error(agent_error: &str) -> String {
-    // AgentManager currently returns launch failures as strings. This exact marker is generated
-    // internally and only adds guidance for an explicitly selected compatibility driver.
+    // This mapper handles both AgentManager launch strings and Agent call errors, so context
+    // must remain before any structured-error compatibility marker.
     if agent_error.contains("driver is not installed") {
-        format!("{agent_error}\n\n{SQLSERVER_LEGACY_DRIVER_INSTALL_HINT}")
+        crate::db::agent_driver::append_legacy_error_context(agent_error, SQLSERVER_LEGACY_DRIVER_INSTALL_HINT)
     } else {
         agent_error.to_string()
     }
@@ -4997,6 +4997,34 @@ mod tests {
 
         assert!(message.contains("Driver Manager"));
         assert!(message.contains("enable SQL Server legacy compatibility mode again"));
+    }
+
+    #[test]
+    fn sqlserver_legacy_driver_hint_preserves_structured_agent_error() {
+        let error = crate::db::agent_driver::AgentCallError::Structured {
+            rpc_code: -6007,
+            message: "driver is not installed".to_string(),
+            context: crate::db::agent_driver::AgentErrorContext {
+                contract_version: 1,
+                category: crate::db::agent_driver::AgentErrorCategory::Connection,
+                retryable: false,
+                session_disposition: crate::db::agent_driver::AgentSessionDisposition::Quarantine,
+                stage: crate::db::agent_driver::AgentErrorStage::Connect,
+                operation_outcome: crate::db::agent_driver::AgentOperationOutcome::NotStarted,
+                agent_session_id: None,
+                sql_state: None,
+                vendor_code: None,
+                exception_class: None,
+            },
+        }
+        .into_legacy_string();
+
+        let message = sqlserver_legacy_driver_error(&error);
+
+        assert!(matches!(
+            crate::db::agent_driver::agent_error_from_legacy(&message, None),
+            crate::db::agent_driver::AgentCallError::Structured { .. }
+        ));
     }
 
     #[test]
