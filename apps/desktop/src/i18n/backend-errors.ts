@@ -118,7 +118,16 @@ function backendErrorMessage(error: unknown): string {
   return String(error);
 }
 
+function translateStructuredBackendError(t: BackendErrorTranslate, error: BackendError): string {
+  const translated = t(error.messageKey, error.messageParams);
+  if (translated !== error.messageKey) return translated;
+  return t("backendErrors.unknown");
+}
+
 export function translateBackendError(t: BackendErrorTranslate, error: unknown): string {
+  const structured = normalizeBackendError(error);
+  if (structured) return translateStructuredBackendError(t, structured);
+
   const message = backendErrorMessage(error);
   const tagged = message.match(/^\[([A-Za-z][A-Za-z0-9]+)\]\s*([\s\S]*)$/);
   if (tagged) {
@@ -148,3 +157,4 @@ export function translateBackendError(t: BackendErrorTranslate, error: unknown):
   }
   return message;
 }
+import { normalizeBackendError, type BackendError } from "@/lib/backend/errorUtils";

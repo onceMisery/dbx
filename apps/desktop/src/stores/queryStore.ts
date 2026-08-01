@@ -61,7 +61,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { useExportTracker } from "@/composables/useExportTracker";
 import { recordQueryCancellationLatency, resourceLifecycleDiagnostics } from "@/lib/diagnostics/resourceLifecycleDiagnostics";
 import { appendDebugLog } from "@/lib/backend/debugLog";
-import { formatError } from "@/lib/backend/errorUtils";
+import { formatError, type BackendError } from "@/lib/backend/errorUtils";
 import { createSavedSqlEditorPosition, initSavedSqlEditorPositions, restoreSavedSqlEditorPosition, saveSavedSqlEditorPosition } from "@/lib/app/savedSqlEditorPosition";
 import { ensureSqlExtension } from "@/lib/savedSql/savedSqlFileName";
 import { resolveSavedSqlExecutionTarget, savedSqlExecutionTargetFromTab, type SavedSqlExecutionTarget, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
@@ -278,7 +278,7 @@ function applyBatchSqlProgress(
     success: boolean;
     executionTimeMs: number;
     affectedRows: number;
-    error?: string;
+    error?: BackendError;
   },
   continueOnError: boolean,
 ) {
@@ -289,7 +289,8 @@ function applyBatchSqlProgress(
   item.status = progress.success ? "success" : "error";
   item.executionTimeMs = progress.executionTimeMs;
   item.affectedRows = progress.affectedRows;
-  item.error = progress.error;
+  item.errorDetails = progress.error;
+  item.error = progress.error?.detail ?? progress.error?.code;
   batch.completed = Math.max(batch.completed, progress.completed);
   if ((progress.success || continueOnError) && progress.completed < batch.total) {
     const next = batch.items[progress.statementIndex + 1];
@@ -310,7 +311,8 @@ function reconcileBatchSqlResults(tab: QueryTab, executionId: string, results: Q
     item.status = failed ? "error" : "success";
     item.executionTimeMs = result.execution_time_ms;
     item.affectedRows = result.affected_rows;
-    item.error = failed ? String(result.rows[0]?.[0] ?? "") : undefined;
+    item.errorDetails = failed ? result.error : undefined;
+    item.error = failed ? (result.error?.detail ?? result.error?.code ?? String(result.rows[0]?.[0] ?? "")) : undefined;
   }
   batch.completed = batch.items.filter((item) => item.status === "success" || item.status === "error").length;
 }

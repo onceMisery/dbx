@@ -1458,6 +1458,22 @@ export default withEnglishFallback({
     mcpDescription: "除了內建 AI 助理，也可以藉由 MCP 讓 Claude Code、Cursor 等程式設計助理查詢你的資料庫。",
     mcpLearnMore: "了解更多",
   },
+  backendErrors: {
+    jdbc: {
+      connectionFailed: "資料庫連線在操作開始前失敗（階段：{stage}）。",
+      connectionInterrupted: "資料庫連線在操作執行期間中斷（階段：{stage}）。",
+      operationTimedOut: "資料庫操作逾時（階段：{stage}）。",
+      operationCanceled: "資料庫操作已取消（階段：{stage}）。",
+      busyRetryLater: "資料庫 Agent 忙碌，請稍後再試（階段：{stage}）。",
+      runtimeReplaced: "資料庫 Agent 執行環境已替換（階段：{stage}）。",
+      sqlFailed: "資料庫回傳了 SQL 錯誤（階段：{stage}）。",
+      protocolFailed: "資料庫 Agent 通訊協定失敗。",
+      contractInvalid: "資料庫 Agent 回傳了無效的錯誤契約。",
+      legacyFailure: "資料庫 Agent 回傳了未分類錯誤。",
+    },
+    legacy: "後端回傳了錯誤。",
+    unknown: "發生未預期的後端錯誤。",
+  },
   common: {
     fileNotFound: "檔案不存在：{path}",
     language: "語言",

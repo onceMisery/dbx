@@ -1459,6 +1459,22 @@ export default withEnglishFallback({
     mcpDescription: "Además del asistente de IA integrado, puedes usar Claude Code, Cursor y otros agentes de programación para consultar tus bases de datos mediante MCP.",
     mcpLearnMore: "Más información",
   },
+  backendErrors: {
+    jdbc: {
+      connectionFailed: "La conexión a la base de datos falló antes de iniciar la operación (fase: {stage}).",
+      connectionInterrupted: "La conexión a la base de datos se interrumpió durante la operación (fase: {stage}).",
+      operationTimedOut: "La operación de la base de datos agotó el tiempo de espera (fase: {stage}).",
+      operationCanceled: "La operación de la base de datos fue cancelada (fase: {stage}).",
+      busyRetryLater: "El agente de la base de datos está ocupado; inténtalo más tarde (fase: {stage}).",
+      runtimeReplaced: "Se reemplazó el entorno del agente de la base de datos (fase: {stage}).",
+      sqlFailed: "La base de datos devolvió un error SQL (fase: {stage}).",
+      protocolFailed: "Falló el protocolo del agente de la base de datos.",
+      contractInvalid: "El agente de la base de datos devolvió un contrato de error no válido.",
+      legacyFailure: "El agente de la base de datos devolvió un error no clasificado.",
+    },
+    legacy: "El backend devolvió un error.",
+    unknown: "Ocurrió un error inesperado del backend.",
+  },
   common: {
     fileNotFound: "El archivo no existe: {path}",
     language: "Idioma",

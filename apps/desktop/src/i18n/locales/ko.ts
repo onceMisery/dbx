@@ -1485,6 +1485,22 @@ export default withEnglishFallback({
     mcpDescription: "내장된 AI 어시스턴트 외에도 Claude Code, Cursor 등의 코딩 에이전트를 MCP로 연결하여 데이터베이스를 쿼리할 수 있습니다.",
     mcpLearnMore: "더 알아보기",
   },
+  backendErrors: {
+    jdbc: {
+      connectionFailed: "작업 시작 전에 데이터베이스 연결에 실패했습니다(단계: {stage}).",
+      connectionInterrupted: "작업 중 데이터베이스 연결이 중단되었습니다(단계: {stage}).",
+      operationTimedOut: "데이터베이스 작업 시간이 초과되었습니다(단계: {stage}).",
+      operationCanceled: "데이터베이스 작업이 취소되었습니다(단계: {stage}).",
+      busyRetryLater: "데이터베이스 Agent가 사용 중입니다. 나중에 다시 시도하세요(단계: {stage}).",
+      runtimeReplaced: "데이터베이스 Agent 런타임이 교체되었습니다(단계: {stage}).",
+      sqlFailed: "데이터베이스에서 SQL 오류를 반환했습니다(단계: {stage}).",
+      protocolFailed: "데이터베이스 Agent 프로토콜에 실패했습니다.",
+      contractInvalid: "데이터베이스 Agent가 잘못된 오류 계약을 반환했습니다.",
+      legacyFailure: "데이터베이스 Agent가 분류되지 않은 오류를 반환했습니다.",
+    },
+    legacy: "백엔드에서 오류를 반환했습니다.",
+    unknown: "예상하지 못한 백엔드 오류가 발생했습니다.",
+  },
   common: {
     fileNotFound: "파일이 존재하지 않습니다: {path}",
     language: "언어",

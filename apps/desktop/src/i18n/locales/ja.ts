@@ -1484,6 +1484,22 @@ export default withEnglishFallback({
     mcpDescription: "内蔵AIアシスタントに加えて、Claude Code、Cursor、その他のコーディングエージェントをMCP経由でデータベースクエリに使用できます。",
     mcpLearnMore: "詳細を見る",
   },
+  backendErrors: {
+    jdbc: {
+      connectionFailed: "操作開始前にデータベース接続に失敗しました（段階: {stage}）。",
+      connectionInterrupted: "操作中にデータベース接続が中断されました（段階: {stage}）。",
+      operationTimedOut: "データベース操作がタイムアウトしました（段階: {stage}）。",
+      operationCanceled: "データベース操作をキャンセルしました（段階: {stage}）。",
+      busyRetryLater: "データベース Agent が混雑しています。後でもう一度お試しください（段階: {stage}）。",
+      runtimeReplaced: "データベース Agent ランタイムを置き換えました（段階: {stage}）。",
+      sqlFailed: "データベースが SQL エラーを返しました（段階: {stage}）。",
+      protocolFailed: "データベース Agent プロトコルに失敗しました。",
+      contractInvalid: "データベース Agent が無効なエラー契約を返しました。",
+      legacyFailure: "データベース Agent が分類できないエラーを返しました。",
+    },
+    legacy: "バックエンドがエラーを返しました。",
+    unknown: "予期しないバックエンドエラーが発生しました。",
+  },
   common: {
     fileNotFound: "ファイルが存在しません: {path}",
     language: "言語",

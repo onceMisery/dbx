@@ -66,6 +66,8 @@ pub struct ExecuteMultiResult {
     pub execution_error: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<crate::backend_error::BackendError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,15 +106,17 @@ fn report_execute_multi_progress(
 
 impl ExecuteMultiResult {
     fn execution_error(result: db::QueryResult) -> Self {
-        Self { result, execution_error: true, statement_index: None }
+        let error = error_from_query_result(&result);
+        Self { result, execution_error: true, statement_index: None, error }
     }
 
     fn execution_error_with_index(result: db::QueryResult, statement_index: usize) -> Self {
-        Self { result, execution_error: true, statement_index: Some(statement_index) }
+        let error = error_from_query_result(&result);
+        Self { result, execution_error: true, statement_index: Some(statement_index), error }
     }
 
     fn success_with_index(result: db::QueryResult, statement_index: usize) -> Self {
-        Self { result, execution_error: false, statement_index: Some(statement_index) }
+        Self { result, execution_error: false, statement_index: Some(statement_index), error: None }
     }
 
     fn into_query_result(self) -> db::QueryResult {
@@ -122,12 +126,16 @@ impl ExecuteMultiResult {
 
 impl From<db::QueryResult> for ExecuteMultiResult {
     fn from(result: db::QueryResult) -> Self {
-        Self { result, execution_error: false, statement_index: None }
+        Self { result, execution_error: false, statement_index: None, error: None }
     }
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn error_from_query_result(result: &db::QueryResult) -> Option<crate::backend_error::BackendError> {
+    result.rows.first()?.first()?.as_str().map(crate::backend_error::BackendError::from_legacy_string)
 }
 
 /// Unified database operation execution budget.
@@ -4447,6 +4455,10 @@ for line in sys.stdin:
         assert_eq!(failure.get("execution_error"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(failure.get("statement_index"), Some(&serde_json::json!(2)));
         assert_eq!(failure.get("columns"), Some(&serde_json::json!(["Error"])));
+        assert_eq!(
+            failure.get("error").and_then(|value| value.get("code")),
+            Some(&serde_json::json!("DBX-LEGACY-0001"))
+        );
     }
 
     #[test]

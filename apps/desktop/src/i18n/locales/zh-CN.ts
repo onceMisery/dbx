@@ -1518,6 +1518,22 @@ export default withEnglishFallback({
     mcpDescription: "除了内置 AI 助手，还可以通过 MCP 让 Claude Code、Cursor 等编程助手直接使用这里的数据库连接。",
     mcpLearnMore: "了解更多",
   },
+  backendErrors: {
+    jdbc: {
+      connectionFailed: "数据库连接在操作开始前失败（阶段：{stage}）。",
+      connectionInterrupted: "数据库连接在操作执行期间中断（阶段：{stage}）。",
+      operationTimedOut: "数据库操作超时（阶段：{stage}）。",
+      operationCanceled: "数据库操作已取消（阶段：{stage}）。",
+      busyRetryLater: "数据库 Agent 忙碌，请稍后重试（阶段：{stage}）。",
+      runtimeReplaced: "数据库 Agent 运行时已替换（阶段：{stage}）。",
+      sqlFailed: "数据库返回了 SQL 错误（阶段：{stage}）。",
+      protocolFailed: "数据库 Agent 协议失败。",
+      contractInvalid: "数据库 Agent 返回了无效的错误契约。",
+      legacyFailure: "数据库 Agent 返回了未分类错误。",
+    },
+    legacy: "后端返回了错误。",
+    unknown: "发生了未预期的后端错误。",
+  },
   common: {
     fileNotFound: "文件不存在：{path}",
     language: "语言",

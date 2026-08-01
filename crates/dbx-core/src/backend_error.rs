@@ -150,6 +150,13 @@ impl BackendError {
         )
     }
 
+    /// Convert a legacy boundary string while preserving Agent data when the
+    /// compatibility adapter can prove that the string came from an Agent.
+    pub fn from_legacy_string(message: &str) -> Self {
+        crate::db::agent_driver::try_agent_error_from_legacy(message)
+            .map_or_else(|| Self::from_legacy_backend(message), |error| Self::from_agent_call_error(&error))
+    }
+
     pub fn version(&self) -> u8 {
         self.version
     }

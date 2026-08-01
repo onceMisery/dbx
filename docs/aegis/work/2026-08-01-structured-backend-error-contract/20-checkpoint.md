@@ -54,6 +54,27 @@
 - Blocked on: none
 - Next step: Commit Slice 2, then implement Tauri/HTTP and frontend structured error transport
 
+## Checkpoint Update
+
+- Current todo: Slice 3 complete; prepare transport/UI commit
+- Active slice: Shared BackendError transport and structured-first frontend handling verified
+- Completed todos:
+- HTTP `AppError` serializes the shared JSON BackendError envelope
+- Tauri `execute_query` and `execute_multi` reject with serializable BackendError objects
+- multi-statement result/progress payloads include optional structured errors while retaining legacy Error rows
+- frontend normalizes HTTP/Tauri objects into `BackendErrorException` without flattening them
+- all eight locales define every initial catalog message key
+- queryStore preserves structured batch error details alongside compatibility display text
+- Evidence refs:
+- `cargo check -j 1 -p dbx-core --no-default-features` (exit 0)
+- `cargo check -j 1 -p dbx-web --no-default-features` (exit 0)
+- `cargo check -j 1 -p dbx --no-default-features` (exit 0; baseline dead-code warning only)
+- focused core/web serialization tests passed
+- `pnpm typecheck` (exit 0)
+- `pnpm vitest run ...backendErrors.spec.ts ...queryStore.multiStatementError.spec.ts` (196 passed)
+- Blocked on: none
+- Next step: Commit Slice 3, then write the developer guide and perform final retirement/acceptance checks
+
 ## DriftCheckDraft
 
 - Scope status: Slice 1 stayed within Agent v2 and typed Rust corridor

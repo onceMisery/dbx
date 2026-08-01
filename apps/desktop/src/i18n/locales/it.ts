@@ -1457,6 +1457,22 @@ export default withEnglishFallback({
     mcpDescription: "Oltre all'assistente AI integrato, puoi utilizzare Claude Code, Cursor e altri agenti di sviluppo per interrogare i tuoi database tramite MCP.",
     mcpLearnMore: "Scopri di più",
   },
+  backendErrors: {
+    jdbc: {
+      connectionFailed: "La connessione al database è fallita prima dell'operazione (fase: {stage}).",
+      connectionInterrupted: "La connessione al database è stata interrotta durante l'operazione (fase: {stage}).",
+      operationTimedOut: "L'operazione del database è scaduta (fase: {stage}).",
+      operationCanceled: "L'operazione del database è stata annullata (fase: {stage}).",
+      busyRetryLater: "L'agente del database è occupato; riprova più tardi (fase: {stage}).",
+      runtimeReplaced: "Il runtime dell'agente del database è stato sostituito (fase: {stage}).",
+      sqlFailed: "Il database ha restituito un errore SQL (fase: {stage}).",
+      protocolFailed: "Il protocollo dell'agente del database è fallito.",
+      contractInvalid: "L'agente del database ha restituito un contratto di errore non valido.",
+      legacyFailure: "L'agente del database ha restituito un errore non classificato.",
+    },
+    legacy: "Il backend ha restituito un errore.",
+    unknown: "Si è verificato un errore backend imprevisto.",
+  },
   common: {
     fileNotFound: "Il file non esiste: {path}",
     language: "Lingua",

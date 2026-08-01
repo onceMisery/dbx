@@ -45,6 +45,7 @@ import type {
   TunnelProfile,
 } from "@/types/database";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
+import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import type { CollectionInfo } from "@/types/database";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
@@ -223,19 +224,19 @@ async function post<T>(url: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
 async function get<T>(url: string): Promise<T> {
   const res = await fetch(apiUrl(url));
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
 async function del<T>(url: string): Promise<T> {
   const res = await fetch(apiUrl(url), { method: "DELETE" });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
 }
 
@@ -245,8 +246,19 @@ async function put<T>(url: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw await backendResponseError(res);
   return res.json();
+}
+
+async function backendResponseError(response: Response): Promise<BackendErrorException> {
+  const text = await response.text();
+  let payload: unknown = text;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    // Preserve legacy plain-text responses at the same compatibility boundary.
+  }
+  return new BackendErrorException(payload);
 }
 
 function qs(params: Record<string, string | number | boolean | undefined>): string {
@@ -880,7 +892,7 @@ export interface ExecuteMultiProgress {
   success: boolean;
   executionTimeMs: number;
   affectedRows: number;
-  error?: string;
+  error?: BackendError;
 }
 
 export async function executeMultiWithProgress(
@@ -918,7 +930,7 @@ export async function executeMultiWithProgress(
       success,
       executionTimeMs: result.execution_time_ms,
       affectedRows: result.affected_rows,
-      error: success ? undefined : String(result.rows[0]?.[0] ?? ""),
+      error: success ? undefined : result.error,
     });
   });
   return results;

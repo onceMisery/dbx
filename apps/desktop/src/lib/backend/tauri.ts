@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import { ExternalSqlFileTooLargeError } from "@/lib/sql/sqlFileOpen";
@@ -1060,14 +1061,18 @@ export async function executeQuery(
     executionMode?: "simple";
   },
 ): Promise<QueryResult> {
-  return invoke("execute_query", {
-    connectionId,
-    database,
-    sql,
-    schema,
-    executionId,
-    ...options,
-  });
+  try {
+    return await invoke("execute_query", {
+      connectionId,
+      database,
+      sql,
+      schema,
+      executionId,
+      ...options,
+    });
+  } catch (error) {
+    throw new BackendErrorException(error);
+  }
 }
 
 export async function executeMulti(
@@ -1089,14 +1094,18 @@ export async function executeMulti(
     executionMode?: "simple";
   },
 ): Promise<QueryResult[]> {
-  return invoke("execute_multi", {
-    connectionId,
-    database,
-    sql,
-    schema,
-    executionId,
-    ...options,
-  });
+  try {
+    return await invoke("execute_multi", {
+      connectionId,
+      database,
+      sql,
+      schema,
+      executionId,
+      ...options,
+    });
+  } catch (error) {
+    throw new BackendErrorException(error);
+  }
 }
 
 export interface ExecuteMultiProgress {
@@ -1107,7 +1116,7 @@ export interface ExecuteMultiProgress {
   success: boolean;
   executionTimeMs: number;
   affectedRows: number;
-  error?: string;
+  error?: BackendError;
 }
 
 export async function executeMultiWithProgress(

@@ -28,6 +28,14 @@ No evidence has been recorded yet.
 
 ## EvidenceBundleDraft
 
+- Artifact key: slice3-transport-and-frontend
+- Type: test
+- Source: core/web serialization tests; `cargo check` for dbx-core/dbx-web/dbx; `pnpm typecheck`; focused Vitest suites
+- Summary: Tauri and HTTP preserve BackendError objects, multi-result/progress errors remain structured, all catalog keys exist in eight locales, and queryStore compatibility behavior passed
+- Verifier: Rust/TypeScript commands exit code 0; 196 focused frontend tests passed
+
+## EvidenceBundleDraft
+
 - Artifact key: slice2-core-recovery-and-catalog
 - Type: test
 - Source: `cargo test -j 1 -p dbx-core --no-default-features --lib query::tests`; `schema::tests`; `connection::tests`; `db::agent_driver::tests`; `backend_error::tests`; `agent_recovery::tests`

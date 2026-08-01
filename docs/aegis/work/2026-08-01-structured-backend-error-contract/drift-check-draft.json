@@ -5,8 +5,8 @@
   "baselineRefs": [
     "docs/aegis/specs/2026-07-31-structured-backend-error-contract-design.md"
   ],
-  "scopeStatus": "Slice 2 stayed within Agent v2, typed Rust recovery, and shared BackendError catalog",
-  "compatStatus": "protocolVersion remains 2; structured_error_v1 is explicit JDBC opt-in; legacy call wrappers remain",
+  "scopeStatus": "Slice 3 stayed within command-scoped BackendError transport, multi-result compatibility, and frontend localization",
+  "compatStatus": "protocolVersion remains 2; migrated Tauri/HTTP paths preserve objects; legacy Error rows and untouched string commands remain compatible",
   "retirementStatus": "business marker consumers are retired; compatibility adapter and explicit fixtures remain until final Slice 4 gate",
   "newRiskSignals": [],
   "decision": "continue"

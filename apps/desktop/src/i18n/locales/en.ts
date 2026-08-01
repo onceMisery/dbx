@@ -1517,6 +1517,22 @@ export default {
     mcpDescription: "Beyond the built-in AI assistant, you can also use Claude Code, Cursor, and other coding agents to query your databases via MCP.",
     mcpLearnMore: "Learn more",
   },
+  backendErrors: {
+    jdbc: {
+      connectionFailed: "Database connection failed before the operation started (stage: {stage}).",
+      connectionInterrupted: "Database connection was interrupted while the operation was running (stage: {stage}).",
+      operationTimedOut: "Database operation timed out (stage: {stage}).",
+      operationCanceled: "Database operation was canceled (stage: {stage}).",
+      busyRetryLater: "Database agent is busy; try again later (stage: {stage}).",
+      runtimeReplaced: "Database agent runtime was replaced (stage: {stage}).",
+      sqlFailed: "Database returned an SQL error (stage: {stage}).",
+      protocolFailed: "Database agent protocol failed.",
+      contractInvalid: "Database agent returned an invalid error contract.",
+      legacyFailure: "Database agent returned an unclassified error.",
+    },
+    legacy: "Backend returned an error.",
+    unknown: "An unexpected backend error occurred.",
+  },
   common: {
     fileNotFound: "File does not exist: {path}",
     language: "Language",

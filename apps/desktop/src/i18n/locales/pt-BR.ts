@@ -1459,6 +1459,22 @@ export default withEnglishFallback({
     mcpDescription: "Além do assistente de IA integrado, você também pode usar Claude Code, Cursor e outros agentes de codificação para consultar seus bancos de dados via MCP.",
     mcpLearnMore: "Saiba mais",
   },
+  backendErrors: {
+    jdbc: {
+      connectionFailed: "A conexão com o banco falhou antes do início da operação (etapa: {stage}).",
+      connectionInterrupted: "A conexão com o banco foi interrompida durante a operação (etapa: {stage}).",
+      operationTimedOut: "A operação do banco excedeu o tempo limite (etapa: {stage}).",
+      operationCanceled: "A operação do banco foi cancelada (etapa: {stage}).",
+      busyRetryLater: "O Agent do banco está ocupado; tente novamente mais tarde (etapa: {stage}).",
+      runtimeReplaced: "O runtime do Agent do banco foi substituído (etapa: {stage}).",
+      sqlFailed: "O banco retornou um erro SQL (etapa: {stage}).",
+      protocolFailed: "O protocolo do Agent do banco falhou.",
+      contractInvalid: "O Agent do banco retornou um contrato de erro inválido.",
+      legacyFailure: "O Agent do banco retornou um erro não classificado.",
+    },
+    legacy: "O backend retornou um erro.",
+    unknown: "Ocorreu um erro inesperado no backend.",
+  },
   common: {
     fileNotFound: "O arquivo não existe: {path}",
     language: "Idioma",
