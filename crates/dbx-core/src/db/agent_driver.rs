@@ -720,11 +720,11 @@ pub(crate) fn valid_agent_error_combination(context: &AgentErrorContext) -> bool
     }
     valid_ascii_diagnostic(context.sql_state.as_deref(), 16)
         && valid_ascii_diagnostic(context.exception_class.as_deref(), 160)
-        && context.agent_session_id.as_deref().map_or(true, valid_ascii_identifier)
+        && context.agent_session_id.as_deref().is_none_or(valid_ascii_identifier)
 }
 
 fn valid_ascii_diagnostic(value: Option<&str>, max_length: usize) -> bool {
-    value.map_or(true, |value| {
+    value.is_none_or(|value| {
         !value.is_empty() && value.len() <= max_length && value.bytes().all(|byte| byte.is_ascii_graphic())
     })
 }

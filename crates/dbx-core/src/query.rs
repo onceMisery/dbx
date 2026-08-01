@@ -3861,7 +3861,13 @@ for line in sys.stdin:
 
         let error = execute_multi_agent(&mut client, None, &["slow".to_string()], None, Some(1)).await.unwrap_err();
 
-        assert_eq!(error, "Agent RPC call timed out (1s)");
+        assert!(matches!(
+            error,
+            AgentCallError::Timeout {
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+            }
+        ));
     }
 
     #[cfg(unix)]

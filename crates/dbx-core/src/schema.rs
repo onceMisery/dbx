@@ -5000,18 +5000,13 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum MetadataErrorAction {
     Retry,
     Discard,
     ReplaceRuntime,
+    #[default]
     Return,
-}
-
-impl Default for MetadataErrorAction {
-    fn default() -> Self {
-        Self::Return
-    }
 }
 
 #[derive(Debug, Default)]
