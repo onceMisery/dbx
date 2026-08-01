@@ -196,6 +196,26 @@ describe("backend error translation", () => {
     expect(translateBackendError(t, new BackendErrorException(error))).toBe(t(error.messageKey, error.messageParams));
   });
 
+  test.each([
+    ["array params", { messageParams: ["execute"] }],
+    ["nested params", { messageParams: { stage: { name: "execute" } } }],
+    ["non-finite params", { messageParams: { retryAfter: Number.POSITIVE_INFINITY } }],
+    ["unknown source", { source: "http" }],
+    ["unknown outcome", { operationOutcome: "completed" }],
+  ])("rejects malformed structured envelopes with %s", (_name, override) => {
+    expect(
+      normalizeBackendError({
+        version: 1,
+        code: "DBX-JDBC-2002",
+        messageKey: "backendErrors.jdbc.operationTimedOut",
+        messageParams: { stage: "execute" },
+        source: "jdbcAgent",
+        operationOutcome: "unknown",
+        ...override,
+      }),
+    ).toBeNull();
+  });
+
   test("falls back to legacy text for plain HTTP and Tauri failures", () => {
     const t = translatorFor("zh-CN");
     const error = new BackendErrorException("legacy backend failure");

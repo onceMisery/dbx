@@ -19,7 +19,21 @@ export interface BackendError {
 function isBackendError(value: unknown): value is BackendError {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
-  return candidate.version === 1 && typeof candidate.code === "string" && typeof candidate.messageKey === "string" && !!candidate.messageParams && typeof candidate.messageParams === "object" && typeof candidate.source === "string" && typeof candidate.operationOutcome === "string";
+  if (
+    candidate.version !== 1 ||
+    typeof candidate.code !== "string" ||
+    !/^DBX-[A-Z][A-Z0-9]*-\d{4}$/.test(candidate.code) ||
+    typeof candidate.messageKey !== "string" ||
+    !candidate.messageKey.startsWith("backendErrors.") ||
+    !candidate.messageParams ||
+    typeof candidate.messageParams !== "object" ||
+    Array.isArray(candidate.messageParams) ||
+    !["jdbcAgent", "jdbcAgentLegacy", "legacyBackend"].includes(String(candidate.source)) ||
+    !["not_started", "unknown"].includes(String(candidate.operationOutcome))
+  ) {
+    return false;
+  }
+  return Object.values(candidate.messageParams).every((param) => typeof param === "string" || typeof param === "boolean" || (typeof param === "number" && Number.isFinite(param)));
 }
 
 export function normalizeBackendError(error: unknown): BackendError | null {

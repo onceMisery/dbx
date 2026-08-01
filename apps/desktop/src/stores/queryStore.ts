@@ -61,7 +61,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { useExportTracker } from "@/composables/useExportTracker";
 import { recordQueryCancellationLatency, resourceLifecycleDiagnostics } from "@/lib/diagnostics/resourceLifecycleDiagnostics";
 import { appendDebugLog } from "@/lib/backend/debugLog";
-import { formatError, type BackendError } from "@/lib/backend/errorUtils";
+import { formatError, normalizeBackendError, type BackendError } from "@/lib/backend/errorUtils";
 import { createSavedSqlEditorPosition, initSavedSqlEditorPositions, restoreSavedSqlEditorPosition, saveSavedSqlEditorPosition } from "@/lib/app/savedSqlEditorPosition";
 import { ensureSqlExtension } from "@/lib/savedSql/savedSqlFileName";
 import { resolveSavedSqlExecutionTarget, savedSqlExecutionTargetFromTab, type SavedSqlExecutionTarget, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
@@ -290,7 +290,7 @@ function applyBatchSqlProgress(
   item.executionTimeMs = progress.executionTimeMs;
   item.affectedRows = progress.affectedRows;
   item.errorDetails = progress.error;
-  item.error = progress.error?.detail ?? progress.error?.code;
+  item.error = progress.error ? translateBackendError(i18n.global.t, progress.error) : undefined;
   batch.completed = Math.max(batch.completed, progress.completed);
   if ((progress.success || continueOnError) && progress.completed < batch.total) {
     const next = batch.items[progress.statementIndex + 1];
@@ -312,7 +312,7 @@ function reconcileBatchSqlResults(tab: QueryTab, executionId: string, results: Q
     item.executionTimeMs = result.execution_time_ms;
     item.affectedRows = result.affected_rows;
     item.errorDetails = failed ? result.error : undefined;
-    item.error = failed ? (result.error?.detail ?? result.error?.code ?? String(result.rows[0]?.[0] ?? "")) : undefined;
+    item.error = failed ? (result.error ? translateBackendError(i18n.global.t, result.error) : String(result.rows[0]?.[0] ?? "")) : undefined;
   }
   batch.completed = batch.items.filter((item) => item.status === "success" || item.status === "error").length;
 }
@@ -323,7 +323,8 @@ function failBatchSqlExecution(tab: QueryTab, executionId: string, error: unknow
   const item = batch.items.find((candidate) => candidate.status === "running") ?? batch.items.find((candidate) => candidate.status === "pending");
   if (!item) return;
   item.status = cancelled ? "cancelled" : "error";
-  item.error = cancelled ? undefined : error instanceof Error ? error.message : String(error);
+  item.errorDetails = cancelled ? undefined : (normalizeBackendError(error) ?? undefined);
+  item.error = cancelled ? undefined : translateBackendError(i18n.global.t, error);
   batch.completed = batch.items.filter((candidate) => candidate.status === "success" || candidate.status === "error").length;
 }
 
@@ -331,7 +332,7 @@ function finishBatchSqlExecution(tab: QueryTab, executionId: string, cancelled: 
   const batch = batchSqlExecutionFor(tab, executionId);
   if (!batch) return;
   if (cancelled) {
-    const cancelledError = [...batch.items].reverse().find((item) => item.status === "error" && /cancel|取消/i.test(item.error ?? ""));
+    const cancelledError = [...batch.items].reverse().find((item) => item.status === "error" && (item.errorDetails?.code === "DBX-JDBC-2003" || /cancel|取消/i.test(item.error ?? "")));
     if (cancelledError) {
       cancelledError.status = "cancelled";
       cancelledError.error = undefined;
@@ -386,9 +387,7 @@ function sqlServerUseDatabaseFromStatement(statement: string | undefined): strin
 }
 
 function isSqlServerBatchErrorResult(result: QueryResult): boolean {
-  // SQL Server batch errors can arrive without execution_error metadata.
-  // A standalone USE statement cannot legitimately return an Error column.
-  return result.execution_error === true || (result.columns.length === 1 && result.columns[0] === "Error" && result.rows.length > 0);
+  return result.execution_error === true;
 }
 
 function sapHanaCurrentSchemaFromResult(result: QueryResult): string | undefined {
@@ -2719,13 +2718,14 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   function toErrorResult(e: any): NonNullable<QueryTab["result"]> {
-    const raw = e instanceof Error ? e.message : String(e);
     // Single funnel for every query execution failure, so backend messages DBX
     // knows about are shown in the active locale rather than as raw English.
-    const message = translateBackendError(i18n.global.t, raw);
+    const error = normalizeBackendError(e) ?? undefined;
+    const message = translateBackendError(i18n.global.t, e);
     return markQueryResultRowsRaw({
       columns: ["Error"],
       execution_error: true,
+      error,
       rows: [[message]],
       affected_rows: 0,
       execution_time_ms: 0,

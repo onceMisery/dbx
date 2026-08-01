@@ -1146,6 +1146,8 @@ export async function executeMultiWithProgress(
   });
   try {
     return await invoke("execute_multi", { connectionId, database, sql, schema, executionId, ...invokeOptions });
+  } catch (error) {
+    throw new BackendErrorException(error);
   } finally {
     unlisten();
   }
