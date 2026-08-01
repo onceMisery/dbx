@@ -186,6 +186,11 @@ impl ExecuteMultiResult {
         Self { result, execution_error: false, statement_index: Some(statement_index), error: None }
     }
 
+    pub fn without_error_detail(mut self) -> Self {
+        self.error = self.error.map(crate::backend_error::BackendError::without_detail);
+        self
+    }
+
     fn into_query_result(self) -> db::QueryResult {
         self.result
     }
@@ -2427,10 +2432,11 @@ pub async fn execute_statements(
                     }
                     PoolErrorAction::Discard | PoolErrorAction::Keep => {}
                 }
-                return Err(query_error_with_omitted_sql_context(
-                    &format!("Statement {} failed: {}. Previous {} statement(s) may have been committed.", i + 1, e, i),
-                    sql,
-                ));
+                let error = crate::db::agent_driver::append_legacy_error_context(
+                    &e,
+                    &format!("Statement {} failed; previous {} statement(s) may have been committed.", i + 1, i),
+                );
+                return Err(query_error_with_omitted_sql_context(&error, sql));
             }
         }
     }
@@ -4579,6 +4585,13 @@ for line in sys.stdin:
             failure.get("error").and_then(|value| value.get("code")),
             Some(&serde_json::json!("DBX-LEGACY-0001"))
         );
+
+        let redacted = serde_json::to_value(
+            ExecuteMultiResult::execution_error_with_index(error_query_result("safe failure".to_string()), 2)
+                .without_error_detail(),
+        )
+        .unwrap();
+        assert!(redacted.get("error").and_then(|value| value.get("detail")).is_none());
     }
 
     #[test]

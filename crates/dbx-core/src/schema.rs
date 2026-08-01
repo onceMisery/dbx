@@ -794,8 +794,9 @@ async fn list_schemas_once(
                                 .await
                                 .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
                                 .map_err(|fallback_error| {
-                                    format!(
-                                        "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
+                                    crate::db::agent_driver::append_legacy_error_context(
+                                        &agent_error,
+                                        &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
                                     )
                                 });
                         }
@@ -2044,7 +2045,10 @@ async fn list_tables_once(
                                 db::postgres::list_tables_filtered(&pool, schema, filter, limit, offset).await
                             };
                             return result.map_err(|fallback_error| {
-                                format!("{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}")
+                                crate::db::agent_driver::append_legacy_error_context(
+                                    &agent_error,
+                                    &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
+                                )
                             });
                         }
                     }
@@ -4690,8 +4694,9 @@ async fn list_objects_once(
                         {
                             return db::postgres::list_objects(&pool, schema).await.map(unpaged_object_list).map_err(
                                 |fallback_error| {
-                                    format!(
-                                        "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
+                                    crate::db::agent_driver::append_legacy_error_context(
+                                        &agent_error,
+                                        &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
                                     )
                                 },
                             );
@@ -4823,8 +4828,9 @@ async fn list_completion_objects_once(
                                 .await
                                 .map(filter_completion_objects)
                                 .map_err(|fallback_error| {
-                                    format!(
-                                        "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
+                                    crate::db::agent_driver::append_legacy_error_context(
+                                        &agent_error,
+                                        &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
                                     )
                                 });
                         }
@@ -5321,8 +5327,9 @@ async fn get_columns_core_for_session_inner(
                                     .await
                                     .map(deduplicate_column_infos)
                                     .map_err(|fallback_error| {
-                                        format!(
-                                            "{agent_error}\n\nNative PostgreSQL metadata fallback failed: {fallback_error}"
+                                        crate::db::agent_driver::append_legacy_error_context(
+                                            &agent_error,
+                                            &format!("Native PostgreSQL metadata fallback failed: {fallback_error}"),
                                         )
                                     });
                             }

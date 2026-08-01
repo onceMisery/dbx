@@ -572,10 +572,10 @@ impl AgentCallError {
 
 fn append_legacy_agent_session_id(error: &str, agent_session_id: &str) -> String {
     if let Some((header, data)) = error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER) {
-        if let Ok(mut data) = serde_json::from_str::<Value>(data) {
+        if let Some((mut data, suffix)) = parse_legacy_agent_error_data(data) {
             if let Some(object) = data.as_object_mut() {
                 object.insert("agentSessionId".to_string(), Value::String(agent_session_id.to_string()));
-                return format!("{header}{AGENT_RPC_ERROR_DATA_MARKER}{data}");
+                return format!("{header}{AGENT_RPC_ERROR_DATA_MARKER}{data}{suffix}");
             }
         }
     }
@@ -979,9 +979,15 @@ pub(crate) fn legacy_agent_call_error(error: String, agent_session_id: Option<&s
     if !is_agent_rpc_response_error(&error) {
         return AgentCallError::Transport { message: error };
     }
-    let (header, data) = error
-        .rsplit_once(AGENT_RPC_ERROR_DATA_MARKER)
-        .map_or((error.as_str(), None), |(header, data)| (header, serde_json::from_str::<Value>(data).ok()));
+    let (header, data, suffix) =
+        error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER).map_or((error.as_str(), None, ""), |(header, data)| {
+            match parse_legacy_agent_error_data(data) {
+                Some((data, suffix)) => (header, Some(data), suffix),
+                None => (header, None, ""),
+            }
+        });
+    let header_with_suffix = (!suffix.is_empty()).then(|| format!("{header}{suffix}"));
+    let header = header_with_suffix.as_deref().unwrap_or(header);
     let (rpc_code, message) = parse_agent_rpc_error_header(header);
     if let Some(data) = data.as_ref().filter(|data| data.get("contractVersion").is_some()) {
         return match parse_structured_error_context(data, agent_session_id) {
@@ -995,6 +1001,12 @@ pub(crate) fn legacy_agent_call_error(error: String, agent_session_id: Option<&s
         hints.session_disposition.get_or_insert(AgentSessionDisposition::Quarantine);
     }
     AgentCallError::Legacy { rpc_code, message, hints }.with_legacy_session_id(agent_session_id)
+}
+
+fn parse_legacy_agent_error_data(data: &str) -> Option<(Value, &str)> {
+    let mut values = serde_json::Deserializer::from_str(data).into_iter::<Value>();
+    let value = values.next()?.ok()?;
+    Some((value, &data[values.byte_offset()..]))
 }
 
 pub(crate) fn append_legacy_error_context(error: &str, context: &str) -> String {
@@ -3217,6 +3229,37 @@ mod tests {
             AgentCallError::ContractViolation { .. }
         ));
         assert_eq!(crate::backend_error::BackendError::from_legacy_string(&legacy).code(), "DBX-JDBC-5002");
+    }
+
+    #[test]
+    fn legacy_adapter_preserves_strict_identity_when_old_callers_append_context() {
+        let structured = AgentCallError::Structured {
+            rpc_code: -6007,
+            message: "connection lost".to_string(),
+            context: AgentErrorContext {
+                contract_version: 1,
+                category: AgentErrorCategory::Connection,
+                retryable: false,
+                session_disposition: AgentSessionDisposition::Quarantine,
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+                agent_session_id: Some("session-1".to_string()),
+                sql_state: None,
+                vendor_code: None,
+                exception_class: None,
+            },
+        };
+        let suffixed = format!("{}: fallback failed", structured.into_legacy_string());
+        assert!(matches!(agent_error_from_legacy(&suffixed, Some("session-1")), AgentCallError::Structured { .. }));
+
+        let violation = AgentCallError::ContractViolation {
+            rpc_code: Some(-6007),
+            message: "invalid strict error".to_string(),
+            reason: super::ContractViolationReason::InvalidDataShape,
+        };
+        let suffixed = format!("{}: fallback failed", violation.into_legacy_string());
+        assert!(matches!(agent_error_from_legacy(&suffixed, None), AgentCallError::ContractViolation { .. }));
+        assert_eq!(crate::backend_error::BackendError::from_legacy_string(&suffixed).code(), "DBX-JDBC-5002");
     }
 
     #[test]

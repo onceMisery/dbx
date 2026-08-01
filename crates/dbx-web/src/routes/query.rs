@@ -413,6 +413,7 @@ pub async fn execute_multi(
     )
     .await
     .map_err(AppError::from)?;
+    let result = result.into_iter().map(dbx_core::query::ExecuteMultiResult::without_error_detail).collect();
 
     drop(registered);
     Ok(Json(result))
