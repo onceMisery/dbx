@@ -5,9 +5,11 @@
   "baselineRefs": [
     "docs/aegis/specs/2026-07-31-structured-backend-error-contract-design.md"
   ],
-  "scopeStatus": "Slice 3 stayed within command-scoped BackendError transport, multi-result compatibility, and frontend localization",
-  "compatStatus": "protocolVersion remains 2; migrated Tauri/HTTP paths preserve objects; legacy Error rows and untouched string commands remain compatible",
-  "retirementStatus": "business marker consumers are retired; compatibility adapter and explicit fixtures remain until final Slice 4 gate",
-  "newRiskSignals": [],
+  "scopeStatus": "All four slices stayed within Agent v2 structured errors, typed Rust recovery, shared BackendError transport, frontend localization, and developer documentation",
+  "compatStatus": "protocolVersion remains 2; structured_error_v1 is opt-in; old Agents, legacy strings, and legacy multi-statement Error rows remain compatible",
+  "retirementStatus": "Business marker consumers are retired. The single compatibility adapter, explicit fixtures, and synthesized Error rows remain behind the documented live-consumer retirement gate",
+  "newRiskSignals": [
+    "Live Dameng, DB2, and TDengine fault-injection regression was unavailable"
+  ],
   "decision": "continue"
 }

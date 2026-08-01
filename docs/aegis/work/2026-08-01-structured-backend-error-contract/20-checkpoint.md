@@ -83,3 +83,22 @@
 - New risk signals:
 - none
 - Advisory decision: continue
+
+## Final Checkpoint Update
+
+- Current todo: complete
+- Active slice: Slice 4 verified; developer guidance, architecture decision, retirement checks, and final acceptance evidence are complete
+- Completed todos:
+- Added the developer guide for error ownership, recovery, catalog extension, redaction, and verification
+- Added the Agent v2 capability ADR and superseded the historical v3 error-contract signal
+- Confirmed runtime `AGENT_PROTOCOL_VERSION` remains `2`
+- Confirmed retired marker helpers have no business-module consumers; the marker remains only in the single compatibility adapter, explicit fixtures, and its static boundary test
+- Re-ran Java, Rust, and frontend acceptance commands with current sources
+- Evidence refs:
+- `docs/backend-error-handling.md`
+- `docs/aegis/adr/2026-08-01-structured-backend-error-contract-v2.md`
+- `evidence-bundle-draft-slice4-final-acceptance.json`
+- Blocked on: none
+- Residual risk: real Dameng, DB2, and TDengine fault-injection environments were unavailable, so connection interruption, backpressure, timeout, cancellation, metadata retry, Runtime replacement, and legacy-Agent behavior were not revalidated against live databases
+- Workspace governance note: the Aegis workspace check remains non-zero because the user-owned untracked index references one missing historical file and does not index several existing documents, including this task's new ADR; no unrelated index content was modified
+- Next step: release through the documented capability rollout; run the live-database matrix before removing either the legacy marker adapter or synthesized multi-statement `Error` rows

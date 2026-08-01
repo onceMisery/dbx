@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "baselineRefs": [
+    "docs/aegis/specs/2026-07-31-structured-backend-error-contract-design.md"
+  ],
+  "impactStatement": "docs/aegis/work/2026-08-01-structured-backend-error-contract/impact-statement-draft.json",
+  "compatPlan": "new v2 capability is opt-in; old Agent and non-Agent strings enter one legacy adapter",
+  "retirementPlan": "Business marker consumers are retired. The single compatibility adapter, explicit fixtures, and synthesized Error rows remain behind the documented live-consumer retirement gate",
+  "evidenceBundle": [
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/evidence-bundle-draft-slice1-java-agent-contract.json",
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/evidence-bundle-draft-slice1-rust-agent-corridor.json",
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/evidence-bundle-draft-slice1-static-checks.json",
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/evidence-bundle-draft-slice2-core-recovery-and-catalog.json",
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/evidence-bundle-draft-slice2-static-checks.json",
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/evidence-bundle-draft-slice3-transport-and-frontend.json",
+    "docs/aegis/work/2026-08-01-structured-backend-error-contract/evidence-bundle-draft-slice4-final-acceptance.json"
+  ]
+}

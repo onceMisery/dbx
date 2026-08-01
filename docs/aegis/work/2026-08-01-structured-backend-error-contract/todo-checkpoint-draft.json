@@ -1,21 +1,24 @@
 {
   "schemaVersion": "aegis.schema.v0",
   "taskId": "2026-08-01-structured-backend-error-contract",
-  "currentTodo": "Slice 4: developer guide, compatibility retirement checks, and final verification",
+  "currentTodo": "complete",
   "completedTodos": [
     "Slice 1: v2 capability and Agent/Rust typed error corridor",
     "Slice 2: typed recovery policy, BackendError catalog, and core consumer migration",
-    "Slice 3: Tauri/HTTP transport, multi-result errors, frontend normalization, and localization"
+    "Slice 3: Tauri/HTTP transport, multi-result errors, frontend normalization, and localization",
+    "Slice 4: developer guide, v2 architecture decision, compatibility retirement checks, and final verification"
   ],
-  "activeSlice": "Slice 3 verified and ready to commit",
+  "activeSlice": "Slice 4 verified and complete",
   "evidenceRefs": [
     "agents: .\\gradlew.bat :common:test --tests *Agent* (BUILD SUCCESSFUL)",
-    "dbx-core: cargo test -p dbx-core --no-default-features db::agent_driver::tests (49 passed)",
+    "dbx-core: cargo test -j 1 -p dbx-core --no-default-features --lib db::agent_driver::tests (51 passed)",
     "cargo fmt --all -- --check and cargo check -j 1 -p dbx-core --no-default-features (exit 0)",
     "query/schema/connection/agent_driver/backend_error/agent_recovery targeted tests (all passed)",
-    "Tauri/web checks, pnpm typecheck, and 196 focused frontend tests (all passed)"
+    "Tauri/web checks, pnpm typecheck, and 196 focused frontend tests (all passed)",
+    "Final acceptance matrix and static retirement boundary checks (all passed)",
+    "docs/backend-error-handling.md and Agent v2 structured error ADR"
   ],
   "blockedOn": null,
-  "nextStep": "Commit Slice 3, then add the developer guide and run the final acceptance matrix",
+  "nextStep": "Run the live Dameng, DB2, and TDengine matrix before retiring compatibility artifacts",
   "updatedAt": "2026-08-01"
 }

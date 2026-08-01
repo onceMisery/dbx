@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "aegis.schema.v0",
+  "artifactKey": "slice4-final-acceptance",
+  "type": "verification",
+  "source": "Gradle Agent tests; focused dbx-core/dbx-web tests; cargo fmt/check; pnpm typecheck/Vitest; static marker and protocol searches",
+  "summary": "The final local acceptance matrix passed. Runtime protocol remains v2, business recovery modules have no legacy marker-helper consumers, and developer/architecture guidance records the compatibility and retirement boundaries.",
+  "verifier": "All executed commands exited 0; 51 agent-driver, 90 query, 78 schema, 288 connection (4 ignored), 5 catalog, 1 recovery, 3 web, and 196 frontend tests passed",
+  "residualRisk": "Live Dameng, DB2, and TDengine fault-injection regression was unavailable"
+}
