@@ -1,8 +1,0 @@
-{
-  "schemaVersion": "aegis.schema.v0",
-  "artifactKey": "slice2-core-recovery-and-catalog",
-  "type": "test",
-  "source": "cargo test -j 1 -p dbx-core --no-default-features --lib query::tests; schema::tests; connection::tests; db::agent_driver::tests; backend_error::tests; agent_recovery::tests",
-  "summary": "Typed recovery, metadata retry/quarantine, keepalive routing, BackendError catalog/redaction, and marker boundary tests passed.",
-  "verifier": "Cargo exit code 0 for every command"
-}

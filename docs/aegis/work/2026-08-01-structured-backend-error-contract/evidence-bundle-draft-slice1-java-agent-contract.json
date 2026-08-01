@@ -1,8 +1,0 @@
-{
-  "schemaVersion": "aegis.schema.v0",
-  "artifactKey": "slice1-java-agent-contract",
-  "type": "test",
-  "source": ".\\gradlew.bat :common:test --tests *Agent*",
-  "summary": "Java Agent protocol and structured error producer tests completed successfully",
-  "verifier": "Gradle exit code 0"
-}

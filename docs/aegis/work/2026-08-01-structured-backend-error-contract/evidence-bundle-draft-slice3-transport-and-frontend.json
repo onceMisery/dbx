@@ -1,8 +1,0 @@
-{
-  "schemaVersion": "aegis.schema.v0",
-  "artifactKey": "slice3-transport-and-frontend",
-  "type": "test",
-  "source": "cargo check for dbx-core/dbx-web/dbx; focused core/web serialization tests; pnpm typecheck; focused Vitest suites",
-  "summary": "BackendError transport, multi-result/progress compatibility, frontend normalization, and eight-locale catalog coverage passed.",
-  "verifier": "Rust and TypeScript commands exited 0; 196 focused frontend tests passed"
-}

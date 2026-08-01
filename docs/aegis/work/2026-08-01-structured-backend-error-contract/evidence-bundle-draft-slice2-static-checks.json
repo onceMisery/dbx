@@ -1,8 +1,0 @@
-{
-  "schemaVersion": "aegis.schema.v0",
-  "artifactKey": "slice2-static-checks",
-  "type": "verification",
-  "source": "cargo fmt --all -- --check; cargo check -j 1 -p dbx-core --no-default-features; rg retired marker consumers",
-  "summary": "Formatting, compilation, and compatibility-boundary static checks passed.",
-  "verifier": "All commands exit code 0"
-}
