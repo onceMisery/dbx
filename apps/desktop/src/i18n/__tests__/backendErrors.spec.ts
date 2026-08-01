@@ -217,6 +217,8 @@ describe("backend error translation", () => {
     ["array params", { messageParams: ["execute"] }],
     ["nested params", { messageParams: { stage: { name: "execute" } } }],
     ["non-finite params", { messageParams: { retryAfter: Number.POSITIVE_INFINITY } }],
+    ["non-string detail", { detail: 42 }],
+    ["object detail", { detail: { message: "database failure" } }],
     ["unknown source", { source: "http" }],
     ["unknown outcome", { operationOutcome: "completed" }],
   ])("rejects malformed structured envelopes with %s", (_name, override) => {

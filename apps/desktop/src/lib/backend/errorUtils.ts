@@ -33,6 +33,7 @@ function isBackendError(value: unknown): value is BackendError {
   ) {
     return false;
   }
+  if (candidate.detail !== undefined && typeof candidate.detail !== "string") return false;
   return Object.values(candidate.messageParams).every((param) => typeof param === "string" || typeof param === "boolean" || (typeof param === "number" && Number.isFinite(param)));
 }
 
