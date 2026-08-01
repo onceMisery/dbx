@@ -2,7 +2,7 @@ import * as api from "@/lib/backend/api";
 import { connectionObjectTreeNodeSchema, effectiveDatabaseTypeForConnection, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { invalidateTableMetadataCache, loadTableMetadata } from "@/lib/metadata/tableMetadataCache";
 import { canApplyDataTabMetadata } from "@/lib/sidebar/dataTabOpenPolicy";
-import { isNoSnapshotErrorResult } from "@/lib/query/queryResultError";
+import { isNoSnapshotErrorResult, isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
 import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
@@ -169,7 +169,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     const tabAfterFirstExecute = queryStore.tabs.find((tab) => tab.id === tabId);
     const firstResult = tabAfterFirstExecute?.result;
     const cancelRequestedDuringExecute = (tabAfterFirstExecute?.cancelRequestCount ?? 0) > cancelCountBeforeExecute;
-    const firstQueryFailed = cancelRequestedDuringExecute || tabAfterFirstExecute?.isCancelling === true || (firstResult?.columns.length === 1 && firstResult.columns[0] === "Error");
+    const firstQueryFailed = cancelRequestedDuringExecute || tabAfterFirstExecute?.isCancelling === true || (firstResult !== undefined && isQueryExecutionErrorResult(firstResult));
     // executeTabSql surfaces query failures as an "Error" result instead of throwing.
     // A snapshot-less lake table fails the data preview above but its metadata still
     // reads fine — retry with LIMIT 0 so the user sees the table structure (columns +

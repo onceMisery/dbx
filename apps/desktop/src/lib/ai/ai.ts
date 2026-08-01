@@ -9,6 +9,7 @@ import { aiSkillForAction } from "@/lib/ai/aiSkills";
 import { isSchemaAware } from "@/lib/database/databaseCapabilities";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { normalizeSqliteNamespace } from "@/lib/database/sqliteNamespace";
+import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 
 import type { AgentEvent } from "@/lib/backend/tauri";
 
@@ -674,12 +675,12 @@ function prioritizeSchemas(schemas: string[]): string[] {
 }
 
 function extractLastError(result?: QueryResult): string | undefined {
-  if (!result?.columns.includes("Error")) return undefined;
+  if (!result || !isQueryExecutionErrorResult(result)) return undefined;
   return result.rows[0]?.[0] == null ? undefined : String(result.rows[0][0]);
 }
 
 function formatResultPreview(result?: QueryResult): string | undefined {
-  if (!result || result.columns.includes("Error") || !result.rows.length) return undefined;
+  if (!result || isQueryExecutionErrorResult(result) || !result.rows.length) return undefined;
   const MAX_VALUE_CHARS = 200;
   const rows = result.rows.slice(0, 5).map((row) => {
     return result.columns

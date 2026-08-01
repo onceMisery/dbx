@@ -78,6 +78,7 @@ import type { ConnectionConfig, QueryTab, SavedSqlFile, TableInfo } from "@/type
 import { fetchNamespaceOptionsForConnection, useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import { decodeSelectableDatabaseValue, encodeSelectableDatabaseValue, formatDatabaseLabel, resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { normalizeSqliteNamespace } from "@/lib/database/sqliteNamespace";
+import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { isSchemaAware } from "@/lib/database/databaseCapabilities";
 import ExplainPlanViewer from "@/components/explain/ExplainPlanViewer.vue";
 import { parseExplainResult, parseOracleExplainText, type ParsedExplainPlan } from "@/lib/diagram/explainPlan";
@@ -650,8 +651,7 @@ watch(
 function selectAction(action: AiAction) {
   activeAction.value = action;
   if (action === "fix" && props.tab?.result) {
-    const cols = props.tab.result.columns;
-    if (cols.includes("Error")) {
+    if (isQueryExecutionErrorResult(props.tab.result)) {
       const errVal = props.tab.result.rows[0]?.[0];
       if (errVal != null) prompt.value = String(errVal);
     }

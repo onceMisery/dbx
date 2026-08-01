@@ -3424,7 +3424,7 @@ export const useQueryStore = defineStore("query", () => {
               connStore.invalidateCompletionCache(tab.connectionId, String(currentDb));
             }
           } catch (e: any) {
-            allResults.push(annotateQueryResultSource({ columns: ["Error"], rows: [[e?.message ?? String(e)]], affected_rows: 0, execution_time_ms: 0 }, command, undefined, undefined, sourceRange));
+            allResults.push(annotateQueryResultSource(toErrorResult(e), command, undefined, undefined, sourceRange));
           }
         }
         queryExecutionLog("info", "redis:done", { traceId, commandCount: commands.length, elapsed: elapsed() });
@@ -3433,7 +3433,7 @@ export const useQueryStore = defineStore("query", () => {
         if (current?.executionId === executionId) {
           if (openInNewResultTab && current.isCancelling && restorePendingResultRun(current, executionId)) return false;
           if (allResults.length > 1) {
-            const activeResultIndex = allResults.findIndex((r) => !r.columns.includes("Error"));
+            const activeResultIndex = allResults.findIndex((result) => !isQueryExecutionErrorResult(result));
             const resultIndex = preservedResultIndex(allResults, current.activeResultIndex, options?.preserveActiveResultIndex) ?? (activeResultIndex >= 0 ? activeResultIndex : 0);
             current.results = allResults;
             current.activeResultIndex = resultIndex;
@@ -3772,7 +3772,7 @@ export const useQueryStore = defineStore("query", () => {
           } else if (allResults.length > 1) {
             // Open grouped output on the first non-error result when possible so
             // mixed success/error batches land on the most useful table first.
-            const activeResultIndex = allResults.findIndex((result) => !result.columns.includes("Error"));
+            const activeResultIndex = allResults.findIndex((result) => !isQueryExecutionErrorResult(result));
             const resultIndex = preservedResultIndex(allResults, current.activeResultIndex, options?.preserveActiveResultIndex) ?? (activeResultIndex >= 0 ? activeResultIndex : 0);
             current.results = allResults;
             current.activeResultIndex = resultIndex;
@@ -3841,7 +3841,7 @@ export const useQueryStore = defineStore("query", () => {
         if (current?.executionId === executionId && openInNewResultTab && current.isCancelling && restorePendingResultRun(current, executionId)) return false;
         if (current?.executionId === executionId && allResults.length > 0) {
           clearResultNavigationState(current);
-          const errorResultIndex = allResults.findIndex((result) => result.columns.includes("Error") || elasticsearchHttpErrorStatus(result) !== undefined);
+          const errorResultIndex = allResults.findIndex((result) => isQueryExecutionErrorResult(result) || elasticsearchHttpErrorStatus(result) !== undefined);
           const resultIndex = errorResultIndex >= 0 ? errorResultIndex : 0;
           current.results = allResults.length > 1 ? allResults : undefined;
           current.activeResultIndex = allResults.length > 1 ? resultIndex : undefined;
