@@ -48,6 +48,7 @@ pub enum PoolErrorAction {
 #[derive(Debug, Clone)]
 pub enum QueryExecutionError {
     Agent(AgentCallError),
+    Timeout(String),
     Legacy(String),
 }
 
@@ -55,6 +56,7 @@ impl QueryExecutionError {
     pub fn into_legacy_string(self) -> String {
         match self {
             Self::Agent(error) => error.into_legacy_string(),
+            Self::Timeout(error) => error,
             Self::Legacy(error) => error,
         }
     }
@@ -62,6 +64,7 @@ impl QueryExecutionError {
     pub fn into_backend_error(self) -> crate::backend_error::BackendError {
         match self {
             Self::Agent(error) => crate::backend_error::BackendError::from_agent_call_error(&error),
+            Self::Timeout(error) => crate::backend_error::BackendError::from_timeout_detail(&error),
             Self::Legacy(error) => crate::backend_error::BackendError::from_legacy_string(&error),
         }
     }
@@ -69,6 +72,7 @@ impl QueryExecutionError {
     fn with_omitted_sql_context(self, sql: &str) -> Self {
         match self {
             Self::Agent(error) => Self::Agent(error),
+            Self::Timeout(error) => Self::Timeout(query_error_with_omitted_sql_context(&error, sql)),
             Self::Legacy(error) => Self::Legacy(query_error_with_omitted_sql_context(&error, sql)),
         }
     }
@@ -76,7 +80,7 @@ impl QueryExecutionError {
     fn as_agent_error(&self) -> Option<&AgentCallError> {
         match self {
             Self::Agent(error) => Some(error),
-            Self::Legacy(_) => None,
+            Self::Timeout(_) | Self::Legacy(_) => None,
         }
     }
 }
@@ -85,6 +89,7 @@ impl std::fmt::Display for QueryExecutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Agent(error) => error.fmt(formatter),
+            Self::Timeout(error) => formatter.write_str(error),
             Self::Legacy(error) => formatter.write_str(error),
         }
     }
@@ -823,7 +828,9 @@ fn query_execution_error_action(
         };
     }
     match error {
-        QueryExecutionError::Legacy(message) => query_pool_error_action(db_type, sql, message),
+        QueryExecutionError::Timeout(message) | QueryExecutionError::Legacy(message) => {
+            query_pool_error_action(db_type, sql, message)
+        }
         QueryExecutionError::Agent(_) => unreachable!("Agent errors return above"),
     }
 }
@@ -1499,9 +1506,21 @@ async fn do_execute_typed(
         }
         PoolKind::HBase(_) => Err("SQL execution is not supported for HBase connections".to_string()),
     };
-    result.map(normalize_query_result_for_js).map_err(|error| {
-        typed_agent_error.map_or_else(|| QueryExecutionError::Legacy(error), QueryExecutionError::Agent)
-    })
+    result
+        .map(normalize_query_result_for_js)
+        .map_err(|error| {
+            typed_agent_error.map_or_else(|| QueryExecutionError::Legacy(error), QueryExecutionError::Agent)
+        })
+        .map_err(classify_timeout_error)
+}
+
+fn classify_timeout_error(error: QueryExecutionError) -> QueryExecutionError {
+    match error {
+        QueryExecutionError::Legacy(message) if is_dbx_query_timeout_error(&message.to_ascii_lowercase()) => {
+            QueryExecutionError::Timeout(message)
+        }
+        other => other,
+    }
 }
 
 pub async fn do_execute(
@@ -4620,6 +4639,23 @@ for line in sys.stdin:
         });
 
         assert_eq!(error.into_backend_error().code(), "DBX-JDBC-1002");
+    }
+
+    #[test]
+    fn query_timeout_preserves_timeout_catalog_identity_and_detail() {
+        let error = classify_timeout_error(QueryExecutionError::Legacy("Query timed out after 1 seconds".to_string()))
+            .with_omitted_sql_context("SELECT pg_sleep(10)");
+        let backend_error = error.into_backend_error();
+
+        assert_eq!(backend_error.code(), "DBX-JDBC-2002");
+        assert_eq!(
+            backend_error.message_params().get("stage"),
+            Some(&crate::backend_error::BackendMessageParam::String("execute".to_string()))
+        );
+        assert_eq!(
+            backend_error.detail(),
+            Some("Query timed out after 1 seconds SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement.")
+        );
     }
 
     #[test]

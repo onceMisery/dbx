@@ -150,6 +150,19 @@ impl BackendError {
         )
     }
 
+    /// Create a timeout envelope while retaining the bounded diagnostic detail.
+    pub fn from_timeout_detail(message: &str) -> Self {
+        let entry = catalog_entry(CatalogCode::TimeoutUnknown);
+        Self::new(
+            entry,
+            BackendErrorSource::JdbcAgent,
+            BackendOperationOutcome::Unknown,
+            stage_param(entry, AgentErrorStage::Execute),
+            safe_detail(message),
+            Some(diagnostics_for_local("timeout", AgentErrorStage::Execute)),
+        )
+    }
+
     /// Convert a legacy boundary string while preserving Agent data when the
     /// compatibility adapter can prove that the string came from an Agent.
     pub fn from_legacy_string(message: &str) -> Self {

@@ -92,6 +92,7 @@ Rust `BackendError` 的字段由 catalog 构造，字段定义如下（JSON 使�
 - 过滤 JDBC URL、密码、token、授权头、密钥、Session 标识等敏感标记。
 - 过滤包含 SQL 语句关键字的内容，避免把完整 SQL 回显给用户。
 - `agentSessionId`、重试标记和内部恢复字段不会进入公共 envelope。
+- Rust 查询执行器生成的查询超时会使用 `DBX-JDBC-2002`（阶段 `execute`）摘要，同时保留安全的超时诊断 detail；它不会作为 `DBX-LEGACY-0001` 展示。
 - 超时和取消没有服务端 detail 时只返回摘要；被过滤的 detail 也不会使用替代文本冒充原始错误。
 
 ## 传输边界
