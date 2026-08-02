@@ -484,10 +484,11 @@ fn bounded_ascii(value: &str, max: usize) -> String {
 
 fn safe_detail(message: &str) -> Option<String> {
     let trimmed = message.trim();
-    if trimmed.is_empty() || !trimmed.is_ascii() || trimmed.contains(['\r', '\n', '\t']) {
+    if trimmed.is_empty() || !trimmed.is_ascii() {
         return None;
     }
-    let lowered = trimmed.to_ascii_lowercase();
+    let normalized = trimmed.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = normalized.to_ascii_lowercase();
     let sensitive_markers = [
         "://",
         "jdbc:",
@@ -524,7 +525,7 @@ fn safe_detail(message: &str) -> Option<String> {
     if lowered.split(|ch: char| !ch.is_ascii_alphabetic()).any(|word| sql_verbs.contains(&word)) {
         return None;
     }
-    let detail = bounded_ascii(trimmed, MAX_DETAIL_BYTES);
+    let detail = bounded_ascii(&normalized, MAX_DETAIL_BYTES);
     (!detail.is_empty()).then_some(detail)
 }
 
@@ -704,6 +705,23 @@ mod tests {
         assert_eq!(legacy.code(), "DBX-JDBC-9001");
         assert_eq!(legacy.source, BackendErrorSource::JdbcAgentLegacy);
         assert_eq!(BackendError::from_legacy_backend("driver failed").code(), "DBX-LEGACY-0001");
+    }
+
+    #[test]
+    fn legacy_agent_envelope_keeps_multiline_database_detail() {
+        let legacy = AgentCallError::Legacy {
+            rpc_code: Some(-1),
+            message: "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\n  Position: 15".to_string(),
+            hints: Default::default(),
+        }
+        .into_legacy_string();
+        let error = BackendError::from_legacy_string(&legacy);
+
+        assert_eq!(error.code(), "DBX-JDBC-9001");
+        assert_eq!(
+            error.detail(),
+            Some("ERROR: relation \"dbx_table_that_does_not_exist\" does not exist Position: 15")
+        );
     }
 
     #[test]
