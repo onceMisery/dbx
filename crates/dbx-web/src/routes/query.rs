@@ -390,7 +390,7 @@ pub async fn execute_multi(
 
     tracing::debug!(connection_id = %req.connection_id, "execute_multi");
 
-    let result = dbx_core::query::execute_multi_core_with_options_for_client(
+    let result = dbx_core::query::execute_multi_core_with_options_for_client_typed(
         &state.app,
         &req.connection_id,
         &req.database,
@@ -412,7 +412,7 @@ pub async fn execute_multi(
         },
     )
     .await
-    .map_err(AppError::from)?;
+    .map_err(|error| AppError::from(error.into_backend_error()))?;
     let result = result.into_iter().map(dbx_core::query::ExecuteMultiResult::without_error_detail).collect();
 
     drop(registered);

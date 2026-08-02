@@ -100,15 +100,15 @@ Rust `BackendError` 的字段由 catalog 构造，字段定义如下（JSON 使�
 
 ### Tauri Desktop
 
-查询命令将 `QueryExecutionError` 映射为 `BackendError`。`apps/desktop/src/lib/backend/tauri.ts` 在查询失败时抛出 `BackendErrorException`，前端因此可以同时取得 `messageKey` 和安全 `detail`。
+查询命令将 `QueryExecutionError` 映射为 `BackendError`。单语句和事务查询即使通过 `execute_multi` 命令执行，`dbx-core` 也会在整个 multi-query 核心链路中保留 `QueryExecutionError`，直到 Tauri 边界才转换为 `BackendError`；不得先降级为字符串再重建 envelope。`apps/desktop/src/lib/backend/tauri.ts` 在查询失败时抛出 `BackendErrorException`，前端因此可以同时取得 `messageKey` 和安全 `detail`。
 
 ### HTTP Web
 
-`crates/dbx-web/src/error.rs` 将 `AppError` 序列化为同一套 envelope，但当前响应使用 `BackendError::without_detail()`，因此 HTTP 客户端只获得稳定摘要身份，不获得 detail。HTTP status 只表示传输结果，不能替代或改变 `BackendError.code`。
+`crates/dbx-web` 的 multi-query 路由也消费 typed 核心入口，并将 `AppError` 序列化为同一套 envelope；当前响应使用 `BackendError::without_detail()`，因此 HTTP 客户端只获得稳定摘要身份，不获得 detail。HTTP status 只表示传输结果，不能替代或改变 `BackendError.code`。
 
 ### 多语句查询
 
-`ExecuteMultiResult.error` 和进度事件中的 `error` 是权威的结构化错误字段，`execution_error` 表示该结果确实失败。旧的 `Error` 行仅用于兼容；真实查询结果中名为 `Error` 的普通列不能被当作失败。
+`ExecuteMultiResult.error` 和进度事件中的 `error` 是权威的结构化错误字段，`execution_error` 表示该结果确实失败。已经进入 typed 通用逐语句路径的错误必须直接从 `QueryExecutionError` 生成该字段，不能从兼容字符串反向推断。MySQL 和 SQL Server 的专用 batch executor 当前仍是字符串驱动边界，只有在驱动层提供可验证的 typed failure facts 后才能迁移，不能在 query/UI 层按错误正文补分类。旧的 `Error` 行仅用于兼容；真实查询结果中名为 `Error` 的普通列不能被当作失败。
 
 ## 前端展示规则
 

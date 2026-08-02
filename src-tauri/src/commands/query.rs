@@ -133,7 +133,7 @@ pub async fn execute_multi(
         schema
     );
 
-    let result = dbx_core::query::execute_multi_core_with_options_for_client_and_progress(
+    let result = dbx_core::query::execute_multi_core_with_options_for_client_and_progress_typed(
         &state,
         &connection_id,
         &database,
@@ -172,7 +172,7 @@ pub async fn execute_multi(
             error
         ),
     }
-    result.map_err(|error| BackendError::from_legacy_string(&error))
+    result.map_err(dbx_core::query::QueryExecutionError::into_backend_error)
 }
 
 #[tauri::command]
