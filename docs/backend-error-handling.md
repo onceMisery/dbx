@@ -88,7 +88,7 @@ Rust `BackendError` 的字段由 catalog 构造，字段定义如下（JSON 使�
 
 `detail` 是服务端诊断的可选补充，不是分类依据。Agent 错误映射会调用 `safe_detail`：
 
-- 最多保留 512 字节且只接受 ASCII；换行、制表符和连续空白会折叠为单个空格，空内容会被丢弃。
+- 最多保留 512 字节的 UTF-8 文本；换行、制表符和连续空白会折叠为单个空格，空内容会被丢弃。
 - 过滤 JDBC URL、密码、token、授权头、密钥、Session 标识等敏感标记。
 - 过滤包含 SQL 语句关键字的内容，避免把完整 SQL 回显给用户。
 - `agentSessionId`、重试标记和内部恢复字段不会进入公共 envelope。

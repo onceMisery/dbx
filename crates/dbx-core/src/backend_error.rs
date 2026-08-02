@@ -482,9 +482,20 @@ fn bounded_ascii(value: &str, max: usize) -> String {
     value.chars().filter(|ch| ch.is_ascii_graphic() || *ch == ' ').take(max).collect()
 }
 
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    let end = value
+        .char_indices()
+        .map(|(index, ch)| (index, index + ch.len_utf8()))
+        .take_while(|(_, next)| *next <= max_bytes)
+        .map(|(_, next)| next)
+        .last()
+        .unwrap_or(0);
+    value[..end].to_string()
+}
+
 fn safe_detail(message: &str) -> Option<String> {
     let trimmed = message.trim();
-    if trimmed.is_empty() || !trimmed.is_ascii() {
+    if trimmed.is_empty() {
         return None;
     }
     let normalized = trimmed.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
@@ -525,7 +536,7 @@ fn safe_detail(message: &str) -> Option<String> {
     if lowered.split(|ch: char| !ch.is_ascii_alphabetic()).any(|word| sql_verbs.contains(&word)) {
         return None;
     }
-    let detail = bounded_ascii(&normalized, MAX_DETAIL_BYTES);
+    let detail = bounded_text(&normalized, MAX_DETAIL_BYTES);
     (!detail.is_empty()).then_some(detail)
 }
 
@@ -722,6 +733,20 @@ mod tests {
             error.detail(),
             Some("ERROR: relation \"dbx_table_that_does_not_exist\" does not exist Position: 15")
         );
+    }
+
+    #[test]
+    fn legacy_agent_envelope_keeps_dm_chinese_database_detail() {
+        let legacy = AgentCallError::Legacy {
+            rpc_code: Some(-1),
+            message: "无效的表或视图名\n错误码: -2106".to_string(),
+            hints: Default::default(),
+        }
+        .into_legacy_string();
+        let error = BackendError::from_legacy_string(&legacy);
+
+        assert_eq!(error.code(), "DBX-JDBC-9001");
+        assert_eq!(error.detail(), Some("无效的表或视图名 错误码: -2106"));
     }
 
     #[test]
