@@ -472,6 +472,7 @@ fn user_shell_node_candidate() -> Option<NodeRuntimeCandidate> {
     Some(NodeRuntimeCandidate { node_path })
 }
 
+#[cfg(not(windows))]
 fn prefixed_output_path(output: &str, prefix: &str) -> Option<PathBuf> {
     output
         .lines()
@@ -834,7 +835,7 @@ fn path_string(path: &Path) -> String {
 pub(crate) fn locate_command(command: &str) -> Option<String> {
     #[cfg(windows)]
     {
-        return locate_windows_command(command);
+        locate_windows_command(command)
     }
     #[cfg(not(windows))]
     {
@@ -909,7 +910,7 @@ fn command_output(command: &str, args: &[&str]) -> Result<CommandOutput, String>
 
     #[cfg(windows)]
     {
-        return run_windows_command_candidates(command, args).or(direct);
+        run_windows_command_candidates(command, args).or(direct)
     }
 
     #[cfg(not(windows))]
@@ -986,7 +987,7 @@ fn windows_common_command_dirs() -> Vec<std::path::PathBuf> {
 #[cfg(windows)]
 fn run_command_through_user_shell(command: &str, args: &[&str]) -> Result<CommandOutput, String> {
     let script = windows_command_script(command, args);
-    let mut output = run_command("powershell.exe", &["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])?;
+    let mut output = run_command("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])?;
     output.stdout = stdout_after_shell_marker(&output.stdout);
     Ok(output)
 }
@@ -1080,13 +1081,12 @@ mod tests {
     #[cfg(windows)]
     use super::first_windows_command_path;
     #[cfg(not(windows))]
-    use super::{bash_login_script, NodeRuntimeCandidate};
+    use super::{bash_login_script, prefixed_output_path, NodeRuntimeCandidate};
     use super::{
         canonical_runtime_path, is_mcp_compatible_node_version, mcp_command_for_runtime, mcp_native_binary_path_for,
         mcp_package, normalized_reported_path, npm_cli_candidates, parse_minimum_node_version, parse_node_version,
-        prefer_runtime, prefixed_output_path, require_managed_mcp_command, resolve_managed_mcp_command,
-        stdout_after_shell_marker, NodeRuntime, NodeVersion, MCP_MIN_NODE_VERSION_REQUIREMENT, MCP_PACKAGE_NAME,
-        SHELL_COMMAND_MARKER,
+        prefer_runtime, require_managed_mcp_command, resolve_managed_mcp_command, stdout_after_shell_marker,
+        NodeRuntime, NodeVersion, MCP_MIN_NODE_VERSION_REQUIREMENT, MCP_PACKAGE_NAME, SHELL_COMMAND_MARKER,
     };
     #[cfg(not(windows))]
     use super::{shell_command_script, shell_quote};
@@ -1151,6 +1151,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn prefixed_output_path_ignores_empty_values() {
         let output = "node=/opt/node/bin/node\nmissing=\n";
 

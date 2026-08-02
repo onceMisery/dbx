@@ -8,7 +8,7 @@ use std::fmt;
 pub struct AppError {
     pub message: String,
     pub status: StatusCode,
-    pub error: BackendError,
+    pub error: Box<BackendError>,
 }
 
 impl fmt::Display for AppError {
@@ -32,17 +32,17 @@ impl AppError {
 
     fn with_status(message: String, status: StatusCode) -> Self {
         let error = BackendError::from_legacy_string(&message);
-        Self { message, status, error }
+        Self { message, status, error: Box::new(error) }
     }
 
     pub fn from_backend_error(error: BackendError) -> Self {
-        Self { message: error.code().to_string(), status: StatusCode::INTERNAL_SERVER_ERROR, error }
+        Self { message: error.code().to_string(), status: StatusCode::INTERNAL_SERVER_ERROR, error: Box::new(error) }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.error.without_detail())).into_response()
+        (self.status, Json((*self.error).without_detail())).into_response()
     }
 }
 
@@ -75,6 +75,11 @@ mod tests {
         assert_eq!(error.error.version(), 1);
         assert_eq!(error.error.code(), "DBX-LEGACY-0001");
         assert_eq!(error.message, "database failed");
+    }
+
+    #[test]
+    fn app_error_stays_small_for_route_result_types() {
+        assert!(std::mem::size_of::<AppError>() <= 64);
     }
 
     #[test]
