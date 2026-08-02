@@ -48,6 +48,7 @@ pub enum PoolErrorAction {
 #[derive(Debug, Clone)]
 pub enum QueryExecutionError {
     Agent(AgentCallError),
+    Canceled { stage: AgentErrorStage, operation_outcome: AgentOperationOutcome },
     Timeout(String),
     Sql(String),
     Legacy(String),
@@ -57,6 +58,7 @@ impl QueryExecutionError {
     pub fn into_legacy_string(self) -> String {
         match self {
             Self::Agent(error) => error.into_legacy_string(),
+            Self::Canceled { .. } => canceled_error(),
             Self::Timeout(error) => error,
             Self::Sql(error) => error,
             Self::Legacy(error) => error,
@@ -66,6 +68,9 @@ impl QueryExecutionError {
     pub fn into_backend_error(self) -> crate::backend_error::BackendError {
         match self {
             Self::Agent(error) => crate::backend_error::BackendError::from_agent_call_error(&error),
+            Self::Canceled { stage, operation_outcome } => {
+                crate::backend_error::BackendError::from_canceled(stage, operation_outcome)
+            }
             Self::Timeout(error) => crate::backend_error::BackendError::from_timeout_detail(&error),
             Self::Sql(error) => crate::backend_error::BackendError::from_sql_detail(&error),
             Self::Legacy(error) => crate::backend_error::BackendError::from_legacy_string(&error),
@@ -75,6 +80,7 @@ impl QueryExecutionError {
     fn with_omitted_sql_context(self, sql: &str) -> Self {
         match self {
             Self::Agent(error) => Self::Agent(error),
+            canceled @ Self::Canceled { .. } => canceled,
             Self::Timeout(error) => Self::Timeout(query_error_with_omitted_sql_context(&error, sql)),
             Self::Sql(error) => Self::Sql(query_error_with_omitted_sql_context(&error, sql)),
             Self::Legacy(error) => Self::Legacy(query_error_with_omitted_sql_context(&error, sql)),
@@ -84,6 +90,7 @@ impl QueryExecutionError {
     fn with_context(self, context: &str) -> Self {
         match self {
             Self::Agent(error) => Self::Agent(error),
+            canceled @ Self::Canceled { .. } => canceled,
             Self::Timeout(error) => Self::Timeout(format!("{error}; {context}")),
             Self::Sql(error) => Self::Sql(format!("{error}; {context}")),
             Self::Legacy(error) => Self::Legacy(format!("{error}; {context}")),
@@ -93,7 +100,7 @@ impl QueryExecutionError {
     fn as_agent_error(&self) -> Option<&AgentCallError> {
         match self {
             Self::Agent(error) => Some(error),
-            Self::Timeout(_) | Self::Sql(_) | Self::Legacy(_) => None,
+            Self::Canceled { .. } | Self::Timeout(_) | Self::Sql(_) | Self::Legacy(_) => None,
         }
     }
 }
@@ -102,6 +109,7 @@ impl std::fmt::Display for QueryExecutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Agent(error) => error.fmt(formatter),
+            Self::Canceled { .. } => formatter.write_str(QUERY_CANCELED),
             Self::Timeout(error) => formatter.write_str(error),
             Self::Sql(error) => formatter.write_str(error),
             Self::Legacy(error) => formatter.write_str(error),
@@ -842,6 +850,7 @@ fn query_execution_error_action(
         };
     }
     match error {
+        QueryExecutionError::Canceled { .. } => PoolErrorAction::Keep,
         QueryExecutionError::Timeout(message)
         | QueryExecutionError::Sql(message)
         | QueryExecutionError::Legacy(message) => query_pool_error_action(db_type, sql, message),
@@ -873,8 +882,14 @@ pub fn canceled_error() -> String {
 }
 
 fn canceled_query_execution_error() -> QueryExecutionError {
-    AgentCallError::Canceled { stage: AgentErrorStage::Cancel, operation_outcome: AgentOperationOutcome::Unknown }
-        .into()
+    QueryExecutionError::Canceled { stage: AgentErrorStage::Cancel, operation_outcome: AgentOperationOutcome::Unknown }
+}
+
+fn pre_dispatch_canceled_query_execution_error() -> QueryExecutionError {
+    QueryExecutionError::Canceled {
+        stage: AgentErrorStage::Request,
+        operation_outcome: AgentOperationOutcome::NotStarted,
+    }
 }
 
 fn postgres_transaction_statement_error(
@@ -1554,6 +1569,7 @@ async fn do_execute_typed(
 
 fn classify_query_error(db_type: Option<DatabaseType>, error: QueryExecutionError) -> QueryExecutionError {
     match error {
+        QueryExecutionError::Legacy(message) if message == QUERY_CANCELED => canceled_query_execution_error(),
         QueryExecutionError::Legacy(message) if is_dbx_query_timeout_error(&message.to_ascii_lowercase()) => {
             QueryExecutionError::Timeout(message)
         }
@@ -1708,7 +1724,7 @@ pub async fn execute_sql_statement_with_options_typed(
         .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?;
 
     if is_canceled(&cancel_token) {
-        return Err(canceled_error().into());
+        return Err(pre_dispatch_canceled_query_execution_error());
     }
 
     let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
@@ -4390,6 +4406,81 @@ for line in sys.stdin:
         .unwrap_err();
 
         assert!(matches!(error, QueryExecutionError::Agent(_)));
+
+        runtime.kill();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn native_pre_dispatch_cancellation_stays_typed() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-native-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "sqlite-cancel";
+        let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
+        state.connections.write().await.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Sqlite));
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let error = execute_sql_statement_with_options_typed(
+            &state,
+            connection_id,
+            "",
+            "SELECT 1",
+            None,
+            Some(cancel_token),
+            QueryExecutionOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            QueryExecutionError::Canceled {
+                stage: AgentErrorStage::Request,
+                operation_outcome: AgentOperationOutcome::NotStarted,
+            }
+        ));
+        let backend_error = error.into_backend_error();
+        assert_eq!(backend_error.code(), "DBX-JDBC-2003");
+        assert_eq!(backend_error.source(), crate::backend_error::BackendErrorSource::LegacyBackend);
+        assert_eq!(backend_error.operation_outcome(), crate::backend_error::BackendOperationOutcome::NotStarted);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn agent_pre_dispatch_cancellation_stays_local_and_typed() {
+        let (state, dir, runtime) = agent_error_state("keep").await;
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let error = execute_sql_statement_with_options_typed(
+            &state,
+            "conn-1",
+            "",
+            "SELECT 1",
+            None,
+            Some(cancel_token),
+            QueryExecutionOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            QueryExecutionError::Canceled {
+                stage: AgentErrorStage::Request,
+                operation_outcome: AgentOperationOutcome::NotStarted,
+            }
+        ));
+        let backend_error = error.into_backend_error();
+        assert_eq!(backend_error.code(), "DBX-JDBC-2003");
+        assert_eq!(backend_error.source(), crate::backend_error::BackendErrorSource::LegacyBackend);
+        assert_eq!(backend_error.operation_outcome(), crate::backend_error::BackendOperationOutcome::NotStarted);
+        assert!(!runtime.is_failed());
 
         runtime.kill();
         let _ = std::fs::remove_dir_all(dir);

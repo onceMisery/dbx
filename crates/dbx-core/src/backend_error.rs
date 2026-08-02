@@ -176,6 +176,19 @@ impl BackendError {
         )
     }
 
+    /// Create a cancellation envelope for work canceled by the Rust executor.
+    pub fn from_canceled(stage: AgentErrorStage, operation_outcome: AgentOperationOutcome) -> Self {
+        let entry = catalog_entry(CatalogCode::Canceled);
+        Self::new(
+            entry,
+            BackendErrorSource::LegacyBackend,
+            map_outcome(operation_outcome),
+            stage_param(entry, stage),
+            None,
+            Some(diagnostics_for_local("canceled", stage)),
+        )
+    }
+
     /// Convert a legacy boundary string while preserving Agent data when the
     /// compatibility adapter can prove that the string came from an Agent.
     pub fn from_legacy_string(message: &str) -> Self {

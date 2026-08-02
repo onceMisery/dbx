@@ -205,6 +205,42 @@ class CommonJavaCompatibilityTest {
     }
 
     @Test
+    void multiSessionLimitReturnsStructuredBackpressureBeforeConnectStarts() {
+        try (MultiSessionJsonRpcServer server = MultiSessionJsonRpcServer.forSessionHandlers(() -> new SessionRpcHandler() {
+            @Override
+            public Object connect(JsonObject params) {
+                return Collections.singletonMap("ok", true);
+            }
+
+            @Override
+            public Object handle(String method, JsonObject params) {
+                return Collections.singletonMap("ok", true);
+            }
+
+            @Override
+            public void close() {
+            }
+        })) {
+            for (int index = 0; index < MultiSessionJsonRpcServer.MAX_SESSIONS; index++) {
+                JsonObject response = JsonParser.parseString(server.handleRequest(openSessionRequest(index, "session-" + index)))
+                    .getAsJsonObject();
+                assertTrue(response.has("result"), response::toString);
+            }
+
+            JsonObject response = JsonParser.parseString(server.handleRequest(
+                openSessionRequest(MultiSessionJsonRpcServer.MAX_SESSIONS, "overflow")
+            )).getAsJsonObject();
+            JsonObject data = response.getAsJsonObject("error").getAsJsonObject("data");
+
+            assertEquals("resource", data.get("category").getAsString());
+            assertTrue(data.get("retryable").getAsBoolean());
+            assertEquals("keep", data.get("sessionDisposition").getAsString());
+            assertEquals("connect", data.get("stage").getAsString());
+            assertEquals("not_started", data.get("operationOutcome").getAsString());
+        }
+    }
+
+    @Test
     void multiSessionServerKeepsProtocolOutputWhenGlobalStdoutChanges() {
         synchronized (System.class) {
             InputStream originalInput = System.in;
@@ -1138,6 +1174,17 @@ class CommonJavaCompatibilityTest {
             }
         }
         return false;
+    }
+
+    private static String openSessionRequest(int requestId, String sessionId) {
+        JsonObject params = new JsonObject();
+        params.addProperty("agentSessionId", sessionId);
+        JsonObject request = new JsonObject();
+        request.addProperty("jsonrpc", "2.0");
+        request.addProperty("id", requestId);
+        request.addProperty("method", AgentProtocol.METHOD_OPEN_SESSION);
+        request.add("params", params);
+        return request.toString();
     }
 
     private static void awaitCondition(java.util.function.BooleanSupplier condition) throws InterruptedException {

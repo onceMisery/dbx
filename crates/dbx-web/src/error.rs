@@ -42,7 +42,7 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json((*self.error).without_detail())).into_response()
+        (self.status, Json(*self.error)).into_response()
     }
 }
 
@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_response_is_json_backend_error() {
+    async fn http_response_preserves_filtered_legacy_detail() {
         let response = AppError::internal("database failed").into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(response.headers()[axum::http::header::CONTENT_TYPE], "application/json");
@@ -101,6 +101,40 @@ mod tests {
         assert_eq!(payload["version"], 1);
         assert_eq!(payload["code"], "DBX-LEGACY-0001");
         assert_eq!(payload["messageKey"], "backendErrors.legacy");
-        assert!(payload.get("detail").is_none());
+        assert_eq!(payload["detail"], "database failed");
+    }
+
+    #[tokio::test]
+    async fn http_response_preserves_filtered_structured_agent_detail() {
+        use dbx_core::db::agent_driver::{
+            AgentCallError, AgentErrorCategory, AgentErrorContext, AgentErrorStage, AgentOperationOutcome,
+            AgentSessionDisposition,
+        };
+
+        let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
+            rpc_code: -1,
+            message: "relation customer_orders does not exist".to_string(),
+            context: AgentErrorContext {
+                contract_version: 1,
+                category: AgentErrorCategory::Sql,
+                retryable: false,
+                session_disposition: AgentSessionDisposition::Keep,
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+                agent_session_id: Some("session-1".to_string()),
+                sql_state: Some("42P01".to_string()),
+                vendor_code: None,
+                exception_class: Some("java.sql.SQLException".to_string()),
+            },
+        });
+
+        let response = AppError::from(error).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["code"], "DBX-JDBC-4001");
+        assert_eq!(payload["source"], "jdbcAgent");
+        assert_eq!(payload["detail"], "relation customer_orders does not exist");
+        assert!(payload["diagnostics"].get("agentSessionId").is_none());
     }
 }
