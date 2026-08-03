@@ -473,6 +473,30 @@ describe("queryStore multi-statement errors", () => {
     });
   });
 
+  it("maps SQL Server batch result sets by source order when statement indexes are unavailable", async () => {
+    mocks.getConnectionConfig.mockReturnValue({
+      id: "sqlserver-1",
+      name: "SQL Server",
+      db_type: "sqlserver",
+      database: "app",
+      query_timeout_secs: 30,
+    });
+    mocks.executeMulti.mockResolvedValue([
+      { columns: ["id"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 },
+      { columns: ["id"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 },
+    ]);
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("sqlserver-1", "app", "Query");
+
+    await store.executeTabSql(tabId, "SELECT * FROM users; SELECT * FROM orders");
+
+    expect(store.tabs.find((item) => item.id === tabId)?.results).toMatchObject([
+      { sourceStatement: "SELECT * FROM users", sourceLabel: "app.users" },
+      { sourceStatement: "SELECT * FROM orders", sourceLabel: "app.orders" },
+    ]);
+  });
+
   it("uses Name comments for their indexed query results", async () => {
     mocks.executeMulti.mockResolvedValue([
       { columns: ["id"], rows: [[2]], affected_rows: 0, execution_time_ms: 1, statement_index: 1 },

@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_response_preserves_filtered_legacy_detail() {
+    async fn http_response_preserves_original_legacy_detail() {
         let response = AppError::internal("database failed").into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(response.headers()[axum::http::header::CONTENT_TYPE], "application/json");
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_response_preserves_filtered_structured_agent_detail() {
+    async fn http_response_preserves_original_structured_agent_detail() {
         use dbx_core::db::agent_driver::{
             AgentCallError, AgentErrorCategory, AgentErrorContext, AgentErrorStage, AgentOperationOutcome,
             AgentSessionDisposition,

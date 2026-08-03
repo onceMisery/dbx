@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it as test } from "vitest";
 import { createI18n } from "vue-i18n";
 import { translateBackendError, type BackendErrorTranslate } from "@/i18n/backend-errors";
-import { BackendErrorException, formatError, normalizeBackendError } from "@/lib/backend/errorUtils";
+import { BackendErrorException, formatError, normalizeBackendError, sanitizeBackendErrorMessage } from "@/lib/backend/errorUtils";
 import en from "@/i18n/locales/en";
 import es from "@/i18n/locales/es";
 import it from "@/i18n/locales/it";
@@ -171,6 +171,23 @@ describe("backend error translation", () => {
     expect(translateBackendError(t, "some driver specific failure")).toBe("some driver specific failure");
   });
 
+  test("hides internal Agent error data from user-facing messages", () => {
+    const t = translatorFor("zh-CN");
+    const message = 'Agent RPC error (-1): driver: bad connection\nDBX_AGENT_ERROR_DATA:{"category":null,"retryable":null,"sessionDisposition":null,"stage":null,"operationOutcome":null,"agentSessionId":"e1a4d0a2907947b8adf31abb10c4dff9"}';
+    const expected = "Agent RPC error (-1): driver: bad connection";
+
+    expect(sanitizeBackendErrorMessage(message)).toBe(expected);
+    expect(formatError(new Error(message))).toBe(expected);
+    expect(new BackendErrorException(message).message).toBe(expected);
+    expect(translateBackendError(t, message)).toBe(expected);
+  });
+
+  test("preserves marker-like database messages without valid internal data", () => {
+    const message = "database returned\nDBX_AGENT_ERROR_DATA:not-json";
+
+    expect(sanitizeBackendErrorMessage(message)).toBe(message);
+  });
+
   test("normalizes Error and structural message objects before translation", () => {
     const t = translatorFor("zh-CN");
     const message = "file does not exist: /tmp/missing.sqlite";
@@ -213,13 +230,29 @@ describe("backend error translation", () => {
     expect(translateBackendError(t, error)).toBe(`${t(error.messageKey)}\n\n${error.detail}`);
   });
 
+  test("hides internal Agent error data from structured error details", () => {
+    const t = translatorFor("zh-CN");
+    const detail = 'driver: bad connection\nDBX_AGENT_ERROR_DATA:{"category":null,"agentSessionId":"session-1"}';
+    const error = {
+      version: 1,
+      code: "DBX-JDBC-9001",
+      messageKey: "backendErrors.jdbc.legacyFailure",
+      messageParams: {},
+      source: "jdbcAgentLegacy",
+      operationOutcome: "unknown",
+      detail,
+    } as const;
+
+    expect(translateBackendError(t, error)).toBe(`${t(error.messageKey)}\n\ndriver: bad connection`);
+  });
+
   test.each([
     ["array params", { messageParams: ["execute"] }],
     ["nested params", { messageParams: { stage: { name: "execute" } } }],
     ["non-finite params", { messageParams: { retryAfter: Number.POSITIVE_INFINITY } }],
     ["non-string detail", { detail: 42 }],
     ["object detail", { detail: { message: "database failure" } }],
-    ["unknown source", { source: "http" }],
+    ["non-string source", { source: 42 }],
     ["unknown outcome", { operationOutcome: "completed" }],
   ])("rejects malformed structured envelopes with %s", (_name, override) => {
     expect(
@@ -233,6 +266,21 @@ describe("backend error translation", () => {
         ...override,
       }),
     ).toBeNull();
+  });
+
+  test("accepts unknown compatibility sources and extensible origins", () => {
+    const error = normalizeBackendError({
+      version: 1,
+      code: "DBX-DB-4001",
+      messageKey: "backendErrors.jdbc.sqlFailed",
+      messageParams: { stage: "execute" },
+      source: "nativeDatabase",
+      operationOutcome: "unknown",
+      origin: { subsystem: "database", adapter: "native", driver: "postgresql" },
+      detail: "relation missing_table does not exist",
+    });
+    expect(error?.source).toBe("nativeDatabase");
+    expect(error?.origin?.driver).toBe("postgresql");
   });
 
   test("falls back to legacy text for plain HTTP and Tauri failures", () => {
@@ -260,7 +308,27 @@ describe("backend error translation", () => {
     const error = new BackendErrorException({ reason: "database worker returned a vendor diagnostic" });
     expect(error.backendError.code).toBe("DBX-LEGACY-0001");
     expect(error.backendError.detail).toBe("database worker returned a vendor diagnostic");
-    expect(new BackendErrorException({ reason: "x".repeat(700) }).backendError.detail).toHaveLength(512);
+    expect(new BackendErrorException({ reason: "x".repeat(70_000) }).backendError.detail).toHaveLength(64 * 1024);
+  });
+
+  test("normalizes structured errors across Error realms and module copies", () => {
+    const envelope = {
+      version: 1,
+      code: "DBX-JDBC-5001",
+      messageKey: "backendErrors.jdbc.protocolFailed",
+      messageParams: {},
+      source: "jdbcAgent" as const,
+      operationOutcome: "unknown" as const,
+      detail: "connection reset by peer",
+    };
+    const copiedError = Object.assign(new Error("Backend request failed"), {
+      name: "BackendErrorException",
+      backendError: envelope,
+    });
+    const workerError = { name: "BackendErrorException", message: JSON.stringify(envelope) };
+
+    expect(normalizeBackendError(copiedError)).toEqual(envelope);
+    expect(normalizeBackendError(workerError)).toEqual(envelope);
   });
 
   test("does not stringify a structured envelope as [object Object]", () => {

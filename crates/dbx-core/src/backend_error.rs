@@ -1,4 +1,4 @@
-//! Stable, safe backend error envelopes and the v1 JDBC Agent catalog.
+//! Stable backend error envelopes and the v1 JDBC Agent catalog.
 
 use std::collections::BTreeMap;
 
@@ -9,15 +9,59 @@ use crate::db::agent_driver::{
     AgentErrorStage, AgentOperationOutcome, AgentSessionDisposition,
 };
 
-const MAX_DETAIL_BYTES: usize = 512;
+const MAX_DETAIL_BYTES: usize = 64 * 1024;
 
-/// The origin of a backend error as exposed on the wire.
+/// The v1 compatibility source of a backend error.
+///
+/// New code should use `origin` for subsystem/adapter information. This field
+/// remains unchanged so older clients can continue to consume v1 envelopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BackendErrorSource {
     JdbcAgent,
     JdbcAgentLegacy,
     LegacyBackend,
+}
+
+/// Extensible subsystem metadata for backend errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackendSubsystem {
+    Database,
+    Tunnel,
+    Extension,
+    Ai,
+    MessageQueue,
+    Backend,
+}
+
+/// The adapter that produced the error within its subsystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackendErrorAdapter {
+    JdbcAgent,
+    JdbcAgentLegacy,
+    Native,
+    Plugin,
+    Http,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendErrorOrigin {
+    subsystem: BackendSubsystem,
+    adapter: BackendErrorAdapter,
+}
+
+impl BackendErrorOrigin {
+    const fn database(adapter: BackendErrorAdapter) -> Self {
+        Self { subsystem: BackendSubsystem::Database, adapter }
+    }
+
+    const fn backend() -> Self {
+        Self { subsystem: BackendSubsystem::Backend, adapter: BackendErrorAdapter::Legacy }
+    }
 }
 
 /// Whether the operation definitely had not started or its result is unknown.
@@ -65,6 +109,7 @@ pub struct BackendError {
     message_key: String,
     message_params: BTreeMap<String, BackendMessageParam>,
     source: BackendErrorSource,
+    origin: BackendErrorOrigin,
     operation_outcome: BackendOperationOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -83,34 +128,38 @@ impl BackendError {
                 Self::new(
                     entry,
                     BackendErrorSource::JdbcAgent,
+                    BackendErrorOrigin::database(BackendErrorAdapter::JdbcAgent),
                     outcome,
                     stage_param(entry, context.stage),
-                    safe_detail(message),
+                    bounded_detail(message),
                     Some(diagnostics_from_context(context)),
                 )
             }
             AgentCallError::Legacy { message, .. } => Self::new(
                 catalog_entry(CatalogCode::JdbcLegacyFailure),
                 BackendErrorSource::JdbcAgentLegacy,
+                BackendErrorOrigin::database(BackendErrorAdapter::JdbcAgentLegacy),
                 BackendOperationOutcome::Unknown,
                 BTreeMap::new(),
-                safe_detail(message),
+                bounded_detail(message),
                 None,
             ),
             AgentCallError::ContractViolation { message, .. } => Self::new(
                 catalog_entry(CatalogCode::ContractInvalid),
                 BackendErrorSource::JdbcAgent,
+                BackendErrorOrigin::database(BackendErrorAdapter::JdbcAgent),
                 BackendOperationOutcome::Unknown,
                 BTreeMap::new(),
-                safe_detail(message),
+                bounded_detail(message),
                 None,
             ),
             AgentCallError::Transport { message } => Self::new(
                 catalog_entry(CatalogCode::ProtocolFailed),
                 BackendErrorSource::JdbcAgent,
+                BackendErrorOrigin::database(BackendErrorAdapter::JdbcAgent),
                 BackendOperationOutcome::Unknown,
                 BTreeMap::new(),
-                safe_detail(message),
+                bounded_detail(message),
                 None,
             ),
             AgentCallError::Timeout { stage, operation_outcome } => {
@@ -121,6 +170,7 @@ impl BackendError {
                 Self::new(
                     entry,
                     BackendErrorSource::JdbcAgent,
+                    BackendErrorOrigin::database(BackendErrorAdapter::JdbcAgent),
                     map_outcome(*operation_outcome),
                     stage_param(entry, *stage),
                     None,
@@ -130,6 +180,7 @@ impl BackendError {
             AgentCallError::Canceled { stage, operation_outcome } => Self::new(
                 catalog_entry(CatalogCode::Canceled),
                 BackendErrorSource::JdbcAgent,
+                BackendErrorOrigin::database(BackendErrorAdapter::JdbcAgent),
                 map_outcome(*operation_outcome),
                 stage_param(catalog_entry(CatalogCode::Canceled), *stage),
                 None,
@@ -143,9 +194,10 @@ impl BackendError {
         Self::new(
             catalog_entry(CatalogCode::LegacyBackend),
             BackendErrorSource::LegacyBackend,
+            BackendErrorOrigin::backend(),
             BackendOperationOutcome::Unknown,
             BTreeMap::new(),
-            safe_detail(message),
+            bounded_detail(message),
             None,
         )
     }
@@ -156,9 +208,10 @@ impl BackendError {
         Self::new(
             entry,
             BackendErrorSource::JdbcAgent,
+            BackendErrorOrigin::database(BackendErrorAdapter::Native),
             BackendOperationOutcome::Unknown,
             stage_param(entry, AgentErrorStage::Execute),
-            safe_detail(message),
+            bounded_detail(message),
             Some(diagnostics_for_local("timeout", AgentErrorStage::Execute)),
         )
     }
@@ -169,9 +222,10 @@ impl BackendError {
         Self::new(
             entry,
             BackendErrorSource::JdbcAgent,
+            BackendErrorOrigin::database(BackendErrorAdapter::Native),
             BackendOperationOutcome::Unknown,
             stage_param(entry, AgentErrorStage::Execute),
-            safe_detail(message),
+            bounded_detail(message),
             Some(diagnostics_for_local("sql", AgentErrorStage::Execute)),
         )
     }
@@ -182,6 +236,7 @@ impl BackendError {
         Self::new(
             entry,
             BackendErrorSource::LegacyBackend,
+            BackendErrorOrigin::database(BackendErrorAdapter::Native),
             map_outcome(operation_outcome),
             stage_param(entry, stage),
             None,
@@ -216,6 +271,10 @@ impl BackendError {
         self.source
     }
 
+    pub fn origin(&self) -> BackendErrorOrigin {
+        self.origin
+    }
+
     pub fn operation_outcome(&self) -> BackendOperationOutcome {
         self.operation_outcome
     }
@@ -236,6 +295,7 @@ impl BackendError {
     fn new(
         entry: &'static CatalogEntry,
         source: BackendErrorSource,
+        origin: BackendErrorOrigin,
         operation_outcome: BackendOperationOutcome,
         message_params: BTreeMap<String, BackendMessageParam>,
         detail: Option<String>,
@@ -249,6 +309,7 @@ impl BackendError {
             message_key: entry.message_key.to_string(),
             message_params,
             source,
+            origin,
             operation_outcome,
             detail,
             diagnostics,
@@ -532,239 +593,12 @@ fn bounded_text(value: &str, max_bytes: usize) -> String {
     value[..end].to_string()
 }
 
-fn safe_detail(message: &str) -> Option<String> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
+fn bounded_detail(message: &str) -> Option<String> {
+    if message.trim().is_empty() {
         return None;
     }
-    let normalized = trimmed.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
-    let lowered = normalized.to_ascii_lowercase();
-    let first_word =
-        lowered.split_whitespace().next().unwrap_or_default().trim_matches(|ch: char| !ch.is_ascii_alphabetic());
-    let sql_verbs = [
-        "select", "insert", "update", "delete", "drop", "create", "alter", "truncate", "merge", "call", "with",
-        "grant", "revoke", "comment", "explain", "begin", "commit", "rollback",
-    ];
-    if sql_verbs.contains(&first_word) {
-        return None;
-    }
-
-    let mut detail = redact_sql_payload(&normalized);
-    detail = redact_sensitive_fragments(&detail);
-    detail = redact_session_identifier(&detail);
-    if detail.split_whitespace().all(|token| token == "[redacted]" || token == "[statement omitted]") {
-        return None;
-    }
-    let detail = bounded_text(&detail, MAX_DETAIL_BYTES);
+    let detail = bounded_text(message, MAX_DETAIL_BYTES);
     (!detail.is_empty()).then_some(detail)
-}
-
-fn redact_sql_payload(value: &str) -> String {
-    let lowered = value.to_ascii_lowercase();
-    if let Some(statement_offset) = lowered.find("statement [") {
-        let bracket_start = statement_offset + "statement ".len();
-        if let Some(relative_end) = value[bracket_start..].find(']') {
-            let bracket_end = bracket_start + relative_end + 1;
-            let mut result = value.to_string();
-            result.replace_range(bracket_start..bracket_end, "[statement omitted]");
-            return result;
-        }
-    }
-
-    let tokens = value
-        .split_whitespace()
-        .scan(0usize, |cursor, token| {
-            let start = value[*cursor..].find(token)? + *cursor;
-            *cursor = start + token.len();
-            Some((start, start + token.len(), token.to_ascii_lowercase()))
-        })
-        .collect::<Vec<_>>();
-    let sql_verbs = [
-        "select", "insert", "update", "delete", "drop", "create", "alter", "truncate", "merge", "call", "with",
-        "grant", "revoke", "comment", "explain", "begin", "commit", "rollback",
-    ];
-    for (index, (_, _, token)) in tokens.iter().enumerate() {
-        if sql_verbs.contains(&token.as_str()) && looks_like_complete_sql(&tokens, index) {
-            let mut result = value.to_string();
-            result.replace_range(tokens[index].0.., "[statement omitted]");
-            return result;
-        }
-    }
-    value.to_string()
-}
-
-fn looks_like_complete_sql(tokens: &[(usize, usize, String)], index: usize) -> bool {
-    let verb = tokens[index].2.as_str();
-    let following = tokens.iter().skip(index + 1).map(|(_, _, token)| token.as_str()).collect::<Vec<_>>();
-    if following.is_empty() {
-        return false;
-    }
-
-    let execution_context = index > 0
-        && matches!(
-            tokens[index - 1].2.as_str(),
-            "statement" | "query" | "sql" | "execute" | "executing" | "executed" | "running" | "command"
-        );
-    let structural_marker = match verb {
-        "select" => ["from", "join", "where", "union", "into", ";"].iter().any(|marker| following.contains(marker)),
-        "insert" => following.contains(&"into"),
-        "update" => following.contains(&"set"),
-        "delete" => following.contains(&"from"),
-        "drop" | "create" | "alter" | "truncate" | "grant" | "revoke" | "comment" => {
-            following.iter().any(|token| matches!(*token, "table" | "index" | "view" | "schema" | "database" | "role"))
-        }
-        "merge" => following.contains(&"into"),
-        "call" => following.iter().any(|token| token.ends_with('(')),
-        "with" => following.contains(&"as") && following.contains(&"select"),
-        "explain" => following.iter().any(|token| sql_verb_token(token)),
-        "begin" | "commit" | "rollback" => following.iter().any(|token| *token == ";"),
-        _ => false,
-    };
-    execution_context || structural_marker
-}
-
-fn sql_verb_token(token: &str) -> bool {
-    matches!(
-        token,
-        "select"
-            | "insert"
-            | "update"
-            | "delete"
-            | "drop"
-            | "create"
-            | "alter"
-            | "truncate"
-            | "merge"
-            | "call"
-            | "with"
-            | "grant"
-            | "revoke"
-            | "comment"
-            | "explain"
-            | "begin"
-            | "commit"
-            | "rollback"
-    )
-}
-
-fn redact_sensitive_fragments(value: &str) -> String {
-    let tokens = value.split_whitespace().collect::<Vec<_>>();
-    let mut redacted = Vec::new();
-    let mut redact_next = 0usize;
-    let mut index = 0usize;
-    while index < tokens.len() {
-        let token = tokens[index];
-        let lowered = token.to_ascii_lowercase();
-        if redact_next > 0 {
-            redacted.push("[redacted]");
-            redact_next -= 1;
-        } else if index + 2 < tokens.len() && sensitive_key_token(token) && sensitive_separator(tokens[index + 1]) {
-            redacted.push("[redacted]");
-            index += 2;
-        } else if lowered.contains("://") || lowered.starts_with("jdbc:") || sensitive_key_value(token) {
-            redacted.push("[redacted]");
-        } else if lowered == "bearer" {
-            redacted.push("[redacted]");
-            redact_next = 1;
-        } else if lowered.starts_with("authorization:") {
-            redacted.push("[redacted]");
-            redact_next = 2;
-        } else if index + 1 < tokens.len()
-            && sensitive_key_token(token)
-            && (token.ends_with('=') || token.ends_with(':'))
-        {
-            redacted.push("[redacted]");
-            redact_next = 1;
-        } else {
-            redacted.push(token);
-        }
-        index += 1;
-    }
-    redacted.join(" ")
-}
-
-fn sensitive_separator(token: &str) -> bool {
-    matches!(token, "=" | ":")
-}
-
-fn sensitive_key_token(token: &str) -> bool {
-    sensitive_key_name(token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
-}
-
-fn sensitive_key_value(token: &str) -> bool {
-    let Some((key, _value)) = token.split_once('=') else {
-        return false;
-    };
-    sensitive_key_name(key)
-}
-
-fn sensitive_key_name(key: &str) -> bool {
-    let key = key.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_').to_ascii_lowercase();
-    matches!(
-        key.as_str(),
-        "password"
-            | "passwd"
-            | "pwd"
-            | "token"
-            | "secret"
-            | "authorization"
-            | "api_key"
-            | "apikey"
-            | "credential"
-            | "auth"
-            | "key"
-            | "user"
-            | "username"
-            | "uid"
-            | "access_key"
-            | "private_key"
-            | "session"
-            | "session_id"
-            | "agentsessionid"
-    )
-}
-
-fn redact_session_identifier(value: &str) -> String {
-    let lowered = value.to_ascii_lowercase();
-    for marker in ["session id", "session_id", "agentsessionid"] {
-        if let Some(marker_start) = lowered.find(marker) {
-            let value_start = value[marker_start + marker.len()..]
-                .char_indices()
-                .find(|(_, ch)| !ch.is_ascii_whitespace() && *ch != ':' && *ch != '=')
-                .map(|(offset, _)| marker_start + marker.len() + offset);
-            if let Some(value_start) = value_start {
-                let value_end = value[value_start..]
-                    .char_indices()
-                    .find(|(_, ch)| ch.is_ascii_whitespace())
-                    .map(|(offset, _)| value_start + offset)
-                    .unwrap_or(value.len());
-                let mut result = value.to_string();
-                result.replace_range(value_start..value_end, "[redacted]");
-                return result;
-            }
-        }
-    }
-    let Some(colon) = value.find(':') else {
-        return value.to_string();
-    };
-    if !lowered[..colon].contains("session") {
-        return value.to_string();
-    }
-    let value_start = value[colon + 1..]
-        .char_indices()
-        .find(|(_, ch)| !ch.is_ascii_whitespace())
-        .map(|(offset, _)| colon + 1 + offset);
-    let Some(value_start) = value_start else {
-        return value.to_string();
-    };
-    let value_end = value[value_start..]
-        .char_indices()
-        .find(|(_, ch)| ch.is_ascii_whitespace())
-        .map(|(offset, _)| value_start + offset)
-        .unwrap_or(value.len());
-    let mut result = value.to_string();
-    result.replace_range(value_start..value_end, "[redacted]");
-    result
 }
 
 #[cfg(test)]
@@ -863,27 +697,26 @@ mod tests {
     }
 
     #[test]
-    fn safe_detail_preserves_diagnostics_and_redacts_sensitive_fragments() {
-        for (message, expected) in [
-            ("Incorrect syntax near SELECT", "Incorrect syntax near SELECT"),
-            ("ERROR: relation missing_table does not exist", "ERROR: relation missing_table does not exist"),
-            ("ORA-00942: table or view does not exist", "ORA-00942: table or view does not exist"),
-            (
-                "syntax error in statement [UPDATE customers SET ssn='123']",
-                "syntax error in statement [statement omitted]",
-            ),
-            ("failed executing SELECT * FROM customers WHERE ssn='123'", "failed executing [statement omitted]"),
-            (
-                "connection failed: jdbc:postgresql://host/db?user=alice&password=secret",
-                "connection failed: [redacted]",
-            ),
-            ("connection failed: Authorization: Bearer abc123", "connection failed: [redacted] [redacted] [redacted]"),
-            ("Agent session not found: 7f51e7f4-7cee-42db-bfeb-76d1199d1afe", "Agent session not found: [redacted]"),
-            ("Agent session id private-session", "Agent session id [redacted]"),
-        ] {
-            assert_eq!(safe_detail(message).as_deref(), Some(expected), "detail changed unexpectedly: {message}");
-        }
+    fn sql_errors_expose_generic_database_origin_without_changing_v1_source() {
+        let payload =
+            serde_json::to_value(BackendError::from_sql_detail("relation missing_table does not exist")).unwrap();
+        assert_eq!(payload["source"], "jdbcAgent");
+        assert_eq!(payload["origin"]["subsystem"], "database");
+        assert_eq!(payload["origin"]["adapter"], "native");
+    }
+
+    #[test]
+    fn detail_preserves_original_driver_text() {
         for message in [
+            "Incorrect syntax near SELECT",
+            "ERROR: relation missing_table does not exist",
+            "ORA-00942: table or view does not exist",
+            "syntax error in statement [UPDATE customers SET ssn='123']",
+            "failed executing SELECT * FROM customers WHERE ssn='123'",
+            "connection failed: jdbc:postgresql://host/db?user=alice&password=secret",
+            "connection failed: Authorization: Bearer abc123",
+            "Agent session not found: 7f51e7f4-7cee-42db-bfeb-76d1199d1afe",
+            "Agent session id private-session",
             "DROP TABLE users",
             "SELECT password FROM users",
             "Bearer token-value",
@@ -892,7 +725,7 @@ mod tests {
             "password: secret",
             "CALL refresh_cache()",
         ] {
-            assert!(safe_detail(message).is_none(), "complete sensitive statement leaked: {message}");
+            assert_eq!(bounded_detail(message).as_deref(), Some(message), "detail changed unexpectedly: {message}");
         }
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
@@ -908,12 +741,13 @@ mod tests {
         assert!(value.get("retryable").is_none());
         assert!(value.get("sessionDisposition").is_none());
         assert!(value.get("agentSessionId").is_none());
-        assert!(value.get("detail").is_none());
+        assert_eq!(value["detail"], "jdbc:postgresql://host/db?password=secret");
     }
 
     #[test]
-    fn safe_detail_remains_bounded_after_redaction() {
-        let detail = safe_detail(&format!("ERROR: {}", "x".repeat(MAX_DETAIL_BYTES + 100))).unwrap();
+    fn bounded_detail_remains_bounded_without_rewriting() {
+        let detail = bounded_detail(&format!("ERROR: {}", "x".repeat(MAX_DETAIL_BYTES + 100))).unwrap();
+        assert!(detail.len() > 512);
         assert!(detail.len() <= MAX_DETAIL_BYTES);
         assert!(detail.is_char_boundary(MAX_DETAIL_BYTES));
     }
@@ -984,7 +818,7 @@ mod tests {
         assert_eq!(error.code(), "DBX-JDBC-9001");
         assert_eq!(
             error.detail(),
-            Some("ERROR: relation \"dbx_table_that_does_not_exist\" does not exist Position: 15")
+            Some("ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\n  Position: 15")
         );
     }
 
@@ -999,7 +833,7 @@ mod tests {
         let error = BackendError::from_legacy_string(&legacy);
 
         assert_eq!(error.code(), "DBX-JDBC-9001");
-        assert_eq!(error.detail(), Some("无效的表或视图名 错误码: -2106"));
+        assert_eq!(error.detail(), Some("无效的表或视图名\n错误码: -2106"));
     }
 
     #[test]

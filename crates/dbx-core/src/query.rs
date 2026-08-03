@@ -2422,6 +2422,10 @@ fn empty_query_result(execution_time_ms: u128) -> db::QueryResult {
     }
 }
 
+fn sqlserver_batch_results(results: Vec<db::QueryResult>) -> Vec<ExecuteMultiResult> {
+    results.into_iter().map(ExecuteMultiResult::from).collect()
+}
+
 async fn execute_multi_sqlserver(
     state: &AppState,
     pool_key: &str,
@@ -2438,12 +2442,12 @@ async fn execute_multi_sqlserver(
     let query_timeout = resolve_query_timeout(options.timeout_secs);
     let execution_mode = options.execution_mode;
 
-    for (statement_index, batch) in batches.iter().enumerate() {
+    for batch in &batches {
         if is_canceled(&cancel_token) {
             let error = canceled_error();
             all_results.push(ExecuteMultiResult::execution_error_with_backend(
                 error_query_result(error.clone()),
-                Some(statement_index),
+                None,
                 crate::backend_error::BackendError::from_legacy_backend(&error),
             ));
             break;
@@ -2462,7 +2466,7 @@ async fn execute_multi_sqlserver(
             Err(err) => {
                 all_results.push(ExecuteMultiResult::execution_error_with_backend(
                     error_query_result(err.clone()),
-                    Some(statement_index),
+                    None,
                     crate::backend_error::BackendError::from_legacy_backend(&err),
                 ));
                 break;
@@ -2473,7 +2477,7 @@ async fn execute_multi_sqlserver(
             let error = "SQL Server connection was reset while waiting for the query lock; please retry.".to_string();
             all_results.push(ExecuteMultiResult::execution_error_with_backend(
                 error_query_result(error.clone()),
-                Some(statement_index),
+                None,
                 crate::backend_error::BackendError::from_legacy_backend(&error),
             ));
             break;
@@ -2490,14 +2494,12 @@ async fn execute_multi_sqlserver(
         drop(client_guard);
 
         match result {
-            Ok(results) => all_results.extend(
-                results.into_iter().map(|result| ExecuteMultiResult::success_with_index(result, statement_index)),
-            ),
+            Ok(results) => all_results.extend(sqlserver_batch_results(results)),
             Err(e) => {
                 let action = pool_error_action(Some(DatabaseType::SqlServer), &e);
                 all_results.push(ExecuteMultiResult::execution_error_with_backend(
                     error_query_result(e.clone()),
-                    Some(statement_index),
+                    None,
                     crate::backend_error::BackendError::from_legacy_backend(&e),
                 ));
                 if matches!(action, PoolErrorAction::Discard | PoolErrorAction::ReconnectAndRetry) {
@@ -4966,6 +4968,15 @@ for line in sys.stdin:
         )
         .unwrap();
         assert!(redacted.get("error").and_then(|value| value.get("detail")).is_none());
+    }
+
+    #[test]
+    fn sqlserver_batch_results_do_not_claim_statement_indexes() {
+        assert_eq!(split_sql_batches("SELECT 1; SELECT 2;").len(), 1);
+
+        let results = sqlserver_batch_results(vec![empty_query_result(1), empty_query_result(2)]);
+
+        assert_eq!(results.iter().map(|result| result.statement_index).collect::<Vec<_>>(), vec![None, None]);
     }
 
     #[test]

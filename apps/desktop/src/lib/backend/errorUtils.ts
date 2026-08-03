@@ -9,14 +9,36 @@ export interface BackendError {
   code: string;
   messageKey: string;
   messageParams: Record<string, BackendErrorParam>;
-  source: "jdbcAgent" | "jdbcAgentLegacy" | "legacyBackend";
+  /** Compatibility provenance. New callers should prefer origin metadata. */
+  source: string;
   operationOutcome: "not_started" | "unknown";
+  origin?: {
+    subsystem: string;
+    adapter: string;
+    driver?: string;
+  };
   detail?: string;
   diagnostics?: Record<string, unknown>;
   helpUrl?: string;
 }
 
-const MAX_FALLBACK_CHARS = 512;
+const MAX_FALLBACK_CHARS = 64 * 1024;
+const AGENT_RPC_ERROR_DATA_MARKER = "\nDBX_AGENT_ERROR_DATA:";
+
+export function sanitizeBackendErrorMessage(message: string): string {
+  const markerIndex = message.lastIndexOf(AGENT_RPC_ERROR_DATA_MARKER);
+  if (markerIndex < 0) return message;
+
+  const rawData = message.slice(markerIndex + AGENT_RPC_ERROR_DATA_MARKER.length).trim();
+  try {
+    const data: unknown = JSON.parse(rawData);
+    if (!data || typeof data !== "object" || Array.isArray(data)) return message;
+  } catch {
+    return message;
+  }
+
+  return message.slice(0, markerIndex).trimEnd();
+}
 
 function isBackendError(value: unknown): value is BackendError {
   if (!value || typeof value !== "object") return false;
@@ -30,28 +52,41 @@ function isBackendError(value: unknown): value is BackendError {
     !candidate.messageParams ||
     typeof candidate.messageParams !== "object" ||
     Array.isArray(candidate.messageParams) ||
-    !["jdbcAgent", "jdbcAgentLegacy", "legacyBackend"].includes(String(candidate.source)) ||
+    typeof candidate.source !== "string" ||
+    candidate.source.length === 0 ||
+    candidate.source.length > 64 ||
     !["not_started", "unknown"].includes(String(candidate.operationOutcome))
   ) {
     return false;
+  }
+  if (candidate.origin !== undefined) {
+    const origin = candidate.origin;
+    const originRecord = origin as Record<string, unknown>;
+    if (
+      !origin ||
+      typeof origin !== "object" ||
+      Array.isArray(origin) ||
+      typeof originRecord.subsystem !== "string" ||
+      typeof originRecord.adapter !== "string" ||
+      originRecord.subsystem.length > 64 ||
+      originRecord.adapter.length > 64 ||
+      (originRecord.driver !== undefined && (typeof originRecord.driver !== "string" || originRecord.driver.length > 64))
+    ) {
+      return false;
+    }
   }
   if (candidate.detail !== undefined && typeof candidate.detail !== "string") return false;
   return Object.values(candidate.messageParams).every((param) => typeof param === "string" || typeof param === "boolean" || (typeof param === "number" && Number.isFinite(param)));
 }
 
 export function normalizeBackendError(error: unknown): BackendError | null {
-  if (error instanceof BackendErrorException) return error.backendError;
+  if (error && typeof error === "object" && "name" in error && error.name === "BackendErrorException" && "backendError" in error) {
+    const normalized = normalizeBackendError((error as { backendError: unknown }).backendError);
+    if (normalized) return normalized;
+  }
   if (typeof error === "string") {
     try {
       return normalizeBackendError(JSON.parse(error));
-    } catch {
-      return null;
-    }
-  }
-  if (error instanceof Error) {
-    try {
-      const parsed: unknown = JSON.parse(error.message);
-      return normalizeBackendError(parsed);
     } catch {
       return null;
     }
@@ -67,6 +102,15 @@ export function normalizeBackendError(error: unknown): BackendError | null {
     const normalized = normalizeBackendError(nested);
     if (normalized) return normalized;
   }
+  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
+    try {
+      const parsed: unknown = JSON.parse(error.message);
+      const normalized = normalizeBackendError(parsed);
+      if (normalized) return normalized;
+    } catch {
+      // Keep checking compatibility wrappers before falling back to plain text.
+    }
+  }
   return null;
 }
 
@@ -76,8 +120,8 @@ export class BackendErrorException extends Error {
   constructor(error: unknown) {
     const backendError = normalizeRawBackendError(error);
     const fallbackDetail = boundedFallbackText(error);
-    const fallbackMessage = fallbackDetail ?? "Backend request failed";
-    super(backendError?.detail || fallbackMessage);
+    const fallbackMessage = sanitizeBackendErrorMessage(fallbackDetail ?? "Backend request failed");
+    super(backendError?.detail ? sanitizeBackendErrorMessage(backendError.detail) : fallbackMessage);
     this.name = "BackendErrorException";
     this.backendError = backendError ?? {
       version: 1,
@@ -86,7 +130,8 @@ export class BackendErrorException extends Error {
       messageParams: {},
       source: "legacyBackend",
       operationOutcome: "unknown",
-      ...(fallbackDetail ? { detail: fallbackDetail } : {}),
+      origin: { subsystem: "backend", adapter: "legacy" },
+      ...(fallbackDetail ? { detail: sanitizeBackendErrorMessage(fallbackDetail) } : {}),
     };
   }
 }
@@ -132,15 +177,15 @@ function boundedFallbackText(error: unknown): string | undefined {
  */
 export function formatError(e: unknown): string {
   const backendError = normalizeBackendError(e);
-  if (backendError?.detail) return backendError.detail;
+  if (backendError?.detail) return sanitizeBackendErrorMessage(backendError.detail);
   if (backendError) return backendError.code;
 
   if (e instanceof Error) {
-    return e.message;
+    return sanitizeBackendErrorMessage(e.message);
   }
 
   if (typeof e === "string") {
-    return e;
+    return sanitizeBackendErrorMessage(e);
   }
 
   if (e === null || e === undefined) {
@@ -151,13 +196,13 @@ export function formatError(e: unknown): string {
   if (typeof e === "object" && "message" in e) {
     const message = (e as { message: unknown }).message;
     if (typeof message === "string") {
-      return message;
+      return sanitizeBackendErrorMessage(message);
     }
   }
 
   // Fallback: attempt to stringify
   try {
-    return String(e);
+    return sanitizeBackendErrorMessage(String(e));
   } catch {
     return "Unknown error occurred";
   }
