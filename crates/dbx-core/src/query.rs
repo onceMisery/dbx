@@ -5017,7 +5017,7 @@ for line in sys.stdin:
         );
         assert_eq!(
             backend_error.detail(),
-            Some("Query timed out after 1 seconds SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement.")
+            Some("Query timed out after 1 seconds\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement.")
         );
     }
 
@@ -5038,7 +5038,7 @@ for line in sys.stdin:
         assert_eq!(
             backend_error.detail(),
             Some(
-                "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
+                "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
             )
         );
     }
@@ -5059,7 +5059,7 @@ for line in sys.stdin:
         assert_eq!(
             backend_error.detail(),
             Some(
-                "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
+                "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
             )
         );
     }
@@ -5079,7 +5079,7 @@ for line in sys.stdin:
         assert_eq!(
             backend_error.detail(),
             Some(
-                "Statement 1 failed: ERROR: relation \"dbx_table_that_does_not_exist\" does not exist SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
+                "Statement 1 failed: ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
             )
         );
     }
