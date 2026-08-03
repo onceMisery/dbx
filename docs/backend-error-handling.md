@@ -146,14 +146,14 @@ pnpm typecheck
 pnpm vitest run apps/desktop/src/i18n/__tests__/backendErrors.spec.ts
 ```
 
-## Detail preservation update (2026-08-03)
+## 详情保留更新（2026-08-03）
 
-The public error contract is still `BackendError v1`. The following boundary rules are now enforced:
+公共错误契约仍然是 `BackendError v1`。当前已在以下边界落实统一规则：
 
-- Rust `safe_detail` is the only public redaction owner. It preserves safe vendor diagnostics even when they contain words such as `SELECT` or `UPDATE`, removes complete SQL payloads, masks credential-bearing URL/key-value fragments, removes Agent/session identifiers, normalizes whitespace, and keeps the 512-byte UTF-8 bound.
-- Axum `AppError`, query multi-result payloads, and Tauri query progress use the same structured `error` field. `execution_error` and legacy `Error` rows remain compatibility carriers; a real result column named `Error` is still data when `execution_error` is false.
-- Desktop HTTP failures, including multipart, SSE, upload, download, and Nacos special endpoints, must call `backendResponseError`. Direct `new Error(await response.text())` construction is forbidden because it discards the v1 envelope.
-- Tauri connection/transfer/import/export boundaries normalize rejections to `BackendErrorException`. Unknown objects are reduced to a bounded `message`, `reason`, or `detail` string when available; an empty or unsafe value keeps the stable summary without fabricating detail.
-- Frontend backend presentation passes the original caught object to `translateBackendError(t, error)`. It renders the localized catalog summary followed by safe detail. `formatError` may be used by legacy non-i18n surfaces, but it must never stringify a structured envelope as `[object Object]`.
+- Rust `safe_detail` 是对外详情脱敏的唯一 owner。即使厂商诊断包含 `SELECT`、`UPDATE` 等词，也会保留安全诊断；完整 SQL 内容会被移除，包含凭据的 URL/键值片段会被掩码，Agent/Session 标识会被移除，空白会被归一化，并保持 512 字节的 UTF-8 上限。
+- Axum `AppError`、查询多结果负载和 Tauri 查询进度事件使用同一个结构化 `error` 字段。`execution_error` 和旧版 `Error` 行继续作为兼容载体；当 `execution_error` 为 false 时，名为 `Error` 的真实结果列仍然是数据，不能当作失败信息。
+- Desktop HTTP 失败（包括 multipart、SSE、上传、下载和 Nacos 特殊接口）必须调用 `backendResponseError`。禁止直接构造 `new Error(await response.text())`，因为这会丢失 `BackendError v1` envelope。
+- Tauri 连接、传输、导入和导出边界统一将拒绝结果转换为 `BackendErrorException`。对于未知对象，在存在可用信息时提取有长度上限的 `message`、`reason` 或 `detail`；内容为空或不安全时只保留稳定摘要，不凭空编造详情。
+- 前端展示后端错误时，将原始捕获对象传给 `translateBackendError(t, error)`。展示内容为本地化错误摘要，后接安全 `detail`。旧版非 i18n 页面可以使用 `formatError`，但绝不能把结构化 envelope 直接转换成 `[object Object]`。
 
-Compatibility retirement gates are: no direct HTTP response-text throws; no pre-extraction of `.message`/`String(error)` before `translateBackendError` in migrated backend call sites; and no removal of legacy strings or error rows until all consumers accept `BackendError v1` and their wire tests pass. Live vendor databases not available in CI remain residual-risk coverage and must be recorded with the release evidence.
+兼容代码的退役门槛包括：不再存在直接读取 HTTP 响应文本并抛错的路径；迁移后的后端错误展示调用点不再在 `translateBackendError` 前预先提取 `.message`/`String(error)`；在所有消费者接受 `BackendError v1` 且线协议测试通过前，不移除旧字符串或旧版错误行。CI 无法接入的真实厂商数据库仍属于残余风险，必须在发布证据中明确记录。
