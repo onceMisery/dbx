@@ -105,6 +105,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_response_preserves_sql_keyword_diagnostic_detail() {
+        let response = AppError::internal("Incorrect syntax near SELECT").into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["code"], "DBX-LEGACY-0001");
+        assert_eq!(payload["detail"], "Incorrect syntax near SELECT");
+    }
+
+    #[tokio::test]
     async fn http_response_preserves_filtered_structured_agent_detail() {
         use dbx_core::db::agent_driver::{
             AgentCallError, AgentErrorCategory, AgentErrorContext, AgentErrorStage, AgentOperationOutcome,

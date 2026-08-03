@@ -16,6 +16,8 @@ export interface BackendError {
   helpUrl?: string;
 }
 
+const MAX_FALLBACK_CHARS = 512;
+
 function isBackendError(value: unknown): value is BackendError {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
@@ -39,14 +41,31 @@ function isBackendError(value: unknown): value is BackendError {
 
 export function normalizeBackendError(error: unknown): BackendError | null {
   if (error instanceof BackendErrorException) return error.backendError;
+  if (typeof error === "string") {
+    try {
+      return normalizeBackendError(JSON.parse(error));
+    } catch {
+      return null;
+    }
+  }
+  if (error instanceof Error) {
+    try {
+      const parsed: unknown = JSON.parse(error.message);
+      return normalizeBackendError(parsed);
+    } catch {
+      return null;
+    }
+  }
   if (isBackendError(error)) return error;
   if (error && typeof error === "object" && "backendError" in error) {
     const backendError = (error as { backendError: unknown }).backendError;
-    if (isBackendError(backendError)) return backendError;
+    const normalized = normalizeBackendError(backendError);
+    if (normalized) return normalized;
   }
   if (error && typeof error === "object" && "error" in error) {
     const nested = (error as { error: unknown }).error;
-    if (isBackendError(nested)) return nested;
+    const normalized = normalizeBackendError(nested);
+    if (normalized) return normalized;
   }
   return null;
 }
@@ -56,7 +75,8 @@ export class BackendErrorException extends Error {
 
   constructor(error: unknown) {
     const backendError = normalizeRawBackendError(error);
-    const fallbackMessage = typeof error === "string" ? error : error instanceof Error ? error.message : "Backend request failed";
+    const fallbackDetail = boundedFallbackText(error);
+    const fallbackMessage = fallbackDetail ?? "Backend request failed";
     super(backendError?.detail || fallbackMessage);
     this.name = "BackendErrorException";
     this.backendError = backendError ?? {
@@ -66,21 +86,34 @@ export class BackendErrorException extends Error {
       messageParams: {},
       source: "legacyBackend",
       operationOutcome: "unknown",
-      detail: fallbackMessage,
+      ...(fallbackDetail ? { detail: fallbackDetail } : {}),
     };
   }
 }
 
 function normalizeRawBackendError(error: unknown): BackendError | null {
-  if (typeof error === "string") {
-    try {
-      const parsed: unknown = JSON.parse(error);
-      return normalizeBackendError(parsed);
-    } catch {
-      return null;
-    }
-  }
   return normalizeBackendError(error);
+}
+
+function boundedFallbackText(error: unknown): string | undefined {
+  let text: string | undefined;
+  if (typeof error === "string") {
+    text = error;
+  } else if (error instanceof Error) {
+    text = error.message;
+  } else if (error && typeof error === "object") {
+    const candidate = error as Record<string, unknown>;
+    for (const key of ["message", "reason", "detail"]) {
+      if (typeof candidate[key] === "string") {
+        text = candidate[key];
+        break;
+      }
+    }
+    if (!text && "error" in candidate) text = boundedFallbackText(candidate.error);
+  }
+  const normalized = text?.trim();
+  if (!normalized) return undefined;
+  return Array.from(normalized).slice(0, MAX_FALLBACK_CHARS).join("");
 }
 
 /**
@@ -100,6 +133,7 @@ function normalizeRawBackendError(error: unknown): BackendError | null {
 export function formatError(e: unknown): string {
   const backendError = normalizeBackendError(e);
   if (backendError?.detail) return backendError.detail;
+  if (backendError) return backendError.code;
 
   if (e instanceof Error) {
     return e.message;

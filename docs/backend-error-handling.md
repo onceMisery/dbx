@@ -145,3 +145,15 @@ cargo check -j 1 -p dbx-web --no-default-features
 pnpm typecheck
 pnpm vitest run apps/desktop/src/i18n/__tests__/backendErrors.spec.ts
 ```
+
+## Detail preservation update (2026-08-03)
+
+The public error contract is still `BackendError v1`. The following boundary rules are now enforced:
+
+- Rust `safe_detail` is the only public redaction owner. It preserves safe vendor diagnostics even when they contain words such as `SELECT` or `UPDATE`, removes complete SQL payloads, masks credential-bearing URL/key-value fragments, removes Agent/session identifiers, normalizes whitespace, and keeps the 512-byte UTF-8 bound.
+- Axum `AppError`, query multi-result payloads, and Tauri query progress use the same structured `error` field. `execution_error` and legacy `Error` rows remain compatibility carriers; a real result column named `Error` is still data when `execution_error` is false.
+- Desktop HTTP failures, including multipart, SSE, upload, download, and Nacos special endpoints, must call `backendResponseError`. Direct `new Error(await response.text())` construction is forbidden because it discards the v1 envelope.
+- Tauri connection/transfer/import/export boundaries normalize rejections to `BackendErrorException`. Unknown objects are reduced to a bounded `message`, `reason`, or `detail` string when available; an empty or unsafe value keeps the stable summary without fabricating detail.
+- Frontend backend presentation passes the original caught object to `translateBackendError(t, error)`. It renders the localized catalog summary followed by safe detail. `formatError` may be used by legacy non-i18n surfaces, but it must never stringify a structured envelope as `[object Object]`.
+
+Compatibility retirement gates are: no direct HTTP response-text throws; no pre-extraction of `.message`/`String(error)` before `translateBackendError` in migrated backend call sites; and no removal of legacy strings or error rows until all consumers accept `BackendError v1` and their wire tests pass. Live vendor databases not available in CI remain residual-risk coverage and must be recorded with the release evidence.

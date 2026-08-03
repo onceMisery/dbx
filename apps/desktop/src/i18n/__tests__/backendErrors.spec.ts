@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it as test } from "vitest";
 import { createI18n } from "vue-i18n";
 import { translateBackendError, type BackendErrorTranslate } from "@/i18n/backend-errors";
-import { BackendErrorException, normalizeBackendError } from "@/lib/backend/errorUtils";
+import { BackendErrorException, formatError, normalizeBackendError } from "@/lib/backend/errorUtils";
 import en from "@/i18n/locales/en";
 import es from "@/i18n/locales/es";
 import it from "@/i18n/locales/it";
@@ -240,6 +240,40 @@ describe("backend error translation", () => {
     const error = new BackendErrorException("legacy backend failure");
     expect(error.backendError.code).toBe("DBX-LEGACY-0001");
     expect(translateBackendError(t, error)).toBe(`${t("backendErrors.legacy")}\n\nlegacy backend failure`);
+  });
+
+  test("preserves JSON envelopes carried by strings and Error messages", () => {
+    const envelope = {
+      version: 1,
+      code: "DBX-JDBC-4001",
+      messageKey: "backendErrors.jdbc.sqlFailed",
+      messageParams: { stage: "execute" },
+      source: "jdbcAgent",
+      operationOutcome: "unknown",
+      detail: "relation missing_table does not exist",
+    } as const;
+    expect(normalizeBackendError(JSON.stringify(envelope))).toEqual(envelope);
+    expect(normalizeBackendError(new Error(JSON.stringify(envelope)))).toEqual(envelope);
+  });
+
+  test("retains bounded diagnostics from unknown rejection objects", () => {
+    const error = new BackendErrorException({ reason: "database worker returned a vendor diagnostic" });
+    expect(error.backendError.code).toBe("DBX-LEGACY-0001");
+    expect(error.backendError.detail).toBe("database worker returned a vendor diagnostic");
+    expect(new BackendErrorException({ reason: "x".repeat(700) }).backendError.detail).toHaveLength(512);
+  });
+
+  test("does not stringify a structured envelope as [object Object]", () => {
+    expect(
+      formatError({
+        version: 1,
+        code: "DBX-JDBC-5001",
+        messageKey: "backendErrors.jdbc.protocolFailed",
+        messageParams: {},
+        source: "jdbcAgent",
+        operationOutcome: "unknown",
+      }),
+    ).toBe("DBX-JDBC-5001");
   });
 });
 

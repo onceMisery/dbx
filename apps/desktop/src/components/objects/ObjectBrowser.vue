@@ -2138,7 +2138,7 @@ async function confirmPasteTable() {
         await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, selectedSchema.value);
         toast(t("contextMenu.pasteTableCancelledAfterPartial"), 5000);
       } catch (e: any) {
-        toast(t("contextMenu.pasteTableRefreshFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
+        toast(t("contextMenu.pasteTableRefreshFailed", { message: translateBackendError(t, e) }), 5000);
       }
     }
     return;
