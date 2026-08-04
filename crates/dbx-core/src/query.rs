@@ -82,7 +82,7 @@ impl QueryExecutionError {
             Self::Agent(error) => Self::Agent(error),
             canceled @ Self::Canceled { .. } => canceled,
             Self::Timeout(error) => Self::Timeout(query_error_with_omitted_sql_context(&error, sql)),
-            Self::Sql(error) => Self::Sql(query_error_with_omitted_sql_context(&error, sql)),
+            Self::Sql(error) => Self::Sql(append_typed_sql_error_context(&error, sql)),
             Self::Legacy(error) => Self::Legacy(query_error_with_omitted_sql_context(&error, sql)),
         }
     }
@@ -137,6 +137,14 @@ impl From<&str> for QueryExecutionError {
 
 fn query_error_with_omitted_sql_context(error: &str, _sql: &str) -> String {
     crate::db::agent_driver::append_legacy_error_context(error, SQL_OMITTED_ERROR_CONTEXT)
+}
+
+fn append_typed_sql_error_context(error: &str, _sql: &str) -> String {
+    if error.contains(SQL_OMITTED_ERROR_CONTEXT) {
+        return error.to_string();
+    }
+    let separator = if error.trim_start().starts_with("Server error:") { " " } else { "\n" };
+    format!("{error}{separator}{SQL_OMITTED_ERROR_CONTEXT}")
 }
 
 /// A multi-statement result with metadata intended for query clients.
@@ -5441,6 +5449,18 @@ for line in sys.stdin:
 
         let repeated = query_error_with_omitted_sql_context(&error, sql);
         assert_eq!(repeated.matches(SQL_OMITTED_ERROR_CONTEXT).count(), 1);
+    }
+
+    #[test]
+    fn typed_sql_error_context_keeps_driver_text_on_one_line() {
+        let error = QueryExecutionError::Sql("Server error: `ERROR 1064 (42000): syntax error`".to_string())
+            .with_omitted_sql_context("SELECT * FROM users")
+            .into_backend_error();
+
+        assert_eq!(
+            error.detail(),
+            Some("Server error: `ERROR 1064 (42000): syntax error` SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement.")
+        );
     }
 
     #[test]
