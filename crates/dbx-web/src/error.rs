@@ -148,6 +148,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_response_preserves_duckdb_native_detail_and_worker_code() {
+        let error = BackendError::from_duckdb_worker_error(
+            "duckdb_execute_failed",
+            "Catalog Error: Table missing_table does not exist",
+        );
+
+        let response = AppError::from(error).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["detail"], "Catalog Error: Table missing_table does not exist");
+        assert_eq!(payload["origin"]["driver"], "duckdb");
+        assert_eq!(payload["diagnostics"]["adapterCode"], "duckdb_execute_failed");
+    }
+
+    #[tokio::test]
     async fn http_response_redacts_sensitive_detail_before_serialization() {
         let error = BackendError::from_sql_detail(
             "ERROR: connection failed for jdbc:postgresql://db.example/app?user=alice&password=secret; session_id=session-42; statement [SELECT email FROM customers WHERE ssn='123']",

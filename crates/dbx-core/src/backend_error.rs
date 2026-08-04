@@ -52,15 +52,21 @@ pub enum BackendErrorAdapter {
 pub struct BackendErrorOrigin {
     subsystem: BackendSubsystem,
     adapter: BackendErrorAdapter,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    driver: Option<&'static str>,
 }
 
 impl BackendErrorOrigin {
     const fn database(adapter: BackendErrorAdapter) -> Self {
-        Self { subsystem: BackendSubsystem::Database, adapter }
+        Self { subsystem: BackendSubsystem::Database, adapter, driver: None }
+    }
+
+    const fn database_driver(adapter: BackendErrorAdapter, driver: &'static str) -> Self {
+        Self { subsystem: BackendSubsystem::Database, adapter, driver: Some(driver) }
     }
 
     const fn backend() -> Self {
-        Self { subsystem: BackendSubsystem::Backend, adapter: BackendErrorAdapter::Legacy }
+        Self { subsystem: BackendSubsystem::Backend, adapter: BackendErrorAdapter::Legacy, driver: None }
     }
 }
 
@@ -95,6 +101,8 @@ pub struct BackendErrorDiagnostics {
     vendor_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exception_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter_code: Option<String>,
 }
 
 /// Public v1 backend error envelope.
@@ -227,6 +235,24 @@ impl BackendError {
             stage_param(entry, AgentErrorStage::Execute),
             bounded_detail(message),
             Some(diagnostics_for_local("sql", AgentErrorStage::Execute)),
+        )
+    }
+
+    /// Adapt a DuckDB worker error while retaining both the native detail and
+    /// the worker protocol code for diagnostics at the public boundary.
+    pub fn from_duckdb_worker_error(code: &str, message: &str) -> Self {
+        let is_sql_error = matches!(code, "duckdb_execute_failed" | "duckdb_worker_poisoned");
+        let entry = catalog_entry(if is_sql_error { CatalogCode::SqlFailed } else { CatalogCode::LegacyBackend });
+        let source = if is_sql_error { BackendErrorSource::JdbcAgent } else { BackendErrorSource::LegacyBackend };
+        let category = if is_sql_error { "sql" } else { "backend" };
+        Self::new(
+            entry,
+            source,
+            BackendErrorOrigin::database_driver(BackendErrorAdapter::Native, "duckdb"),
+            BackendOperationOutcome::Unknown,
+            stage_param(entry, AgentErrorStage::Execute),
+            bounded_detail(message),
+            Some(diagnostics_for_local_with_adapter_code(category, AgentErrorStage::Execute, code)),
         )
     }
 
@@ -567,13 +593,23 @@ fn diagnostics_from_context(context: &AgentErrorContext) -> BackendErrorDiagnost
         sql_state: context.sql_state.as_deref().map(|value| bounded_ascii(value, 32)),
         vendor_code: context.vendor_code,
         exception_class: context.exception_class.as_deref().map(|value| bounded_ascii(value, 128)),
+        ..Default::default()
     }
 }
 
 fn diagnostics_for_local(category: &str, stage: AgentErrorStage) -> BackendErrorDiagnostics {
+    diagnostics_for_local_with_adapter_code(category, stage, "")
+}
+
+fn diagnostics_for_local_with_adapter_code(
+    category: &str,
+    stage: AgentErrorStage,
+    adapter_code: &str,
+) -> BackendErrorDiagnostics {
     BackendErrorDiagnostics {
         category: Some(category.to_string()),
         stage: Some(stage_name(stage).to_string()),
+        adapter_code: (!adapter_code.is_empty()).then(|| bounded_ascii(adapter_code, 64)),
         ..Default::default()
     }
 }
@@ -1009,6 +1045,22 @@ mod tests {
         assert_eq!(payload["source"], "jdbcAgent");
         assert_eq!(payload["origin"]["subsystem"], "database");
         assert_eq!(payload["origin"]["adapter"], "native");
+    }
+
+    #[test]
+    fn duckdb_worker_sql_error_preserves_worker_code_detail_and_driver_origin() {
+        let payload = serde_json::to_value(BackendError::from_duckdb_worker_error(
+            "duckdb_execute_failed",
+            "Parser Error: syntax error at or near SELECT",
+        ))
+        .unwrap();
+
+        assert_eq!(payload["code"], "DBX-JDBC-4001");
+        assert_eq!(payload["detail"], "Parser Error: syntax error at or near SELECT");
+        assert_eq!(payload["origin"]["subsystem"], "database");
+        assert_eq!(payload["origin"]["adapter"], "native");
+        assert_eq!(payload["origin"]["driver"], "duckdb");
+        assert_eq!(payload["diagnostics"]["adapterCode"], "duckdb_execute_failed");
     }
 
     #[test]

@@ -230,6 +230,23 @@ describe("backend error translation", () => {
     expect(translateBackendError(t, error)).toBe(`${t(error.messageKey)}\n\n${error.detail}`);
   });
 
+  test("shows a native adapter code with the DuckDB detail", () => {
+    const t = translatorFor("en");
+    const error = {
+      version: 1,
+      code: "DBX-JDBC-4001",
+      messageKey: "backendErrors.jdbc.sqlFailed",
+      messageParams: { stage: "execute" },
+      source: "jdbcAgent",
+      operationOutcome: "unknown",
+      origin: { subsystem: "database", adapter: "native", driver: "duckdb" },
+      diagnostics: { category: "sql", stage: "execute", adapterCode: "duckdb_execute_failed" },
+      detail: "Catalog Error: Table missing_table does not exist",
+    } as const;
+
+    expect(translateBackendError(t, error)).toBe(`${t(error.messageKey, error.messageParams)}\n\n[duckdb_execute_failed] ${error.detail}`);
+  });
+
   test("hides internal Agent error data from structured error details", () => {
     const t = translatorFor("zh-CN");
     const detail = 'driver: bad connection\nDBX_AGENT_ERROR_DATA:{"category":null,"agentSessionId":"session-1"}';

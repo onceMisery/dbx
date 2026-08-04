@@ -48,6 +48,7 @@ pub enum PoolErrorAction {
 #[derive(Debug, Clone)]
 pub enum QueryExecutionError {
     Agent(AgentCallError),
+    DuckDb { code: String, message: String },
     Canceled { stage: AgentErrorStage, operation_outcome: AgentOperationOutcome },
     Timeout(String),
     Sql(String),
@@ -58,6 +59,7 @@ impl QueryExecutionError {
     pub fn into_legacy_string(self) -> String {
         match self {
             Self::Agent(error) => error.into_legacy_string(),
+            Self::DuckDb { message, .. } => message,
             Self::Canceled { .. } => canceled_error(),
             Self::Timeout(error) => error,
             Self::Sql(error) => error,
@@ -68,6 +70,9 @@ impl QueryExecutionError {
     pub fn into_backend_error(self) -> crate::backend_error::BackendError {
         match self {
             Self::Agent(error) => crate::backend_error::BackendError::from_agent_call_error(&error),
+            Self::DuckDb { code, message } => {
+                crate::backend_error::BackendError::from_duckdb_worker_error(&code, &message)
+            }
             Self::Canceled { stage, operation_outcome } => {
                 crate::backend_error::BackendError::from_canceled(stage, operation_outcome)
             }
@@ -80,6 +85,9 @@ impl QueryExecutionError {
     fn with_omitted_sql_context(self, sql: &str) -> Self {
         match self {
             Self::Agent(error) => Self::Agent(error),
+            Self::DuckDb { code, message } => {
+                Self::DuckDb { code, message: query_error_with_omitted_sql_context(&message, sql) }
+            }
             canceled @ Self::Canceled { .. } => canceled,
             Self::Timeout(error) => Self::Timeout(query_error_with_omitted_sql_context(&error, sql)),
             Self::Sql(error) => Self::Sql(append_typed_sql_error_context(&error, sql)),
@@ -90,6 +98,7 @@ impl QueryExecutionError {
     fn with_context(self, context: &str) -> Self {
         match self {
             Self::Agent(error) => Self::Agent(error),
+            Self::DuckDb { code, message } => Self::DuckDb { code, message: format!("{message}; {context}") },
             canceled @ Self::Canceled { .. } => canceled,
             Self::Timeout(error) => Self::Timeout(format!("{error}; {context}")),
             Self::Sql(error) => Self::Sql(format!("{error}; {context}")),
@@ -100,7 +109,7 @@ impl QueryExecutionError {
     fn as_agent_error(&self) -> Option<&AgentCallError> {
         match self {
             Self::Agent(error) => Some(error),
-            Self::Canceled { .. } | Self::Timeout(_) | Self::Sql(_) | Self::Legacy(_) => None,
+            Self::DuckDb { .. } | Self::Canceled { .. } | Self::Timeout(_) | Self::Sql(_) | Self::Legacy(_) => None,
         }
     }
 }
@@ -109,6 +118,7 @@ impl std::fmt::Display for QueryExecutionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Agent(error) => error.fmt(formatter),
+            Self::DuckDb { message, .. } => formatter.write_str(message),
             Self::Canceled { .. } => formatter.write_str(QUERY_CANCELED),
             Self::Timeout(error) => formatter.write_str(error),
             Self::Sql(error) => formatter.write_str(error),
@@ -887,6 +897,7 @@ fn query_execution_error_action(
     }
     match error {
         QueryExecutionError::Canceled { .. } => PoolErrorAction::Keep,
+        QueryExecutionError::DuckDb { message, .. } => query_pool_error_action(db_type, sql, message),
         QueryExecutionError::Timeout(message)
         | QueryExecutionError::Sql(message)
         | QueryExecutionError::Legacy(message) => query_pool_error_action(db_type, sql, message),
@@ -1239,6 +1250,8 @@ async fn do_execute_typed(
     let pool = connections.get(pool_key).ok_or("Connection not found")?;
 
     let mut typed_agent_error = None;
+    #[cfg(feature = "duckdb-sidecar")]
+    let mut typed_duckdb_error = None;
     let result: Result<db::QueryResult, String> = match pool {
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
@@ -1258,7 +1271,17 @@ async fn do_execute_typed(
             let database = database.map(str::to_string);
             let max_rows = options.max_rows;
             drop(connections);
-            client.execute(database, sql, max_rows, cancel_token, query_timeout).await
+            match client.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    let is_control_error = error.message == QUERY_CANCELED
+                        || is_dbx_query_timeout_error(&error.message.to_ascii_lowercase());
+                    if !is_control_error {
+                        typed_duckdb_error = Some(error.clone());
+                    }
+                    Err(error.message)
+                }
+            }
         }
         #[cfg(not(feature = "duckdb-sidecar"))]
         PoolKind::DuckDbWorker(_) => {
@@ -1610,6 +1633,10 @@ async fn do_execute_typed(
     result
         .map(normalize_query_result_for_js)
         .map_err(|error| {
+            #[cfg(feature = "duckdb-sidecar")]
+            if let Some(duckdb_error) = typed_duckdb_error {
+                return QueryExecutionError::DuckDb { code: duckdb_error.code, message: duckdb_error.message };
+            }
             typed_agent_error.map_or_else(|| QueryExecutionError::Legacy(error), QueryExecutionError::Agent)
         })
         .map_err(|error| classify_query_error(pool_db_type, error))
@@ -5007,6 +5034,18 @@ for line in sys.stdin:
         });
 
         assert_eq!(error.into_backend_error().code(), "DBX-JDBC-1002");
+    }
+
+    #[test]
+    fn duckdb_worker_error_preserves_catalog_identity_and_detail() {
+        let error = QueryExecutionError::DuckDb {
+            code: "duckdb_execute_failed".to_string(),
+            message: "Catalog Error: Table missing_table does not exist".to_string(),
+        };
+        let backend_error = error.into_backend_error();
+
+        assert_eq!(backend_error.code(), "DBX-JDBC-4001");
+        assert_eq!(backend_error.detail(), Some("Catalog Error: Table missing_table does not exist"));
     }
 
     #[test]

@@ -59,6 +59,7 @@ Rust `BackendError` 的字段由 catalog 构造，字段定义如下（JSON 使�
 - `code` 和 `messageKey` 发布后永久保留，不能复用或改义；废弃错误码只能停止新增使用，不能重新分配给其他含义。
 - `source` 是 v1 兼容字段，表示旧的错误来源；新代码使用 `origin.subsystem` 和 `origin.adapter` 描述数据库、隧道、插件、AI、消息队列等子系统。客户端不能因为未知的 source/origin 值而丢弃整个 envelope。
 - `origin` 是可扩展元数据，至少包含 `subsystem` 和 `adapter`，可选 `driver`；它不参与错误分类、恢复或重试决策。
+- `diagnostics.adapterCode` 是适配器协议提供的可选错误码（例如 DuckDB worker 的 `duckdb_execute_failed`），仅用于诊断展示，不替代稳定的 DBX `code`。
 - `operationOutcome` 只能是 `not_started` 或 `unknown`。结果未知时不能自动重放用户操作。
 - `messageParams` 只能包含 catalog 声明的 string、number、boolean 标量，不得携带 SQL、URL、凭据或任意对象。
 - Rust 字段保持私有，新增错误必须通过 catalog 构造，避免 code、key 和参数声明漂移。
@@ -98,6 +99,7 @@ Rust `BackendError` 的字段由 catalog 构造，字段定义如下（JSON 使�
 - `AgentErrorContext` 中的 `agentSessionId`、重试标记和内部恢复字段不会作为结构化字段进入公共 envelope；如果驱动错误正文包含 Session 或凭据文本，公共 detail 仍会脱敏。
 - Rust 查询执行器生成的查询超时会使用 `DBX-JDBC-2002`（阶段 `execute`）摘要，同时保留超时诊断 detail；它不会作为 `DBX-LEGACY-0001` 展示。
 - PostgreSQL native driver 返回的标准服务端 `ERROR:` 诊断会使用 `DBX-JDBC-4001`（阶段 `execute`）摘要并保留公共安全 detail；连接、超时、取消和清理错误不使用该分类。
+- DuckDB worker 返回的 `Parser Error`、`Catalog Error` 等厂商正文会保留在 `detail`；worker code 会放入 `diagnostics.adapterCode`，并在前端详情前显示。
 - 超时和取消没有服务端 detail 时只返回摘要；`without_detail()` 只有在调用方明确要求隐藏 detail 时才会移除原文。
 
 ## 传输边界
