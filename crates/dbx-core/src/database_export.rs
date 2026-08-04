@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::sync::RwLock;
 
 use crate::connection::task_client_session_id;
@@ -12,8 +12,7 @@ use crate::sql_dialect::{qualified_table_name, quote_table_identifier, uses_sing
 use crate::transfer::{
     format_ch_array_sql_literal, format_pg_array_sql_literal, is_identity_column_extra,
     is_mysql_generated_column_extra, keyset_pagination_sql_with_identifier_quote, quote_identifier,
-    quote_postgres_string_literal, selected_columns_include_identity_extras, wrap_dameng_identity_insert_sql,
-    wrap_dameng_identity_insert_sql_for_table,
+    quote_postgres_string_literal, wrap_dameng_identity_insert_sql_for_table,
 };
 use crate::types::ObjectSourceKind;
 
@@ -1369,7 +1368,7 @@ fn database_export_metadata_prefetch_concurrency(db_type: DatabaseType) -> usize
     }
 }
 
-fn record_export_error(file: &mut std::fs::File, fail_on_error: bool, message: String) -> Result<(), String> {
+fn record_export_error<W: Write>(file: &mut W, fail_on_error: bool, message: String) -> Result<(), String> {
     if fail_on_error {
         Err(message)
     } else {
@@ -1383,8 +1382,8 @@ fn database_export_select_sql(columns: &[String], table: &str, schema: &str, db_
     format!("SELECT {columns} FROM {table}")
 }
 
-fn write_database_export_rows(
-    file: &mut std::fs::File,
+fn write_database_export_rows<W: Write>(
+    file: &mut W,
     rows: &[Vec<Value>],
     columns: &[String],
     column_types: &[Option<String>],
@@ -1434,28 +1433,21 @@ fn write_database_export_rows(
             filtered_rows.as_slice(),
         )
     };
-    let mut insert_sql = crate::transfer::generate_insert_typed(
-        insert_columns,
-        insert_column_types,
-        insert_rows,
-        table,
-        schema,
-        db_type,
-        None,
-    );
-    if *db_type == DatabaseType::Dameng
-        && selected_columns_include_identity_extras(insert_columns, insert_column_extras)
-    {
-        insert_sql = wrap_dameng_identity_insert_sql(&insert_sql, table, schema);
+    let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+        database_type: Some(*db_type),
+        schema: (!schema.is_empty()).then(|| schema.to_string()),
+        table_name: Some(table.to_string()),
+        qualified_table_name: None,
+        columns: insert_columns.to_vec(),
+        column_types: insert_column_types.to_vec(),
+        column_extras: insert_column_extras.to_vec(),
+        rows: insert_rows.to_vec(),
+        batch_size: Some(DATABASE_EXPORT_INSERT_BATCH_SIZE),
+    })?;
+    for statement in statements {
+        writeln!(file, "{statement}\n").map_err(|error| format!("Failed to write file: {error}"))?;
     }
-    if insert_sql.is_empty() {
-        return Ok(());
-    }
-    if insert_sql.trim_end().ends_with(';') {
-        writeln!(file, "{}\n", insert_sql).map_err(|error| format!("Failed to write file: {error}"))
-    } else {
-        writeln!(file, "{};\n", insert_sql).map_err(|error| format!("Failed to write file: {error}"))
-    }
+    Ok(())
 }
 
 fn emit_database_export_running(
@@ -1517,7 +1509,8 @@ pub async fn export_database_sql_core(
     )
     .await?;
     // 4. Create file
-    let mut file = std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to write file: {e}"))?;
+    let file = std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to write file: {e}"))?;
+    let mut file = BufWriter::new(file);
 
     let create_database_preamble = if request.include_create_database && matches!(db_type, DatabaseType::Mysql) {
         Some(mysql_database_export_preamble_for_request(state, request).await)
@@ -2293,6 +2286,8 @@ pub async fn export_database_sql_core(
     if matches!(db_type, DatabaseType::Mysql) {
         writeln!(file, "SET FOREIGN_KEY_CHECKS = 1;").map_err(|e| format!("Failed to write file: {e}"))?;
     }
+
+    file.flush().map_err(|e| format!("Failed to finalize export file: {e}"))?;
 
     // Emit Done progress
     on_progress(ExportProgress {
@@ -3310,7 +3305,7 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
-            "INSERT INTO `orders` (`id`, `quantity`, `created_at`) VALUES\n(7, 2, '2026-07-30 08:00:00');\n\n"
+            "INSERT INTO `orders` (`id`, `quantity`, `created_at`) VALUES (7, 2, '2026-07-30 08:00:00');\n\n"
         );
     }
 
