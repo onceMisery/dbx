@@ -5519,6 +5519,8 @@ const exportProgressState = ref({
   status: "",
   errorMessage: null as string | null,
   filePath: null as string | null,
+  startedAt: undefined as number | undefined,
+  finishedAt: undefined as number | undefined,
 });
 const exportCancelHandler = ref<(() => Promise<void>) | null>(null);
 const exportCanMinimize = ref(false);
