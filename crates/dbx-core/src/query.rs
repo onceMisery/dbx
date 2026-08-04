@@ -5044,6 +5044,30 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn mysql_server_error_preserves_sql_catalog_identity_and_detail() {
+        let error = classify_query_error(
+            Some(DatabaseType::Mysql),
+            QueryExecutionError::Sql(
+                "Server error: `ERROR 1064 (42000): You have an error in your SQL syntax`".to_string(),
+            ),
+        )
+        .with_omitted_sql_context("SELECT * FROM dbx_table_that_does_not_exist");
+        let backend_error = error.into_backend_error();
+
+        assert_eq!(backend_error.code(), "DBX-JDBC-4001");
+        assert_eq!(
+            backend_error.message_params().get("stage"),
+            Some(&crate::backend_error::BackendMessageParam::String("execute".to_string()))
+        );
+        assert_eq!(
+            backend_error.detail(),
+            Some(
+                "Server error: `ERROR 1064 (42000): You have an error in your SQL syntax`\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
+            )
+        );
+    }
+
+    #[test]
     fn single_statement_multi_result_preserves_sql_error_type() {
         let error = classify_query_error(
             Some(DatabaseType::Postgres),
