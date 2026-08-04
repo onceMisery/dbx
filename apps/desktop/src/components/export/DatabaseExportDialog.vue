@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogHeader, DialogTitle, DialogFooter, DialogContent } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -18,7 +18,7 @@ import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useToast } from "@/composables/useToast";
 import { Input } from "@/components/ui/input";
 import { Download, Square, CheckSquare, Search, X, Loader2 } from "@lucide/vue";
-import { useExportTracker } from "@/composables/useExportTracker";
+import { formatDataTransferDuration, useExportTracker } from "@/composables/useExportTracker";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -73,6 +73,9 @@ const exportId = ref("");
 const exportDone = ref(false);
 const exportError = ref<string | null>(null);
 const exportCancelled = ref(false);
+const exportStartedAt = ref<number | null>(null);
+const exportFinishedAt = ref<number | null>(null);
+const currentTime = ref(Date.now());
 const pendingPrefillTable = ref("");
 const pendingPrefillTables = ref<string[]>([]);
 const exportAllDatabases = ref(false);
@@ -80,6 +83,25 @@ const batchDatabaseIndex = ref(0);
 const batchDatabaseTotal = ref(0);
 const batchRowsExported = ref(0);
 const activeDatabaseExportId = ref("");
+
+let elapsedTimer: ReturnType<typeof setInterval> | undefined;
+onMounted(() => {
+  elapsedTimer = setInterval(() => {
+    currentTime.value = Date.now();
+  }, 1000);
+});
+onBeforeUnmount(() => {
+  if (elapsedTimer) clearInterval(elapsedTimer);
+});
+
+function finishExportTiming() {
+  exportFinishedAt.value ??= Date.now();
+}
+
+const exportElapsedText = computed(() => {
+  if (exportStartedAt.value === null) return "";
+  return formatDataTransferDuration((exportFinishedAt.value ?? currentTime.value) - exportStartedAt.value);
+});
 
 const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "mq", "nacos"].includes(c.db_type)));
 
@@ -257,6 +279,8 @@ async function startExport() {
   // Switch to the progress view only after the save dialog closes, and seed a
   // preparing state so the dialog is never a blank panel while metadata loads.
   isExporting.value = true;
+  exportStartedAt.value = Date.now();
+  exportFinishedAt.value = null;
   exportDone.value = false;
   exportError.value = null;
   exportCancelled.value = false;
@@ -297,13 +321,16 @@ async function startExport() {
       exportProgress.value = { ...progress };
       updateDatabaseExportTask(progress.exportId, progress);
       if (progress.status === "Done") {
+        finishExportTiming();
         exportDone.value = true;
         isExporting.value = false;
         toast(t("databaseExport.exportSuccess"), 3000);
       } else if (progress.status === "Error") {
+        finishExportTiming();
         exportError.value = progress.error;
         isExporting.value = false;
       } else if (progress.status === "Cancelled") {
+        finishExportTiming();
         exportCancelled.value = true;
         isExporting.value = false;
       }
@@ -322,6 +349,7 @@ async function startExport() {
       error: exportError.value,
     };
     updateDatabaseExportTask(exportId.value, fallbackProgress);
+    finishExportTiming();
     isExporting.value = false;
   }
 }
@@ -347,6 +375,8 @@ async function startAllDatabasesExport() {
   }
 
   isExporting.value = true;
+  exportStartedAt.value = Date.now();
+  exportFinishedAt.value = null;
   exportDone.value = false;
   exportError.value = null;
   exportCancelled.value = false;
@@ -429,9 +459,11 @@ async function startAllDatabasesExport() {
           rowsExported: batchRowsExported.value,
         });
         if (progress.status === "Error") {
+          finishExportTiming();
           exportError.value = progress.error;
           isExporting.value = false;
         } else if (progress.status === "Cancelled") {
+          finishExportTiming();
           exportCancelled.value = true;
           isExporting.value = false;
         }
@@ -443,6 +475,7 @@ async function startAllDatabasesExport() {
 
     if (!exportError.value && !exportCancelled.value) {
       exportDone.value = true;
+      finishExportTiming();
       isExporting.value = false;
       const finalProgress: api.ExportProgress = {
         exportId: batchId,
@@ -470,6 +503,7 @@ async function startAllDatabasesExport() {
       status: "Error",
       error: exportError.value,
     });
+    finishExportTiming();
     isExporting.value = false;
   }
 }
@@ -478,6 +512,7 @@ async function cancelExport() {
   if (exportId.value) {
     if (exportAllDatabases.value) {
       exportCancelled.value = true;
+      finishExportTiming();
       isExporting.value = false;
       if (activeDatabaseExportId.value) {
         await api.cancelDatabaseExport(activeDatabaseExportId.value);
@@ -513,6 +548,8 @@ function resetState() {
   exportDone.value = false;
   exportError.value = null;
   exportCancelled.value = false;
+  exportStartedAt.value = null;
+  exportFinishedAt.value = null;
   exportId.value = "";
   batchDatabaseIndex.value = 0;
   batchDatabaseTotal.value = 0;
@@ -805,6 +842,9 @@ watch(
 
             <div v-if="exportProgress && !isPreparingExport" class="text-xs text-muted-foreground">
               {{ exportAllDatabases ? t("databaseExport.allRowsExported", { count: exportProgress.rowsExported.toLocaleString() }) : t("databaseExport.rowsExported", { current: exportProgress.objectIndex, total: exportProgress.totalObjects, count: exportProgress.rowsExported.toLocaleString() }) }}
+            </div>
+            <div v-if="exportElapsedText" class="text-xs text-muted-foreground tabular-nums">
+              {{ t("exportProgress.elapsed", { duration: exportElapsedText }) }}
             </div>
           </div>
 
