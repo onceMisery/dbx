@@ -271,6 +271,7 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
         format,
         columns: queryColumns,
         batchSize: settingsStore.editorSettings.exportBatchSize,
+        skipCount: format === "sql",
         rowLimit,
       };
 

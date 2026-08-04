@@ -1884,6 +1884,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "
       columns,
       columnComments: format === "xlsx" ? columnComments : undefined,
       batchSize: settingsStore.editorSettings.exportBatchSize,
+      skipCount: format === "sql",
       rowLimit,
     };
 

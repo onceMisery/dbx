@@ -231,6 +231,7 @@ pub enum ExportStatus {
 pub const DATABASE_EXPORT_ROW_LIMIT: usize = 10_000;
 pub const DATABASE_EXPORT_PAGE_SIZE: usize = 500;
 pub const DATABASE_EXPORT_INSERT_BATCH_SIZE: usize = 100;
+pub const DATABASE_EXPORT_TARGET_STATEMENT_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PostgresExportSequence {
@@ -859,7 +860,12 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
     let batch_size = if options.database_type.is_some_and(uses_single_row_insert_statements) {
         1
     } else {
-        options.batch_size.unwrap_or(DATABASE_EXPORT_INSERT_BATCH_SIZE).max(1)
+        let requested = options.batch_size.unwrap_or(DATABASE_EXPORT_INSERT_BATCH_SIZE).max(1);
+        if options.database_type == Some(DatabaseType::SqlServer) {
+            requested.min(1000)
+        } else {
+            requested
+        }
     };
     let columns = insert_columns
         .iter()
@@ -872,35 +878,67 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
             is_identity_column_extra(options.column_extras.get(*index).and_then(|value| value.as_deref()))
         });
 
-    for rows in options.rows.chunks(batch_size) {
-        let values = rows
-            .iter()
-            .map(|row| {
-                let values = insert_columns
-                    .iter()
-                    .map(|(index, _)| {
-                        let value = row.get(*index).unwrap_or(&Value::Null);
-                        format_export_sql_literal_typed(
-                            value,
-                            options.database_type,
-                            options.column_types.get(*index).and_then(|value| value.as_deref()),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("({values})")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let insert_sql = format!("INSERT INTO {table} ({columns}) VALUES {values};");
+    let statement_prefix = format!("INSERT INTO {table} ({columns}) VALUES ");
+    let statement_overhead_bytes = export_sql_statement_bytes(options.database_type, &statement_prefix) + 1;
+    let target_statement_bytes = DATABASE_EXPORT_TARGET_STATEMENT_BYTES;
+    let separator_bytes = export_sql_statement_bytes(options.database_type, ", ");
+    let mut current_values = Vec::with_capacity(batch_size);
+    let mut current_values_bytes = 0usize;
+
+    let flush_values = |statements: &mut Vec<String>, values: &mut Vec<String>, values_bytes: &mut usize| {
+        if values.is_empty() {
+            return;
+        }
+        let insert_sql = format!("{statement_prefix}{};", values.join(", "));
         if needs_dameng_identity_insert {
             statements.push(wrap_dameng_identity_insert_sql_for_table(&insert_sql, &table));
         } else {
             statements.push(insert_sql);
         }
+        values.clear();
+        *values_bytes = 0;
+    };
+
+    for row in options.rows {
+        let row_values = insert_columns
+            .iter()
+            .map(|(index, _)| {
+                let value = row.get(*index).unwrap_or(&Value::Null);
+                format_export_sql_literal_typed(
+                    value,
+                    options.database_type,
+                    options.column_types.get(*index).and_then(|value| value.as_deref()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rendered_row = format!("({row_values})");
+        let rendered_row_bytes = export_sql_statement_bytes(options.database_type, &rendered_row);
+        let candidate_bytes = statement_overhead_bytes
+            + current_values_bytes
+            + if current_values.is_empty() { 0 } else { separator_bytes }
+            + rendered_row_bytes;
+
+        if !current_values.is_empty()
+            && (current_values.len() >= batch_size || candidate_bytes > target_statement_bytes)
+        {
+            flush_values(&mut statements, &mut current_values, &mut current_values_bytes);
+        }
+        current_values_bytes += if current_values.is_empty() { 0 } else { separator_bytes };
+        current_values_bytes += rendered_row_bytes;
+        current_values.push(rendered_row);
     }
+    flush_values(&mut statements, &mut current_values, &mut current_values_bytes);
 
     Ok(statements)
+}
+
+fn export_sql_statement_bytes(database_type: Option<DatabaseType>, text: &str) -> usize {
+    if database_type == Some(DatabaseType::SqlServer) {
+        text.encode_utf16().count() * 2
+    } else {
+        text.len()
+    }
 }
 
 pub(crate) fn is_internal_export_column(database_type: Option<DatabaseType>, column: &str) -> bool {
@@ -2668,6 +2706,46 @@ mod tests {
             statements,
             vec!["INSERT INTO `notes` (`body`) VALUES ('line1\\nline2\\tcol\\rend\\\\slash\\0\\ZO''Hara');"]
         );
+    }
+
+    #[test]
+    fn export_insert_batches_split_on_statement_bytes() {
+        let long_value = "x".repeat(300_000);
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: Some("payloads".to_string()),
+            qualified_table_name: None,
+            columns: vec!["payload".to_string()],
+            column_types: vec![Some("longtext".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!(long_value.clone())], vec![json!(long_value)]],
+            batch_size: Some(100),
+        })
+        .unwrap();
+
+        assert_eq!(statements.len(), 2);
+        assert!(statements.iter().all(|statement| statement.matches("INSERT INTO").count() == 1));
+    }
+
+    #[test]
+    fn sqlserver_export_caps_multi_row_insert_at_1000_rows() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::SqlServer),
+            schema: Some("dbo".to_string()),
+            table_name: Some("items".to_string()),
+            qualified_table_name: None,
+            columns: vec!["id".to_string()],
+            column_types: vec![Some("int".to_string())],
+            column_extras: Vec::new(),
+            rows: (0..1001).map(|id| vec![json!(id)]).collect(),
+            batch_size: Some(2000),
+        })
+        .unwrap();
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0].matches("), (").count(), 999);
+        assert_eq!(statements[1].matches("), (").count(), 0);
     }
 
     #[test]
