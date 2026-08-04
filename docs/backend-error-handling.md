@@ -104,11 +104,13 @@ Rust `BackendError` 的字段由 catalog 构造，字段定义如下（JSON 使�
 
 ### Tauri Desktop
 
-查询命令将 `QueryExecutionError` 映射为 `BackendError`。单语句和事务查询即使通过 `execute_multi` 命令执行，`dbx-core` 也会在整个 multi-query 核心链路中保留 `QueryExecutionError`，直到 Tauri 边界才转换为 `BackendError`；不得先降级为字符串再重建 envelope。`apps/desktop/src/lib/backend/tauri.ts` 在查询失败时抛出 `BackendErrorException`，前端因此可以同时取得 `messageKey` 和原始 `detail`。
+查询命令将 `QueryExecutionError` 映射为 `BackendError`。单语句和事务查询即使通过 `execute_multi` 命令执行，`dbx-core` 也会在整个 multi-query 核心链路中保留 `QueryExecutionError`，直到 Tauri 边界才转换为 `BackendError`；不得先降级为字符串再重建 envelope。`apps/desktop/src/lib/backend/tauri.ts` 在查询失败时抛出 `BackendErrorException`，前端因此可以同时取得 `messageKey` 和原始 `detail`。Tauri 的连接、传输、导入和导出边界也统一将拒绝结果转换为 `BackendErrorException`；未知对象只提取有长度上限的 `message`、`reason` 或 `detail`，内容为空时使用稳定摘要。
 
 ### HTTP Web
 
 `crates/dbx-web` 的 multi-query 路由也消费 typed 核心入口，并将 `AppError` 序列化为同一套 envelope；正常 HTTP 错误响应会保留公共安全 `detail`。`BackendError::without_detail()` 仅用于需要主动隐藏详情的兼容场景，不是默认响应路径。HTTP status 只表示传输结果，不能替代或改变 `BackendError.code`。
+
+桌面端 HTTP 失败（包括 multipart、SSE、上传、下载和 Nacos 特殊接口）必须调用 `backendResponseError`，不能直接构造 `new Error(await response.text())`，否则会丢失 `BackendError v1` envelope。
 
 ### 多语句查询
 
@@ -116,7 +118,7 @@ Rust `BackendError` 的字段由 catalog 构造，字段定义如下（JSON 使�
 
 ## 前端展示规则
 
-`normalizeBackendError` 只接受完整且类型正确的 envelope；`detail` 如果存在必须是 string，兼容 fallback 的单次上限为 64 KiB。`translateBackendError` 的结构化路径为：
+`normalizeBackendError` 只接受完整且类型正确的 envelope；`detail` 如果存在必须是 string，兼容 fallback 的单次上限为 64 KiB。解析嵌套的 `{ error }`、`{ backendError }`、`BackendErrorException` 和跨 realm 的 Error-like 对象时使用有限深度和循环检测；无法识别的对象只保留有界的 `message`、`reason` 或 `detail` 文本，空对象使用稳定摘要。`translateBackendError` 的结构化路径为：
 
 1. 使用 `messageKey` 和 `messageParams` 生成当前 locale 的自定义摘要。
 2. 若 `detail` 非空且不同于摘要，在摘要后追加空行和 detail。
@@ -128,7 +130,7 @@ catch 到异常时必须把原始对象传给翻译器：
 translateBackendError(t, error)
 ```
 
-不要先执行 `error.message || String(error)`，否则会丢失 `messageKey`、参数和服务端 detail。`BackendErrorException`、嵌套的 `{ error }`/`{ backendError }`、跨 realm 的 Error-like 对象和普通 `Error` 都由 `normalizeBackendError` 统一处理。无法识别的对象只保留有界的 `message`、`reason` 或 `detail` 文本；空对象使用稳定摘要。
+不要先执行 `error.message || String(error)`，否则会丢失 `messageKey`、参数和服务端 detail。旧版非 i18n 页面可以使用 `formatError`，但绝不能把结构化 envelope 直接转换成 `[object Object]`。
 
 ## 协议演进与兼容规则
 
@@ -138,6 +140,8 @@ translateBackendError(t, error)
 - `code` 是稳定机器标识，不能复用；`messageKey` 是稳定本地化标识，文案可以调整，但 key 的语义不能改变。错误码废弃时保留旧 locale 和兼容映射。
 - 结构化 envelope 可生成本地化摘要并追加公共安全 `detail`；旧字符串或 malformed object 使用有界文本 fallback；空响应只显示稳定摘要，不伪造数据库原因。
 - `operationOutcome=unknown` 不能因为 fallback 文本、source、origin 或 detail 推断为可重试；恢复决策只依赖 Rust 中的类型化事实。
+
+兼容代码的退役门槛包括：不再存在直接读取 HTTP 响应文本并抛错的路径；迁移后的后端错误展示调用点不再在 `translateBackendError` 前预先提取 `.message`/`String(error)`；在所有消费者接受 `BackendError v1` 且线协议测试通过前，不移除旧字符串或旧版错误行。
 
 ## 恢复规则
 
@@ -158,15 +162,3 @@ cargo check -j 1 -p dbx-web --no-default-features
 pnpm typecheck
 pnpm vitest run apps/desktop/src/i18n/__tests__/backendErrors.spec.ts
 ```
-
-## 详情保留更新（2026-08-03）
-
-公共错误契约仍然是 `BackendError v1`。当前已在以下边界落实统一规则：
-
-- Rust `bounded_detail` 负责公共 detail 的敏感片段脱敏、空内容判断和 64 KiB 的 UTF-8 长度上限；它保留安全的数据库/驱动错误正文，不把内部诊断字段直接暴露给客户端。
-- Axum `AppError`、查询多结果负载和 Tauri 查询进度事件使用同一个结构化 `error` 字段。`execution_error` 和旧版 `Error` 行继续作为兼容载体；当 `execution_error` 为 false 时，名为 `Error` 的真实结果列仍然是数据，不能当作失败信息。
-- Desktop HTTP 失败（包括 multipart、SSE、上传、下载和 Nacos 特殊接口）必须调用 `backendResponseError`。禁止直接构造 `new Error(await response.text())`，因为这会丢失 `BackendError v1` envelope。
-- Tauri 连接、传输、导入和导出边界统一将拒绝结果转换为 `BackendErrorException`。对于未知对象，在存在可用信息时提取有长度上限的 `message`、`reason` 或 `detail`；内容为空时只保留稳定摘要，不凭空编造详情。
-- 前端展示后端错误时，将原始捕获对象传给 `translateBackendError(t, error)`。展示内容为本地化错误摘要，后接公共安全 `detail`。旧版非 i18n 页面可以使用 `formatError`，但绝不能把结构化 envelope 直接转换成 `[object Object]`。
-
-兼容代码的退役门槛包括：不再存在直接读取 HTTP 响应文本并抛错的路径；迁移后的后端错误展示调用点不再在 `translateBackendError` 前预先提取 `.message`/`String(error)`；在所有消费者接受 `BackendError v1` 且线协议测试通过前，不移除旧字符串或旧版错误行。CI 无法接入的真实厂商数据库仍属于残余风险，必须在发布证据中明确记录。
