@@ -13,6 +13,7 @@
 5. 查询层通过 `QueryExecutionError::into_backend_error` 生成公共错误对象；Tauri、HTTP 和多语句结果只负责携带该对象，不重复分类。
 6. 前端通过 `normalizeBackendError` 和 `translateBackendError` 生成本地化摘要，并在可用时追加服务端 `detail`。
 
+
 ## Agent 调用契约
 
 Agent runtime 必须完成 Protocol v2 handshake，并支持 `multi_session`。如果声明 `structured_error_v1`，`call_typed` 在 RPC 失败时返回 `AgentCallError::Structured`；否则进入 `Legacy` 兼容路径。超时、取消、传输失败和契约不满足分别使用 `Timeout`、`Canceled`、`Transport` 和 `ContractViolation`。
