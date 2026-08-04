@@ -11,8 +11,8 @@ use crate::object_source_sql::build_export_object_source_sql;
 use crate::sql_dialect::{qualified_table_name, quote_table_identifier, uses_single_row_insert_statements};
 use crate::transfer::{
     format_ch_array_sql_literal, format_pg_array_sql_literal, is_identity_column_extra,
-    is_mysql_generated_column_extra, quote_identifier, quote_postgres_string_literal,
-    selected_columns_include_identity_extras, wrap_dameng_identity_insert_sql,
+    is_mysql_generated_column_extra, keyset_pagination_sql_with_identifier_quote, quote_identifier,
+    quote_postgres_string_literal, selected_columns_include_identity_extras, wrap_dameng_identity_insert_sql,
     wrap_dameng_identity_insert_sql_for_table,
 };
 use crate::types::ObjectSourceKind;
@@ -2000,24 +2000,21 @@ pub async fn export_database_sql_core(
                     )
                     .await?;
                 } else {
-                    let count_query = crate::transfer::count_sql(table_name, &request.schema, &db_type, None);
-                    let total_rows = match crate::transfer::execute_read_on_pool(state, &pool_key, &count_query).await {
-                        Ok(result) => {
-                            let count = result.rows.first().and_then(|row| row.first()).and_then(|value| match value {
-                                serde_json::Value::Number(number) => number.as_u64(),
-                                serde_json::Value::String(text) => text.parse::<u64>().ok(),
-                                _ => None,
-                            });
-                            if request.fail_on_error && count.is_none() {
-                                return Err(format!("Failed to read row count for table {table_name}"));
-                            }
-                            count
-                        }
-                        Err(error) if request.fail_on_error => {
-                            return Err(format!("Failed to read row count for table {table_name}: {error}"));
-                        }
-                        Err(_) => None,
-                    };
+                    // Exact COUNT(*) is deliberately skipped for manual database exports. It adds a full
+                    // table scan before the real read and does not improve correctness. Progress reports
+                    // exported rows while total_rows remains indeterminate.
+                    let total_rows = None;
+                    let primary_keys = columns
+                        .iter()
+                        .filter(|column| column.is_primary_key)
+                        .map(|column| column.name.clone())
+                        .collect::<Vec<_>>();
+                    let primary_key_indices = primary_keys
+                        .iter()
+                        .filter_map(|primary_key| col_names.iter().position(|column| column == primary_key))
+                        .collect::<Vec<_>>();
+                    let use_keyset = !primary_keys.is_empty() && primary_key_indices.len() == primary_keys.len();
+                    let mut last_primary_key_values = Vec::new();
                     let mut offset = 0_u64;
 
                     loop {
@@ -2036,14 +2033,27 @@ pub async fn export_database_sql_core(
                             return Ok(());
                         }
 
-                        let sql = crate::transfer::pagination_sql(
-                            &col_names,
-                            table_name,
-                            &request.schema,
-                            &db_type,
-                            offset,
-                            batch_size,
-                        );
+                        let sql = if use_keyset {
+                            keyset_pagination_sql_with_identifier_quote(
+                                &col_names,
+                                table_name,
+                                &request.schema,
+                                &db_type,
+                                &primary_keys,
+                                &last_primary_key_values,
+                                batch_size,
+                                None,
+                            )
+                        } else {
+                            crate::transfer::pagination_sql(
+                                &col_names,
+                                table_name,
+                                &request.schema,
+                                &db_type,
+                                offset,
+                                batch_size,
+                            )
+                        };
                         let result = match crate::transfer::execute_read_on_pool(state, &pool_key, &sql).await {
                             Ok(result) => result,
                             Err(error) => {
@@ -2070,7 +2080,14 @@ pub async fn export_database_sql_core(
                             &db_type,
                         )?;
                         total_rows_exported += row_count as u64;
-                        offset += row_count as u64;
+                        if use_keyset {
+                            if let Some(last_row) = result.rows.last() {
+                                last_primary_key_values =
+                                    primary_key_indices.iter().map(|&index| last_row[index].clone()).collect();
+                            }
+                        } else {
+                            offset += row_count as u64;
+                        }
                         on_progress(ExportProgress {
                             export_id: request.export_id.clone(),
                             current_object: table_name.clone(),

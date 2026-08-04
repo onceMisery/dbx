@@ -272,25 +272,27 @@ async function startExport() {
     preparing: true,
   };
 
-  const request: api.DatabaseExportRequest = {
-    exportId: exportId.value,
-    connectionId: connectionId.value,
-    database: database.value,
-    schema: schema.value,
-    filePath,
-    selectedTables: buildSelectedTablesPayload(tables.value, selectedTables.value),
-    includeStructure: includeStructure.value,
-    includeData: includeData.value,
-    includeObjects: includeObjects.value,
-    includeCreateDatabase: includeCreateDatabase.value,
-    dropTableIfExists: dropTableIfExists.value,
-    omitAutoIncrement: omitAutoIncrement.value,
-    batchSize: 1000,
-  };
-
   addDatabaseExportTask(exportId.value, database.value || "database", filePath);
 
   try {
+    const connectionType = store.getConfig(connectionId.value)?.db_type;
+    const snapshotSessionId = includeData.value && (connectionType === "mysql" || connectionType === "postgres") ? (await api.beginDatabaseBackupSnapshot(connectionId.value, database.value)).sessionId : undefined;
+    const request: api.DatabaseExportRequest = {
+      exportId: exportId.value,
+      connectionId: connectionId.value,
+      database: database.value,
+      schema: schema.value,
+      filePath,
+      selectedTables: buildSelectedTablesPayload(tables.value, selectedTables.value),
+      includeStructure: includeStructure.value,
+      includeData: includeData.value,
+      includeObjects: includeObjects.value,
+      includeCreateDatabase: includeCreateDatabase.value,
+      dropTableIfExists: dropTableIfExists.value,
+      omitAutoIncrement: omitAutoIncrement.value,
+      snapshotSessionId,
+      batchSize: 1000,
+    };
     await api.exportDatabaseSql(request, (progress) => {
       exportProgress.value = { ...progress };
       updateDatabaseExportTask(progress.exportId, progress);
@@ -352,6 +354,7 @@ async function startAllDatabasesExport() {
   batchRowsExported.value = 0;
 
   const dbs = [...selectedDatabases.value];
+  const connectionType = store.getConfig(connectionId.value)?.db_type;
   const batchId = generateDatabaseExportId();
   exportId.value = batchId;
   exportProgress.value = {
@@ -402,6 +405,7 @@ async function startAllDatabasesExport() {
         includeCreateDatabase: includeCreateDatabase.value,
         dropTableIfExists: dropTableIfExists.value,
         omitAutoIncrement: omitAutoIncrement.value,
+        snapshotSessionId: includeData.value && (connectionType === "mysql" || connectionType === "postgres") ? (await api.beginDatabaseBackupSnapshot(connectionId.value, item.database)).sessionId : undefined,
         batchSize: 1000,
       };
       let currentDatabaseRowsExported = 0;
