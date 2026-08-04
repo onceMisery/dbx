@@ -708,22 +708,25 @@ fn sql_tokens(value: &str) -> Vec<(usize, usize, String)> {
 }
 
 fn redact_quoted_sql_payload(value: &str) -> Option<String> {
-    let mut chars = value.char_indices();
-    while let Some((start, quote)) = chars.next() {
+    for (start, quote) in value.char_indices() {
         if !matches!(quote, '\'' | '"') {
             continue;
         }
 
         let content_start = start + quote.len_utf8();
         let mut end = None;
-        let mut quoted_chars = value[content_start..].char_indices();
-        while let Some((offset, ch)) = quoted_chars.next() {
+        let mut skip_next = false;
+        for (offset, ch) in value[content_start..].char_indices() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
             if ch != quote {
                 continue;
             }
             let absolute = content_start + offset;
             if value[absolute + quote.len_utf8()..].starts_with(quote) {
-                quoted_chars.next();
+                skip_next = true;
                 continue;
             }
             end = Some(absolute);
@@ -778,7 +781,7 @@ fn looks_like_complete_sql(tokens: &[(usize, usize, String)], index: usize) -> b
         "call" => following.iter().any(|token| token.ends_with('(')),
         "with" => following.contains(&"as") && following.contains(&"select"),
         "explain" => following.iter().any(|token| sql_verbs().contains(token)),
-        "begin" | "commit" | "rollback" => following.iter().any(|token| *token == ";"),
+        "begin" | "commit" | "rollback" => following.contains(&";"),
         _ => false,
     };
     execution_context || structural_marker
