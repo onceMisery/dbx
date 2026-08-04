@@ -23,6 +23,7 @@ export interface BackendError {
 }
 
 const MAX_FALLBACK_CHARS = 64 * 1024;
+const MAX_ERROR_PARSE_DEPTH = 16;
 const AGENT_RPC_ERROR_DATA_MARKER = "\nDBX_AGENT_ERROR_DATA:";
 
 export function sanitizeBackendErrorMessage(message: string): string {
@@ -80,13 +81,24 @@ function isBackendError(value: unknown): value is BackendError {
 }
 
 export function normalizeBackendError(error: unknown): BackendError | null {
-  if (error && typeof error === "object" && "name" in error && error.name === "BackendErrorException" && "backendError" in error) {
-    const normalized = normalizeBackendError((error as { backendError: unknown }).backendError);
-    if (normalized) return normalized;
+  return normalizeBackendErrorAtDepth(error, new WeakSet<object>(), 0);
+}
+
+function normalizeBackendErrorAtDepth(error: unknown, seen: WeakSet<object>, depth: number): BackendError | null {
+  if (depth > MAX_ERROR_PARSE_DEPTH) return null;
+
+  if (error && typeof error === "object") {
+    if (seen.has(error)) return null;
+    seen.add(error);
+
+    if ("name" in error && error.name === "BackendErrorException" && "backendError" in error) {
+      const normalized = normalizeBackendErrorAtDepth((error as { backendError: unknown }).backendError, seen, depth + 1);
+      if (normalized) return normalized;
+    }
   }
   if (typeof error === "string") {
     try {
-      return normalizeBackendError(JSON.parse(error));
+      return normalizeBackendErrorAtDepth(JSON.parse(error), seen, depth + 1);
     } catch {
       return null;
     }
@@ -94,18 +106,18 @@ export function normalizeBackendError(error: unknown): BackendError | null {
   if (isBackendError(error)) return error;
   if (error && typeof error === "object" && "backendError" in error) {
     const backendError = (error as { backendError: unknown }).backendError;
-    const normalized = normalizeBackendError(backendError);
+    const normalized = normalizeBackendErrorAtDepth(backendError, seen, depth + 1);
     if (normalized) return normalized;
   }
   if (error && typeof error === "object" && "error" in error) {
     const nested = (error as { error: unknown }).error;
-    const normalized = normalizeBackendError(nested);
+    const normalized = normalizeBackendErrorAtDepth(nested, seen, depth + 1);
     if (normalized) return normalized;
   }
   if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
     try {
       const parsed: unknown = JSON.parse(error.message);
-      const normalized = normalizeBackendError(parsed);
+      const normalized = normalizeBackendErrorAtDepth(parsed, seen, depth + 1);
       if (normalized) return normalized;
     } catch {
       // Keep checking compatibility wrappers before falling back to plain text.
@@ -141,12 +153,20 @@ function normalizeRawBackendError(error: unknown): BackendError | null {
 }
 
 function boundedFallbackText(error: unknown): string | undefined {
+  return boundedFallbackTextAtDepth(error, new WeakSet<object>(), 0);
+}
+
+function boundedFallbackTextAtDepth(error: unknown, seen: WeakSet<object>, depth: number): string | undefined {
+  if (depth > MAX_ERROR_PARSE_DEPTH) return undefined;
+
   let text: string | undefined;
   if (typeof error === "string") {
     text = error;
   } else if (error instanceof Error) {
     text = error.message;
   } else if (error && typeof error === "object") {
+    if (seen.has(error)) return undefined;
+    seen.add(error);
     const candidate = error as Record<string, unknown>;
     for (const key of ["message", "reason", "detail"]) {
       if (typeof candidate[key] === "string") {
@@ -154,7 +174,8 @@ function boundedFallbackText(error: unknown): string | undefined {
         break;
       }
     }
-    if (!text && "error" in candidate) text = boundedFallbackText(candidate.error);
+    if (!text && "error" in candidate) text = boundedFallbackTextAtDepth(candidate.error, seen, depth + 1);
+    if (!text && "backendError" in candidate) text = boundedFallbackTextAtDepth(candidate.backendError, seen, depth + 1);
   }
   const normalized = text?.trim();
   if (!normalized) return undefined;

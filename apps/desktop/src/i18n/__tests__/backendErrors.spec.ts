@@ -331,6 +331,27 @@ describe("backend error translation", () => {
     expect(normalizeBackendError(workerError)).toEqual(envelope);
   });
 
+  test("does not recurse forever through cyclic error wrappers", () => {
+    const self: Record<string, unknown> = {};
+    self.error = self;
+    expect(normalizeBackendError(self)).toBeNull();
+    expect(() => new BackendErrorException(self)).not.toThrow();
+
+    const first: Record<string, unknown> = {};
+    const second: Record<string, unknown> = {};
+    first.backendError = second;
+    second.error = first;
+    expect(normalizeBackendError(first)).toBeNull();
+    expect(() => new BackendErrorException(first)).not.toThrow();
+  });
+
+  test("stops at a finite wrapper depth", () => {
+    let wrapper: Record<string, unknown> = { error: { message: "deep legacy error" } };
+    for (let index = 0; index < 32; index += 1) wrapper = { backendError: wrapper };
+
+    expect(normalizeBackendError(wrapper)).toBeNull();
+  });
+
   test("does not stringify a structured envelope as [object Object]", () => {
     expect(
       formatError({

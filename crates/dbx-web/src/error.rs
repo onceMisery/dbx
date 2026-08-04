@@ -146,4 +146,23 @@ mod tests {
         assert_eq!(payload["detail"], "relation customer_orders does not exist");
         assert!(payload["diagnostics"].get("agentSessionId").is_none());
     }
+
+    #[tokio::test]
+    async fn http_response_redacts_sensitive_detail_before_serialization() {
+        let error = BackendError::from_sql_detail(
+            "ERROR: connection failed for jdbc:postgresql://db.example/app?user=alice&password=secret; session_id=session-42; statement [SELECT email FROM customers WHERE ssn='123']",
+        );
+
+        let response = AppError::from(error).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let detail = payload["detail"].as_str().unwrap();
+
+        assert!(detail.contains("ERROR: connection failed"));
+        assert!(detail.contains("[redacted]"));
+        assert!(detail.contains("[statement omitted]"));
+        assert!(!detail.contains("password=secret"));
+        assert!(!detail.contains("session-42"));
+        assert!(!detail.contains("ssn='123'"));
+    }
 }

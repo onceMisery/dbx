@@ -1,5 +1,6 @@
-import { describe, expect, test } from "vitest";
-import { backendResponseError } from "@/lib/backend/http";
+import { describe, expect, test, vi } from "vitest";
+import { backendResponseError, importAgentDriver, installJdbcPluginLocal } from "@/lib/backend/http";
+import { BackendErrorException } from "@/lib/backend/errorUtils";
 
 const envelope = {
   version: 1,
@@ -37,5 +38,35 @@ describe("HTTP backend error parsing", () => {
   test("keeps a safe SQL diagnostic in a JSON envelope unchanged", async () => {
     const error = await backendResponseError(new Response(JSON.stringify(envelope), { status: 400 }));
     expect(error.backendError.detail).toBe("Incorrect syntax near SELECT");
+  });
+
+  test.each([
+    ["JDBC plugin upload", () => installJdbcPluginLocal(new File(["plugin"], "plugin.zip"))],
+    ["Agent driver upload", () => importAgentDriver("postgres", new File(["driver"], "driver.zip"))],
+  ])("normalizes %s multipart failures through the nested backend envelope", async (_name, upload) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: envelope }), { status: 400 })));
+
+    const error = await upload().catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(BackendErrorException);
+    expect(error).toMatchObject({
+      backendError: expect.objectContaining({ code: envelope.code, detail: envelope.detail }),
+    });
+
+    vi.unstubAllGlobals();
+  });
+
+  test.each([
+    ["JDBC plugin upload", () => installJdbcPluginLocal(new File(["plugin"], "plugin.zip"))],
+    ["Agent driver upload", () => importAgentDriver("postgres", new File(["driver"], "driver.zip"))],
+  ])("normalizes %s multipart failures through the direct backend envelope", async (_name, upload) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(envelope), { status: 400 })));
+
+    const error = await upload().catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(BackendErrorException);
+    expect(error).toMatchObject({
+      backendError: expect.objectContaining({ code: envelope.code, detail: envelope.detail }),
+    });
+
+    vi.unstubAllGlobals();
   });
 });

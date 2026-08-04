@@ -597,8 +597,311 @@ fn bounded_detail(message: &str) -> Option<String> {
     if message.trim().is_empty() {
         return None;
     }
-    let detail = bounded_text(message, MAX_DETAIL_BYTES);
+    let detail = safe_detail(message)?;
+    let detail = bounded_text(&detail, MAX_DETAIL_BYTES);
     (!detail.is_empty()).then_some(detail)
+}
+
+fn safe_detail(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = normalized.to_ascii_lowercase();
+    let first_word =
+        lowered.split_whitespace().next().unwrap_or_default().trim_matches(|ch: char| !ch.is_ascii_alphabetic());
+    let sql_verbs = [
+        "select", "insert", "update", "delete", "drop", "create", "alter", "truncate", "merge", "call", "with",
+        "grant", "revoke", "comment", "explain", "begin", "commit", "rollback",
+    ];
+    if sql_verbs.contains(&first_word) {
+        return None;
+    }
+
+    let sql_detail = redact_sql_payload(trimmed);
+    let detail = if sql_detail != trimmed || contains_sensitive_marker(trimmed) {
+        let mut detail = redact_sensitive_fragments(&sql_detail);
+        detail = redact_session_identifier(&detail);
+        detail
+    } else {
+        trimmed.to_string()
+    };
+    if detail.split_whitespace().all(|token| token == "[redacted]" || token == "[statement omitted]") {
+        return None;
+    }
+    (!detail.is_empty()).then_some(detail)
+}
+
+fn contains_sensitive_marker(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    [
+        "://",
+        "jdbc:",
+        "bearer ",
+        "password",
+        "passwd",
+        "pwd",
+        "token",
+        "secret",
+        "authorization",
+        "api_key",
+        "apikey",
+        "credential",
+        "auth=",
+        "auth:",
+        "key=",
+        "key:",
+        "user=",
+        "user:",
+        "username",
+        "uid=",
+        "access_key",
+        "private_key",
+        "session id",
+        "session ",
+        "session_id",
+        "agentsessionid",
+        "session:",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+fn redact_sql_payload(value: &str) -> String {
+    let lowered = value.to_ascii_lowercase();
+    if let Some(statement_offset) = lowered.find("statement [") {
+        let bracket_start = statement_offset + "statement ".len();
+        if let Some(relative_end) = value[bracket_start..].find(']') {
+            let bracket_end = bracket_start + relative_end + 1;
+            let mut result = value.to_string();
+            result.replace_range(bracket_start..bracket_end, "[statement omitted]");
+            return result;
+        }
+    }
+
+    if let Some(result) = redact_quoted_sql_payload(value) {
+        return result;
+    }
+
+    let tokens = sql_tokens(value);
+    for (index, (_, _, token)) in tokens.iter().enumerate() {
+        if sql_verbs().contains(&token.as_str()) && looks_like_complete_sql(&tokens, index) {
+            let mut result = value.to_string();
+            result.replace_range(tokens[index].0.., "[statement omitted]");
+            return result;
+        }
+    }
+    value.to_string()
+}
+
+fn sql_tokens(value: &str) -> Vec<(usize, usize, String)> {
+    value
+        .split_whitespace()
+        .scan(0usize, |cursor, token| {
+            let start = value[*cursor..].find(token)? + *cursor;
+            *cursor = start + token.len();
+            Some((start, start + token.len(), token.to_ascii_lowercase()))
+        })
+        .collect()
+}
+
+fn redact_quoted_sql_payload(value: &str) -> Option<String> {
+    let mut chars = value.char_indices();
+    while let Some((start, quote)) = chars.next() {
+        if !matches!(quote, '\'' | '"') {
+            continue;
+        }
+
+        let content_start = start + quote.len_utf8();
+        let mut end = None;
+        let mut quoted_chars = value[content_start..].char_indices();
+        while let Some((offset, ch)) = quoted_chars.next() {
+            if ch != quote {
+                continue;
+            }
+            let absolute = content_start + offset;
+            if value[absolute + quote.len_utf8()..].starts_with(quote) {
+                quoted_chars.next();
+                continue;
+            }
+            end = Some(absolute);
+            break;
+        }
+
+        let end = end?;
+        let inner = &value[content_start..end];
+        let tokens = sql_tokens(inner);
+        if tokens
+            .first()
+            .is_some_and(|(_, _, token)| sql_verbs().contains(&token.as_str()) && looks_like_complete_sql(&tokens, 0))
+        {
+            let mut result = String::with_capacity(value.len());
+            result.push_str(&value[..start]);
+            result.push_str("[statement omitted]");
+            result.push_str(&value[end + quote.len_utf8()..]);
+            return Some(result);
+        }
+    }
+    None
+}
+
+fn sql_verbs() -> [&'static str; 18] {
+    [
+        "select", "insert", "update", "delete", "drop", "create", "alter", "truncate", "merge", "call", "with",
+        "grant", "revoke", "comment", "explain", "begin", "commit", "rollback",
+    ]
+}
+
+fn looks_like_complete_sql(tokens: &[(usize, usize, String)], index: usize) -> bool {
+    let verb = tokens[index].2.as_str();
+    let following = tokens.iter().skip(index + 1).map(|(_, _, token)| token.as_str()).collect::<Vec<_>>();
+    if following.is_empty() {
+        return false;
+    }
+
+    let execution_context = index > 0
+        && matches!(
+            tokens[index - 1].2.as_str(),
+            "statement" | "query" | "sql" | "execute" | "executing" | "executed" | "running" | "command"
+        );
+    let structural_marker = match verb {
+        "select" => ["from", "join", "where", "union", "into", ";"].iter().any(|marker| following.contains(marker)),
+        "insert" => following.contains(&"into"),
+        "update" => following.contains(&"set"),
+        "delete" => following.contains(&"from"),
+        "drop" | "create" | "alter" | "truncate" | "grant" | "revoke" | "comment" => {
+            following.iter().any(|token| matches!(*token, "table" | "index" | "view" | "schema" | "database" | "role"))
+        }
+        "merge" => following.contains(&"into"),
+        "call" => following.iter().any(|token| token.ends_with('(')),
+        "with" => following.contains(&"as") && following.contains(&"select"),
+        "explain" => following.iter().any(|token| sql_verbs().contains(token)),
+        "begin" | "commit" | "rollback" => following.iter().any(|token| *token == ";"),
+        _ => false,
+    };
+    execution_context || structural_marker
+}
+
+fn redact_sensitive_fragments(value: &str) -> String {
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    let mut redacted = Vec::new();
+    let mut redact_next = 0usize;
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index];
+        let lowered = token.to_ascii_lowercase();
+        if redact_next > 0 {
+            redacted.push("[redacted]");
+            redact_next -= 1;
+        } else if index + 2 < tokens.len() && sensitive_key_token(token) && sensitive_separator(tokens[index + 1]) {
+            redacted.push("[redacted]");
+            index += 2;
+        } else if lowered.contains("://") || lowered.starts_with("jdbc:") || sensitive_key_value(token) {
+            redacted.push("[redacted]");
+        } else if lowered == "bearer" {
+            redacted.push("[redacted]");
+            redact_next = 1;
+        } else if lowered.starts_with("authorization:") {
+            redacted.push("[redacted]");
+            redact_next = 2;
+        } else if index + 1 < tokens.len()
+            && sensitive_key_token(token)
+            && (token.ends_with('=') || token.ends_with(':'))
+        {
+            redacted.push("[redacted]");
+            redact_next = 1;
+        } else {
+            redacted.push(token);
+        }
+        index += 1;
+    }
+    redacted.join(" ")
+}
+
+fn sensitive_separator(token: &str) -> bool {
+    matches!(token, "=" | ":")
+}
+
+fn sensitive_key_token(token: &str) -> bool {
+    sensitive_key_name(token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
+}
+
+fn sensitive_key_value(token: &str) -> bool {
+    let Some((key, _value)) = token.split_once('=') else {
+        return false;
+    };
+    sensitive_key_name(key)
+}
+
+fn sensitive_key_name(key: &str) -> bool {
+    let key = key.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_').to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "password"
+            | "passwd"
+            | "pwd"
+            | "token"
+            | "secret"
+            | "authorization"
+            | "api_key"
+            | "apikey"
+            | "credential"
+            | "auth"
+            | "key"
+            | "user"
+            | "username"
+            | "uid"
+            | "access_key"
+            | "private_key"
+            | "session"
+            | "session_id"
+            | "agentsessionid"
+    )
+}
+
+fn redact_session_identifier(value: &str) -> String {
+    let lowered = value.to_ascii_lowercase();
+    for marker in ["session id", "session_id", "agentsessionid"] {
+        if let Some(marker_start) = lowered.find(marker) {
+            let value_start = value[marker_start + marker.len()..]
+                .char_indices()
+                .find(|(_, ch)| !ch.is_ascii_whitespace() && *ch != ':' && *ch != '=')
+                .map(|(offset, _)| marker_start + marker.len() + offset);
+            if let Some(value_start) = value_start {
+                let value_end = value[value_start..]
+                    .char_indices()
+                    .find(|(_, ch)| ch.is_ascii_whitespace())
+                    .map(|(offset, _)| value_start + offset)
+                    .unwrap_or(value.len());
+                let mut result = value.to_string();
+                result.replace_range(value_start..value_end, "[redacted]");
+                return result;
+            }
+        }
+    }
+    let Some(colon) = value.find(':') else {
+        return value.to_string();
+    };
+    if !lowered[..colon].contains("session") {
+        return value.to_string();
+    }
+    let value_start = value[colon + 1..]
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_whitespace())
+        .map(|(offset, _)| colon + 1 + offset);
+    let Some(value_start) = value_start else {
+        return value.to_string();
+    };
+    let value_end = value[value_start..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_ascii_whitespace())
+        .map(|(offset, _)| value_start + offset)
+        .unwrap_or(value.len());
+    let mut result = value.to_string();
+    result.replace_range(value_start..value_end, "[redacted]");
+    result
 }
 
 #[cfg(test)]
@@ -706,17 +1009,31 @@ mod tests {
     }
 
     #[test]
-    fn detail_preserves_original_driver_text() {
+    fn public_detail_redacts_sensitive_fragments_and_preserves_vendor_text() {
+        for (message, expected) in [
+            ("Incorrect syntax near SELECT", "Incorrect syntax near SELECT"),
+            ("ERROR: relation missing_table does not exist", "ERROR: relation missing_table does not exist"),
+            ("ORA-00942: table or view does not exist", "ORA-00942: table or view does not exist"),
+            (
+                "syntax error in statement [UPDATE customers SET ssn='123']",
+                "syntax error in statement [statement omitted]",
+            ),
+            (
+                "syntax error at or near 'SELECT email FROM customers WHERE ssn = 123'",
+                "syntax error at or near [statement omitted]",
+            ),
+            ("failed executing SELECT * FROM customers WHERE ssn='123'", "failed executing [statement omitted]"),
+            (
+                "connection failed: jdbc:postgresql://host/db?user=alice&password=secret",
+                "connection failed: [redacted]",
+            ),
+            ("connection failed: Authorization: Bearer abc123", "connection failed: [redacted] [redacted] [redacted]"),
+            ("Agent session not found: 7f51e7f4-7cee-42db-bfeb-76d1199d1afe", "Agent session not found: [redacted]"),
+            ("Agent session id private-session", "Agent session id [redacted]"),
+        ] {
+            assert_eq!(bounded_detail(message).as_deref(), Some(expected), "detail changed unexpectedly: {message}");
+        }
         for message in [
-            "Incorrect syntax near SELECT",
-            "ERROR: relation missing_table does not exist",
-            "ORA-00942: table or view does not exist",
-            "syntax error in statement [UPDATE customers SET ssn='123']",
-            "failed executing SELECT * FROM customers WHERE ssn='123'",
-            "connection failed: jdbc:postgresql://host/db?user=alice&password=secret",
-            "connection failed: Authorization: Bearer abc123",
-            "Agent session not found: 7f51e7f4-7cee-42db-bfeb-76d1199d1afe",
-            "Agent session id private-session",
             "DROP TABLE users",
             "SELECT password FROM users",
             "Bearer token-value",
@@ -725,7 +1042,7 @@ mod tests {
             "password: secret",
             "CALL refresh_cache()",
         ] {
-            assert_eq!(bounded_detail(message).as_deref(), Some(message), "detail changed unexpectedly: {message}");
+            assert!(bounded_detail(message).is_none(), "sensitive detail leaked: {message}");
         }
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
@@ -741,11 +1058,11 @@ mod tests {
         assert!(value.get("retryable").is_none());
         assert!(value.get("sessionDisposition").is_none());
         assert!(value.get("agentSessionId").is_none());
-        assert_eq!(value["detail"], "jdbc:postgresql://host/db?password=secret");
+        assert!(value.get("detail").is_none());
     }
 
     #[test]
-    fn bounded_detail_remains_bounded_without_rewriting() {
+    fn bounded_detail_remains_bounded_after_redaction() {
         let detail = bounded_detail(&format!("ERROR: {}", "x".repeat(MAX_DETAIL_BYTES + 100))).unwrap();
         assert!(detail.len() > 512);
         assert!(detail.len() <= MAX_DETAIL_BYTES);

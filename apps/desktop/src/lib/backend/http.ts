@@ -455,7 +455,7 @@ export async function installJdbcPluginLocal(pathOrFile: string | File): Promise
     method: "POST",
     body: formData,
   });
-  if (!uploadRes.ok) throw new Error(await uploadRes.text());
+  if (!uploadRes.ok) throw await backendResponseError(uploadRes);
   return uploadRes.json();
 }
 
@@ -556,7 +556,7 @@ export async function importAgentDriver(dbType: string, pathOrFile: string | Fil
     method: "POST",
     body: formData,
   });
-  if (!uploadRes.ok) throw new Error(await uploadRes.text());
+  if (!uploadRes.ok) throw await backendResponseError(uploadRes);
 }
 
 export const importAgentJar = importAgentDriver;
