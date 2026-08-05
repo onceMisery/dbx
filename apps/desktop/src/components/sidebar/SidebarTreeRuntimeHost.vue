@@ -1075,7 +1075,7 @@ function activateDataTableFromDoubleClick() {
   if (node.type !== "table" || !hasNodeDatabaseContext(node)) return;
   const activation = settingsStore.editorSettings.sidebarActivation;
   const existingSameTableTab = findExistingSameTableDataTab();
-  const action = dataTableDoubleClickAction(existingSameTableTab, activation, settingsStore.editorSettings.reuseDataTab);
+  const action = dataTableDoubleClickAction(existingSameTableTab, activation, settingsStore.editorSettings.dataTabReuseMode);
   if (action === "none") return;
   if (action === "open") {
     openDataImmediately(node);
