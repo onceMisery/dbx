@@ -700,8 +700,12 @@ jobs:
             }
             trap cleanup EXIT
             ready=false
+            probe_database="dbx_ci_ready_${version//./_}"
             for _ in $(seq 1 90); do
-              if docker exec "$name" taos -s 'SELECT server_version()' >/dev/null 2>&1; then
+              # `SELECT server_version()` can succeed before a dnode is ready to
+              # accept writes. Probe the same CREATE DATABASE operation used by
+              # the live test so it cannot race TDengine cluster startup.
+              if docker exec "$name" taos -s "CREATE DATABASE IF NOT EXISTS ${probe_database}" >/dev/null 2>&1; then
                 ready=true
                 break
               fi
