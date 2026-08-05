@@ -181,4 +181,20 @@ mod tests {
         assert!(!detail.contains("session-42"));
         assert!(!detail.contains("ssn='123'"));
     }
+
+    #[tokio::test]
+    async fn http_response_redacts_common_sensitive_key_variants() {
+        let error = BackendError::from_sql_detail(
+            "driver failed: PASSWORD:secret-a refresh_token = \"secret-b\" api-key:secret-c authorization: Bearer secret-d sessionid=secret-e",
+        );
+
+        let response = AppError::from(error).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let detail = payload["detail"].as_str().unwrap();
+
+        for secret in ["secret-a", "secret-b", "secret-c", "secret-d", "secret-e"] {
+            assert!(!detail.contains(secret), "sensitive value leaked: {secret}; detail={detail}");
+        }
+    }
 }

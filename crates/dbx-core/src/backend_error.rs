@@ -657,52 +657,32 @@ fn safe_detail(message: &str) -> Option<String> {
     }
 
     let sql_detail = redact_sql_payload(trimmed);
-    let detail = if sql_detail != trimmed || contains_sensitive_marker(trimmed) {
-        let mut detail = redact_sensitive_fragments(&sql_detail);
-        detail = redact_session_identifier(&detail);
-        detail
-    } else {
-        trimmed.to_string()
-    };
-    if detail.split_whitespace().all(|token| token == "[redacted]" || token == "[statement omitted]") {
+    let detail = redact_session_identifier(&redact_sensitive_fragments(&sql_detail));
+    if contains_only_redacted_sensitive_tokens(&detail) {
         return None;
     }
     (!detail.is_empty()).then_some(detail)
 }
 
-fn contains_sensitive_marker(value: &str) -> bool {
-    let lowered = value.to_ascii_lowercase();
-    [
-        "://",
-        "jdbc:",
-        "bearer ",
-        "password",
-        "passwd",
-        "pwd",
-        "token",
-        "secret",
-        "authorization",
-        "api_key",
-        "apikey",
-        "credential",
-        "auth=",
-        "auth:",
-        "key=",
-        "key:",
-        "user=",
-        "user:",
-        "username",
-        "uid=",
-        "access_key",
-        "private_key",
-        "session id",
-        "session ",
-        "session_id",
-        "agentsessionid",
-        "session:",
-    ]
-    .iter()
-    .any(|marker| lowered.contains(marker))
+fn contains_only_redacted_sensitive_tokens(value: &str) -> bool {
+    let mut has_token = false;
+    let all_sensitive = value.split_whitespace().all(|token| {
+        has_token = true;
+        if token == "[redacted]" || token == "[statement omitted]" || matches!(token, "=" | ":") {
+            return true;
+        }
+        let normalized = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
+        if sensitive_key_name(normalized) {
+            return true;
+        }
+        ['=', ':'].iter().any(|separator| {
+            token.split_once(*separator).is_some_and(|(key, value)| {
+                sensitive_key_name(key)
+                    && value.trim_matches(|ch| matches!(ch, ';' | ',' | ']' | ')' | '}')) == "[redacted]"
+            })
+        })
+    });
+    has_token && all_sensitive
 }
 
 fn redact_sql_payload(value: &str) -> String {
@@ -824,67 +804,57 @@ fn looks_like_complete_sql(tokens: &[(usize, usize, String)], index: usize) -> b
 }
 
 fn redact_sensitive_fragments(value: &str) -> String {
-    let tokens = value.split_whitespace().collect::<Vec<_>>();
-    let mut redacted = Vec::new();
-    let mut redact_next = 0usize;
-    let mut index = 0usize;
-    while index < tokens.len() {
-        let token = tokens[index];
-        let lowered = token.to_ascii_lowercase();
-        if redact_next > 0 {
-            redacted.push("[redacted]");
-            redact_next -= 1;
-        } else if index + 2 < tokens.len() && sensitive_key_token(token) && sensitive_separator(tokens[index + 1]) {
-            redacted.push("[redacted]");
-            index += 2;
-        } else if lowered.contains("://") || lowered.starts_with("jdbc:") || sensitive_key_value(token) {
-            redacted.push("[redacted]");
-        } else if lowered == "bearer" {
-            redacted.push("[redacted]");
-            redact_next = 1;
-        } else if lowered.starts_with("authorization:") {
-            redacted.push("[redacted]");
-            redact_next = 2;
-        } else if index + 1 < tokens.len()
-            && sensitive_key_token(token)
-            && (token.ends_with('=') || token.ends_with(':'))
-        {
-            redacted.push("[redacted]");
-            redact_next = 1;
+    let mut redacted = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while let Some((value_start, value_end)) = next_sensitive_assignment(value, cursor) {
+        redacted.push_str(&value[cursor..value_start]);
+        redacted.push_str("[redacted]");
+        cursor = value_end;
+    }
+    redacted.push_str(&value[cursor..]);
+    let source_tokens = redacted.split_whitespace().collect::<Vec<_>>();
+    let mut tokens = Vec::with_capacity(source_tokens.len());
+    let mut redact_next = false;
+    let mut changed = false;
+    let mut index = 0;
+    while index < source_tokens.len() {
+        let token = source_tokens[index];
+        if redact_next {
+            tokens.push("[redacted]");
+            redact_next = false;
+            changed = true;
+        } else if token.eq_ignore_ascii_case("bearer") {
+            tokens.push("[redacted]");
+            redact_next = true;
+            changed = true;
+        } else if token.eq_ignore_ascii_case("authorization:") && source_tokens.get(index + 1) == Some(&"[redacted]") {
+            tokens.push("[redacted]");
+            index += 1;
+            changed = true;
         } else {
-            redacted.push(token);
+            tokens.push(token);
         }
         index += 1;
     }
-    redacted.join(" ")
-}
-
-fn sensitive_separator(token: &str) -> bool {
-    matches!(token, "=" | ":")
-}
-
-fn sensitive_key_token(token: &str) -> bool {
-    sensitive_key_name(token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_'))
-}
-
-fn sensitive_key_value(token: &str) -> bool {
-    let Some((key, _value)) = token.split_once('=') else {
-        return false;
-    };
-    sensitive_key_name(key)
+    if changed {
+        tokens.join(" ")
+    } else {
+        redacted
+    }
 }
 
 fn sensitive_key_name(key: &str) -> bool {
-    let key = key.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_').to_ascii_lowercase();
+    let key = key.chars().filter(|ch| ch.is_ascii_alphanumeric()).map(|ch| ch.to_ascii_lowercase()).collect::<String>();
     matches!(
         key.as_str(),
         "password"
             | "passwd"
             | "pwd"
             | "token"
+            | "accesstoken"
+            | "refreshtoken"
             | "secret"
             | "authorization"
-            | "api_key"
             | "apikey"
             | "credential"
             | "auth"
@@ -892,12 +862,135 @@ fn sensitive_key_name(key: &str) -> bool {
             | "user"
             | "username"
             | "uid"
-            | "access_key"
-            | "private_key"
+            | "accesskey"
+            | "privatekey"
             | "session"
-            | "session_id"
+            | "sessionid"
             | "agentsessionid"
+            | "jwt"
+            | "cookie"
     )
+}
+
+fn next_sensitive_assignment(value: &str, from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index < value.len() {
+        let ch = value[index..].chars().next()?;
+        if !is_sensitive_key_char(ch)
+            || (index > 0 && value[..index].chars().next_back().is_some_and(is_sensitive_key_char))
+        {
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let key_start = index;
+        let mut key_end = index;
+        while key_end < value.len() {
+            let key_char = value[key_end..].chars().next()?;
+            if !is_sensitive_key_char(key_char) {
+                break;
+            }
+            key_end += key_char.len_utf8();
+        }
+        if !sensitive_key_name(&value[key_start..key_end]) {
+            index = key_end;
+            continue;
+        }
+
+        let mut separator_start = key_end;
+        if let Some(quote) = value[..key_start].chars().next_back().filter(|ch| matches!(ch, '\'' | '"')) {
+            if value[separator_start..].starts_with(quote) {
+                separator_start += quote.len_utf8();
+            }
+        }
+        while separator_start < value.len()
+            && value[separator_start..].chars().next().is_some_and(|ch| ch.is_ascii_whitespace())
+        {
+            separator_start += value[separator_start..].chars().next()?.len_utf8();
+        }
+        let separator = value[separator_start..].chars().next()?;
+        if !matches!(separator, '=' | ':') {
+            index = key_end;
+            continue;
+        }
+
+        let mut value_start = separator_start + separator.len_utf8();
+        while value_start < value.len()
+            && value[value_start..].chars().next().is_some_and(|ch| ch.is_ascii_whitespace())
+        {
+            value_start += value[value_start..].chars().next()?.len_utf8();
+        }
+        let value_end = consume_sensitive_value(value, value_start, &value[key_start..key_end]);
+        return Some((value_start, value_end));
+    }
+    None
+}
+
+fn is_sensitive_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')
+}
+
+fn consume_sensitive_value(value: &str, start: usize, key: &str) -> usize {
+    if start >= value.len() {
+        return start;
+    }
+    let first = value[start..].chars().next().unwrap_or_default();
+    if matches!(first, '\'' | '"') {
+        let mut escaped = false;
+        let mut iter = value[start + first.len_utf8()..].char_indices();
+        while let Some((offset, ch)) = iter.next() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == first {
+                let end = start + first.len_utf8() + offset + ch.len_utf8();
+                if value[end..].starts_with(first) {
+                    iter.next();
+                    continue;
+                }
+                return end;
+            }
+        }
+        return value.len();
+    }
+
+    let mut end = start;
+    while end < value.len() {
+        let ch = value[end..].chars().next().unwrap_or_default();
+        if ch.is_ascii_whitespace() || matches!(ch, '&' | ';' | ',' | ']' | ')' | '}') {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+
+    let normalized_key =
+        key.chars().filter(|ch| ch.is_ascii_alphanumeric()).map(|ch| ch.to_ascii_lowercase()).collect::<String>();
+    if normalized_key == "authorization" {
+        let scheme = value[start..end].to_ascii_lowercase();
+        if matches!(scheme.as_str(), "bearer" | "basic" | "digest") {
+            let mut token_start = end;
+            while token_start < value.len()
+                && value[token_start..].chars().next().is_some_and(|ch| ch.is_ascii_whitespace())
+            {
+                token_start += value[token_start..].chars().next().unwrap().len_utf8();
+            }
+            let mut token_end = token_start;
+            while token_end < value.len() {
+                let ch = value[token_end..].chars().next().unwrap_or_default();
+                if ch.is_ascii_whitespace() || matches!(ch, '&' | ';' | ',' | ']' | ')' | '}') {
+                    break;
+                }
+                token_end += ch.len_utf8();
+            }
+            return token_end;
+        }
+    }
+    end
 }
 
 fn redact_session_identifier(value: &str) -> String {
@@ -1080,9 +1173,9 @@ mod tests {
             ("failed executing SELECT * FROM customers WHERE ssn='123'", "failed executing [statement omitted]"),
             (
                 "connection failed: jdbc:postgresql://host/db?user=alice&password=secret",
-                "connection failed: [redacted]",
+                "connection failed: jdbc:postgresql://host/db?user=[redacted]&password=[redacted]",
             ),
-            ("connection failed: Authorization: Bearer abc123", "connection failed: [redacted] [redacted] [redacted]"),
+            ("connection failed: Authorization: Bearer abc123", "connection failed: [redacted]"),
             ("Agent session not found: 7f51e7f4-7cee-42db-bfeb-76d1199d1afe", "Agent session not found: [redacted]"),
             ("Agent session id private-session", "Agent session id [redacted]"),
         ] {
@@ -1113,7 +1206,42 @@ mod tests {
         assert!(value.get("retryable").is_none());
         assert!(value.get("sessionDisposition").is_none());
         assert!(value.get("agentSessionId").is_none());
-        assert!(value.get("detail").is_none());
+        assert_eq!(value["detail"], "jdbc:postgresql://host/db?password=[redacted]");
+    }
+
+    #[test]
+    fn public_detail_redacts_sensitive_key_value_variants() {
+        let message = concat!(
+            "driver failed: PASSWORD:secret-a passwd = 'secret-b' PWD : \"secret-c\" ",
+            "refresh_token=secret-d access-token : secret-e api_key='secret-f' ",
+            "apikey : secret-g credential=secret-h private-key:secret-i ",
+            "authorization: Bearer secret-j cookie = \"session=secret-k\" ",
+            "sessionid:secret-l jwt = secret-m secret:secret-n token = secret-o ",
+            "access_token:secret-p session=secret-q private_key='secret-r'"
+        );
+
+        let detail = bounded_detail(message).expect("non-sensitive context should remain");
+        for secret in [
+            "secret-a", "secret-b", "secret-c", "secret-d", "secret-e", "secret-f", "secret-g", "secret-h", "secret-i",
+            "secret-j", "secret-k", "secret-l", "secret-m", "secret-n", "secret-o", "secret-p", "secret-q", "secret-r",
+        ] {
+            assert!(!detail.contains(secret), "sensitive value leaked: {secret}; detail={detail}");
+        }
+        assert!(detail.contains("driver failed"));
+    }
+
+    #[test]
+    fn public_detail_redacts_mixed_url_and_dsn_sensitive_fields() {
+        let message = concat!(
+            "connection failed for jdbc:postgresql://db.example/app?user=alice&password : url-secret&sslmode=require ",
+            "host=db.example port=5432 password:\"dsn secret\" session = 'session-secret'"
+        );
+
+        let detail = bounded_detail(message).expect("non-sensitive context should remain");
+        for secret in ["alice", "url-secret", "dsn secret", "session-secret"] {
+            assert!(!detail.contains(secret), "sensitive value leaked: {secret}; detail={detail}");
+        }
+        assert!(detail.contains("connection failed"));
     }
 
     #[test]
