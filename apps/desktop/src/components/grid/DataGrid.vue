@@ -3054,6 +3054,16 @@ watch([pendingChangeCount, pendingChangesVersion], () => {
   schedulePreviewRefresh();
 });
 
+watch(
+  pendingChangeCount,
+  (count) => {
+    if (props.context !== "table-data" || !props.cacheKey) return;
+    const tab = queryStore.tabs.find((item) => item.id === props.cacheKey);
+    if (tab?.mode === "data") tab.pendingDataChangeCount = count || undefined;
+  },
+  { immediate: true },
+);
+
 const saveActionMode = computed(() =>
   dataGridSaveActionMode({
     pendingChangeCount: pendingChangeCount.value,
