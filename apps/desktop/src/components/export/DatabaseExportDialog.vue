@@ -12,7 +12,7 @@ import * as api from "@/lib/backend/api";
 import type { ExportProgress } from "@/lib/backend/api";
 import { isSchemaAware } from "@/lib/database/databaseFeatureSupport";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
-import { buildAllDatabaseExportPlan, generateDatabaseExportId, runDatabaseExportUntilTerminal, type AllDatabaseExportPlanItem } from "@/lib/export/databaseExport";
+import { buildAllDatabaseExportPlan, generateDatabaseExportId, runDatabaseExportUntilTerminal, runWithDatabaseBackupSnapshot, type AllDatabaseExportPlanItem } from "@/lib/export/databaseExport";
 import { buildSelectedTablesPayload } from "@/lib/export/databaseExportSelection";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useToast } from "@/composables/useToast";
@@ -300,41 +300,50 @@ async function startExport() {
 
   try {
     const connectionType = store.getConfig(connectionId.value)?.db_type;
-    const snapshotSessionId = includeData.value && (connectionType === "mysql" || connectionType === "postgres") ? (await api.beginDatabaseBackupSnapshot(connectionId.value, database.value)).sessionId : undefined;
-    const request: api.DatabaseExportRequest = {
-      exportId: exportId.value,
-      connectionId: connectionId.value,
-      database: database.value,
-      schema: schema.value,
-      filePath,
-      selectedTables: buildSelectedTablesPayload(tables.value, selectedTables.value),
-      includeStructure: includeStructure.value,
-      includeData: includeData.value,
-      includeObjects: includeObjects.value,
-      includeCreateDatabase: includeCreateDatabase.value,
-      dropTableIfExists: dropTableIfExists.value,
-      omitAutoIncrement: omitAutoIncrement.value,
-      snapshotSessionId,
-      batchSize: 1000,
-    };
-    await api.exportDatabaseSql(request, (progress) => {
-      exportProgress.value = { ...progress };
-      updateDatabaseExportTask(progress.exportId, progress);
-      if (progress.status === "Done") {
-        finishExportTiming();
-        exportDone.value = true;
-        isExporting.value = false;
-        toast(t("databaseExport.exportSuccess"), 3000);
-      } else if (progress.status === "Error") {
-        finishExportTiming();
-        exportError.value = progress.error;
-        isExporting.value = false;
-      } else if (progress.status === "Cancelled") {
-        finishExportTiming();
-        exportCancelled.value = true;
-        isExporting.value = false;
-      }
-    });
+    await runWithDatabaseBackupSnapshot(
+      {
+        connectionId: connectionId.value,
+        database: database.value,
+        enabled: includeData.value && (connectionType === "mysql" || connectionType === "postgres"),
+      },
+      async (snapshotSessionId) => {
+        const request: api.DatabaseExportRequest = {
+          exportId: exportId.value,
+          connectionId: connectionId.value,
+          database: database.value,
+          schema: schema.value,
+          filePath,
+          selectedTables: buildSelectedTablesPayload(tables.value, selectedTables.value),
+          includeStructure: includeStructure.value,
+          includeData: includeData.value,
+          includeObjects: includeObjects.value,
+          includeCreateDatabase: includeCreateDatabase.value,
+          dropTableIfExists: dropTableIfExists.value,
+          omitAutoIncrement: omitAutoIncrement.value,
+          snapshotSessionId,
+          batchSize: 1000,
+        };
+        await api.exportDatabaseSql(request, (progress) => {
+          exportProgress.value = { ...progress };
+          updateDatabaseExportTask(progress.exportId, progress);
+          if (progress.status === "Done") {
+            finishExportTiming();
+            exportDone.value = true;
+            isExporting.value = false;
+            toast(t("databaseExport.exportSuccess"), 3000);
+          } else if (progress.status === "Error") {
+            finishExportTiming();
+            exportError.value = progress.error;
+            isExporting.value = false;
+          } else if (progress.status === "Cancelled") {
+            finishExportTiming();
+            exportCancelled.value = true;
+            isExporting.value = false;
+          }
+        });
+      },
+      () => !exportError.value && !exportCancelled.value,
+    );
   } catch (e: any) {
     exportError.value = e?.message || String(e);
     const lastProgress = exportProgress.value as api.ExportProgress | null;
@@ -423,51 +432,62 @@ async function startAllDatabasesExport() {
       const currentExportId = `${batchId}-${index + 1}`;
       activeDatabaseExportId.value = currentExportId;
       const filePath = isTauriRuntime() ? joinExportPath(directoryPath, `${sanitizeFileName(item.fileStem)}.sql`) : `__web_export_${currentExportId}.sql`;
-      const request: api.DatabaseExportRequest = {
-        exportId: currentExportId,
-        connectionId: connectionId.value,
-        database: item.database,
-        schema: item.schema,
-        filePath,
-        includeStructure: includeStructure.value,
-        includeData: includeData.value,
-        includeObjects: includeObjects.value,
-        includeCreateDatabase: includeCreateDatabase.value,
-        dropTableIfExists: dropTableIfExists.value,
-        omitAutoIncrement: omitAutoIncrement.value,
-        snapshotSessionId: includeData.value && (connectionType === "mysql" || connectionType === "postgres") ? (await api.beginDatabaseBackupSnapshot(connectionId.value, item.database)).sessionId : undefined,
-        batchSize: 1000,
-      };
       let currentDatabaseRowsExported = 0;
 
-      await runDatabaseExportUntilTerminal(request, (progress) => {
-        const nextRowsExported = Math.max(0, progress.rowsExported);
-        batchRowsExported.value += Math.max(0, nextRowsExported - currentDatabaseRowsExported);
-        currentDatabaseRowsExported = nextRowsExported;
-        exportProgress.value = {
-          ...progress,
-          exportId: batchId,
-          currentObject: `${item.displayName}: ${progress.currentObject || item.displayName}`,
-          rowsExported: batchRowsExported.value,
-        };
-        updateDatabaseExportTask(batchId, {
-          ...progress,
-          exportId: batchId,
-          currentObject: item.displayName,
-          objectIndex: index,
-          totalObjects: exportPlan.length,
-          rowsExported: batchRowsExported.value,
-        });
-        if (progress.status === "Error") {
-          finishExportTiming();
-          exportError.value = progress.error;
-          isExporting.value = false;
-        } else if (progress.status === "Cancelled") {
-          finishExportTiming();
-          exportCancelled.value = true;
-          isExporting.value = false;
-        }
-      });
+      await runWithDatabaseBackupSnapshot(
+        {
+          connectionId: connectionId.value,
+          database: item.database,
+          enabled: includeData.value && (connectionType === "mysql" || connectionType === "postgres"),
+        },
+        (snapshotSessionId) =>
+          runDatabaseExportUntilTerminal(
+            {
+              exportId: currentExportId,
+              connectionId: connectionId.value,
+              database: item.database,
+              schema: item.schema,
+              filePath,
+              includeStructure: includeStructure.value,
+              includeData: includeData.value,
+              includeObjects: includeObjects.value,
+              includeCreateDatabase: includeCreateDatabase.value,
+              dropTableIfExists: dropTableIfExists.value,
+              omitAutoIncrement: omitAutoIncrement.value,
+              snapshotSessionId,
+              batchSize: 1000,
+            },
+            (progress) => {
+              const nextRowsExported = Math.max(0, progress.rowsExported);
+              batchRowsExported.value += Math.max(0, nextRowsExported - currentDatabaseRowsExported);
+              currentDatabaseRowsExported = nextRowsExported;
+              exportProgress.value = {
+                ...progress,
+                exportId: batchId,
+                currentObject: `${item.displayName}: ${progress.currentObject || item.displayName}`,
+                rowsExported: batchRowsExported.value,
+              };
+              updateDatabaseExportTask(batchId, {
+                ...progress,
+                exportId: batchId,
+                currentObject: item.displayName,
+                objectIndex: index,
+                totalObjects: exportPlan.length,
+                rowsExported: batchRowsExported.value,
+              });
+              if (progress.status === "Error") {
+                finishExportTiming();
+                exportError.value = progress.error;
+                isExporting.value = false;
+              } else if (progress.status === "Cancelled") {
+                finishExportTiming();
+                exportCancelled.value = true;
+                isExporting.value = false;
+              }
+            },
+          ),
+        (terminal) => terminal.status === "Done",
+      );
 
       if (exportError.value || exportCancelled.value) break;
       activeDatabaseExportId.value = "";
