@@ -1433,11 +1433,15 @@ fn write_database_export_rows<W: Write>(
             filtered_rows.as_slice(),
         )
     };
+    // Database exports use the same table qualification as the SELECT/DDL
+    // path and the legacy typed INSERT writer. In particular, MySQL uses the
+    // selected database rather than a schema-qualified table name.
+    let qualified_table_name = crate::transfer::qualified_table(table, schema, db_type, None);
     let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
         database_type: Some(*db_type),
         schema: (!schema.is_empty()).then(|| schema.to_string()),
         table_name: Some(table.to_string()),
-        qualified_table_name: None,
+        qualified_table_name: Some(qualified_table_name),
         columns: insert_columns.to_vec(),
         column_types: insert_column_types.to_vec(),
         column_extras: insert_column_extras.to_vec(),
