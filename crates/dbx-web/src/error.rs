@@ -186,7 +186,7 @@ mod tests {
             "driver failed: PASSWORD:secret-a refresh_token = \"secret-b\" api-key:secret-c authorization: Bearer secret-d sessionid=secret-e",
         );
 
-        let response = AppError::from(error).into_response();
+        let response = error.into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let detail = payload["detail"].as_str().unwrap();
