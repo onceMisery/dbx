@@ -804,14 +804,15 @@ fn looks_like_complete_sql(tokens: &[(usize, usize, String)], index: usize) -> b
 }
 
 fn redact_sensitive_fragments(value: &str) -> String {
-    let mut redacted = String::with_capacity(value.len());
+    let redacted_url = redact_url_userinfo(value);
+    let mut redacted = String::with_capacity(redacted_url.len());
     let mut cursor = 0;
-    while let Some((value_start, value_end)) = next_sensitive_assignment(value, cursor) {
-        redacted.push_str(&value[cursor..value_start]);
+    while let Some((value_start, value_end)) = next_sensitive_assignment(&redacted_url, cursor) {
+        redacted.push_str(&redacted_url[cursor..value_start]);
         redacted.push_str("[redacted]");
         cursor = value_end;
     }
-    redacted.push_str(&value[cursor..]);
+    redacted.push_str(&redacted_url[cursor..]);
     let source_tokens = redacted.split_whitespace().collect::<Vec<_>>();
     let mut tokens = Vec::with_capacity(source_tokens.len());
     let mut redact_next = false;
@@ -841,6 +842,50 @@ fn redact_sensitive_fragments(value: &str) -> String {
     } else {
         redacted
     }
+}
+
+fn redact_url_userinfo(value: &str) -> String {
+    let mut ranges = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative_scheme_end) = value[search_from..].find("://") {
+        let authority_start = search_from + relative_scheme_end + "://".len();
+        let authority_end = value[authority_start..]
+            .char_indices()
+            .find(|(_, ch)| matches!(ch, '/' | '?' | '#') || ch.is_ascii_whitespace())
+            .map(|(offset, _)| authority_start + offset)
+            .unwrap_or(value.len());
+        let authority = &value[authority_start..authority_end];
+
+        if let Some(user_info_end) = authority.rfind('@') {
+            let user_info = &authority[..user_info_end];
+            if let Some(password_separator) = user_info.find(':') {
+                let password_start = authority_start + password_separator + 1;
+                let password_end = authority_start + user_info_end;
+                if password_start < password_end {
+                    ranges.push((password_start, password_end));
+                }
+            }
+        }
+
+        if authority_end == value.len() {
+            break;
+        }
+        search_from = authority_end;
+    }
+
+    if ranges.is_empty() {
+        return value.to_string();
+    }
+
+    let mut redacted = String::with_capacity(value.len());
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        redacted.push_str(&value[cursor..start]);
+        redacted.push_str("[redacted]");
+        cursor = end;
+    }
+    redacted.push_str(&value[cursor..]);
+    redacted
 }
 
 fn sensitive_key_name(key: &str) -> bool {
@@ -935,6 +980,9 @@ fn consume_sensitive_value(value: &str, start: usize, key: &str) -> usize {
         return start;
     }
     let first = value[start..].chars().next().unwrap_or_default();
+    if first == '{' {
+        return consume_braced_value(value, start);
+    }
     if matches!(first, '\'' | '"') {
         let mut escaped = false;
         let mut iter = value[start + first.len_utf8()..].char_indices();
@@ -991,6 +1039,23 @@ fn consume_sensitive_value(value: &str, start: usize, key: &str) -> usize {
         }
     }
     end
+}
+
+fn consume_braced_value(value: &str, start: usize) -> usize {
+    let mut index = start + '{'.len_utf8();
+    while index < value.len() {
+        let ch = value[index..].chars().next().unwrap_or_default();
+        if ch == '}' {
+            let next = index + ch.len_utf8();
+            if value[next..].starts_with('}') {
+                index = next + '}'.len_utf8();
+                continue;
+            }
+            return next;
+        }
+        index += ch.len_utf8();
+    }
+    value.len()
 }
 
 fn redact_session_identifier(value: &str) -> String {
@@ -1242,6 +1307,27 @@ mod tests {
             assert!(!detail.contains(secret), "sensitive value leaked: {secret}; detail={detail}");
         }
         assert!(detail.contains("connection failed"));
+    }
+
+    #[test]
+    fn serialized_public_detail_redacts_url_userinfo_and_braced_dsn_values() {
+        let cases = [
+            (
+                "connection failed: jdbc:postgresql://alice:url-secret@db.example/app",
+                "connection failed: jdbc:postgresql://alice:[redacted]@db.example/app",
+            ),
+            (
+                "connection failed: Driver={PostgreSQL};PWD={dsn;secret};SERVER=db.example",
+                "connection failed: Driver={PostgreSQL};PWD=[redacted];SERVER=db.example",
+            ),
+        ];
+
+        for (message, expected) in cases {
+            let payload = serde_json::to_value(BackendError::from_sql_detail(message)).unwrap();
+            assert_eq!(payload["detail"].as_str(), Some(expected), "detail changed unexpectedly: {message}");
+            assert!(!payload["detail"].as_str().unwrap().contains("url-secret"));
+            assert!(!payload["detail"].as_str().unwrap().contains("dsn;secret"));
+        }
     }
 
     #[test]
