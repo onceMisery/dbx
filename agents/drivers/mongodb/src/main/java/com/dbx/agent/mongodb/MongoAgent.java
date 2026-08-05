@@ -15,6 +15,12 @@ import com.mongodb.ServerAddress;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.Collation;
+import com.mongodb.client.model.CollationAlternate;
+import com.mongodb.client.model.CollationCaseFirst;
+import com.mongodb.client.model.CollationMaxVariable;
+import com.mongodb.client.model.CollationStrength;
+import com.mongodb.client.model.CountOptions;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.result.UpdateResult;
 import java.io.BufferedReader;
@@ -423,12 +429,13 @@ public final class MongoAgent {
         Document filterDoc = documentOrNull(params, "filter");
         Document projectionDoc = documentOrNull(params, "projection");
         Document sortDoc = documentOrNull(params, "sort");
+        Collation collation = collationOrNull(documentOrNull(params, "collation"));
 
         var col = c.getDatabase(database).getCollection(collection);
         if (filterDoc == null) {
             filterDoc = new Document();
         }
-        CollectionTotal total = collectionTotal(col, filterDoc);
+        CollectionTotal total = collectionTotal(col, filterDoc, collation);
 
         var iterable = col.find(filterDoc).skip((int) skip).limit(limit);
         if (projectionDoc != null) {
@@ -437,12 +444,59 @@ public final class MongoAgent {
         if (sortDoc != null) {
             iterable = iterable.sort(sortDoc);
         }
+        if (collation != null) {
+            iterable = iterable.collation(collation);
+        }
 
         List<Map<String, Object>> documents = new ArrayList<>();
         for (Document document : iterable) {
             documents.add(bsonToJson(document));
         }
         return documentQueryResult(documents, total);
+    }
+
+    private static Object findOne(JsonObject params) {
+        MongoClient c = requireClient();
+        String database = params.get("database").getAsString();
+        String collection = params.get("collection").getAsString();
+        Document filter = documentOrNull(params, "filter");
+        Document projection = documentOrNull(params, "projection");
+        Document options = documentOrNull(params, "options");
+        Document sort = null;
+
+        if (options != null) {
+            for (String key : options.keySet()) {
+                if (!"sort".equals(key)) {
+                    throw new IllegalArgumentException("Unsupported findOne option: " + key);
+                }
+            }
+            Object rawSort = options.get("sort");
+            if (rawSort != null) {
+                if (!(rawSort instanceof Document sortDocument)) {
+                    throw new IllegalArgumentException("Invalid findOne option sort: expected an object");
+                }
+                sort = sortDocument;
+            }
+        }
+
+        var iterable = c.getDatabase(database).getCollection(collection).find(filter == null ? new Document() : filter);
+        if (projection != null) {
+            iterable = iterable.projection(projection);
+        }
+        if (sort != null) {
+            iterable = iterable.sort(sort);
+        }
+        Document document = iterable.limit(1).first();
+
+        List<Map<String, Object>> documents = new ArrayList<>();
+        List<JsonObject> extendedDocuments = new ArrayList<>();
+        if (document != null) {
+            documents.add(bsonToJson(document));
+            extendedDocuments.add(bsonToExtendedJson(document));
+        }
+        Map<String, Object> result = documentQueryResult(documents, new CollectionTotal(documents.size(), true));
+        result.put("extended_documents", extendedDocuments);
+        return result;
     }
 
     /**
@@ -458,12 +512,13 @@ public final class MongoAgent {
         Document filterDoc = documentOrNull(params, "filter");
         Document projectionDoc = documentOrNull(params, "projection");
         Document sortDoc = documentOrNull(params, "sort");
+        Collation collation = collationOrNull(documentOrNull(params, "collation"));
 
         var col = c.getDatabase(database).getCollection(collection);
         if (filterDoc == null) {
             filterDoc = new Document();
         }
-        CollectionTotal total = collectionTotal(col, filterDoc);
+        CollectionTotal total = collectionTotal(col, filterDoc, collation);
 
         var iterable = col.find(filterDoc).skip((int) skip).limit(limit);
         if (projectionDoc != null) {
@@ -471,6 +526,9 @@ public final class MongoAgent {
         }
         if (sortDoc != null) {
             iterable = iterable.sort(sortDoc);
+        }
+        if (collation != null) {
+            iterable = iterable.collation(collation);
         }
 
         List<JsonObject> documents = new ArrayList<>();
@@ -480,11 +538,89 @@ public final class MongoAgent {
         return documentQueryResult(documents, total);
     }
 
+    static Collation collationOrNull(Document document) {
+        if (document == null) {
+            return null;
+        }
+        Set<String> supported = Set.of(
+            "locale", "strength", "caseLevel", "caseFirst", "numericOrdering",
+            "alternate", "maxVariable", "normalization", "backwards"
+        );
+        for (String key : document.keySet()) {
+            if (!supported.contains(key)) {
+                throw new IllegalArgumentException("Unsupported collation option: " + key);
+            }
+        }
+        String locale = document.getString("locale");
+        if (locale == null || locale.isBlank()) {
+            throw new IllegalArgumentException("Invalid collation: locale must not be empty");
+        }
+
+        Collation.Builder builder = Collation.builder().locale(locale);
+        if (document.containsKey("strength")) {
+            Object strength = document.get("strength");
+            if (!(strength instanceof Number number) || number.doubleValue() != Math.rint(number.doubleValue())) {
+                throw new IllegalArgumentException("Invalid collation option strength: expected an integer from 1 to 5");
+            }
+            int strengthValue = number.intValue();
+            if (strengthValue < 1 || strengthValue > 5) {
+                throw new IllegalArgumentException("Invalid collation option strength: expected an integer from 1 to 5");
+            }
+            builder.collationStrength(CollationStrength.fromInt(strengthValue));
+        }
+        if (document.containsKey("caseLevel")) {
+            builder.caseLevel(collationBoolean(document, "caseLevel"));
+        }
+        if (document.containsKey("caseFirst")) {
+            builder.collationCaseFirst(CollationCaseFirst.fromString(collationString(document, "caseFirst")));
+        }
+        if (document.containsKey("numericOrdering")) {
+            builder.numericOrdering(collationBoolean(document, "numericOrdering"));
+        }
+        if (document.containsKey("alternate")) {
+            builder.collationAlternate(CollationAlternate.fromString(collationString(document, "alternate")));
+        }
+        if (document.containsKey("maxVariable")) {
+            builder.collationMaxVariable(CollationMaxVariable.fromString(collationString(document, "maxVariable")));
+        }
+        if (document.containsKey("normalization")) {
+            builder.normalization(collationBoolean(document, "normalization"));
+        }
+        if (document.containsKey("backwards")) {
+            builder.backwards(collationBoolean(document, "backwards"));
+        }
+        return builder.build();
+    }
+
+    private static boolean collationBoolean(Document document, String key) {
+        Object value = document.get(key);
+        if (value instanceof Boolean booleanValue) {
+            return booleanValue;
+        }
+        throw new IllegalArgumentException("Invalid collation option " + key + ": expected a boolean");
+    }
+
+    private static String collationString(Document document, String key) {
+        Object value = document.get(key);
+        if (value instanceof String stringValue) {
+            return stringValue;
+        }
+        throw new IllegalArgumentException("Invalid collation option " + key + ": expected a string");
+    }
+
     static CollectionTotal collectionTotal(MongoCollection<Document> collection, Document filter) {
+        return collectionTotal(collection, filter, null);
+    }
+
+    static CollectionTotal collectionTotal(MongoCollection<Document> collection, Document filter, Collation collation) {
         if (filter.isEmpty()) {
             return new CollectionTotal(collection.estimatedDocumentCount(), false);
         }
-        return new CollectionTotal(collection.countDocuments(filter), true);
+        CountOptions options = new CountOptions();
+        if (collation != null) {
+            options.collation(collation);
+        }
+        return new CollectionTotal(collection.countDocuments(filter, options), true);
     }
 
     static Map<String, Object> documentQueryResult(List<?> documents, CollectionTotal total) {
@@ -1157,6 +1293,7 @@ public final class MongoAgent {
             case AgentProtocol.MONGO_METHOD_LIST_COLLECTIONS -> listCollections(params);
             case AgentProtocol.METHOD_LIST_INDEXES -> listIndexes(params);
             case AgentProtocol.MONGO_METHOD_FIND_DOCUMENTS -> findDocuments(params);
+            case AgentProtocol.MONGO_METHOD_FIND_ONE -> findOne(params);
             case AgentProtocol.MONGO_METHOD_FIND_DOCUMENTS_EXTENDED_JSON -> findDocumentsExtendedJson(params);
             case AgentProtocol.MONGO_METHOD_COUNT_DOCUMENTS -> countDocuments(params);
             case AgentProtocol.MONGO_METHOD_SERVER_VERSION -> serverVersion(params);

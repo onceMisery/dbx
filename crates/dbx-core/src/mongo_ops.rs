@@ -138,6 +138,7 @@ pub async fn mongo_find_documents_core(
     filter: Option<&str>,
     projection: Option<&str>,
     sort: Option<&str>,
+    collation: Option<&str>,
 ) -> Result<MongoDocumentResult, String> {
     crate::document_ops::find_documents_core(
         state,
@@ -149,6 +150,7 @@ pub async fn mongo_find_documents_core(
         filter,
         projection,
         sort,
+        collation,
     )
     .await
 }
@@ -168,8 +170,18 @@ pub async fn mongo_find_one_core(
         PoolKind::MongoDb(client) => {
             mongo_driver::find_one(client, database, collection, filter, projection, options).await
         }
-        // The legacy agent only exposes paginated find, which also performs a count.
-        PoolKind::Agent(_) => Err("MongoDB legacy agent does not support the bounded findOne path".to_string()),
+        PoolKind::Agent(client) => {
+            let mut client = client.lock().await;
+            client
+                .mongo_find_one(serde_json::json!({
+                    "database": database,
+                    "collection": collection,
+                    "filter": filter,
+                    "projection": projection,
+                    "options": options,
+                }))
+                .await
+        }
         _ => Err("Not a MongoDB connection".to_string()),
     }
 }
@@ -236,7 +248,7 @@ pub async fn mongo_find_documents_extended_json_core(
     match connections.get(connection_id).ok_or("Not found")? {
         PoolKind::MongoDb(client) => {
             mongo_driver::find_documents_extended_json(
-                client, database, collection, skip, limit, filter, projection, sort,
+                client, database, collection, skip, limit, filter, projection, sort, None,
             )
             .await
         }

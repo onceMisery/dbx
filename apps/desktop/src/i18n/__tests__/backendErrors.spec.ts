@@ -55,6 +55,11 @@ const WINDOWS_JRE_REMOVE_ERROR = [
 // key and params it must resolve to.
 const CASES: { name: string; message: string; key: string; params?: Record<string, string> }[] = [
   {
+    name: "SSH TOTP prompt cancelled",
+    message: "SSH layer 1 failed: SSH keyboard-interactive authentication was cancelled",
+    key: "connection.sshTotpCancelled",
+  },
+  {
     name: "streaming export unsupported",
     message: "Streaming export is unsupported for this query. Simplify it or use a supported driver.",
     key: "exportProgress.streamingUnsupported",
@@ -97,6 +102,11 @@ const CASES: { name: string; message: string; key: string; params?: Record<strin
     message: "Close these database connections before updating drivers: Prod MySQL, Stage PG",
     key: "driverStore.driverUpdateBlocked",
     params: { labels: "Prod MySQL, Stage PG" },
+  },
+  {
+    name: "GBase 8s server name mismatch",
+    message: "Agent RPC error (-1): java.sql.SQLException: GBASEDBTSERVER 与 DBSERVERNAME 或 DBSERVERALIASES 不匹配。",
+    key: "connection.gbaseServerMismatch",
   },
   {
     name: "Kafka topic unload unsupported",

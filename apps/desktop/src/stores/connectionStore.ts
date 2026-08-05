@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import { uuid } from "@/lib/common/utils";
+import { containsHan, orderedSubsequenceSpan, pinyinFirstLetters } from "@/lib/common/pinyin";
 import { ref, computed, watch, markRaw } from "vue";
 import type {
   ColumnInfo,
@@ -2658,6 +2659,8 @@ export const useConnectionStore = defineStore("connection", () => {
       await loadVectorCollections(connectionId);
     } else if (config.db_type === "mq") {
       await loadMqTenants(connectionId, { force: true });
+    } else if (config.db_type === "mqtt") {
+      await loadMqttTopics(connectionId);
     } else if (config.db_type === "nacos") {
       await loadNacosNamespaces(connectionId, { force: true });
     } else {
@@ -3322,6 +3325,48 @@ export const useConnectionStore = defineStore("connection", () => {
     } finally {
       finishTreeNodeLoad(load);
     }
+  }
+
+  async function loadMqttTopics(connectionId: string) {
+    const node = findConnectionNode(connectionId);
+    if (!node) return;
+
+    node.isLoading = true;
+    try {
+      await ensureConnected(connectionId);
+      const { mqttGetTopicTree } = await import("@/lib/backend/api");
+      const topicTree = (await mqttGetTopicTree(connectionId)) as { name: string; fullPath: string; children?: unknown[]; isLeaf: boolean };
+      const topicNodes = mqttTopicTreeToSidebarNodes(connectionId, topicTree);
+      // Always prepend a synthetic console entry so users can open the MQTT admin
+      // even when no topics are subscribed yet.
+      const consoleNode: TreeNode = {
+        id: `${connectionId}:mqtt-topic:__console__`,
+        label: "MQTT 控制台",
+        type: "mqtt-topic" as const,
+        connectionId,
+        children: topicNodes.length > 0 ? topicNodes : [],
+        isExpanded: topicNodes.length > 0,
+      };
+      setChildren(node, [consoleNode]);
+      node.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(connectionId, e);
+      throw e;
+    } finally {
+      node.isLoading = false;
+    }
+  }
+
+  function mqttTopicTreeToSidebarNodes(connectionId: string, tree: { name: string; fullPath: string; children?: unknown[]; isLeaf: boolean }): TreeNode[] {
+    const children = tree.children ?? [];
+    return children.map((child: any) => ({
+      id: `${connectionId}:mqtt-topic:${child.fullPath}`,
+      label: child.isLeaf ? child.name : `${child.name}/`,
+      type: "mqtt-topic",
+      connectionId,
+      children: child.children?.length > 0 ? mqttTopicTreeToSidebarNodes(connectionId, child) : [],
+      isExpanded: false,
+    })) as TreeNode[];
   }
 
   async function loadMqTenants(connectionId: string, options?: LoadTreeOptions) {
@@ -5089,6 +5134,8 @@ export const useConnectionStore = defineStore("connection", () => {
         await loadVectorCollections(node.connectionId);
       } else if (config?.db_type === "mq") {
         await loadMqTenants(node.connectionId, options);
+      } else if (config?.db_type === "mqtt") {
+        await loadMqttTopics(node.connectionId);
       } else if (config?.db_type === "nacos") {
         await loadNacosNamespaces(node.connectionId, options);
       } else {
@@ -5603,6 +5650,15 @@ export const useConnectionStore = defineStore("connection", () => {
     const acronym = completionNameAcronym(table.name);
     if (acronym === normalized) return score + 7_100 - text.length;
     if (acronym.startsWith(normalized)) return score + 6_900 - text.length;
+    // DataGrip-style pinyin initials for Han names, e.g. "zzj" → 总租金,
+    // including ordered subsequences like "zj" → 总租金.
+    if (/^[a-z0-9]+$/.test(normalized) && containsHan(text)) {
+      const pinyinInitials = pinyinFirstLetters(text);
+      if (pinyinInitials === normalized) return score + 7_050 - text.length;
+      if (pinyinInitials.startsWith(normalized)) return score + 6_850 - text.length;
+      const subsequence = orderedSubsequenceSpan(pinyinInitials, normalized);
+      if (subsequence) return score + 5_000 - subsequence.first * 30 - subsequence.span * 10 - text.length;
+    }
     if (normalized.length <= segments.length && segments.every((segment, index) => segment.startsWith(normalized[index] ?? ""))) return score + 6_700 - text.length;
     if (text.includes(normalized)) return score + 4_000 - text.length;
     const subsequenceScore = orderedSubsequenceScore(text, normalized);
@@ -6073,6 +6129,11 @@ export const useConnectionStore = defineStore("connection", () => {
     if (!filter) return true;
     const text = value.toLowerCase();
     if (text.includes(filter)) return true;
+    // Pinyin initials, e.g. "zzj" or "zj" matches 总租金.
+    if (/^[a-z0-9]+$/.test(filter) && containsHan(text)) {
+      const pinyinInitials = pinyinFirstLetters(text);
+      if (pinyinInitials.startsWith(filter) || orderedSubsequenceSpan(pinyinInitials, filter)) return true;
+    }
     let index = 0;
     for (const ch of filter) {
       index = text.indexOf(ch, index);
@@ -6863,6 +6924,7 @@ export const useConnectionStore = defineStore("connection", () => {
     loadEtcdRoot,
     loadZooKeeperRoot,
     loadMqTenants,
+    loadMqttTopics,
     loadNacosNamespaces,
     updateRedisDbKeyStats,
     loadMongoDatabases,

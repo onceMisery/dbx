@@ -1,6 +1,9 @@
-import { test } from "vitest";
+import { afterAll, beforeAll, test, vi } from "vitest";
 import assert from "node:assert/strict";
 import { copyNameForTreeNode, isDocumentBrowserTreeNode, objectSourceKindForTreeNode, shouldRunTreeNodeRowAction, sidebarSelectionCopyAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "../../apps/desktop/src/lib/sidebar/treeNodeClick.ts";
+
+beforeAll(() => vi.stubGlobal("navigator", { platform: "Linux x86_64" }));
+afterAll(() => vi.unstubAllGlobals());
 
 test("table and view rows open data without toggling structure groups", () => {
   assert.equal(treeNodeRowAction("table", true), "open-data");

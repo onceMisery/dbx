@@ -1521,6 +1521,8 @@ async fn do_execute_typed(
         PoolKind::Redis(_) => Err("Use Redis-specific commands".to_string()),
         PoolKind::MongoDb(_) => Err(MONGO_SHELL_COMMAND_HINT.to_string()),
         PoolKind::MessageQueue => Err("Use Message Queue-specific commands".to_string()),
+        #[cfg(feature = "mq-admin")]
+        PoolKind::Mqtt(_) => Err("Use MQTT-specific commands".to_string()),
         PoolKind::Nacos => Err("Use Nacos-specific commands".to_string()),
         PoolKind::InfluxDb(client) => {
             let client = client.clone();
@@ -1648,12 +1650,19 @@ fn classify_query_error(db_type: Option<DatabaseType>, error: QueryExecutionErro
         QueryExecutionError::Legacy(message) if is_dbx_query_timeout_error(&message.to_ascii_lowercase()) => {
             QueryExecutionError::Timeout(message)
         }
-        QueryExecutionError::Legacy(message)
-            if db_type == Some(DatabaseType::Postgres) && message.trim_start().starts_with("ERROR:") =>
-        {
+        QueryExecutionError::Legacy(message) if is_native_sql_server_error(db_type, &message) => {
             QueryExecutionError::Sql(message)
         }
         other => other,
+    }
+}
+
+fn is_native_sql_server_error(db_type: Option<DatabaseType>, message: &str) -> bool {
+    let message = message.trim_start();
+    match db_type {
+        Some(DatabaseType::Postgres) => message.starts_with("ERROR:"),
+        Some(DatabaseType::Mysql) => message.starts_with("Server error: `ERROR "),
+        _ => false,
     }
 }
 
@@ -2811,6 +2820,8 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         | PoolKind::VectorDb(_)
         | PoolKind::InfluxDb(_)
         | PoolKind::ExternalDriver { .. } => false,
+        #[cfg(feature = "mq-admin")]
+        PoolKind::Mqtt(_) => false,
     }
 }
 
@@ -3043,6 +3054,8 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
             }
             PoolKind::Agent(client) => TxPath::Agent(client.clone()),
             PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::HBase(_) => TxPath::None,
+            #[cfg(feature = "mq-admin")]
+            PoolKind::Mqtt(_) => TxPath::None,
             PoolKind::DuckDbWorker(_)
             | PoolKind::Redis(_)
             | PoolKind::MongoDb(_)
@@ -5086,6 +5099,31 @@ for line in sys.stdin:
             backend_error.detail(),
             Some(
                 "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
+            )
+        );
+    }
+
+    #[test]
+    fn mysql_server_error_preserves_sql_catalog_identity_and_detail() {
+        let error = classify_query_error(
+            Some(DatabaseType::Mysql),
+            QueryExecutionError::Legacy(
+                "Server error: `ERROR 1064 (42000): You have an error in your SQL syntax`".to_string(),
+            ),
+        )
+        .with_omitted_sql_context("SELECT 111 AS first_value FROM DUAL");
+        let backend_error = error.into_backend_error();
+
+        assert_eq!(backend_error.code(), "DBX-JDBC-4001");
+        assert_eq!(backend_error.message_key(), "backendErrors.jdbc.sqlFailed");
+        assert_eq!(
+            backend_error.message_params().get("stage"),
+            Some(&crate::backend_error::BackendMessageParam::String("execute".to_string()))
+        );
+        assert_eq!(
+            backend_error.detail(),
+            Some(
+                "Server error: `ERROR 1064 (42000): You have an error in your SQL syntax` SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
             )
         );
     }

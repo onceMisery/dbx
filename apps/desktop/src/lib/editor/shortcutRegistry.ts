@@ -55,6 +55,7 @@ export type ShortcutActionId =
   | "pasteSidebarSelection"
   | "editSidebarConnection"
   | "openDataInNewTab"
+  | "viewTableDdl"
   | "sendSelectionToAi";
 
 export type ShortcutScope = "global" | "editor" | "grid" | "search" | "sidebar";
@@ -408,6 +409,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     scope: "sidebar",
     defaultShortcut: "Alt",
     inputKind: "modifier-only",
+  },
+  {
+    id: "viewTableDdl",
+    labelKey: "settings.shortcutViewTableDdl",
+    scope: "sidebar",
+    defaultShortcut: "Shift+Mod+D",
   },
   {
     id: "sendSelectionToAi",

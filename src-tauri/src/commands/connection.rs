@@ -485,7 +485,7 @@ mod tests {
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         state.configs.write().await.insert(initial.id.clone(), initial.clone());
         state.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
-        let first = state.mq_registry.get_or_build(&initial).await.unwrap();
+        let first = state.mq_registry.get_or_build(&initial).await.unwrap().adapter;
 
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
         save_connection_configs(&state, std::slice::from_ref(&updated)).await.unwrap();
@@ -501,7 +501,7 @@ mod tests {
             .map(str::to_string);
         assert_eq!(cached_admin_url.as_deref(), Some("http://127.0.0.1:8081"));
 
-        let second = state.mq_registry.get_or_build(&updated).await.unwrap();
+        let second = state.mq_registry.get_or_build(&updated).await.unwrap().adapter;
         assert!(!std::sync::Arc::ptr_eq(&first, &second));
         assert!(!state.connections.read().await.contains_key(&initial.id));
 
@@ -553,7 +553,7 @@ mod tests {
             configs.insert(kept.id.clone(), kept.clone());
             configs.insert(removed.id.clone(), removed.clone());
         }
-        let stale = state.mq_registry.get_or_build(&removed).await.unwrap();
+        let stale = state.mq_registry.get_or_build(&removed).await.unwrap().adapter;
 
         save_connection_configs(&state, std::slice::from_ref(&kept)).await.unwrap();
 
@@ -562,7 +562,7 @@ mod tests {
         assert!(!configs.contains_key("removed-mq"));
         drop(configs);
 
-        let rebuilt = state.mq_registry.get_or_build(&removed).await.unwrap();
+        let rebuilt = state.mq_registry.get_or_build(&removed).await.unwrap().adapter;
         assert!(!std::sync::Arc::ptr_eq(&stale, &rebuilt));
 
         let _ = std::fs::remove_dir_all(dir);
@@ -1085,25 +1085,29 @@ async fn test_connection_with_info_inner(
             }
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
+                // Probe with a transient adapter so Test Connection never retains/replaces
+                // a live cached MQ agent for this connection id (same pattern as Nacos).
                 let mqc = state.mq_admin_config_for_connection(connection_id, &config).await?;
                 let agent_launch = dbx_core::mq::service::resolve_mq_agent_launch_spec(&mqc, state);
-                let adapter = match state.mq_registry.get_or_build_config(connection_id, mqc, agent_launch).await {
-                    Ok(adapter) => adapter,
-                    Err(err) => {
-                        state.mq_registry.drop_connection(connection_id).await;
-                        return Err(err);
-                    }
-                };
-                if let Err(err) = adapter.test_connection().await {
-                    state.mq_registry.drop_connection(connection_id).await;
-                    return Err(err);
-                }
+                let adapter = state.mq_registry.build_transient_config(mqc, agent_launch).await?;
+                adapter.test_connection().await?;
                 Ok("Connection successful".to_string())
             }
             #[cfg(not(feature = "mq-admin"))]
             DatabaseType::MessageQueue => {
                 Err("Message queue admin support is not compiled in this build. Rebuild with the 'mq-admin' feature."
                     .to_string())
+            }
+            #[cfg(feature = "mq-admin")]
+            DatabaseType::Mqtt => {
+                let mqtt_config = dbx_core::mqtt::types::MqttConnectionConfig::from_connection(&config)?;
+                let client = dbx_core::mqtt::client::MqttClient::connect(mqtt_config).await?;
+                client.disconnect().await;
+                Ok("Connection successful".to_string())
+            }
+            #[cfg(not(feature = "mq-admin"))]
+            DatabaseType::Mqtt => {
+                Err("MQTT support is not compiled in this build. Rebuild with the 'mq-admin' feature.".to_string())
             }
             db_type if database_capabilities::is_agent_type(&db_type) => {
                 match test_agent_connection(state, &config, &host, port).await {
@@ -1420,8 +1424,8 @@ pub async fn connect_db(
         DatabaseType::MessageQueue => {
             let mqc = state.mq_admin_config_for_connection(&id, &config).await?;
             let agent_launch = dbx_core::mq::service::resolve_mq_agent_launch_spec(&mqc, &state);
-            let adapter = match state.mq_registry.get_or_build_config(&id, mqc, agent_launch).await {
-                Ok(adapter) => adapter,
+            let build = match state.mq_registry.get_or_build_config(&id, mqc, agent_launch).await {
+                Ok(build) => build,
                 Err(err) => {
                     state.mq_registry.drop_connection(&id).await;
                     return Err(err);
@@ -1431,7 +1435,7 @@ pub async fn connect_db(
                 state.mq_registry.drop_connection(&id).await;
                 return Err(err);
             }
-            if let Err(err) = adapter.test_connection().await {
+            if let Err(err) = dbx_core::mq::validate_mq_adapter_after_build(&build).await {
                 state.mq_registry.drop_connection(&id).await;
                 return Err(err);
             }
@@ -1456,6 +1460,16 @@ pub async fn connect_db(
             state.external_driver_pool("jdbc", &jdbc_config).await?
         }
         DatabaseType::Jdbc => state.external_driver_pool("jdbc", &db_config).await?,
+        #[cfg(feature = "mq-admin")]
+        DatabaseType::Mqtt => {
+            let mqtt_config = dbx_core::mqtt::types::MqttConnectionConfig::from_connection(&db_config)?;
+            let client = dbx_core::mqtt::client::MqttClient::connect(mqtt_config).await?;
+            PoolKind::Mqtt(client)
+        }
+        #[cfg(not(feature = "mq-admin"))]
+        DatabaseType::Mqtt => {
+            return Err("MQTT support is not compiled in this build. Rebuild with the 'mq-admin' feature.".to_string());
+        }
         db_type => return Err(format!("Unsupported database type: {db_type:?}")),
     };
 
