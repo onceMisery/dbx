@@ -164,9 +164,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_response_redacts_sensitive_detail_before_serialization() {
+    async fn http_response_preserves_native_sql_detail() {
         let error = BackendError::from_sql_detail(
-            "ERROR: connection failed for jdbc:postgresql://db.example/app?user=alice&password=secret; session_id=session-42; statement [SELECT email FROM customers WHERE ssn='123']",
+            "ERROR: statement [UPDATE users SET password='user-input' WHERE email='literal-secret@example.com']",
         );
 
         let response = AppError::from(error).into_response();
@@ -174,17 +174,15 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let detail = payload["detail"].as_str().unwrap();
 
-        assert!(detail.contains("ERROR: connection failed"));
-        assert!(detail.contains("[redacted]"));
-        assert!(detail.contains("[statement omitted]"));
-        assert!(!detail.contains("password=secret"));
-        assert!(!detail.contains("session-42"));
-        assert!(!detail.contains("ssn='123'"));
+        assert_eq!(
+            detail,
+            "ERROR: statement [UPDATE users SET password='user-input' WHERE email='literal-secret@example.com']"
+        );
     }
 
     #[tokio::test]
     async fn http_response_redacts_common_sensitive_key_variants() {
-        let error = BackendError::from_sql_detail(
+        let error = AppError::internal(
             "driver failed: PASSWORD:secret-a refresh_token = \"secret-b\" api-key:secret-c authorization: Bearer secret-d sessionid=secret-e",
         );
 

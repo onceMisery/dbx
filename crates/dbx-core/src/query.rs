@@ -36,7 +36,7 @@ pub const QUERY_CANCELED: &str = "Query canceled";
 /// (desktop/CLI diagnose first; this is only the Rust SQL-executor backstop).
 const MONGO_SHELL_COMMAND_HINT: &str = "Use MongoDB shell-style commands, for example: db.collection.find({}).limit(100), db.collection.aggregate([]), db.collection.aggregate([], { explain: true }), db.version(), db.collection.countDocuments({}), db.collection.distinct(\"field\"), db.collection.getIndexes(), db.collection.createIndex({...}), or db.collection.insertOne({...}).";
 const SQL_OMITTED_ERROR_CONTEXT: &str =
-    "SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement.";
+    "SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolErrorAction {
@@ -5077,7 +5077,7 @@ for line in sys.stdin:
         );
         assert_eq!(
             backend_error.detail(),
-            Some("Query timed out after 1 seconds\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement.")
+            Some("Query timed out after 1 seconds\nSQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.")
         );
     }
 
@@ -5098,7 +5098,7 @@ for line in sys.stdin:
         assert_eq!(
             backend_error.detail(),
             Some(
-                "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
+                "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement."
             )
         );
     }
@@ -5123,7 +5123,7 @@ for line in sys.stdin:
         assert_eq!(
             backend_error.detail(),
             Some(
-                "Server error: `ERROR 1064 (42000): You have an error in your SQL syntax` SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
+                "Server error: `ERROR 1064 (42000): You have an error in your SQL syntax` SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement."
             )
         );
     }
@@ -5144,7 +5144,7 @@ for line in sys.stdin:
         assert_eq!(
             backend_error.detail(),
             Some(
-                "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
+                "ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement."
             )
         );
     }
@@ -5164,7 +5164,7 @@ for line in sys.stdin:
         assert_eq!(
             backend_error.detail(),
             Some(
-                "Statement 1 failed: ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement."
+                "Statement 1 failed: ERROR: relation \"dbx_table_that_does_not_exist\" does not exist\nSQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement."
             )
         );
     }
@@ -5536,7 +5536,7 @@ for line in sys.stdin:
 
         assert_eq!(
             error.detail(),
-            Some("Server error: `ERROR 1064 (42000): syntax error` SQL text omitted from user-facing error; enable debug SQL diagnostics for a redacted statement.")
+            Some("Server error: `ERROR 1064 (42000): syntax error` SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.")
         );
     }
 

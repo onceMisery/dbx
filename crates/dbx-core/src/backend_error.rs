@@ -133,25 +133,35 @@ impl BackendError {
         match error {
             AgentCallError::Structured { message, context, .. } => {
                 let (entry, outcome) = structured_entry(context);
+                let detail = match context.category {
+                    AgentErrorCategory::Sql => bounded_native_detail(message),
+                    _ => bounded_detail(message),
+                };
                 Self::new(
                     entry,
                     BackendErrorSource::JdbcAgent,
                     BackendErrorOrigin::database(BackendErrorAdapter::JdbcAgent),
                     outcome,
                     stage_param(entry, context.stage),
-                    bounded_detail(message),
+                    detail,
                     Some(diagnostics_from_context(context)),
                 )
             }
-            AgentCallError::Legacy { message, .. } => Self::new(
-                catalog_entry(CatalogCode::JdbcLegacyFailure),
-                BackendErrorSource::JdbcAgentLegacy,
-                BackendErrorOrigin::database(BackendErrorAdapter::JdbcAgentLegacy),
-                BackendOperationOutcome::Unknown,
-                BTreeMap::new(),
-                bounded_detail(message),
-                None,
-            ),
+            AgentCallError::Legacy { message, hints, .. } => {
+                let detail = match hints.category {
+                    Some(AgentErrorCategory::Sql) => bounded_native_detail(message),
+                    _ => bounded_detail(message),
+                };
+                Self::new(
+                    catalog_entry(CatalogCode::JdbcLegacyFailure),
+                    BackendErrorSource::JdbcAgentLegacy,
+                    BackendErrorOrigin::database(BackendErrorAdapter::JdbcAgentLegacy),
+                    BackendOperationOutcome::Unknown,
+                    BTreeMap::new(),
+                    detail,
+                    None,
+                )
+            }
             AgentCallError::ContractViolation { message, .. } => Self::new(
                 catalog_entry(CatalogCode::ContractInvalid),
                 BackendErrorSource::JdbcAgent,
@@ -224,7 +234,11 @@ impl BackendError {
         )
     }
 
-    /// Create a SQL failure envelope while retaining the bounded diagnostic detail.
+    /// Create a SQL failure envelope while retaining bounded native driver detail.
+    ///
+    /// The caller must pass a typed SQL execution error, not a connection or
+    /// transport diagnostic. Native SQL text is intentionally not parsed or
+    /// rewritten because the database dialect owns its format.
     pub fn from_sql_detail(message: &str) -> Self {
         let entry = catalog_entry(CatalogCode::SqlFailed);
         Self::new(
@@ -233,7 +247,7 @@ impl BackendError {
             BackendErrorOrigin::database(BackendErrorAdapter::Native),
             BackendOperationOutcome::Unknown,
             stage_param(entry, AgentErrorStage::Execute),
-            bounded_detail(message),
+            bounded_native_detail(message),
             Some(diagnostics_for_local("sql", AgentErrorStage::Execute)),
         )
     }
@@ -251,7 +265,7 @@ impl BackendError {
             BackendErrorOrigin::database_driver(BackendErrorAdapter::Native, "duckdb"),
             BackendOperationOutcome::Unknown,
             stage_param(entry, AgentErrorStage::Execute),
-            bounded_detail(message),
+            if is_sql_error { bounded_native_detail(message) } else { bounded_detail(message) },
             Some(diagnostics_for_local_with_adapter_code(category, AgentErrorStage::Execute, code)),
         )
     }
@@ -638,26 +652,24 @@ fn bounded_detail(message: &str) -> Option<String> {
     (!detail.is_empty()).then_some(detail)
 }
 
+fn bounded_native_detail(message: &str) -> Option<String> {
+    // This path is only for typed native SQL failures. Do not infer or rewrite
+    // SQL content here; preserving the driver's diagnostic is the contract.
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let detail = bounded_text(trimmed, MAX_DETAIL_BYTES);
+    (!detail.is_empty()).then_some(detail)
+}
+
 fn safe_detail(message: &str) -> Option<String> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let normalized = trimmed.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
-    let lowered = normalized.to_ascii_lowercase();
-    let first_word =
-        lowered.split_whitespace().next().unwrap_or_default().trim_matches(|ch: char| !ch.is_ascii_alphabetic());
-    let sql_verbs = [
-        "select", "insert", "update", "delete", "drop", "create", "alter", "truncate", "merge", "call", "with",
-        "grant", "revoke", "comment", "explain", "begin", "commit", "rollback",
-    ];
-    if sql_verbs.contains(&first_word) {
-        return None;
-    }
-
-    let sql_detail = redact_sql_payload(trimmed);
-    let detail = redact_session_identifier(&redact_sensitive_fragments(&sql_detail));
+    let detail = redact_session_identifier(&redact_sensitive_fragments(trimmed));
     if contains_only_redacted_sensitive_tokens(&detail) {
         return None;
     }
@@ -668,7 +680,7 @@ fn contains_only_redacted_sensitive_tokens(value: &str) -> bool {
     let mut has_token = false;
     let all_sensitive = value.split_whitespace().all(|token| {
         has_token = true;
-        if token == "[redacted]" || token == "[statement omitted]" || matches!(token, "=" | ":") {
+        if token == "[redacted]" || matches!(token, "=" | ":") {
             return true;
         }
         let normalized = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
@@ -683,124 +695,6 @@ fn contains_only_redacted_sensitive_tokens(value: &str) -> bool {
         })
     });
     has_token && all_sensitive
-}
-
-fn redact_sql_payload(value: &str) -> String {
-    let lowered = value.to_ascii_lowercase();
-    if let Some(statement_offset) = lowered.find("statement [") {
-        let bracket_start = statement_offset + "statement ".len();
-        if let Some(relative_end) = value[bracket_start..].find(']') {
-            let bracket_end = bracket_start + relative_end + 1;
-            let mut result = value.to_string();
-            result.replace_range(bracket_start..bracket_end, "[statement omitted]");
-            return result;
-        }
-    }
-
-    if let Some(result) = redact_quoted_sql_payload(value) {
-        return result;
-    }
-
-    let tokens = sql_tokens(value);
-    for (index, (_, _, token)) in tokens.iter().enumerate() {
-        if sql_verbs().contains(&token.as_str()) && looks_like_complete_sql(&tokens, index) {
-            let mut result = value.to_string();
-            result.replace_range(tokens[index].0.., "[statement omitted]");
-            return result;
-        }
-    }
-    value.to_string()
-}
-
-fn sql_tokens(value: &str) -> Vec<(usize, usize, String)> {
-    value
-        .split_whitespace()
-        .scan(0usize, |cursor, token| {
-            let start = value[*cursor..].find(token)? + *cursor;
-            *cursor = start + token.len();
-            Some((start, start + token.len(), token.to_ascii_lowercase()))
-        })
-        .collect()
-}
-
-fn redact_quoted_sql_payload(value: &str) -> Option<String> {
-    for (start, quote) in value.char_indices() {
-        if !matches!(quote, '\'' | '"') {
-            continue;
-        }
-
-        let content_start = start + quote.len_utf8();
-        let mut end = None;
-        let mut skip_next = false;
-        for (offset, ch) in value[content_start..].char_indices() {
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
-            if ch != quote {
-                continue;
-            }
-            let absolute = content_start + offset;
-            if value[absolute + quote.len_utf8()..].starts_with(quote) {
-                skip_next = true;
-                continue;
-            }
-            end = Some(absolute);
-            break;
-        }
-
-        let end = end?;
-        let inner = &value[content_start..end];
-        let tokens = sql_tokens(inner);
-        if tokens
-            .first()
-            .is_some_and(|(_, _, token)| sql_verbs().contains(&token.as_str()) && looks_like_complete_sql(&tokens, 0))
-        {
-            let mut result = String::with_capacity(value.len());
-            result.push_str(&value[..start]);
-            result.push_str("[statement omitted]");
-            result.push_str(&value[end + quote.len_utf8()..]);
-            return Some(result);
-        }
-    }
-    None
-}
-
-fn sql_verbs() -> [&'static str; 18] {
-    [
-        "select", "insert", "update", "delete", "drop", "create", "alter", "truncate", "merge", "call", "with",
-        "grant", "revoke", "comment", "explain", "begin", "commit", "rollback",
-    ]
-}
-
-fn looks_like_complete_sql(tokens: &[(usize, usize, String)], index: usize) -> bool {
-    let verb = tokens[index].2.as_str();
-    let following = tokens.iter().skip(index + 1).map(|(_, _, token)| token.as_str()).collect::<Vec<_>>();
-    if following.is_empty() {
-        return false;
-    }
-
-    let execution_context = index > 0
-        && matches!(
-            tokens[index - 1].2.as_str(),
-            "statement" | "query" | "sql" | "execute" | "executing" | "executed" | "running" | "command"
-        );
-    let structural_marker = match verb {
-        "select" => ["from", "join", "where", "union", "into", ";"].iter().any(|marker| following.contains(marker)),
-        "insert" => following.contains(&"into"),
-        "update" => following.contains(&"set"),
-        "delete" => following.contains(&"from"),
-        "drop" | "create" | "alter" | "truncate" | "grant" | "revoke" | "comment" => {
-            following.iter().any(|token| matches!(*token, "table" | "index" | "view" | "schema" | "database" | "role"))
-        }
-        "merge" => following.contains(&"into"),
-        "call" => following.iter().any(|token| token.ends_with('(')),
-        "with" => following.contains(&"as") && following.contains(&"select"),
-        "explain" => following.iter().any(|token| sql_verbs().contains(token)),
-        "begin" | "commit" | "rollback" => following.contains(&";"),
-        _ => false,
-    };
-    execution_context || structural_marker
 }
 
 fn redact_sensitive_fragments(value: &str) -> String {
@@ -1222,20 +1116,23 @@ mod tests {
     }
 
     #[test]
-    fn public_detail_redacts_sensitive_fragments_and_preserves_vendor_text() {
+    fn public_detail_redacts_credentials_and_preserves_native_sql_text() {
         for (message, expected) in [
             ("Incorrect syntax near SELECT", "Incorrect syntax near SELECT"),
             ("ERROR: relation missing_table does not exist", "ERROR: relation missing_table does not exist"),
             ("ORA-00942: table or view does not exist", "ORA-00942: table or view does not exist"),
             (
                 "syntax error in statement [UPDATE customers SET ssn='123']",
-                "syntax error in statement [statement omitted]",
+                "syntax error in statement [UPDATE customers SET ssn='123']",
             ),
             (
                 "syntax error at or near 'SELECT email FROM customers WHERE ssn = 123'",
-                "syntax error at or near [statement omitted]",
+                "syntax error at or near 'SELECT email FROM customers WHERE ssn = 123'",
             ),
-            ("failed executing SELECT * FROM customers WHERE ssn='123'", "failed executing [statement omitted]"),
+            (
+                "failed executing SELECT * FROM [Users] WHERE email='literal-secret@example.com'",
+                "failed executing SELECT * FROM [Users] WHERE email='literal-secret@example.com'",
+            ),
             (
                 "connection failed: jdbc:postgresql://host/db?user=alice&password=secret",
                 "connection failed: jdbc:postgresql://host/db?user=[redacted]&password=[redacted]",
@@ -1246,16 +1143,13 @@ mod tests {
         ] {
             assert_eq!(bounded_detail(message).as_deref(), Some(expected), "detail changed unexpectedly: {message}");
         }
-        for message in [
-            "DROP TABLE users",
-            "SELECT password FROM users",
-            "Bearer token-value",
-            "Authorization: Bearer token-value",
-            "password = secret",
-            "password: secret",
-            "CALL refresh_cache()",
-        ] {
-            assert!(bounded_detail(message).is_none(), "sensitive detail leaked: {message}");
+        for message in ["DROP TABLE users", "SELECT password FROM users", "CALL refresh_cache()"] {
+            assert_eq!(bounded_detail(message).as_deref(), Some(message));
+        }
+        for message in
+            ["Bearer token-value", "Authorization: Bearer token-value", "password = secret", "password: secret"]
+        {
+            assert!(bounded_detail(message).is_none(), "credential detail leaked: {message}");
         }
         let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
             rpc_code: -1,
@@ -1310,24 +1204,57 @@ mod tests {
     }
 
     #[test]
-    fn serialized_public_detail_redacts_url_userinfo_and_braced_dsn_values() {
+    fn serialized_native_sql_detail_preserves_url_like_text_and_braced_literals() {
         let cases = [
             (
-                "connection failed: jdbc:postgresql://alice:url-secret@db.example/app",
-                "connection failed: jdbc:postgresql://alice:[redacted]@db.example/app",
+                "syntax error in statement [SELECT 'jdbc:postgresql://alice:url-secret@db.example/app']",
+                "syntax error in statement [SELECT 'jdbc:postgresql://alice:url-secret@db.example/app']",
             ),
             (
-                "connection failed: Driver={PostgreSQL};PWD={dsn;secret};SERVER=db.example",
-                "connection failed: Driver={PostgreSQL};PWD=[redacted];SERVER=db.example",
+                "syntax error in statement [SELECT 'Driver={PostgreSQL};PWD={dsn;secret};SERVER=db.example']",
+                "syntax error in statement [SELECT 'Driver={PostgreSQL};PWD={dsn;secret};SERVER=db.example']",
             ),
         ];
 
         for (message, expected) in cases {
             let payload = serde_json::to_value(BackendError::from_sql_detail(message)).unwrap();
             assert_eq!(payload["detail"].as_str(), Some(expected), "detail changed unexpectedly: {message}");
-            assert!(!payload["detail"].as_str().unwrap().contains("url-secret"));
-            assert!(!payload["detail"].as_str().unwrap().contains("dsn;secret"));
         }
+    }
+
+    #[test]
+    fn serialized_public_detail_preserves_nested_sql_and_literals() {
+        let message = "syntax error in statement [SELECT * FROM [Users] WHERE email='literal-secret@example.com']";
+        let payload = serde_json::to_value(BackendError::from_sql_detail(message)).unwrap();
+
+        assert_eq!(payload["detail"].as_str(), Some(message));
+    }
+
+    #[test]
+    fn structured_connection_detail_still_redacts_credentials() {
+        let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
+            rpc_code: -1,
+            message: "connection failed: jdbc:postgresql://alice:url-secret@db.example/app".to_string(),
+            context: context(
+                AgentErrorCategory::Connection,
+                AgentErrorStage::Connect,
+                AgentOperationOutcome::NotStarted,
+            ),
+        });
+
+        assert_eq!(error.detail(), Some("connection failed: jdbc:postgresql://alice:[redacted]@db.example/app"));
+    }
+
+    #[test]
+    fn structured_sql_detail_preserves_native_text() {
+        let message = "syntax error in statement [UPDATE users SET password='user-input']";
+        let error = BackendError::from_agent_call_error(&AgentCallError::Structured {
+            rpc_code: -1,
+            message: message.to_string(),
+            context: context(AgentErrorCategory::Sql, AgentErrorStage::Execute, AgentOperationOutcome::Unknown),
+        });
+
+        assert_eq!(error.detail(), Some(message));
     }
 
     #[test]

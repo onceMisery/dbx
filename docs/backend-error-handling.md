@@ -91,15 +91,15 @@ Rust `BackendError` 的字段由 catalog 构造，字段定义如下（JSON 使�
 
 ## detail 与安全边界
 
-`detail` 是数据库/驱动诊断的可选补充，不是分类依据。公共错误 envelope 在保留安全厂商错误正文的同时，会移除凭据和业务敏感片段：
+`detail` 是数据库/驱动诊断的可选补充，不是分类依据。已类型化的 SQL 错误会保留数据库/驱动返回的原始正文；未知或连接类错误才使用 DBX 的凭据和 Session 清洗兜底：
 
 - 最多保留 64 KiB 的 UTF-8 文本；超出部分按字符边界截断，空内容会被丢弃。
 - 查询层需要补充上下文（例如说明 SQL 文本未随错误返回）时，使用独立换行符（`\n`）追加，不以空格拼接；消费者和测试应保留该换行边界。
-- 数据库厂商错误正文（例如 `ERROR: relation ... does not exist`、`ORA-00942`）会保留；JDBC URL、密码、token、授权头、密钥和 Session 标识会被替换或在只剩敏感内容时删除。
-- SQL 语句中的业务字面量不会进入公共 detail；带有完整 SQL 的错误上下文会保留安全前缀，并将语句替换为 `[statement omitted]`。服务端内部日志可以另行保留完整诊断，但不得直接复用为公共 envelope。
-- `AgentErrorContext` 中的 `agentSessionId`、重试标记和内部恢复字段不会作为结构化字段进入公共 envelope；如果驱动错误正文包含 Session 或凭据文本，公共 detail 仍会脱敏。
+- 数据库厂商错误正文（例如 `ERROR: relation ... does not exist`、`ORA-00942`、约束冲突中的值和驱动返回的 statement 文本）会原样保留；连接配置和未知错误文本中的 JDBC URL、密码、token、授权头、密钥和 Session 标识会被替换或在只剩敏感内容时删除。
+- DBX 不解析、抽取或改写 SQL payload，也不会主动把执行 SQL 追加到错误；因此 SQL 方言、嵌套括号、引号和业务字面量不会被错误的通用字符串规则破坏。需要内部诊断时应单独记录原始请求，不得把内部日志对象直接复用为公共 envelope。
+- `AgentErrorContext` 中的 `agentSessionId`、重试标记和内部恢复字段不会作为结构化字段进入公共 envelope；`connection` 等非 SQL 类别的驱动错误正文如果包含 Session 或凭据文本，公共 detail 仍会脱敏。
 - Rust 查询执行器生成的查询超时会使用 `DBX-JDBC-2002`（阶段 `execute`）摘要，同时保留超时诊断 detail；它不会作为 `DBX-LEGACY-0001` 展示。
-- PostgreSQL native driver 返回的标准服务端 `ERROR:` 诊断会使用 `DBX-JDBC-4001`（阶段 `execute`）摘要并保留公共安全 detail；连接、超时、取消和清理错误不使用该分类。
+- PostgreSQL native driver 返回的标准服务端 `ERROR:` 诊断会使用 `DBX-JDBC-4001`（阶段 `execute`）摘要并保留原始 detail；连接、超时、取消和清理错误不使用该分类。
 - DuckDB worker 返回的 `Parser Error`、`Catalog Error` 等厂商正文会保留在 `detail`；worker code 会放入 `diagnostics.adapterCode`，并在前端详情前显示。
 - 超时和取消没有服务端 detail 时只返回摘要；`without_detail()` 只有在调用方明确要求隐藏 detail 时才会移除原文。
 
@@ -111,7 +111,7 @@ Rust `BackendError` 的字段由 catalog 构造，字段定义如下（JSON 使�
 
 ### HTTP Web
 
-`crates/dbx-web` 的 multi-query 路由也消费 typed 核心入口，并将 `AppError` 序列化为同一套 envelope；正常 HTTP 错误响应会保留公共安全 `detail`。`BackendError::without_detail()` 仅用于需要主动隐藏详情的兼容场景，不是默认响应路径。HTTP status 只表示传输结果，不能替代或改变 `BackendError.code`。
+`crates/dbx-web` 的 multi-query 路由也消费 typed 核心入口，并将 `AppError` 序列化为同一套 envelope；正常 HTTP 错误响应会保留按上述规则生成的 `detail`。`BackendError::without_detail()` 仅用于需要主动隐藏详情的兼容场景，不是默认响应路径。HTTP status 只表示传输结果，不能替代或改变 `BackendError.code`。
 
 桌面端 HTTP 失败（包括 multipart、SSE、上传、下载和 Nacos 特殊接口）必须调用 `backendResponseError`，不能直接构造 `new Error(await response.text())`，否则会丢失 `BackendError v1` envelope。
 
@@ -141,7 +141,7 @@ translateBackendError(t, error)
 - 新增可选字段属于向后兼容变更；改变字段类型、必填性、枚举语义、错误码含义或安全边界时，必须发布新版本并保留旧版本适配器。
 - 客户端应忽略未知的可选字段和未知的 `source`/`origin` 枚举值，但仍严格校验 `version`、`code`、`messageKey`、`messageParams`、`operationOutcome` 和 `detail` 的基本类型。
 - `code` 是稳定机器标识，不能复用；`messageKey` 是稳定本地化标识，文案可以调整，但 key 的语义不能改变。错误码废弃时保留旧 locale 和兼容映射。
-- 结构化 envelope 可生成本地化摘要并追加公共安全 `detail`；旧字符串或 malformed object 使用有界文本 fallback；空响应只显示稳定摘要，不伪造数据库原因。
+- 结构化 envelope 可生成本地化摘要并追加按错误来源处理的 `detail`；旧字符串或 malformed object 使用有界文本 fallback；空响应只显示稳定摘要，不伪造数据库原因。
 - `operationOutcome=unknown` 不能因为 fallback 文本、source、origin 或 detail 推断为可重试；恢复决策只依赖 Rust 中的类型化事实。
 
 兼容代码的退役门槛包括：不再存在直接读取 HTTP 响应文本并抛错的路径；迁移后的后端错误展示调用点不再在 `translateBackendError` 前预先提取 `.message`/`String(error)`；在所有消费者接受 `BackendError v1` 且线协议测试通过前，不移除旧字符串或旧版错误行。
