@@ -83,6 +83,86 @@ interface MultiDbExecutionTarget {
 
 为了避免生成多个不可见的手动事务，第一期要求源 SQL Tab 处于自动提交模式且没有活动事务。`autoCommit === false` 或存在活动事务时，“多库执行”按钮禁用，并提示先提交/回滚或恢复自动提交。
 
+### 2.7 SQL 执行目标组
+
+多库执行支持保存和复用目标集合。该能力命名为“SQL 执行目标组”，简称“目标组”。目标组表达“SQL 要执行到哪些目标”，不复用侧边栏已有的连接展示分组，也不绑定某一份 SQL。
+
+目标组独立于 SQL，可被任意 SQL 窗口复用，包括查询、数据变更和结构变更 SQL。目标组只保存执行目标，不保存 SQL 文本、查询结果、密码、当前编辑器内容或单次执行状态。
+
+```ts
+interface SqlExecutionTargetGroup {
+  id: string;
+  name: string;
+  databaseType: DatabaseType;
+  targets: MultiDbExecutionTarget[];
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt?: string;
+}
+```
+
+产品规则：
+
+- 一个目标组只能包含同一种有效数据库类型的目标，数据库类型沿用 `effectiveDatabaseTypeForConnection` 判断。
+- 目标组保存 `connectionId`、`catalog`、`database` 和 `schema`，不复制连接密码或其他凭据。
+- 目标组与 SQL 解耦，同一目标组可以用于不同 SQL；保存目标组不会保存或覆盖当前 SQL。
+- 目标组保存在当前用户/工作区的本地配置中，第一期不提供团队共享，不新增后端批量执行 API。
+- 目标组名称必填且不可与已有目标组重名；删除目标组只删除预设，不删除连接、database 或 schema。
+- 选择目标组只恢复目标列表，不自动执行 SQL。用户仍需点击“确认执行”/“执行”，以便在当前 SQL 和当前目标状态下完成最终确认。
+- 加载目标组后仍允许增删目标。用户可以保存修改，或使用“另存为新目标组”保留原目标组不变。
+
+目标组与侧边栏连接分组的边界如下：
+
+| 对象 | 目的 | 约束 | 入口 |
+| --- | --- | --- | --- |
+| SQL 执行目标组 | 复用一组可执行的 SQL 目标 | 目标必须属于同一种有效数据库类型，保存的是 `connectionId + catalog + database + schema` | 多库执行弹窗 |
+| 侧边栏连接分组 | 组织和浏览连接 | 只承担导航展示，不要求同类型，也不代表可执行目标集合 | 连接侧边栏 |
+
+第一期不把两者合并，也不根据侧边栏分组自动生成执行目标。这样可以避免连接分组的展示调整意外改变 SQL 执行范围。后续如果需要在连接管理页增加“从所选连接创建目标组”的快捷入口，也只能复用目标组 Store，不新增第二套目标组数据或执行逻辑。
+
+目标组的生命周期状态定义如下：
+
+- `未保存`：用户在弹窗中手动勾选目标，但尚未保存为目标组；
+- `已加载`：目标组已加载，当前选择与持久化内容一致；
+- `已修改`：目标组已加载，但用户增删了目标或调整了目标顺序；
+- `存在失效目标`：目标组加载或重新校验后，至少有一个目标无法解析或执行；
+- `执行快照`：用户点击执行后复制出的不可变目标列表，只属于当前批次。
+
+状态转换规则：
+
+```text
+未保存 ──保存为目标组──> 已加载
+已加载 ──手动调整──────> 已修改
+已修改 ──保存修改──────> 已加载
+已修改 ──另存为新组────> 已加载（原组保持不变）
+已加载/已修改 ──重新校验──> 已加载 或 存在失效目标
+有效目标 ──点击执行────> 执行快照
+```
+
+目标组不是动态规则组：第一期不支持按标签、连接分组或数据库名称模式动态扩展成员。每次加载时只恢复保存的目标引用，再根据当前连接和 database/schema 状态重新校验。
+
+目标组中的连接、database 或 schema 可能在保存后失效。加载目标组时必须逐目标重新校验：
+
+- 连接不存在、类型不匹配、database/schema 不存在或当前用户无权访问时，目标标记为失效；
+- 失效目标显示明确原因，不得静默替换为其他目标；
+- 默认禁止执行包含失效目标的目标组，用户移除失效目标或修复后重新校验后才能执行；
+- 提供移除失效目标、重新校验和保存修改操作；
+- 目标组本身仍保留失效目标信息，避免一次加载失败导致持久化配置被静默破坏。
+
+目标校验结果使用统一状态模型：
+
+```ts
+type SqlExecutionTargetValidationState = "valid" | "invalid" | "needsRecheck";
+
+interface SqlExecutionTargetValidation {
+  target: MultiDbExecutionTarget;
+  state: SqlExecutionTargetValidationState;
+  reason?: string;
+}
+```
+
+校验原因至少包括：连接不存在、连接数据库类型不匹配、catalog 不存在、database 不存在、schema 不存在、权限不足和元数据加载失败。`needsRecheck` 只表示当前元数据尚未完成加载，不得被当作有效目标执行；只有重新校验为 `valid` 后才允许执行。
+
 ## 3. 用户界面设计
 
 ### 3.1 工具栏按钮
@@ -110,13 +190,30 @@ interface MultiDbExecutionTarget {
 
 `apps/desktop/src/components/editor/MultiDbExecuteDialog.vue`
 
-弹窗打开后显示：
+目标组的选择、保存和管理统一放在多库执行弹窗中；第一期不在连接管理页增加另一套保存入口。弹窗打开后显示：
 
-1. SQL 只读预览，可折叠，展示当前最终执行 SQL。
-2. 目标搜索框，匹配连接名、database 名和 schema 名。
-3. 按连接分组的树形选择器。
-4. 已选择目标数量。
-5. “取消”和“确认执行”按钮。
+1. 已保存目标组选择器，支持选择目标组和清空当前目标组。
+2. “管理目标组”入口，支持新建、重命名、删除和编辑目标组。
+3. SQL 只读预览，可折叠，展示当前最终执行 SQL。
+4. 目标搜索框，匹配连接名、database 名和 schema 名。
+5. 按连接分组的树形选择器。
+6. 已选择目标数量和失效目标数量。
+7. “保存为目标组”和“另存为新目标组”操作。
+8. “取消”和“确认执行”按钮。
+
+目标组选择器规则：
+
+- 执行弹窗默认只显示当前 SQL 窗口数据库类型可用的目标组；“管理目标组”中可以查看其他数据库类型的目标组，但这些目标组不可加载，并显示类型不匹配原因。
+- 每项显示目标组名称、数据库类型、目标数量和最近使用时间。
+- 选择目标组后，用目标组内容替换当前目标选择；如果当前存在未保存的手动选择，替换前提示用户确认。
+- 目标组加载完成后立即显示逐目标校验状态，不等待点击执行时才暴露失效目标。
+- 目标组中存在失效目标时，保留可用目标和失效目标的明细，禁止确认执行，直到用户移除失效目标或重新校验成功。
+- 选择目标组后仍然可以手动调整目标；调整后的目标组状态显示为“已修改”。
+- 点击“保存为目标组”弹出名称输入框；名称为空、重名或没有有效目标时禁止保存。
+- 点击“保存修改”更新当前目标组的目标和更新时间；点击“另存为新目标组”创建新的目标组，不修改原目标组。
+- “管理目标组”中的删除操作需要二次确认，但不影响任何连接配置。
+- 当前选择存在未保存修改时，关闭弹窗或加载其他目标组前提示用户选择“保存修改”“放弃修改”或“取消操作”；直接取消多库执行不会自动保存修改。
+- 目标组按 `lastUsedAt` 优先、`updatedAt` 次之排序；从未使用过的目标组按名称排序，方便复用最近使用的目标组。
 
 树形层级为：
 
@@ -137,6 +234,27 @@ interface MultiDbExecutionTarget {
 - 当前目标默认勾选。
 - 目标类型不匹配的连接不展示，不使用“展示后禁用”的方式混入列表。
 - 连接列表为空或没有有效 database/schema 时，显示空状态并禁用确认。
+
+建议的弹窗结构：
+
+```text
+多库执行
+
+已保存目标组：[请选择目标组 ▼] [管理目标组]
+
+数据库类型：PostgreSQL
+执行目标：
+☑ pg-prod-01 / app / public
+☑ pg-prod-02 / app / public
+⚠ pg-prod-03 / report / public（连接不存在）
+
+[添加目标] [移除选中目标] [保存为目标组]
+
+执行策略：串行执行，失败后继续
+                              [取消] [执行]
+```
+
+目标组选择、保存和管理属于执行目标配置操作，不改变普通 SQL 执行按钮和当前编辑器的行为。
 
 ### 3.3 执行进度和最终汇总
 
@@ -170,9 +288,11 @@ interface MultiDbExecutionTarget {
 | `App.vue` | 打开弹窗，传递当前 SQL 快照，协调全局执行和取消 |
 | `MultiDbExecuteDialog.vue` | 加载目标、选择目标、显示执行进度和最终汇总 |
 | `useMultiDbExecution.ts` | 管理批次状态、串行队列、取消和目标结果映射 |
+| `sqlExecutionTargetGroupStore.ts` | 持久化目标组，提供按数据库类型查询、保存、更新、重命名、删除和最近使用时间更新 |
 | `useSqlExecution.ts` | 抽取可复用的 SQL 解析、安全预检和参数处理能力 |
 | `queryStore.ts` | 创建目标 Tab，调用 `executeTabSql`，保存结果和执行状态 |
 | `useDatabaseOptions.ts` / `useSchemaOptions.ts` | 复用现有 database/schema 加载、过滤和排序规则 |
+| `connectionStore.ts` | 解析目标组中的 `connectionId`，校验连接存在性和有效数据库类型；不复用侧边栏连接分组语义 |
 | `lib/backend/api.ts` | 不新增批量 API；继续通过现有 `executeQuery` 路径执行 |
 
 ### 4.2 批次状态模型
@@ -284,6 +404,35 @@ Tab 保存：
 
 多库执行不把目标 SQL 拼接成多语句，也不把多个目标的结果写入同一个 Tab。执行期间保留源 SQL Tab 作为活动 Tab；用户可从 Tab 栏打开任意目标结果。
 
+### 4.6 目标组持久化和执行快照
+
+目标组 Store 只负责目标预设的生命周期，不参与 SQL 执行编排。建议提供以下能力：
+
+```ts
+interface SqlExecutionTargetGroupStore {
+  groups: SqlExecutionTargetGroup[];
+  getGroupsByDatabaseType(databaseType: DatabaseType): SqlExecutionTargetGroup[];
+  createGroup(name: string, databaseType: DatabaseType, targets: MultiDbExecutionTarget[]): void;
+  updateGroup(id: string, patch: { name?: string; targets?: MultiDbExecutionTarget[] }): void;
+  deleteGroup(id: string): void;
+  markGroupUsed(id: string): void;
+}
+```
+
+保存目标组时只持久化目标引用和展示所需的标识，不持久化凭据。目标组加载后由连接 Store 和现有 database/schema 选项逻辑重新解析实际对象，并产生每项目标的 `valid`、`invalid` 或 `needsRecheck` 状态。
+
+校验时必须区分三个时点：
+
+1. 保存前：校验目标非空、目标去重、目标数据库类型一致、目标组名称非空且不重名；
+2. 加载后：根据保存的引用重新解析连接、catalog、database 和 schema，逐项显示当前状态；
+3. 执行前：再次确认目标仍有效、仍属于当前有效数据库类型且具备执行条件，防止弹窗打开期间连接或元数据发生变化。
+
+目标组数据只保存稳定引用，不保存运行时校验结果作为事实来源。可选的显示名称仅用于提升失效目标的可读性，不能替代 `connectionId`、database、schema 等稳定字段。任何校验失败都必须保留原始引用并展示原因，禁止静默改指向相近名称的连接或 database。
+
+点击执行时，执行器必须把当前目标列表复制为本次批次快照。执行期间用户对目标组的重命名、编辑或删除不影响正在执行的批次；批次仍按确认执行时的目标快照串行运行。
+
+目标组的数据库类型、失效目标和当前目标数量应在保存、加载和执行前分别校验，不能仅依赖保存时的校验结果。
+
 ## 5. 安全、事务和错误处理
 
 ### 5.1 安全确认
@@ -338,7 +487,33 @@ Tab 保存：
 - `multiDbExecute.notExecuted`；
 - `multiDbExecute.cancelBatch`；
 - `multiDbExecute.noTargets`；
-- `multiDbExecute.loadFailed`。
+- `multiDbExecute.loadFailed`；
+- `multiDbExecute.selectGroup`；
+- `multiDbExecute.manageGroups`；
+- `multiDbExecute.saveAsGroup`；
+- `multiDbExecute.saveChanges`；
+- `multiDbExecute.saveAsNewGroup`；
+- `multiDbExecute.renameGroup`；
+- `multiDbExecute.deleteGroup`；
+- `multiDbExecute.deleteGroupConfirm`；
+- `multiDbExecute.groupName`；
+- `multiDbExecute.groupNameRequired`；
+- `multiDbExecute.groupNameExists`；
+- `multiDbExecute.groupSaved`；
+- `multiDbExecute.groupSaveFailed`；
+- `multiDbExecute.groupLoadFailed`；
+- `multiDbExecute.groupModified`；
+- `multiDbExecute.invalidTarget`；
+- `multiDbExecute.targetMissingConnection`；
+- `multiDbExecute.targetTypeMismatch`；
+- `multiDbExecute.targetCatalogMissing`；
+- `multiDbExecute.targetDatabaseMissing`；
+- `multiDbExecute.targetSchemaMissing`；
+- `multiDbExecute.targetPermissionDenied`；
+- `multiDbExecute.targetValidationFailed`；
+- `multiDbExecute.retryValidation`；
+- `multiDbExecute.serialContinueOnError`；
+- `production.sourceMultiDbSql`（生产库安全确认来源）。
 
 弹窗需满足现有 UI 组件的键盘和无障碍约定：
 
@@ -370,6 +545,14 @@ Tab 保存：
 - 确认事件序列化为 `MultiDbExecutionTarget[]`；
 - 进度状态和最终汇总正确显示；
 - 键盘操作和 aria 属性存在。
+- 目标组按数据库类型过滤，并支持选择、清空和加载目标组；
+- 保存目标组时校验名称、重名和有效目标数量；
+- 加载目标组后正确显示目标校验状态和失效原因；
+- 目标组存在失效目标时确认按钮禁用；
+- 手动调整目标后可保存修改或另存为新目标组，原目标组不会被隐式修改；
+- 管理目标组支持重命名和删除，并且删除需要二次确认；
+- 未保存修改时关闭弹窗或切换目标组会给出明确提示；
+- 目标组排序优先展示最近使用的目标组。
 
 ### 7.2 执行编排器测试
 
@@ -390,6 +573,9 @@ Tab 保存：
 - 目标 Tab 创建失败后继续后续目标；
 - 批次完成汇总数量正确；
 - SQL 快照和参数值在整个批次中保持稳定。
+- 执行开始时复制目标快照，执行期间目标组的编辑或删除不影响当前批次；
+- 目标组加载后逐目标复用连接、database/schema 和权限校验；
+- 目标组失效目标不被静默替换，且不能绕过安全检查执行。
 
 ### 7.3 普通执行回归测试
 
@@ -410,10 +596,11 @@ Tab 保存：
 | `apps/desktop/src/components/layout/EditorToolbar.vue` | 增加“多库执行”按钮和事件 |
 | `apps/desktop/src/components/editor/MultiDbExecuteDialog.vue` | 新增目标选择、进度和汇总弹窗 |
 | `apps/desktop/src/composables/useMultiDbExecution.ts` | 新增串行执行编排器 |
+| `apps/desktop/src/stores/sqlExecutionTargetGroupStore.ts` | 新增 SQL 执行目标组的本地持久化和生命周期管理 |
 | `apps/desktop/src/composables/useSqlExecution.ts` | 抽取可传入目标上下文的 SQL 预处理和安全预检 helper |
 | `apps/desktop/src/stores/queryStore.ts` | 为 `createTab` 增加可选 `activate`，复用 `executeTabSql` |
 | `apps/desktop/src/App.vue` | 打开弹窗、传递 SQL 快照、挂载批次执行和取消事件 |
-| `apps/desktop/src/i18n/locales/*.ts` | 增加多库执行文案 |
+| `apps/desktop/src/i18n/locales/*.ts` | 增加多库执行、目标组选择、保存、失效和管理文案 |
 | `apps/desktop/src/components/editor/__tests__/MultiDbExecuteDialog.spec.ts` | 弹窗测试 |
 | `apps/desktop/src/composables/__tests__/useMultiDbExecution.spec.ts` | 编排器测试 |
 
@@ -431,3 +618,11 @@ Tab 保存：
 8. 用户取消批次后，当前执行可取消，后续目标不再执行，已完成结果保留。
 9. 执行完成后显示成功、失败、跳过和未执行汇总。
 10. 普通 SQL 执行行为、快捷键、结果生命周期和取消行为不回归。
+11. 用户可以将所选连接、catalog、database、schema 保存为“SQL 执行目标组”，并在后续 SQL 窗口中复用。
+12. 目标组与 SQL 解耦，加载目标组只恢复执行目标，不自动执行 SQL。
+13. 目标组只展示或允许选择当前有效数据库类型的目标组。
+14. 目标组中的失效目标被逐项标记并说明原因，存在失效目标时不能直接执行。
+15. 目标组加载后的编辑、保存修改、另存为、重命名和删除行为符合预期，且不影响原有连接配置。
+16. 目标组执行仍支持查询、DML、DDL 和其他现有可执行 SQL，并对每个目标独立执行现有安全检查。
+17. SQL 执行目标组与侧边栏连接分组相互独立，侧边栏分组变化不会改变已保存目标组或执行范围。
+18. 目标组在保存、加载和执行前分别完成校验；失效目标保留原始引用并显示原因，不被静默替换。
