@@ -989,7 +989,7 @@ watch(
           <span v-if="hasUnsavedChanges" class="text-amber-600 dark:text-amber-300">{{ t("multiDbExecute.groupModified") }}</span>
         </div>
 
-        <DialogFooter class="shrink-0 flex-wrap border-t px-5 py-3">
+        <DialogFooter class="mx-0 mb-0 shrink-0 flex-wrap border-t px-5 py-3">
           <Button variant="outline" :disabled="isExecuting" @click="openGroupNameDialog('create')">{{ t("multiDbExecute.saveAsGroup") }}</Button>
           <Button v-if="selectedGroupId" variant="outline" :disabled="!canSaveGroup || !hasUnsavedChanges" @click="openGroupNameDialog('update')">{{ t("multiDbExecute.saveChanges") }}</Button>
           <Button v-if="selectedGroupId" variant="outline" :disabled="!canSaveGroup" @click="openGroupNameDialog('clone')">{{ t("multiDbExecute.saveAsNewGroup") }}</Button>
