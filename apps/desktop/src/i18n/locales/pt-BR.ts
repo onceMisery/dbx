@@ -68,6 +68,7 @@ export default withEnglishFallback({
     updatableDriverCount: "Quantidade de drivers atualizáveis",
     mcpUpdateAvailable: "Atualização do servidor MCP disponível",
     blockDangerousRedisCommands: "Bloquear comandos perigosos",
+    multiDbExecute: "Execução em múltiplos bancos",
   },
   multiDbExecute: {
     title: "Execução em vários bancos de dados",

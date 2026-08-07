@@ -68,6 +68,7 @@ export default withEnglishFallback({
     updatableDriverCount: "可更新驅動程式數量",
     mcpUpdateAvailable: "MCP 服務有可用更新",
     blockDangerousRedisCommands: "攔截危險命令",
+    multiDbExecute: "多庫執行",
   },
   multiDbExecute: {
     title: "多資料庫執行",

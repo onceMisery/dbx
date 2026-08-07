@@ -68,6 +68,7 @@ export default withEnglishFallback({
     updatableDriverCount: "更新可能なドライバー数",
     mcpUpdateAvailable: "MCPサーバーの更新があります",
     blockDangerousRedisCommands: "危険なコマンドをブロック",
+    multiDbExecute: "複数DB実行",
   },
   multiDbExecute: {
     title: "複数データベースで実行",
