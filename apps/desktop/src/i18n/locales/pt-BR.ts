@@ -1085,6 +1085,7 @@ export default withEnglishFallback({
       confirm: "Confirmar",
       selectFirst: "Selecione o texto da lista primeiro",
     },
+    connectionOnlyTarget: "Alvo em nível de conexão",
   },
   tabs: {
     sql: "SQL",
@@ -6790,6 +6791,7 @@ export default withEnglishFallback({
     sourceQueryHistory: "Reversão do histórico de consultas",
     sourceAdmin: "Administração de banco de dados",
     aiReviewRequired: "O SQL de produção foi colocado no editor. Verifique-o primeiro e execute manualmente para confirmar.",
+    sourceMultiDbSql: "Execução de SQL em múltiplos bancos de dados",
   },
   processList: {
     title: "Lista de Processos",

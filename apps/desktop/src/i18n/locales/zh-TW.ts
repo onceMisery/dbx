@@ -1084,6 +1084,7 @@ export default withEnglishFallback({
       confirm: "確定",
       selectFirst: "請選擇清單文字",
     },
+    connectionOnlyTarget: "連線級目標",
   },
   tabs: {
     sql: "SQL",
@@ -6783,6 +6784,7 @@ export default withEnglishFallback({
     sourceQueryHistory: "查詢歷史回復",
     sourceAdmin: "資料庫管理",
     aiReviewRequired: "生產 SQL 已放入編輯器。請先檢查，再手動執行以確認。",
+    sourceMultiDbSql: "多庫 SQL 執行",
   },
   processList: {
     title: "處理程序清單",

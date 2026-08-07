@@ -1105,6 +1105,7 @@ export default withEnglishFallback({
       confirm: "確定",
       selectFirst: "リストテキストを選択してください",
     },
+    connectionOnlyTarget: "接続レベル目標",
   },
   tabs: {
     sql: "SQL",
@@ -6843,6 +6844,7 @@ export default withEnglishFallback({
     sourceQueryHistory: "クエリ履歴のロールバック",
     sourceAdmin: "データベース管理",
     aiReviewRequired: "本番SQLがエディターに配置されました。まず確認し、手動で実行して確定してください。",
+    sourceMultiDbSql: "複数DB SQL実行",
   },
   processList: {
     title: "プロセス一覧",
