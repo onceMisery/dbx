@@ -1792,6 +1792,7 @@ mod tests {
             connection_id: "conn-1".to_string(),
             database: "db".to_string(),
             schema: None,
+            catalog: None,
             sql: "SELECT * FROM users".to_string(),
             query_base_sql: "SELECT * FROM users".to_string(),
             setup_sql: Vec::new(),

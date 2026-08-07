@@ -1060,7 +1060,8 @@ export const useQueryStore = defineStore("query", () => {
   async function setActiveResultRun(id: string, runId: string) {
     const tab = findExecutionTab(id);
     if (!tab) return false;
-    const run = await restoreResultRunPayload(tab, runId);
+    const existingRun = tab.resultRuns?.find((item) => item.id === runId);
+    const run = existingRun && resultRunHasPayload(existingRun) ? existingRun : await restoreResultRunPayload(tab, runId);
     if (!run?.result && !run?.results?.length) return false;
     projectResultRun(tab, run);
     evictInactiveResultRunPayloads(tab);
