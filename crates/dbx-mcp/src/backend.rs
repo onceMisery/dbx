@@ -74,6 +74,19 @@ fn effective_mcp_policy_with_legacy_allow_writes(
     policy
 }
 
+/// Wire-level options for a documentation snapshot. Mirrors
+/// `dbx_core::docs::CollectOptions` minus the fields the backend fills in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocsSnapshotOptions {
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    #[serde(default)]
+    pub tables: Vec<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
+}
+
 #[async_trait]
 pub trait DbxBackend: Send + Sync {
     async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicy, String>;
@@ -151,6 +164,15 @@ pub trait DbxBackend: Send + Sync {
     async fn bridge_request(&self, path: &str, body: Value) -> Result<(), String> {
         let _ = (path, body);
         Err("DBX is not running. Please start DBX first.".to_string())
+    }
+    async fn collect_docs_snapshot(
+        &self,
+        connection: &ConnectionConfig,
+        database: &str,
+        options: DocsSnapshotOptions,
+    ) -> Result<dbx_core::docs::SchemaSnapshot, String> {
+        let _ = (connection, database, options);
+        Err("Documentation snapshots are not supported by this backend.".to_string())
     }
 }
 
@@ -436,6 +458,28 @@ impl DbxBackend for LocalBackend {
         table: &str,
     ) -> Result<Vec<ColumnInfo>, String> {
         dbx_core::schema::get_columns_core(&self.state, &connection.id, database, schema, table).await
+    }
+
+    async fn collect_docs_snapshot(
+        &self,
+        connection: &ConnectionConfig,
+        database: &str,
+        options: DocsSnapshotOptions,
+    ) -> Result<dbx_core::docs::SchemaSnapshot, String> {
+        let collect_options = dbx_core::docs::CollectOptions {
+            database: database.to_string(),
+            schemas: options.schemas,
+            tables: options.tables,
+            project_name: options.project_name.unwrap_or_else(|| connection.name.clone()),
+        };
+        dbx_core::docs::collect_snapshot(
+            &self.state,
+            connection,
+            &collect_options,
+            &|_progress| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
     }
 
     async fn execute_redis_command(
@@ -741,6 +785,30 @@ impl DbxBackend for WebBackend {
         .json()
         .await
         .map_err(|error| format!("Invalid column list response: {error}"))
+    }
+
+    async fn collect_docs_snapshot(
+        &self,
+        connection: &ConnectionConfig,
+        database: &str,
+        options: DocsSnapshotOptions,
+    ) -> Result<dbx_core::docs::SchemaSnapshot, String> {
+        self.ensure_connected(connection).await?;
+        self.request(
+            reqwest::Method::POST,
+            "/api/docs/snapshot",
+            Some(json!({
+                "connectionId": connection.id,
+                "database": database,
+                "schemas": options.schemas,
+                "tables": options.tables,
+                "projectName": options.project_name.clone().unwrap_or_else(|| connection.name.clone()),
+            })),
+        )
+        .await?
+        .json()
+        .await
+        .map_err(|error| format!("Invalid docs snapshot response: {error}"))
     }
 
     async fn execute_redis_command(
@@ -1446,5 +1514,56 @@ mod tests {
 
         assert_eq!(local_plugin_dir(&explicit, data_dir), PathBuf::from("D:/DBX/plugins-custom"));
         assert_eq!(local_plugin_dir(&legacy, data_dir), PathBuf::from("D:/DBX/drivers/plugins"));
+    }
+
+    struct StubBackend;
+
+    #[async_trait]
+    impl DbxBackend for StubBackend {
+        async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicy, String> {
+            Err("unused".to_string())
+        }
+        async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String> {
+            Ok(vec![])
+        }
+        async fn execute_agent_tool(
+            &self,
+            _connection: &ConnectionConfig,
+            _database: &str,
+            _tool_name: &str,
+            _arguments: Value,
+            _permissions: AgentSqlPermissions,
+        ) -> ToolResult {
+            unimplemented!("not exercised by this test")
+        }
+        async fn add_connection_for_mcp(&self, config: ConnectionConfig) -> Result<ConnectionConfig, String> {
+            Ok(config)
+        }
+        async fn remove_connection_for_mcp(&self, _connection_id: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_docs_snapshot_defaults_to_unsupported() {
+        let backend = StubBackend;
+        let connection = new_connection_config(
+            "c1".to_string(),
+            "local".to_string(),
+            DatabaseType::Postgres,
+            "127.0.0.1".to_string(),
+            5432,
+            "user".to_string(),
+            "password".to_string(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let result = backend.collect_docs_snapshot(&connection, "shop", DocsSnapshotOptions::default()).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not supported"));
     }
 }

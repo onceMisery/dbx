@@ -145,6 +145,12 @@ export interface ConnectionConfig {
   attached_databases?: AttachedDatabaseConfig[];
   init_script?: string;
   color?: string;
+  /**
+   * Where this connection's documentation notes are stored. Absent means the
+   * per-connection default inside the app data directory; an explicit path
+   * lets the notes file live in a repository and be reviewed in pull requests.
+   */
+  docs_notes_path?: string;
   transport_layers?: TransportLayerConfig[];
   connect_timeout_secs?: number;
   query_timeout_secs?: number;

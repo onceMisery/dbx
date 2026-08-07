@@ -102,6 +102,8 @@ export function useDatabaseOptions() {
           );
         } else if (connection.db_type === "mongodb") {
           databaseOptions.value[connectionId] = filterDatabaseNamesForConnection(await api.mongoListDatabases(connectionId), connection);
+        } else if (connection.db_type === "dameng") {
+          databaseOptions.value[connectionId] = await fetchNamespaceOptionsForConnection(connectionId, connection);
         } else if (supportsQueryTargetDatabaseListing(connection.db_type)) {
           databaseOptions.value[connectionId] = filterDatabaseNamesForConnection(await api.documentListDatabases(connectionId), connection);
         } else if (catalog && isDorisFamilyCatalogCapable(connection?.db_type, connection?.driver_profile)) {

@@ -1151,6 +1151,7 @@ for line in sys.stdin:
     #[cfg(unix)]
     fn agent_test_connection(id: &str, name: &str, db_type: DatabaseType, database: &str) -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: id.to_string(),
             name: name.to_string(),
             note: String::new(),

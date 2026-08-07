@@ -108,6 +108,7 @@ import { codeMirrorSqlDialect, connectionUsesDatabaseObjectTreeMode, effectiveDa
 import { sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
 import { detectDatabaseFileType } from "@/lib/database/databaseFileDetection";
 import { ensureJdbcxRuntimeDrivers } from "@/lib/database/jdbcxBuiltinDriver";
+import { ensureRegisteredJdbcProductRuntimeDrivers } from "@/lib/database/jdbcProductProfiles";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -140,7 +141,23 @@ const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const savedSqlStore = useSavedSqlStore();
 const promptTemplateStore = usePromptTemplateStore();
-connectionStore.setBeforeConnectHandler((config) => ensureJdbcxRuntimeDrivers(config, api).then(() => undefined));
+connectionStore.setBeforeConnectHandler(async (config) => {
+  await ensureJdbcxRuntimeDrivers(config, api);
+  const jdbcProductRuntimeBefore = JSON.stringify({
+    connectionString: config.connection_string ?? null,
+    driverClass: config.jdbc_driver_class ?? null,
+    driverPaths: config.jdbc_driver_paths ?? [],
+  });
+  const jdbcProductRuntime = await ensureRegisteredJdbcProductRuntimeDrivers(config, api);
+  const jdbcProductRuntimeAfter = JSON.stringify({
+    connectionString: config.connection_string ?? null,
+    driverClass: config.jdbc_driver_class ?? null,
+    driverPaths: config.jdbc_driver_paths ?? [],
+  });
+  if (jdbcProductRuntime && jdbcProductRuntimeBefore !== jdbcProductRuntimeAfter && connectionStore.getConfig(config.id)) {
+    await connectionStore.updateConnection(config);
+  }
+});
 const { message: toastMessage, visible: toastVisible, toast } = useToast();
 const { isDark, themeMode, applyTheme, setThemeMode } = useTheme();
 const { activeCount: activeBackgroundTaskCount } = useExportTracker();

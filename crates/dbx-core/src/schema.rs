@@ -2690,6 +2690,7 @@ mod tests {
 
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: "test".to_string(),
             name: "test".to_string(),
             note: String::new(),

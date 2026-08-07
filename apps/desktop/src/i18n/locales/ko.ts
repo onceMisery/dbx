@@ -1,9 +1,11 @@
 import { withEnglishFallback } from "./fallback";
+import docs from "./docs/ko";
 
 export default withEnglishFallback({
   app: {
     name: "DBX",
   },
+  docs,
   auth: {
     rateLimited: "{seconds}초 후에 다시 시도해 주세요",
     setupTitle: "접속 비밀번호 설정",
@@ -581,6 +583,7 @@ export default withEnglishFallback({
     connectSuccess: "{name}에 연결됨",
     connectFailed: "연결 실패: {message}",
     driverNotInstalled: "{driver} 드라이버가 설치되지 않았습니다. 드라이버 관리자에서 설치하세요.",
+    phoenixDriverNotInstalled: "Apache Phoenix JDBC 드라이버가 설치되지 않았습니다. 드라이버 관리자에서 설치한 후 다시 시도하세요.",
     jreNotInstalled: "JRE {jre} 런타임이 설치되지 않았습니다. 드라이버 관리자에서 설치하세요.",
     systemJavaNotFound: "PATH에서 시스템 Java 런타임을 찾을 수 없습니다. Java를 설치하거나 사용자 지정 Java 실행 파일을 선택하세요.",
     customJavaPathEmpty: "사용자 지정 Java 런타임 경로가 비어 있습니다. Java 실행 파일을 선택하세요.",
@@ -686,6 +689,9 @@ export default withEnglishFallback({
     readOnlyHint: "모든 쓰기 작업 차단 (INSERT, UPDATE, DELETE 등)",
     showSystemSchemas: "시스템 스키마 표시",
     showSystemSchemasHint: "이 연결의 사이드바와 스키마 선택기에 내장 및 메타데이터 스키마를 표시합니다.",
+    docsNotesPath: "노트 파일",
+    docsNotesPathPlaceholder: "docs/dbx-docs.json",
+    docsNotesPathHint: "문서 노트를 저장할 위치입니다. 비워 두면 앱 데이터 디렉터리에 저장되며, 저장소 내 파일을 지정하면 스키마 문서를 풀 리퀘스트에서 검토할 수 있습니다.",
     readOnlyBadge: "읽기 전용",
     proxy: "프록시",
     proxyEnable: "프록시를 통해 데이터베이스 연결",
@@ -715,6 +721,14 @@ export default withEnglishFallback({
     httpTunnelInvalidTimeout: "{hop}: HTTP 터널 제한 시간은 1에서 300초 사이여야 합니다",
     dremioArrowFlightSqlMode: "Arrow Flight SQL",
     dremioLegacyJdbcMode: "레거시 JDBC",
+    phoenixDirectMode: "직접 연결",
+    phoenixRuntimeOption: "Apache Phoenix JDBC({mode})",
+    phoenixQueryServerMode: "Query Server",
+    phoenixDirectModeHint: "HBase에 직접 연결합니다. 기본 런타임은 Phoenix 5.2.1 및 HBase 2.5를 대상으로 합니다. 다른 클러스터 버전에서는 호환되는 Phoenix 클라이언트를 선택하고 필요한 경우 hbase-site.xml을 추가하세요.",
+    phoenixQueryServerModeHint: "Phoenix Thin Client를 사용하여 별도로 배포된 Phoenix Query Server(PQS)에 HTTP로 연결합니다.",
+    phoenixDriverManagerHintPrefix: "기본 런타임은 ",
+    phoenixDriverManagerHintSuffix: "에서 설치하거나 제거할 수 있습니다. 수동으로 선택한 호환 드라이버 경로가 우선합니다.",
+    phoenixDocs: "Phoenix 문서 보기",
     jdbcUrl: "JDBC URL",
     jdbcUrlPlaceholder: "jdbc:postgresql://localhost:5432/database",
     jdbcDriverClass: "드라이버 클래스 (선택)",
@@ -1201,7 +1215,9 @@ export default withEnglishFallback({
     filterBuilderContains: "포함",
     filterBuilderNotContains: "포함하지 않음",
     filterBuilderGreaterThan: "보다 큼",
+    filterBuilderGreaterThanOrEqual: "크거나 같음",
     filterBuilderLessThan: "보다 작음",
+    filterBuilderLessThanOrEqual: "작거나 같음",
     filterBuilderIn: "목록 내",
     filterBuilderNotIn: "목록 외",
     filterBuilderBetween: "범위 내",
@@ -2344,6 +2360,8 @@ export default withEnglishFallback({
   },
   visibleDatabases: {
     title: "표시할 데이터베이스",
+    detailLabel: "표시할 데이터베이스",
+    detailActionLabel: '"{connection}"의 표시할 데이터베이스 구성',
     description: '"{connection}" 아래에 표시할 데이터베이스를 선택하세요.',
     searchPlaceholder: "데이터베이스 검색...",
     selectedCount: "{selected}/{total} 선택됨",
@@ -2358,6 +2376,8 @@ export default withEnglishFallback({
   },
   visibleSchemas: {
     title: "스키마 필터",
+    detailLabel: "표시할 스키마",
+    detailActionLabel: '"{connection}"의 표시할 스키마 구성',
     description: '"{connection}" 아래에 표시할 스키마를 선택하세요.',
     searchPlaceholder: "스키마 검색...",
     selectedCount: "{selected}/{total} 선택됨",
