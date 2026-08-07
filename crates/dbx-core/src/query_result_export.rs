@@ -63,6 +63,8 @@ pub struct QueryResultExportRequest {
     pub database: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
     pub sql: String,
     pub query_base_sql: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -710,6 +712,7 @@ async fn export_query_result_core_inner(
                 timeout_secs: request.timeout_secs,
                 client_session_id: request.client_session_id.clone(),
                 execution_id: request.execution_id.clone(),
+                catalog: request.catalog.clone(),
                 ..Default::default()
             }
         } else {
@@ -719,6 +722,7 @@ async fn export_query_result_core_inner(
                 timeout_secs: request.timeout_secs,
                 client_session_id: request.client_session_id.clone(),
                 execution_id: request.execution_id.clone(),
+                catalog: request.catalog.clone(),
                 ..Default::default()
             }
         };

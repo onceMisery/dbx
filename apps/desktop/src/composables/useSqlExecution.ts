@@ -309,10 +309,9 @@ export function useSqlExecution(deps: {
           schema: input.executionTarget.schema,
         }
       : tab;
-    const finish = (result: MultiDbTargetExecutionResult, resultRunId?: string): MultiDbTargetExecutionResult => ({
+    const finish = (result: MultiDbTargetExecutionResult): MultiDbTargetExecutionResult => ({
       ...result,
       durationMs: Date.now() - startedAt,
-      ...(resultRunId ? { resultRunId } : {}),
     });
     const cancelRequested = () => input.isCancellationRequested?.() === true;
     const tabCancelRequested = (count: number) => (tab.cancelRequestCount ?? 0) !== count;
@@ -415,7 +414,7 @@ export function useSqlExecution(deps: {
       const errorMessage = failure ? String(failure.rows?.[0]?.[0] ?? t("common.failed")) : undefined;
       const success = !failure;
       const resultStatus = success ? "success" : "failed";
-      const resultRunId = captureWorkerResult(resultStatus, errorMessage);
+      captureWorkerResult(resultStatus, errorMessage);
       historyStore.add({
         connection_id: executionTab.connectionId,
         connection_name: connection.name || "",
@@ -437,13 +436,13 @@ export function useSqlExecution(deps: {
         }
       }
       deps.activeOutputView.value = success && (latest.result?.columns.length || latest.results?.some((result) => result.columns.length)) ? "result" : "summary";
-      return finish(success ? { status: "success", errorMessage } : { status: "failed", errorMessage }, resultRunId);
+      return finish(success ? { status: "success", errorMessage } : { status: "failed", errorMessage });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      const resultRunId = captureWorkerResult("failed", errorMessage);
-      return finish({ status: "failed", errorMessage }, resultRunId);
+      captureWorkerResult("failed", errorMessage);
+      return finish({ status: "failed", errorMessage });
     } finally {
-      if (workerId) queryStore.removeMultiDbExecutionWorker(workerId, input.scopeId);
+      if (workerId) await queryStore.removeMultiDbExecutionWorker(workerId, input.scopeId);
     }
   }
 

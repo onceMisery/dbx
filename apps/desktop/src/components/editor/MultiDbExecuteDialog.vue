@@ -29,13 +29,12 @@ const props = defineProps<{
   executeTarget: MultiDbExecutionAdapter["executeTarget"];
   cancelTarget?: MultiDbExecutionAdapter["cancelTarget"];
   cancelPending?: MultiDbExecutionAdapter["cancelPending"];
-  blockDangerousRedisCommands?: boolean;
   sourceOffset?: number;
 }>();
 
 const { t } = useI18n();
 const { toast } = useToast();
-const { addMultiDbExecutionTask, updateMultiDbExecutionTask } = useExportTracker();
+const { addMultiDbExecutionTask, updateMultiDbExecutionTask, registerTaskCancelHandler, unregisterTaskCancelHandler } = useExportTracker();
 const targetGroupStore = useSqlExecutionTargetGroupStore();
 const targetSelection = useMultiDbTargetSelection(computed(() => props.databaseType));
 const compatibleConnections = targetSelection.compatibleConnections;
@@ -158,8 +157,10 @@ watch(
       addMultiDbExecutionTask(current.id, t("multiDbExecute.title"), current.sourceTabId, () => {
         open.value = true;
       });
+      registerTaskCancelHandler(current.id, () => execution.cancel());
     }
     syncBackgroundTask(current);
+    if (current.status === "completed" || current.status === "cancelled") unregisterTaskCancelHandler(current.id);
   },
   { deep: true, flush: "sync" },
 );
@@ -172,6 +173,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (elapsedTimer) clearInterval(elapsedTimer);
+  if (trackedBatchId) unregisterTaskCancelHandler(trackedBatchId);
 });
 
 const searchQuery = computed(() => searchText.value.trim().toLocaleLowerCase());

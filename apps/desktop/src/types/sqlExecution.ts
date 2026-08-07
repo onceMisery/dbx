@@ -35,7 +35,6 @@ export interface MultiDbTargetExecutionResult {
   status: Exclude<MultiDbExecutionItemStatus, "pending" | "running" | "not_executed">;
   errorMessage?: string;
   durationMs?: number;
-  resultRunId?: string;
 }
 
 export interface SqlExecutionTargetValidation {

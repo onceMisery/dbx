@@ -3651,6 +3651,7 @@ export interface TableExportRequest {
   connectionId: string;
   database: string;
   schema?: string;
+  catalog?: string;
   identifierQuote?: string;
   tableName: string;
   filePath: string;
@@ -3693,6 +3694,7 @@ export interface QueryResultExportRequest {
   connectionId: string;
   database: string;
   schema?: string;
+  catalog?: string;
   sql: string;
   queryBaseSql: string;
   setupSql?: string[];

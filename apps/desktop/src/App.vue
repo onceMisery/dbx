@@ -2757,7 +2757,6 @@ onUnmounted(() => {
           :execute-target="executeMultiDbTarget"
           :cancel-target="cancelMultiDbTarget"
           :cancel-pending="cancelPendingMultiDbTarget"
-          :block-dangerous-redis-commands="blockDangerousRedisCommands"
           :source-offset="multiExecuteSourceOffset"
         />
         <UpdateDialog

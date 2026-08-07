@@ -17,6 +17,7 @@ import { uuid } from "@/lib/common/utils";
 import { simpleDataGridOrderByReferencesMissingColumn, type DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
 import type { DataGridReloadIntent } from "@/lib/dataGrid/dataGridToolbar";
 import { queryResultBaseSql, queryResultExecutionSql } from "@/lib/tabs/tabPresentation";
+import { sqlExecutionTargetCapabilities } from "@/lib/database/sqlExecutionTargetCapabilities";
 
 const DATA_TAB_METADATA_TTL_MS = TABLE_METADATA_CACHE_TTL_MS;
 
@@ -39,6 +40,14 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
   const settingsStore = useSettingsStore();
+
+  function activeQueryTargetOptions(tab: QueryTab) {
+    const executionTarget = queryStore.activeResultExecutionTarget(tab.id);
+    if (!executionTarget) return {};
+    const connection = connectionStore.getConfig(executionTarget.connectionId);
+    const capabilities = sqlExecutionTargetCapabilities(connection);
+    return capabilities ? { executionTarget, targetContext: capabilities.provider.toExecutionContext(executionTarget, connection!) } : { executionTarget };
+  }
 
   function quoteIdent(tab: QueryTab, name: string): string {
     const config = connectionStore.getConfig(tab.connectionId);
@@ -210,6 +219,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       tab.resultSortMode = undefined;
       tab.resultSortedSql = undefined;
       await queryStore.executeTabSql(tab.id, resultGroupSql, {
+        ...activeQueryTargetOptions(tab),
         resultBaseSql: resultGroupSql,
         resultSortedSql: undefined,
         preserveResultDuringExecution: true,
@@ -221,6 +231,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       const sortColumns = visibleQuerySortColumns(tab.result?.columns ?? [], tab.result?.hidden_column_indexes, tab.resultSortColumnIndex ?? -1);
       const rebuildHiddenKeySort = !!tab.result?.hidden_column_indexes?.length && tab.resultSortMode === "database" && !!tab.resultSortDirection && !!tab.resultSortColumn && !!sortColumns;
       await queryStore.executeTabSql(tab.id, rebuildHiddenKeySort ? (tab.resultBaseSql ?? tab.sql) : tab.resultSortedSql, {
+        ...activeQueryTargetOptions(tab),
         resultBaseSql: tab.resultBaseSql ?? tab.sql,
         ...(rebuildHiddenKeySort
           ? {
@@ -239,6 +250,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
     }
     if (sql?.trim()) {
       await queryStore.executeTabSql(tab.id, sql, {
+        ...(tab.mode === "query" ? activeQueryTargetOptions(tab) : {}),
         resultBaseSql: sql,
         resultSortedSql: undefined,
         preserveResultDuringExecution: true,
@@ -263,6 +275,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       const sessionId = tab.result?.has_more && tab.result?.session_id && continuesResultSession ? tab.result.session_id : undefined;
       const resultBaseSql = queryResultBaseSql(tab);
       await queryStore.executeTabSql(tab.id, baseSql, {
+        ...activeQueryTargetOptions(tab),
         resultBaseSql,
         resultSortedSql: tab.resultSortedSql,
         ...(hasDatabaseSort
@@ -275,7 +288,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
               },
             }
           : {}),
-        pagination: { offset, limit, sessionId },
+        pagination: { offset, limit, sessionId, clientSessionId: sessionId ? tab.resultClientSessionId : undefined },
         ...appendOptions,
         preserveResultDuringExecution: true,
         preserveTotalRowCountDuringExecution: true,
@@ -330,6 +343,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
 
     if (!direction) {
       await queryStore.executeTabSql(tab.id, baseSql, {
+        ...activeQueryTargetOptions(tab),
         resultBaseSql: baseSql,
         resultSortedSql: undefined,
         preserveResultDuringExecution: true,
@@ -339,7 +353,8 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       return;
     }
 
-    const config = connectionStore.getConfig(tab.connectionId);
+    const executionTarget = queryStore.activeResultExecutionTarget(tab.id);
+    const config = connectionStore.getConfig(executionTarget?.connectionId ?? tab.connectionId);
     if (effectiveDatabaseTypeForConnection(config) === "mongodb") {
       const sortedSql = applyMongoFindSort(baseSql, column, direction);
       if (!sortedSql) {
@@ -348,6 +363,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       }
       queryStore.updateSql(tab.id, sortedSql);
       await queryStore.executeTabSql(tab.id, sortedSql, {
+        ...activeQueryTargetOptions(tab),
         resultBaseSql: baseSql,
         resultSortedSql: sortedSql,
         preserveResultDuringExecution: true,
@@ -376,6 +392,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
         return;
       }
       await queryStore.executeTabSql(tab.id, built.sql, {
+        ...activeQueryTargetOptions(tab),
         resultBaseSql: baseSql,
         resultSortedSql: built.sql,
         preserveResultDuringExecution: true,
@@ -385,6 +402,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       return;
     }
     await queryStore.executeTabSql(tab.id, baseSql, {
+      ...activeQueryTargetOptions(tab),
       resultBaseSql: baseSql,
       querySort: {
         resultColumns: sortColumns.resultColumns,

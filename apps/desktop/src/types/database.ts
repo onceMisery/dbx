@@ -691,6 +691,7 @@ export interface QueryResultRun {
   resultTotalRowCount?: number;
   resultTotalRowCountLoading?: boolean;
   resultSessionId?: string;
+  resultClientSessionId?: string;
   resultAccessedAt?: number;
   resultEstimatedBytes?: number;
   resultCacheKey?: string;
@@ -970,6 +971,7 @@ export interface QueryTab {
   resultTotalRowCount?: number;
   resultTotalRowCountLoading?: boolean;
   resultSessionId?: string;
+  resultClientSessionId?: string;
   resultAccessedAt?: number;
   resultEstimatedBytes?: number;
   resultCacheKey?: string;

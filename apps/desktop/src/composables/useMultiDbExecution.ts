@@ -9,7 +9,6 @@ export interface MultiDbExecutionItem {
   startedAt?: number;
   completedAt?: number;
   durationMs?: number;
-  resultRunId?: string;
 }
 
 export interface MultiDbExecutionBatch {
@@ -62,8 +61,6 @@ function normalizeError(error: unknown): string {
 export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: MultiDbExecutionOptions) {
   const batch = ref<MultiDbExecutionBatch>();
   const isRunning = computed(() => batch.value?.status === "running" || batch.value?.status === "cancelling");
-  const currentItem = computed(() => batch.value?.items.find((item) => item.status === "running"));
-  const currentItems = computed(() => batch.value?.items.filter((item) => item.status === "running") ?? []);
 
   function sourceTabId(): string {
     return typeof options.sourceTabId === "string" ? options.sourceTabId : options.sourceTabId.value;
@@ -118,7 +115,6 @@ export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: M
       item.status = current.cancelRequested && result.status === "failed" ? "cancelled" : result.status;
       item.errorMessage = result.errorMessage;
       item.durationMs = result.durationMs;
-      item.resultRunId = result.resultRunId;
     } catch (error) {
       // One target is intentionally isolated from the queue. Adapter errors
       // become target failures so later targets keep running.
@@ -212,8 +208,6 @@ export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: M
   return {
     batch,
     isRunning,
-    currentItem,
-    currentItems,
     start,
     cancel,
     reset,
