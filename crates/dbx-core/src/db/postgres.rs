@@ -1016,7 +1016,7 @@ async fn postgres_query_one_cached(
 }
 
 enum PreparedSelectOutcome {
-    Complete(QueryResult),
+    Complete(Box<QueryResult>),
     TextFallback { column_types: Vec<String>, unsupported_type: String },
 }
 
@@ -1129,7 +1129,7 @@ async fn execute_select_prepared(
     );
 
     let (spatial_columns, spatial_values) = spatial_columns.finish_with_values(spatial_values);
-    Ok(PreparedSelectOutcome::Complete(QueryResult {
+    Ok(PreparedSelectOutcome::Complete(Box::new(QueryResult {
         columns,
         column_types,
         column_sortables: Vec::new(),
@@ -1143,7 +1143,7 @@ async fn execute_select_prepared(
         has_more: false,
         elasticsearch_raw_body: None,
         messages: Vec::new(),
-    }))
+    })))
 }
 
 fn matching_pg_text_column_types(columns: &[String], prepared: Option<Vec<String>>) -> Vec<String> {
@@ -1250,7 +1250,7 @@ async fn finish_prepared_select(
     progress_clock: Option<&StreamProgressClock>,
 ) -> Result<QueryResult, String> {
     match outcome {
-        PreparedSelectOutcome::Complete(result) => Ok(result),
+        PreparedSelectOutcome::Complete(result) => Ok(*result),
         PreparedSelectOutcome::TextFallback { column_types, unsupported_type } => {
             log::info!(
                 "[postgres][select:text_fallback] unsupported_type={} switching_to=simple_query",
@@ -1577,6 +1577,9 @@ async fn connect_with_local_timezone(url: &str, fallback_timeout: Duration, time
 /// across different servers, so the server's own address/port disambiguate
 /// (`inet_server_addr()` is NULL for Unix sockets, hence the fallback).
 type PostgresConnectionKey = (String, i32, i32);
+type PostgresNoticeBuffers = Mutex<HashMap<PostgresConnectionKey, Weak<Mutex<Vec<QueryMessage>>>>>;
+type PostgresClientKey = (Weak<deadpool_postgres::StatementCache>, Option<PostgresConnectionKey>);
+type PostgresClientKeys = Mutex<HashMap<usize, PostgresClientKey>>;
 
 const POSTGRES_CONNECTION_IDENTITY_SQL: &str = "SELECT pg_backend_pid(), \
      COALESCE(host(inet_server_addr()), 'unix'), \
@@ -1585,8 +1588,8 @@ const POSTGRES_CONNECTION_IDENTITY_SQL: &str = "SELECT pg_backend_pid(), \
 /// Notice buffers for live connections, keyed by connection identity. Entries
 /// are weak so they disappear once the pooled connection (and its driver
 /// task) is dropped.
-fn postgres_notice_buffers() -> &'static Mutex<HashMap<PostgresConnectionKey, Weak<Mutex<Vec<QueryMessage>>>>> {
-    static BUFFERS: OnceLock<Mutex<HashMap<PostgresConnectionKey, Weak<Mutex<Vec<QueryMessage>>>>>> = OnceLock::new();
+fn postgres_notice_buffers() -> &'static PostgresNoticeBuffers {
+    static BUFFERS: OnceLock<PostgresNoticeBuffers> = OnceLock::new();
     BUFFERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1599,11 +1602,8 @@ fn postgres_notice_buffers() -> &'static Mutex<HashMap<PostgresConnectionKey, We
 /// never be retried from `drain_postgres_notices`, which can run inside the
 /// read-only transaction used for EXPLAIN, where a failing query would abort
 /// the user's statement.
-fn postgres_client_keys(
-) -> &'static Mutex<HashMap<usize, (Weak<deadpool_postgres::StatementCache>, Option<PostgresConnectionKey>)>> {
-    static KEYS: OnceLock<
-        Mutex<HashMap<usize, (Weak<deadpool_postgres::StatementCache>, Option<PostgresConnectionKey>)>>,
-    > = OnceLock::new();
+fn postgres_client_keys() -> &'static PostgresClientKeys {
+    static KEYS: OnceLock<PostgresClientKeys> = OnceLock::new();
     KEYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
