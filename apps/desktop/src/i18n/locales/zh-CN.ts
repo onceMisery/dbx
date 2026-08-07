@@ -114,6 +114,7 @@ export default withEnglishFallback({
     needsRecheckCount: "有 {count} 个目标待校验",
     invalidTargetCount: "有 {count} 个目标失效",
     invalidTarget: "目标失效",
+    connectionOnlyTarget: "连接级目标",
     targetMissingConnection: "连接已不存在",
     targetTypeMismatch: "连接数据库类型已不匹配",
     targetCatalogMissing: "Catalog 已不存在",

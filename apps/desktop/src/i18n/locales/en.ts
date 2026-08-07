@@ -113,6 +113,7 @@ export default {
     needsRecheckCount: "{count} target(s) need validation",
     invalidTargetCount: "{count} invalid target(s)",
     invalidTarget: "Invalid target",
+    connectionOnlyTarget: "Connection-level target",
     targetMissingConnection: "Connection no longer exists",
     targetTypeMismatch: "Connection database type no longer matches",
     targetCatalogMissing: "Catalog no longer exists",
