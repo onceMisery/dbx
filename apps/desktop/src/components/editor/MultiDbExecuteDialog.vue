@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { AlertTriangle, Check, CheckSquare, ChevronDown, ChevronRight, FolderOpen, Layers, Loader2, MinusSquare, Pencil, Play, RefreshCw, Search, Settings2, Square, Trash2, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,8 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import { useToast } from "@/composables/useToast";
-import { useMultiDbExecution, type MultiDbExecutionAdapter } from "@/composables/useMultiDbExecution";
+import { useMultiDbExecution, type MultiDbExecutionAdapter, type MultiDbExecutionMode } from "@/composables/useMultiDbExecution";
+import { formatDataTransferDuration, useExportTracker } from "@/composables/useExportTracker";
 import { useMultiDbTargetSelection, type MultiDbTargetCatalogOption, type SqlExecutionTargetValidationReason } from "@/composables/useMultiDbTargetSelection";
 import { useSqlExecutionTargetGroupStore } from "@/stores/sqlExecutionTargetGroupStore";
 import { dedupeMultiDbExecutionTargets, multiDbExecutionTargetKey, type MultiDbExecutionTarget, type MultiDbExecutionItemStatus, type SqlExecutionTargetGroup, type SqlExecutionTargetValidation } from "@/types/sqlExecution";
@@ -24,7 +25,7 @@ const props = defineProps<{
   sourceTabId: string;
   databaseType?: DatabaseType;
   initialTargets: MultiDbExecutionTarget[];
-  createTargetTab: MultiDbExecutionAdapter["createTargetTab"];
+  launchId: number;
   executeTarget: MultiDbExecutionAdapter["executeTarget"];
   cancelTarget?: MultiDbExecutionAdapter["cancelTarget"];
   cancelPending?: MultiDbExecutionAdapter["cancelPending"];
@@ -34,6 +35,7 @@ const props = defineProps<{
 
 const { t } = useI18n();
 const { toast } = useToast();
+const { addMultiDbExecutionTask, updateMultiDbExecutionTask } = useExportTracker();
 const targetGroupStore = useSqlExecutionTargetGroupStore();
 const targetSelection = useMultiDbTargetSelection(computed(() => props.databaseType));
 const compatibleConnections = targetSelection.compatibleConnections;
@@ -59,11 +61,15 @@ const pendingGroupId = ref<string | null>();
 const pendingClose = ref(false);
 const unsavedPromptOpen = ref(false);
 const executionStarted = ref(false);
+const executionMode = ref<MultiDbExecutionMode>("serial");
+const currentTime = ref(Date.now());
+let elapsedTimer: ReturnType<typeof setInterval> | undefined;
 let validationRun = 0;
+let trackedBatchId: string | undefined;
+let initializedLaunchId = -1;
 
 const execution = useMultiDbExecution(
   {
-    createTargetTab: props.createTargetTab,
     validateTarget: async (target) => {
       const result = await targetSelection.validateTarget(target);
       return {
@@ -105,6 +111,67 @@ const progressCounts = computed(() => {
     skipped: items.filter((item) => item.status === "skipped").length,
     notExecuted: items.filter((item) => item.status === "not_executed" || item.status === "cancelled").length,
   };
+});
+const elapsedMs = computed(() => {
+  const current = batch.value;
+  if (!current) return 0;
+  return current.durationMs ?? Math.max(0, (current.completedAt ?? currentTime.value) - current.startedAt);
+});
+
+function syncBackgroundTask(current: NonNullable<typeof batch.value>): void {
+  const items = current.items;
+  const completed = items.filter((item) => !["pending", "running"].includes(item.status)).length;
+  const failureCount = items.filter((item) => item.status === "failed").length;
+  const status = current.status === "cancelled" ? "cancelled" : current.status === "completed" ? "completed" : "running";
+  updateMultiDbExecutionTask(current.id, {
+    sourceTabId: current.sourceTabId,
+    total: items.length,
+    completed,
+    successCount: items.filter((item) => item.status === "success").length,
+    failureCount,
+    skippedCount: items.filter((item) => item.status === "skipped").length,
+    notExecutedCount: items.filter((item) => item.status === "not_executed" || item.status === "cancelled").length,
+    status,
+    startedAt: current.startedAt,
+    finishedAt: current.completedAt,
+    elapsedMs: current.durationMs,
+    currentTarget: current.items.find((item) => item.status === "running")?.target,
+    errorMessage: failureCount > 0 ? current.items.find((item) => item.status === "failed")?.errorMessage : undefined,
+  });
+}
+
+function executionModeLabel(): string {
+  return executionMode.value === "serial" ? t("multiDbExecute.serial") : t("multiDbExecute.parallel");
+}
+
+function toggleExecutionMode(): void {
+  if (isExecuting.value) return;
+  executionMode.value = executionMode.value === "serial" ? "parallel" : "serial";
+}
+
+watch(
+  batch,
+  (current) => {
+    if (!current) return;
+    if (trackedBatchId !== current.id) {
+      trackedBatchId = current.id;
+      addMultiDbExecutionTask(current.id, t("multiDbExecute.title"), current.sourceTabId, () => {
+        open.value = true;
+      });
+    }
+    syncBackgroundTask(current);
+  },
+  { deep: true, flush: "sync" },
+);
+
+onMounted(() => {
+  elapsedTimer = setInterval(() => {
+    currentTime.value = Date.now();
+  }, 1000);
+});
+
+onBeforeUnmount(() => {
+  if (elapsedTimer) clearInterval(elapsedTimer);
 });
 
 const searchQuery = computed(() => searchText.value.trim().toLocaleLowerCase());
@@ -484,7 +551,10 @@ function cancelUnsavedPrompt(): void {
 }
 
 function requestClose(): void {
-  if (isExecuting.value) return;
+  if (isExecuting.value) {
+    open.value = false;
+    return;
+  }
   if (hasUnsavedChanges.value) {
     pendingClose.value = true;
     pendingGroupId.value = undefined;
@@ -492,10 +562,6 @@ function requestClose(): void {
     return;
   }
   open.value = false;
-}
-
-function preventCloseDuringExecution(event: { preventDefault: () => void }): void {
-  if (isExecuting.value) event.preventDefault();
 }
 
 function openGroupNameDialog(mode: "create" | "update" | "clone" | "rename", group?: SqlExecutionTargetGroup): void {
@@ -567,6 +633,8 @@ function groupNameForId(id: string): string {
 function openForNewBatch(): void {
   execution.reset();
   executionStarted.value = false;
+  executionMode.value = "serial";
+  trackedBatchId = undefined;
   manageGroups.value = false;
   selectedGroupId.value = undefined;
   searchText.value = "";
@@ -588,7 +656,7 @@ async function startExecution(): Promise<void> {
   if (!valid || !canExecute.value) return;
   if (selectedGroupId.value) targetGroupStore.markGroupUsed(selectedGroupId.value);
   executionStarted.value = true;
-  void execution.start(props.sql, selectedTargets.value, { sourceOffset: props.sourceOffset });
+  void execution.start(props.sql, selectedTargets.value, { sourceOffset: props.sourceOffset }, executionMode.value);
 }
 
 function removeSelected(target: MultiDbExecutionTarget): void {
@@ -623,9 +691,12 @@ watch(
 );
 
 watch(
-  open,
-  (value) => {
-    if (value) openForNewBatch();
+  () => [open.value, props.launchId] as const,
+  ([value, launchId]) => {
+    if (value && launchId !== initializedLaunchId) {
+      initializedLaunchId = launchId;
+      openForNewBatch();
+    }
   },
   { immediate: true },
 );
@@ -641,7 +712,7 @@ watch(
 
 <template>
   <Dialog :open="open" @update:open="(value) => (value ? (open = true) : requestClose())">
-    <DialogContent class="flex h-[min(88vh,860px)] max-w-[min(1080px,calc(100vw-32px))] flex-col gap-0 overflow-hidden p-0" @interact-outside="preventCloseDuringExecution">
+    <DialogContent class="flex h-[min(88vh,860px)] max-w-[min(1080px,calc(100vw-32px))] flex-col gap-0 overflow-hidden p-0">
       <DialogHeader class="shrink-0 border-b px-5 py-3">
         <DialogTitle class="flex items-center gap-2">
           <Layers class="h-5 w-5 text-primary" />
@@ -652,6 +723,8 @@ watch(
       <div v-if="executionStarted && batch" class="flex min-h-0 flex-1 flex-col">
         <div class="flex shrink-0 flex-wrap items-center gap-2 border-b bg-muted/20 px-5 py-3 text-xs text-muted-foreground">
           <span>{{ t("multiDbExecute.progress", { completed: progressCompleted, total: batch.items.length }) }}</span>
+          <Badge variant="secondary">{{ executionModeLabel() }}</Badge>
+          <span class="tabular-nums">{{ t("multiDbExecute.elapsed", { duration: formatDataTransferDuration(elapsedMs) }) }}</span>
           <Badge variant="outline">{{ t("multiDbExecute.success") }} {{ progressCounts.success }}</Badge>
           <Badge variant="outline">{{ t("multiDbExecute.failed") }} {{ progressCounts.failed }}</Badge>
           <Badge variant="outline">{{ t("multiDbExecute.skipped") }} {{ progressCounts.skipped }}</Badge>
@@ -668,6 +741,7 @@ watch(
               <div class="min-w-0 flex-1">
                 <div class="truncate text-sm" :class="statusClass(item.status)">{{ targetLabel(item.target) }}</div>
                 <div class="text-xs text-muted-foreground">{{ statusLabel(item.status) }}</div>
+                <div v-if="item.durationMs !== undefined" class="text-xs tabular-nums text-muted-foreground">{{ t("multiDbExecute.elapsed", { duration: formatDataTransferDuration(item.durationMs) }) }}</div>
                 <div v-if="item.errorMessage" class="mt-1 whitespace-pre-wrap break-words text-xs text-destructive">{{ item.errorMessage }}</div>
               </div>
             </div>
@@ -678,6 +752,7 @@ watch(
             <X class="h-4 w-4" />
             {{ t("multiDbExecute.cancelBatch") }}
           </Button>
+          <Button v-if="isExecuting" variant="outline" @click="requestClose">{{ t("exportProgress.minimize") }}</Button>
           <Button v-else @click="requestClose">{{ t("common.close") }}</Button>
         </DialogFooter>
       </div>
@@ -905,7 +980,7 @@ watch(
         </div>
 
         <div class="flex shrink-0 flex-wrap items-center gap-2 border-t bg-muted/15 px-5 py-2 text-xs text-muted-foreground">
-          <span>{{ t("multiDbExecute.serialContinueOnError") }}</span>
+          <span>{{ executionMode === "serial" ? t("multiDbExecute.serialContinueOnError") : t("multiDbExecute.parallelContinueOnError") }}</span>
           <span v-if="validating" class="inline-flex items-center gap-1"><Loader2 class="h-3 w-3 animate-spin" />{{ t("common.loading") }}</span>
           <span v-else-if="invalidTargetCount" class="text-destructive">{{ t("multiDbExecute.invalidTargetCount", { count: invalidTargetCount }) }}</span>
           <span v-else-if="needsRecheckCount" class="text-amber-600 dark:text-amber-300">{{ t("multiDbExecute.needsRecheckCount", { count: needsRecheckCount }) }}</span>
@@ -918,6 +993,7 @@ watch(
           <Button v-if="selectedGroupId" variant="outline" :disabled="!canSaveGroup" @click="openGroupNameDialog('clone')">{{ t("multiDbExecute.saveAsNewGroup") }}</Button>
           <span class="flex-1" />
           <Button variant="outline" :disabled="isExecuting" @click="requestClose">{{ t("dangerDialog.cancel") }}</Button>
+          <Button variant="outline" :disabled="isExecuting" @click="toggleExecutionMode">{{ executionMode === "serial" ? t("multiDbExecute.switchToParallel") : t("multiDbExecute.switchToSerial") }}</Button>
           <Button class="gap-1.5" :disabled="!canExecute" @click="startExecution">
             <Loader2 v-if="validating" class="h-4 w-4 animate-spin" />
             <Play v-else class="h-4 w-4" />

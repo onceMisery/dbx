@@ -21,9 +21,21 @@ export type SqlExecutionTargetValidationState = "valid" | "invalid" | "needsRech
 
 export type MultiDbExecutionItemStatus = "pending" | "running" | "success" | "failed" | "skipped" | "cancelled" | "not_executed";
 
+export interface MultiDbResultRunExecution {
+  kind: "multi-db";
+  batchId: string;
+  target: MultiDbExecutionTarget;
+  title?: string;
+  status: MultiDbExecutionItemStatus;
+  durationMs?: number;
+  errorMessage?: string;
+}
+
 export interface MultiDbTargetExecutionResult {
   status: Exclude<MultiDbExecutionItemStatus, "pending" | "running" | "not_executed">;
   errorMessage?: string;
+  durationMs?: number;
+  resultRunId?: string;
 }
 
 export interface SqlExecutionTargetValidation {

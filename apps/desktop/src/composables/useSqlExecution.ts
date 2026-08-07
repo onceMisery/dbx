@@ -21,7 +21,7 @@ import { assessProductionSql } from "@/lib/database/productionSafety";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import type { SqlExecutionDangerRequest } from "@/stores/sqlExecutionDangerStore";
 import type { ConnectionConfig, DatabaseType, QueryTab } from "@/types/database";
-import type { MultiDbTargetExecutionResult } from "@/types/sqlExecution";
+import type { MultiDbExecutionTarget, MultiDbResultRunExecution, MultiDbTargetExecutionResult } from "@/types/sqlExecution";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import type { SqlExecutionTargetContext } from "@/lib/database/sqlExecutionTargetRegistry";
 
@@ -35,6 +35,12 @@ interface TargetSqlExecutionInput {
   tab: QueryTab;
   connection: ConnectionConfig;
   sql: string;
+  executionTarget?: MultiDbExecutionTarget;
+  resultRun?: {
+    batchId: string;
+    title: string;
+    target: MultiDbExecutionTarget;
+  };
   sourceOffset?: number;
   blockDangerousRedisCommands?: boolean;
   targetLabel?: string;
@@ -293,12 +299,27 @@ export function useSqlExecution(deps: {
 
   async function executeTargetSql(input: TargetSqlExecutionInput): Promise<MultiDbTargetExecutionResult> {
     const { tab, connection, sql, sourceOffset, targetLabel } = input;
+    const startedAt = Date.now();
+    const executionTab = input.executionTarget
+      ? {
+          ...tab,
+          connectionId: input.executionTarget.connectionId,
+          catalog: input.executionTarget.catalog,
+          database: input.executionTarget.database,
+          schema: input.executionTarget.schema,
+        }
+      : tab;
+    const finish = (result: MultiDbTargetExecutionResult, resultRunId?: string): MultiDbTargetExecutionResult => ({
+      ...result,
+      durationMs: Date.now() - startedAt,
+      ...(resultRunId ? { resultRunId } : {}),
+    });
     const cancelRequested = () => input.isCancellationRequested?.() === true;
     const tabCancelRequested = (count: number) => (tab.cancelRequestCount ?? 0) !== count;
-    if (cancelRequested()) return { status: "cancelled" };
-    if (!sql.trim()) return { status: "failed", errorMessage: t("explain.emptySql") };
-    if (requiresDatabaseSelection(tab, connection, sql)) {
-      return { status: "failed", errorMessage: t("editor.selectDatabaseRequired") };
+    if (cancelRequested()) return finish({ status: "cancelled" });
+    if (!sql.trim()) return finish({ status: "failed", errorMessage: t("explain.emptySql") });
+    if (requiresDatabaseSelection(executionTab, connection, sql)) {
+      return finish({ status: "failed", errorMessage: t("editor.selectDatabaseRequired") });
     }
 
     const blockRedisCommands = input.blockDangerousRedisCommands !== false;
@@ -317,35 +338,35 @@ export function useSqlExecution(deps: {
         if (safety === "confirm") highestSafety = "confirm";
       }
       if (highestSafety === "blocked") {
-        return { status: "skipped", errorMessage: t("redis.blockedCommand", { command: "Redis" }) };
+        return finish({ status: "skipped", errorMessage: t("redis.blockedCommand", { command: "Redis" }) });
       }
       if (highestSafety === "confirm") {
         const confirmed = await deps.requestDangerConfirmation?.({
           sql,
           kind: "redis",
           connectionName: connection.name,
-          database: tab.database,
+          database: executionTab.database,
           targetLabel,
           databaseType: connection.db_type,
           scopeId: input.scopeId,
         });
-        if (cancelRequested()) return { status: "cancelled" };
-        if (!confirmed) return { status: "skipped", errorMessage: t("dangerDialog.cancel") };
+        if (cancelRequested()) return finish({ status: "cancelled" });
+        if (!confirmed) return finish({ status: "skipped", errorMessage: t("dangerDialog.cancel") });
       }
     }
 
-    const productionAssessment = assessProductionSql(sql, connection, tab.database);
+    const productionAssessment = assessProductionSql(sql, connection, executionTab.database);
     if (productionAssessment.active && productionAssessment.isMutation) {
       const confirmed = await productionSafetyStore.requestConfirmation({
         sql,
         connectionName: connection.name,
-        database: tab.database,
+        database: executionTab.database,
         productionDatabases: productionAssessment.databases,
         source: t("production.sourceMultiDbSql"),
         scopeId: input.scopeId,
       });
-      if (cancelRequested()) return { status: "cancelled" };
-      if (!confirmed) return { status: "skipped", errorMessage: t("dangerDialog.cancel") };
+      if (cancelRequested()) return finish({ status: "cancelled" });
+      if (!confirmed) return finish({ status: "skipped", errorMessage: t("dangerDialog.cancel") });
     }
 
     if (isDangerousSql(sql, connection.db_type) && settingsStore.editorSettings.confirmDangerousSqlExecution) {
@@ -353,34 +374,52 @@ export function useSqlExecution(deps: {
         sql,
         kind: "sql",
         connectionName: connection.name,
-        database: tab.database,
+        database: executionTab.database,
         targetLabel,
         databaseType: connection.db_type,
         scopeId: input.scopeId,
       });
-      if (cancelRequested()) return { status: "cancelled" };
-      if (!confirmed) return { status: "skipped", errorMessage: t("dangerDialog.cancel") };
+      if (cancelRequested()) return finish({ status: "cancelled" });
+      if (!confirmed) return finish({ status: "skipped", errorMessage: t("dangerDialog.cancel") });
     }
 
-    if (cancelRequested()) return { status: "cancelled" };
+    if (cancelRequested()) return finish({ status: "cancelled" });
     const cancelRequestCount = tab.cancelRequestCount ?? 0;
-    const startedAt = Date.now();
+    const workerId = input.executionTarget ? queryStore.createMultiDbExecutionWorker(tab.id, input.executionTarget, input.scopeId ?? "") : undefined;
+    if (input.executionTarget && !workerId) return finish({ status: "failed", errorMessage: t("multiDbExecute.targetMissingConnection") });
+    const executionTabId = workerId ?? tab.id;
+    const captureWorkerResult = (status: MultiDbResultRunExecution["status"], errorMessage?: string): string | undefined => {
+      if (!workerId || !input.resultRun) return undefined;
+      return queryStore.captureMultiDbExecutionWorkerResult(tab.id, workerId, sql, {
+        kind: "multi-db",
+        batchId: input.resultRun.batchId,
+        target: input.resultRun.target,
+        title: input.resultRun.title,
+        status,
+        durationMs: Date.now() - startedAt,
+        errorMessage,
+      });
+    };
     try {
-      await queryStore.executeTabSql(tab.id, sql, {
+      await queryStore.executeTabSql(executionTabId, sql, {
         resultBaseSql: sql,
         ...(input.targetContext ? { targetContext: input.targetContext } : {}),
         ...(sourceOffset !== undefined ? { sourceOffset } : {}),
         ...(connection.db_type === "redis" ? { skipRedisSafetyCheck: !blockRedisCommands } : {}),
       });
-      const latest = queryStore.tabs.find((candidate) => candidate.id === tab.id) ?? tab;
-      if (cancelRequested() || tabCancelRequested(cancelRequestCount)) return { status: "cancelled" };
+      const latest = queryStore.getExecutionTab(executionTabId) ?? tab;
+      if (cancelRequested() || tabCancelRequested(cancelRequestCount)) {
+        return finish({ status: "cancelled" });
+      }
       const failure = firstQueryExecutionError(latest);
       const errorMessage = failure ? String(failure.rows?.[0]?.[0] ?? t("common.failed")) : undefined;
       const success = !failure;
+      const resultStatus = success ? "success" : "failed";
+      const resultRunId = captureWorkerResult(resultStatus, errorMessage);
       historyStore.add({
-        connection_id: tab.connectionId,
+        connection_id: executionTab.connectionId,
         connection_name: connection.name || "",
-        database: tab.database,
+        database: executionTab.database,
         sql,
         execution_time_ms: Date.now() - startedAt,
         success,
@@ -390,16 +429,21 @@ export function useSqlExecution(deps: {
         affected_rows: success ? latest.result?.affected_rows : undefined,
       });
       if (success) {
-        const refreshTarget = sqlMetadataRefreshTarget(sql, latest.schema);
+        const refreshTarget = sqlMetadataRefreshTarget(sql, executionTab.schema);
         if (refreshTarget.scope === "connection") {
-          await connectionStore.loadDatabases(latest.connectionId, { force: true });
+          await connectionStore.loadDatabases(executionTab.connectionId, { force: true });
         } else if (refreshTarget.scope === "database") {
-          await connectionStore.refreshObjectListTreeNode(latest.connectionId, latest.database, refreshTarget.schema);
+          await connectionStore.refreshObjectListTreeNode(executionTab.connectionId, executionTab.database, refreshTarget.schema);
         }
       }
-      return success ? { status: "success" } : { status: "failed", errorMessage };
+      deps.activeOutputView.value = success && (latest.result?.columns.length || latest.results?.some((result) => result.columns.length)) ? "result" : "summary";
+      return finish(success ? { status: "success", errorMessage } : { status: "failed", errorMessage }, resultRunId);
     } catch (error) {
-      return { status: "failed", errorMessage: error instanceof Error ? error.message : String(error) };
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const resultRunId = captureWorkerResult("failed", errorMessage);
+      return finish({ status: "failed", errorMessage }, resultRunId);
+    } finally {
+      if (workerId) queryStore.removeMultiDbExecutionWorker(workerId, input.scopeId);
     }
   }
 

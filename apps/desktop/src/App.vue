@@ -387,6 +387,7 @@ function requestActiveEditorExecuteInNewResultTab() {
 
 const multiExecuteDatabaseType = ref<DatabaseType>();
 const multiExecuteInitialTargets = ref<Array<{ connectionId: string; catalog?: string; database: string; schema?: string }>>([]);
+const multiExecuteLaunchId = ref(0);
 // Launch-time input only. MultiDbExecuteDialog copies this into its immutable
 // batch context before the first target starts; execution never reads this ref.
 const multiExecuteSourceOffset = ref<number>();
@@ -396,21 +397,20 @@ function multiExecuteTargetLabel(target: { connectionId: string; catalog?: strin
   return [connection?.name || target.connectionId, target.catalog, target.database, target.schema].filter((value) => value !== undefined && value !== "").join(" / ");
 }
 
-function createMultiExecuteTargetTab(target: { connectionId: string; catalog?: string; database: string; schema?: string }, sql: string, index: number): string {
-  const connection = connectionStore.getConfig(target.connectionId);
-  if (!connection) throw new Error(t("multiDbExecute.targetMissingConnection"));
-  const title = [t("multiDbExecute.resultTabPrefix"), connection.name || target.connectionId, target.catalog, target.database, target.schema].filter((value) => value !== undefined && value !== "").join(" · ");
-  return queryStore.createTab(target.connectionId, target.database, title || `${t("multiDbExecute.resultTabPrefix")} ${index + 1}`, "query", target.schema, sql, target.catalog, { forceNew: true, activate: false });
-}
-
-async function executeMultiDbTarget(input: { target: { connectionId: string; catalog?: string; database: string; schema?: string }; tabId: string; sql: string; scopeId: string; context: { sourceOffset?: number }; isCancellationRequested: () => boolean }) {
-  const tab = queryStore.tabs.find((candidate) => candidate.id === input.tabId);
+async function executeMultiDbTarget(input: { target: { connectionId: string; catalog?: string; database: string; schema?: string }; sourceTabId: string; sql: string; scopeId: string; context: { sourceOffset?: number }; isCancellationRequested: () => boolean }) {
+  const tab = queryStore.tabs.find((candidate) => candidate.id === input.sourceTabId);
   const connection = connectionStore.getConfig(input.target.connectionId);
   if (!tab || !connection) return { status: "failed" as const, errorMessage: t("multiDbExecute.targetMissingConnection") };
   return executeTargetSql({
     tab,
     connection,
     sql: input.sql,
+    executionTarget: input.target,
+    resultRun: {
+      batchId: input.scopeId,
+      title: multiExecuteTargetLabel(input.target),
+      target: input.target,
+    },
     sourceOffset: input.context.sourceOffset,
     blockDangerousRedisCommands: blockDangerousRedisCommands.value,
     targetLabel: multiExecuteTargetLabel(input.target),
@@ -420,8 +420,8 @@ async function executeMultiDbTarget(input: { target: { connectionId: string; cat
   });
 }
 
-async function cancelMultiDbTarget(tabId: string): Promise<void> {
-  await queryStore.cancelTabExecution(tabId);
+async function cancelMultiDbTarget(_sourceTabId: string, scopeId?: string): Promise<void> {
+  if (scopeId) await queryStore.cancelMultiDbExecutionScope(scopeId);
 }
 
 function cancelPendingMultiDbTarget(scopeId: string): void {
@@ -443,6 +443,7 @@ async function requestMultiDbExecute() {
   await prepareMultiExecute(async (sql, sourceOffset) => {
     multiExecuteSql.value = sql;
     multiExecuteSourceOffset.value = sourceOffset;
+    multiExecuteLaunchId.value += 1;
     multiExecuteSourceTabId.value = sourceTabId;
     multiExecuteDatabaseType.value = effectiveDatabaseTypeForConnection(sourceConnection);
     multiExecuteInitialTargets.value = [sourceTarget];
@@ -2747,13 +2748,12 @@ onUnmounted(() => {
           @open-diagram-target="openDiagramTarget"
         />
         <MultiDbExecuteDialog
-          v-if="showMultiDbExecuteDialog"
           v-model:open="showMultiDbExecuteDialog"
           :sql="multiExecuteSql"
           :source-tab-id="multiExecuteSourceTabId"
           :database-type="multiExecuteDatabaseType"
           :initial-targets="multiExecuteInitialTargets"
-          :create-target-tab="createMultiExecuteTargetTab"
+          :launch-id="multiExecuteLaunchId"
           :execute-target="executeMultiDbTarget"
           :cancel-target="cancelMultiDbTarget"
           :cancel-pending="cancelPendingMultiDbTarget"

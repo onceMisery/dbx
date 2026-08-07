@@ -1,14 +1,15 @@
-import { computed, ref, type ComputedRef, type Ref } from "vue";
+import { computed, reactive, ref, type ComputedRef, type Ref } from "vue";
 import type { MultiDbExecutionTarget, MultiDbExecutionItemStatus, MultiDbTargetExecutionResult } from "@/types/sqlExecution";
 
 export interface MultiDbExecutionItem {
   id: string;
   target: Readonly<MultiDbExecutionTarget>;
-  tabId?: string;
   status: MultiDbExecutionItemStatus;
   errorMessage?: string;
   startedAt?: number;
   completedAt?: number;
+  durationMs?: number;
+  resultRunId?: string;
 }
 
 export interface MultiDbExecutionBatch {
@@ -19,15 +20,16 @@ export interface MultiDbExecutionBatch {
   status: "running" | "cancelling" | "completed" | "cancelled";
   cancelRequested: boolean;
   context: MultiDbExecutionContext;
+  mode: "serial" | "parallel";
   startedAt: number;
   completedAt?: number;
+  durationMs?: number;
 }
 
 export interface MultiDbExecutionAdapter {
-  createTargetTab: (target: MultiDbExecutionTarget, sql: string, index: number) => string | Promise<string>;
-  executeTarget: (input: { target: MultiDbExecutionTarget; tabId: string; sql: string; scopeId: string; context: Readonly<MultiDbExecutionContext>; isCancellationRequested: () => boolean }) => Promise<MultiDbTargetExecutionResult>;
+  executeTarget: (input: { target: MultiDbExecutionTarget; sourceTabId: string; sql: string; scopeId: string; context: Readonly<MultiDbExecutionContext>; isCancellationRequested: () => boolean }) => Promise<MultiDbTargetExecutionResult>;
   validateTarget?: (target: MultiDbExecutionTarget) => Promise<{ valid: boolean; errorMessage?: string }>;
-  cancelTarget?: (tabId: string) => Promise<void>;
+  cancelTarget?: (sourceTabId: string, scopeId: string) => Promise<void>;
   cancelPending?: (scopeId: string) => void | Promise<void>;
 }
 
@@ -46,6 +48,8 @@ export interface MultiDbExecutionOptions {
   sourceTabId: Ref<string> | ComputedRef<string> | string;
 }
 
+export type MultiDbExecutionMode = "serial" | "parallel";
+
 function executionId(): string {
   return `multi-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -59,6 +63,7 @@ export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: M
   const batch = ref<MultiDbExecutionBatch>();
   const isRunning = computed(() => batch.value?.status === "running" || batch.value?.status === "cancelling");
   const currentItem = computed(() => batch.value?.items.find((item) => item.status === "running"));
+  const currentItems = computed(() => batch.value?.items.filter((item) => item.status === "running") ?? []);
 
   function sourceTabId(): string {
     return typeof options.sourceTabId === "string" ? options.sourceTabId : options.sourceTabId.value;
@@ -68,74 +73,85 @@ export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: M
     const current = batch.value;
     if (!current) return;
     for (const item of current.items) {
-      if (item.status === "pending") item.status = "not_executed";
+      if (item.status === "pending") {
+        item.status = "not_executed";
+        item.completedAt ??= Date.now();
+        item.durationMs ??= 0;
+      }
+    }
+  }
+
+  async function executeItem(current: MultiDbExecutionBatch, item: MultiDbExecutionItem): Promise<void> {
+    if (current.cancelRequested) {
+      markPendingNotExecuted();
+      return;
+    }
+
+    item.status = "running";
+    item.startedAt = Date.now();
+    try {
+      if (adapter.validateTarget) {
+        const validation = await adapter.validateTarget(item.target);
+        if (!validation.valid) {
+          item.status = current.cancelRequested ? "cancelled" : "failed";
+          item.errorMessage = validation.errorMessage;
+          item.completedAt = Date.now();
+          item.durationMs = item.completedAt - (item.startedAt ?? item.completedAt);
+          return;
+        }
+      }
+      if (current.cancelRequested) {
+        item.status = "cancelled";
+        markPendingNotExecuted();
+        item.completedAt = Date.now();
+        item.durationMs = item.completedAt - (item.startedAt ?? item.completedAt);
+        return;
+      }
+      const result = await adapter.executeTarget({
+        target: item.target,
+        sourceTabId: current.sourceTabId,
+        sql: current.sql,
+        scopeId: current.id,
+        context: current.context,
+        isCancellationRequested: () => current.cancelRequested,
+      });
+      item.status = current.cancelRequested && result.status === "failed" ? "cancelled" : result.status;
+      item.errorMessage = result.errorMessage;
+      item.durationMs = result.durationMs;
+      item.resultRunId = result.resultRunId;
+    } catch (error) {
+      // One target is intentionally isolated from the queue. Adapter errors
+      // become target failures so later targets keep running.
+      item.status = current.cancelRequested ? "cancelled" : "failed";
+      item.errorMessage = normalizeError(error);
+    } finally {
+      item.completedAt = Date.now();
+      item.durationMs ??= item.completedAt - (item.startedAt ?? item.completedAt);
     }
   }
 
   async function executeBatch(current: MultiDbExecutionBatch): Promise<void> {
-    for (const item of current.items) {
-      if (current.cancelRequested) {
-        markPendingNotExecuted();
-        break;
-      }
-
-      item.status = "running";
-      item.startedAt = Date.now();
-      try {
-        if (adapter.validateTarget) {
-          const validation = await adapter.validateTarget(item.target);
-          if (!validation.valid) {
-            item.status = current.cancelRequested ? "cancelled" : "failed";
-            item.errorMessage = validation.errorMessage;
-            item.completedAt = Date.now();
-            continue;
-          }
-        }
-        if (current.cancelRequested) {
-          item.status = "cancelled";
-          markPendingNotExecuted();
-          item.completedAt = Date.now();
-          break;
-        }
-        item.tabId = await adapter.createTargetTab(item.target, current.sql, current.items.indexOf(item));
-        if (current.cancelRequested) {
-          item.status = "cancelled";
-          if (item.tabId && adapter.cancelTarget) await adapter.cancelTarget(item.tabId);
-          markPendingNotExecuted();
-          item.completedAt = Date.now();
-          break;
-        }
-        const result = await adapter.executeTarget({
-          target: item.target,
-          tabId: item.tabId,
-          sql: current.sql,
-          scopeId: current.id,
-          context: current.context,
-          isCancellationRequested: () => current.cancelRequested,
-        });
-        item.status = current.cancelRequested && result.status === "failed" ? "cancelled" : result.status;
-        item.errorMessage = result.errorMessage;
-      } catch (error) {
-        // One target is intentionally isolated from the queue. Adapter errors
-        // become target failures so later targets keep running.
-        item.status = current.cancelRequested ? "cancelled" : "failed";
-        item.errorMessage = normalizeError(error);
-      } finally {
-        item.completedAt = Date.now();
+    if (current.mode === "parallel") {
+      await Promise.all(current.items.map((item) => executeItem(current, item)));
+    } else {
+      for (const item of current.items) {
+        await executeItem(current, item);
+        if (current.cancelRequested) break;
       }
     }
 
     if (current.cancelRequested) markPendingNotExecuted();
     current.status = current.cancelRequested ? "cancelled" : "completed";
     current.completedAt = Date.now();
+    current.durationMs = current.completedAt - current.startedAt;
   }
 
-  async function start(sql: string, targets: readonly MultiDbExecutionTarget[], context: MultiDbExecutionContextOverrides = {}): Promise<MultiDbExecutionBatch | undefined> {
+  async function start(sql: string, targets: readonly MultiDbExecutionTarget[], context: MultiDbExecutionContextOverrides = {}, mode: MultiDbExecutionMode = "serial"): Promise<MultiDbExecutionBatch | undefined> {
     if (isRunning.value || !sql.trim() || targets.length === 0) return undefined;
     const sourceId = sourceTabId();
     const id = executionId();
     const targetSnapshot = targets.map((target) => Object.freeze({ ...target }));
-    const current: MultiDbExecutionBatch = {
+    const current = reactive<MultiDbExecutionBatch>({
       id,
       sourceTabId: sourceId,
       sql,
@@ -146,6 +162,7 @@ export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: M
       })),
       status: "running",
       cancelRequested: false,
+      mode,
       context: Object.freeze({
         batchId: id,
         sourceTabId: sourceId,
@@ -154,7 +171,7 @@ export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: M
         ...context,
       }),
       startedAt: Date.now(),
-    };
+    });
     batch.value = current;
     await executeBatch(current);
     return current;
@@ -172,9 +189,9 @@ export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: M
       // a confirmation store has already settled concurrently.
     }
     const running = current.items.find((item) => item.status === "running");
-    if (running?.tabId && adapter.cancelTarget) {
+    if (running && adapter.cancelTarget) {
       try {
-        await adapter.cancelTarget(running.tabId);
+        await adapter.cancelTarget(current.sourceTabId, current.id);
       } catch {
         // The target execution will settle the batch when its request returns.
       }
@@ -183,6 +200,7 @@ export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: M
       markPendingNotExecuted();
       current.status = "cancelled";
       current.completedAt = Date.now();
+      current.durationMs = current.completedAt - current.startedAt;
     }
   }
 
@@ -195,6 +213,7 @@ export function useMultiDbExecution(adapter: MultiDbExecutionAdapter, options: M
     batch,
     isRunning,
     currentItem,
+    currentItems,
     start,
     cancel,
     reset,

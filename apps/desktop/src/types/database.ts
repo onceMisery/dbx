@@ -1,4 +1,5 @@
 import type { BackendError } from "@/lib/backend/errorUtils";
+import type { MultiDbResultRunExecution } from "@/types/sqlExecution";
 
 export type DatabaseType =
   | "mysql"
@@ -700,6 +701,7 @@ export interface QueryResultRun {
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
+  multiDbExecution?: MultiDbResultRunExecution;
 }
 
 export interface ParticipantInfo {

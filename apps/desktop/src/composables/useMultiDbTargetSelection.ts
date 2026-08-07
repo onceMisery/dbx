@@ -306,9 +306,11 @@ export function useMultiDbTargetSelection(databaseTypeSource: DatabaseTypeSource
   }
 
   async function validateTargets(targets: readonly MultiDbExecutionTarget[]): Promise<SqlExecutionTargetValidation[]> {
-    const results: SqlExecutionTargetValidation[] = [];
-    for (const target of targets) results.push(await validateTarget(target));
-    return results;
+    // Target validation is independent. Keep the shared loadOnce/pendingLoads
+    // deduplication semantics, but allow different connections/databases to
+    // load metadata concurrently instead of making the dialog wait for a
+    // full serial pass.
+    return Promise.all(targets.map((target) => validateTarget(target)));
   }
 
   return {

@@ -13,7 +13,6 @@ describe("useMultiDbExecution", () => {
     const executionOrder: string[] = [];
     const executor = useMultiDbExecution(
       {
-        createTargetTab: async (target) => `tab-${target.connectionId}`,
         executeTarget: async ({ target }) => {
           executionOrder.push(target.connectionId);
           return target.connectionId === "conn-1" ? { status: "failed", errorMessage: "boom" } : { status: "success" };
@@ -29,6 +28,42 @@ describe("useMultiDbExecution", () => {
     expect(batch?.status).toBe("completed");
   });
 
+  it("executes all targets concurrently in parallel mode", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started: string[] = [];
+    let running = 0;
+    let maxRunning = 0;
+    const executor = useMultiDbExecution(
+      {
+        executeTarget: async ({ target }) => {
+          started.push(target.connectionId);
+          running += 1;
+          maxRunning = Math.max(maxRunning, running);
+          await gate;
+          running -= 1;
+          return { status: "success" as const, durationMs: 12 };
+        },
+      },
+      { sourceTabId: "source" },
+    );
+
+    const run = executor.start("UPDATE users SET active = TRUE", targets, {}, "parallel");
+    await Promise.resolve();
+
+    expect(started).toEqual(["conn-1", "conn-2", "conn-3"]);
+    expect(maxRunning).toBe(3);
+
+    release();
+    const batch = await run;
+    expect(batch?.mode).toBe("parallel");
+    expect(batch?.items.map((item) => item.status)).toEqual(["success", "success", "success"]);
+    expect(batch?.items.every((item) => item.durationMs === 12)).toBe(true);
+    expect(batch?.durationMs).toEqual(expect.any(Number));
+  });
+
   it("takes a target snapshot before execution starts", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -36,7 +71,6 @@ describe("useMultiDbExecution", () => {
     });
     const executor = useMultiDbExecution(
       {
-        createTargetTab: (target) => `tab-${target.connectionId}`,
         executeTarget: async () => {
           await gate;
           return { status: "success" };
@@ -59,7 +93,6 @@ describe("useMultiDbExecution", () => {
     let receivedOffset: number | undefined;
     const executor = useMultiDbExecution(
       {
-        createTargetTab: (target) => `tab-${target.connectionId}`,
         executeTarget: async ({ context }) => {
           receivedOffset = context.sourceOffset;
           return { status: "success" };
@@ -84,7 +117,6 @@ describe("useMultiDbExecution", () => {
     });
     const executor = useMultiDbExecution(
       {
-        createTargetTab: (target) => `tab-${target.connectionId}`,
         executeTarget: async () => {
           await gate;
           return { status: "cancelled" };
@@ -99,7 +131,7 @@ describe("useMultiDbExecution", () => {
     await executor.cancel();
     await run;
 
-    expect(cancelTarget).toHaveBeenCalledWith("tab-conn-1");
+    expect(cancelTarget).toHaveBeenCalledWith("source", expect.any(String));
     expect(executor.batch.value?.items.map((item) => item.status)).toEqual(["cancelled", "not_executed", "not_executed"]);
     expect(executor.batch.value?.status).toBe("cancelled");
   });
@@ -111,7 +143,6 @@ describe("useMultiDbExecution", () => {
     });
     const executor = useMultiDbExecution(
       {
-        createTargetTab: (target) => `tab-${target.connectionId}`,
         executeTarget: async () => {
           await gate;
           return { status: "cancelled" };
@@ -135,10 +166,8 @@ describe("useMultiDbExecution", () => {
     const validationFinished = new Promise<void>((resolve) => {
       releaseValidation = resolve;
     });
-    const createTargetTab = vi.fn((target) => `tab-${target.connectionId}`);
     const executor = useMultiDbExecution(
       {
-        createTargetTab,
         validateTarget: async () => {
           await validationFinished;
           return { valid: true };
@@ -154,7 +183,6 @@ describe("useMultiDbExecution", () => {
     releaseValidation();
     await run;
 
-    expect(createTargetTab).not.toHaveBeenCalled();
     expect(executor.batch.value?.items.map((item) => item.status)).toEqual(["cancelled", "not_executed", "not_executed"]);
   });
 });
