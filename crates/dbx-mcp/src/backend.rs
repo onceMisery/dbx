@@ -9,7 +9,7 @@ use dbx_core::{
     agent_events::{ToolCall, ToolResult},
     agent_tools::{self, AgentSqlPermissions},
     connection::AppState,
-    db::{redis_driver::RedisCommandResult, ColumnInfo, TableInfo},
+    db::{redis_driver::RedisCommandResult, ColumnInfo, IndexInfo, TableInfo},
     models::connection::{ConnectionConfig, DatabaseType},
     storage::{DesktopSettings, McpGlobalPolicy, McpGlobalPolicyState, Storage},
 };
@@ -881,6 +881,30 @@ impl DbxBackend for WebBackend {
                     .map_err(|error| format!("Invalid MongoDB find response: {error}"))?;
                 Ok(mongo_documents_query_result(result.documents))
             }
+            MongoCommand::FindExplain { collection, filter, projection, sort, collation, skip, limit, verbosity } => {
+                let result = self
+                    .request(
+                        reqwest::Method::POST,
+                        "/api/mongo/explain-find",
+                        Some(json!({
+                            "connectionId": connection_id,
+                            "database": database,
+                            "collection": collection,
+                            "skip": skip,
+                            "limit": limit,
+                            "filter": filter,
+                            "projection": projection,
+                            "sort": sort,
+                            "collation": collation,
+                            "verbosity": verbosity,
+                        })),
+                    )
+                    .await?
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| format!("Invalid MongoDB explain response: {error}"))?;
+                Ok(mongo_documents_query_result(vec![result]))
+            }
             MongoCommand::FindOne { collection, filter, projection, options } => {
                 let result = self
                     .request(
@@ -960,23 +984,22 @@ impl DbxBackend for WebBackend {
                 Ok(mongo_documents_query_result(result.documents))
             }
             MongoCommand::GetIndexes { collection } => {
-                let result = self
+                let indexes = self
                     .request(
-                        reqwest::Method::POST,
-                        "/api/mongo/aggregate-documents",
-                        Some(json!({
-                            "connectionId": connection_id,
-                            "database": database,
-                            "collection": collection,
-                            "pipelineJson": r#"[{"$indexStats":{}}]"#,
-                            "maxRows": 100,
-                        })),
+                        reqwest::Method::GET,
+                        &format!(
+                            "/api/schema/indexes?connection_id={}&database={}&schema=&table={}",
+                            url_encode(connection_id),
+                            url_encode(database),
+                            url_encode(collection)
+                        ),
+                        None,
                     )
                     .await?
-                    .json::<WebMongoDocuments>()
+                    .json::<Vec<IndexInfo>>()
                     .await
                     .map_err(|error| format!("Invalid MongoDB indexes response: {error}"))?;
-                Ok(mongo_documents_query_result(result.documents))
+                Ok(dbx_core::mongo_ops::mongo_indexes_query_result(indexes, 100))
             }
             MongoCommand::CollectionStats { collection, metric, scale } => {
                 let value: Value = self
@@ -1216,17 +1239,25 @@ fn url_encode(value: &str) -> String {
 }
 
 pub(crate) fn format_query_result(result: &dbx_core::db::QueryResult, max_rows: usize) -> String {
-    if result.columns.is_empty() {
-        return format!("Query executed. {} row(s) affected.", result.affected_rows);
+    let mut output = if result.columns.is_empty() {
+        format!("Query executed. {} row(s) affected.", result.affected_rows)
+    } else {
+        let rows = result
+            .rows
+            .iter()
+            .take(max_rows)
+            .map(|row| row.iter().map(format_query_cell).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut output = markdown_table(&result.columns, &rows);
+        output.push_str(&format!("\n\n{} row(s)", rows.len()));
+        output
+    };
+    if !result.messages.is_empty() {
+        output.push_str("\n\nServer messages:");
+        for message in &result.messages {
+            output.push_str(&format!("\n- {}", message.format_line()));
+        }
     }
-    let rows = result
-        .rows
-        .iter()
-        .take(max_rows)
-        .map(|row| row.iter().map(format_query_cell).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    let mut output = markdown_table(&result.columns, &rows);
-    output.push_str(&format!("\n\n{} row(s)", rows.len()));
     output
 }
 
@@ -1244,6 +1275,7 @@ fn query_result(columns: Vec<String>, rows: Vec<Vec<Value>>, affected_rows: u64)
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 
@@ -1422,6 +1454,12 @@ pub fn new_connection_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        time::Duration,
+    };
 
     fn policy_state(configured: bool, read_only: bool) -> McpGlobalPolicyState {
         McpGlobalPolicyState { configured, read_only, allow_dangerous_sql: false, allowed_connection_ids: None }
@@ -1451,6 +1489,33 @@ mod tests {
     }
 
     #[test]
+    fn format_query_result_appends_server_messages() {
+        let mut result = query_result(Vec::new(), Vec::new(), 3);
+        assert_eq!(format_query_result(&result, 100), "Query executed. 3 row(s) affected.");
+
+        result.messages = vec![
+            dbx_core::db::QueryMessage {
+                severity: "notice".to_string(),
+                message: "hello world".to_string(),
+                code: Some("00000".to_string()),
+                detail: None,
+                hint: Some("use a table".to_string()),
+            },
+            dbx_core::db::QueryMessage {
+                severity: "WARNING".to_string(),
+                message: "careful".to_string(),
+                code: None,
+                detail: None,
+                hint: None,
+            },
+        ];
+        assert_eq!(
+            format_query_result(&result, 100),
+            "Query executed. 3 row(s) affected.\n\nServer messages:\n- NOTICE: hello world (code: 00000, hint: use a table)\n- WARNING: careful"
+        );
+    }
+
+    #[test]
     fn mongo_drop_indexes_query_result_preserves_partial_failures() {
         let result = mongo_drop_indexes_query_result(
             vec!["email_1".to_string()],
@@ -1471,6 +1536,174 @@ mod tests {
             ]
         );
         assert_eq!(result.affected_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn web_mongo_get_indexes_uses_schema_indexes_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                if count == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            let request_line = request.lines().next().unwrap().to_string();
+            request_sender.send(request_line.clone()).unwrap();
+            let body = if request_line.starts_with("GET /api/schema/indexes?") {
+                r#"[{"name":"email_1","columns":["email"],"is_unique":true,"is_primary":false,"filter":null,"index_type":"email: 1","included_columns":null,"comment":null}]"#
+            } else {
+                r#"{"documents":[{"name":"email_1","columns":["email"],"is_unique":true,"is_primary":false,"filter":null,"index_type":"email: 1"}]}"#
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let backend = WebBackend::new(format!("http://{address}"), String::new()).unwrap();
+        backend.auth.lock().await.checked = true;
+        let connection = new_connection_config(
+            "legacy".to_string(),
+            "Legacy MongoDB".to_string(),
+            DatabaseType::MongoDb,
+            "localhost".to_string(),
+            27017,
+            String::new(),
+            String::new(),
+            Some("app".to_string()),
+            false,
+            Some("mongodb-legacy".to_string()),
+        )
+        .unwrap();
+        backend.connected.lock().await.insert(connection.id.clone(), connection.clone());
+
+        let result = backend
+            .execute_mongo_command(&connection, "app", &MongoCommand::GetIndexes { collection: "im_msg".to_string() })
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(
+            request_receiver.recv().unwrap(),
+            "GET /api/schema/indexes?connection_id=legacy&database=app&schema=&table=im_msg HTTP/1.1"
+        );
+        assert_eq!(result.columns, ["name", "columns", "unique", "primary", "type", "filter"]);
+        assert_eq!(
+            result.rows,
+            [vec![
+                Value::String("email_1".to_string()),
+                Value::String("email".to_string()),
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::String("email: 1".to_string()),
+                Value::Null,
+            ]]
+        );
+        assert_eq!(result.affected_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn web_mongo_find_explain_uses_explain_endpoint_and_preserves_options() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then_some(value.trim())
+                })
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let body = request[header_end..header_end + content_length].to_string();
+            request_sender.send((request.lines().next().unwrap().to_string(), body)).unwrap();
+
+            let response_body = r#"{"queryPlanner":{"winningPlan":{"stage":"COLLSCAN"}}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        });
+
+        let backend = WebBackend::new(format!("http://{address}"), String::new()).unwrap();
+        backend.auth.lock().await.checked = true;
+        let connection = new_connection_config(
+            "legacy".to_string(),
+            "Legacy MongoDB".to_string(),
+            DatabaseType::MongoDb,
+            "localhost".to_string(),
+            27017,
+            String::new(),
+            String::new(),
+            Some("app".to_string()),
+            false,
+            Some("mongodb-legacy".to_string()),
+        )
+        .unwrap();
+        backend.connected.lock().await.insert(connection.id.clone(), connection.clone());
+
+        let command = MongoCommand::FindExplain {
+            collection: "im_msg".to_string(),
+            filter: r#"{"active":true}"#.to_string(),
+            projection: Some(r#"{"email":1}"#.to_string()),
+            sort: Some(r#"{"email":1}"#.to_string()),
+            collation: Some(r#"{"locale":"en","strength":1}"#.to_string()),
+            skip: 2,
+            limit: 5,
+            verbosity: "executionStats".to_string(),
+        };
+        let result = backend.execute_mongo_command(&connection, "app", &command).await.unwrap();
+
+        server.join().unwrap();
+        let (request_line, body) = request_receiver.recv().unwrap();
+        assert_eq!(request_line, "POST /api/mongo/explain-find HTTP/1.1");
+        let request: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(request["connectionId"], "legacy");
+        assert_eq!(request["database"], "app");
+        assert_eq!(request["collection"], "im_msg");
+        assert_eq!(request["skip"], 2);
+        assert_eq!(request["limit"], 5);
+        assert_eq!(request["filter"], r#"{"active":true}"#);
+        assert_eq!(request["projection"], r#"{"email":1}"#);
+        assert_eq!(request["sort"], r#"{"email":1}"#);
+        assert_eq!(request["collation"], r#"{"locale":"en","strength":1}"#);
+        assert_eq!(request["verbosity"], "executionStats");
+        assert_eq!(result.columns, ["queryPlanner"]);
+        assert_eq!(result.rows.len(), 1);
     }
 
     #[tokio::test]

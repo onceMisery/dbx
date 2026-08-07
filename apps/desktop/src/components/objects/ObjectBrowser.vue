@@ -3000,7 +3000,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             <template #default="{ item }">
               <CustomContextMenu :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
                 <div
-                  class="grid h-[34px] cursor-pointer items-center gap-3 border-b px-3 hover:bg-accent/50"
+                  class="grid h-[34px] cursor-default items-center gap-3 border-b px-3 hover:bg-accent/50"
                   :class="{
                     'bg-accent/40': sourceRow?.id === item.id,
                     'bg-primary/10': sidePanelRow?.id === item.id && !selectedTableIds.has(item.id),
@@ -3059,7 +3059,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               <div class="object-browser-grid-row" :style="{ gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, height: `${objectGridRowHeight - OBJECT_GRID_GAP}px` }">
                 <CustomContextMenu v-for="item in row.cards" :key="item.id" :items="() => getObjectBrowserMenuItems(item)" v-slot="{ onContextMenu }">
                   <div
-                    class="relative flex h-full min-h-0 cursor-pointer flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
+                    class="relative flex h-full min-h-0 cursor-default flex-col items-center gap-1 rounded-lg border bg-card p-3 text-center transition-all hover:border-primary/40 hover:shadow-sm"
                     :class="{
                       'border-primary bg-primary/5': selectedTableIds.has(item.id),
                       'border-primary/60': sourceRow?.id === item.id && !selectedTableIds.has(item.id),

@@ -10,6 +10,7 @@ import { supportsConnectionScopedQueryExecution } from "@/lib/database/databaseF
 import { supportsConnectionLevelSqlExecution } from "@/lib/connection/connectionLevelDatabaseBootstrap";
 import { classifySqlActivityKind } from "@/lib/history/historyActivityKind";
 import { sqlMetadataRefreshTarget } from "@/lib/sql/sqlMetadataRefresh";
+import { defaultViewForResult } from "@/lib/query/queryResultDefaultView";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { classifyRedisCommandSafety } from "@/lib/redis/redisCommandSafety";
 import { isSqlExecutionSnapshot, resolveExecutableSql, type SqlExecutionOverride, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
@@ -99,7 +100,7 @@ export function useSqlExecution(deps: {
   activeConnection: ComputedRef<ConnectionConfig | undefined>;
   executableSql: ComputedRef<string>;
   resolveExecutableSql?: (snapshot?: SqlExecutionSnapshot) => Promise<string>;
-  activeOutputView: Ref<"result" | "summary" | "explain" | "chart">;
+  activeOutputView: Ref<"result" | "summary" | "explain" | "chart" | "messages">;
   blockDangerousRedisCommands?: Ref<boolean>;
   onMissingDatabase?: () => void;
   requestDangerConfirmation?: (request: SqlExecutionDangerRequest) => Promise<boolean>;
@@ -270,7 +271,7 @@ export function useSqlExecution(deps: {
     } else if (executionDatabaseType === "sqlserver" && tab.result?.server_message === true) {
       deps.activeOutputView.value = "result";
     } else if (tab.result && !tab.result.columns.length && !tab.results?.some((result) => result.columns.length > 0)) {
-      deps.activeOutputView.value = "summary";
+      deps.activeOutputView.value = statementCount === 1 ? defaultViewForResult(tab.result) : "summary";
     }
     const elapsed = Date.now() - start;
     const failure = firstQueryExecutionError(tab);

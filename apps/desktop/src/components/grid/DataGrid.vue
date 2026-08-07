@@ -135,7 +135,7 @@ import { canFormatCellDetailJson, cellDetailEditorText, compactJsonText, default
 import { buildDataGridCellDetail, buildDataGridColumnDetail, buildDataGridRowDetail, CELL_DETAIL_VALUE_PREVIEW_MAX_LENGTH, dataGridColumnDetailJson, dataGridColumnDetailTsv, dataGridRowDetailJson, dataGridRowDetailTsv, type DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
 import { applyColumnFormatter, buildColumnFormatterKey, getSupportedTimeZoneOptions, normalizeColumnFormatter, resolveColumnFormatter, type ColumnFormatterConfig, type DateTimeFormatterUnit, DateTimePatterns } from "@/lib/dataGrid/columnFormatter";
 import { temporalCellEditorConfig, type TemporalCellEditorConfig } from "@/lib/dataGrid/dataGridTemporalEditor";
-import { BOOLEAN_CELL_EDITOR_VALUES, booleanCellEditorValue, isBooleanCellValue, isBooleanColumnType, parseBooleanCellEditorValue } from "@/lib/dataGrid/dataGridBooleanColumn";
+import { BOOLEAN_CELL_EDITOR_VALUES, booleanCellEditorValue, isBooleanCellValue, isBooleanColumnType, isPointInBooleanCheckbox, nextBooleanCellValue, normalizeBooleanCellValue, parseBooleanCellEditorValue } from "@/lib/dataGrid/dataGridBooleanColumn";
 import { resolveDataGridColumnsByResultIndex } from "@/lib/dataGrid/dataGridColumnMetadata";
 import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowShortcut, isFocusSearchShortcut, isModRShortcut, isSaveShortcut, isToggleTransposeShortcut } from "@/lib/editor/keyboardShortcuts";
 import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid/dataGridScrollGutter";
@@ -170,6 +170,7 @@ import { buildDataGridColumnLookupItems, dataGridColumnCommentFor, filterDataGri
 import { uniqueDataGridColumnOrderKeys } from "@/lib/dataGrid/dataGridColumnOrder";
 import { dataGridColumnLayoutScopeKey, TABLE_DATA_GRID_COLUMN_ORDER_CHANGED_EVENT, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
 import { summarizeSelection } from "@/lib/dataGrid/gridSelection";
+import { dataGridFrameCoversRow, dataGridSelectionEdgeMask, dataGridSelectionFrameKindAtCell, dataGridSelectionUsesOuterFrame, resolveDataGridSelectionFrames } from "@/lib/dataGrid/dataGridSelectionFrames";
 import {
   createDataGridCellContextMenuItems,
   createDataGridColumnContextMenuItems,
@@ -273,6 +274,8 @@ const tableFontSize = computed(() => settingsStore.editorSettings.tableFontSize)
 const rowNumberWidth = ref(DATA_GRID_ROW_NUM_WIDTH);
 const multiRowTranspose = computed(() => settingsStore.editorSettings.dataGridMultiRowTranspose);
 const hideNullColumns = computed(() => settingsStore.editorSettings.dataGridHideNullColumns);
+const booleanCellsUseCheckbox = computed(() => settingsStore.editorSettings.dataGridBooleanDisplayMode === "checkbox");
+const booleanDisplayMode = computed(() => settingsStore.editorSettings.dataGridBooleanDisplayMode);
 const { isDark, themePalette } = useTheme();
 const { toast } = useToast();
 // 外键单元格跳转复用导航入口；对话框引用传 stub（同 AiAssistant 模式）
@@ -498,6 +501,10 @@ const dataGridViewportWidth = ref(0);
 const showColumnCommentsInHeader = computed(() => settingsStore.editorSettings.showColumnCommentsInHeader);
 const showColumnTypesInHeader = computed(() => settingsStore.editorSettings.showColumnTypesInHeader);
 const showIndexIndicatorsInHeader = computed(() => settingsStore.editorSettings.showIndexIndicatorsInHeader !== false);
+const indexes = ref<IndexInfo[]>([]);
+const indexesLoaded = ref(false);
+const indexesLoading = ref(false);
+const indexesError = ref("");
 const primaryKeyColumnNames = computed(() => {
   const names = new Set(props.tableMeta?.primaryKeys ?? []);
   for (const column of props.tableMeta?.columns ?? []) {
@@ -1827,6 +1834,13 @@ const filteredGoToColumns = computed(() => {
   return filterDataGridColumnLookupItems(goToColumnItems.value, goToColumnSearch.value);
 });
 const visibleColumns = computed(() => visibleColumnIndexes.value.map((index) => props.result.columns[index]));
+const visibleColumnIndexIndicators = computed(() =>
+  visibleColumns.value.map((column) => {
+    if (!showIndexIndicatorsInHeader.value) return false;
+    const kind = columnIndexMap.value.get(columnIndexNameKey(column));
+    return !!kind && kind !== "none";
+  }),
+);
 const visibleSourceColumns = computed(() => {
   if (!props.sourceColumns || props.sourceColumns.length !== props.result.columns.length) return undefined;
   return visibleColumnIndexes.value.map((index) => props.sourceColumns?.[index]);
@@ -1948,6 +1962,7 @@ const { initColumnWidths, onResizeStart, autoFitColumn, renderedColumnWidths, to
   columnIndexes: visibleColumnIndexes,
   density: columnWidthDensity,
   compactColumnHeaderActions,
+  columnIndexIndicators: visibleColumnIndexIndicators,
   cacheKey: columnWidthCacheKey,
   columnStructureSignature,
   measureHeaderText: measureColumnHeaderText,
@@ -2381,6 +2396,7 @@ function onScrollerScroll(e: Event) {
     clampGridScrollerBounds(target);
     updateDomGridVisibleItemsDuringScroll(target);
     syncHeaderScroll(e);
+    if (domGridScrollTop.value !== target.scrollTop) domGridScrollTop.value = target.scrollTop;
     recordScrollPosition({ top: target.scrollTop, left: target.scrollLeft });
     maybeCheckInfiniteScroll(target);
   } else {
@@ -3179,6 +3195,7 @@ function showReadonlyCellDetailsOnDblClick(item: RowItem, rowIndex: number, visi
 }
 
 function onDomCellDblClick(item: RowItem, rowIndex: number, visibleColIdx: number, actualColIdx: number, event: MouseEvent) {
+  if (booleanCellsUseCheckbox.value && isBooleanGridCell(item, actualColIdx) && canEditCellItem(item, actualColIdx)) return;
   if (showReadonlyCellDetailsOnDblClick(item, rowIndex, visibleColIdx, actualColIdx)) return;
   startDomCellEdit(item.id, actualColIdx, formatCellCached(item.data[actualColIdx], actualColIdx), event);
 }
@@ -3215,6 +3232,19 @@ function measureCellTextWidth(text: string, font: string): number {
   context.font = font;
   const width = context.measureText(text).width;
   context.restore();
+  return width;
+}
+
+const cellTextWidthCache = new Map<string, number>();
+
+function measureCellTextWidthCached(text: string, font: string): number {
+  const key = `${font}|${text}`;
+  let width = cellTextWidthCache.get(key);
+  if (width === undefined) {
+    width = measureCellTextWidth(text, font);
+    if (cellTextWidthCache.size >= 200) cellTextWidthCache.clear();
+    cellTextWidthCache.set(key, width);
+  }
   return width;
 }
 
@@ -3281,6 +3311,17 @@ const booleanEditorModelValue = computed({
     editValue.value = value;
   },
 });
+
+function booleanCellChecked(value: unknown): boolean {
+  return normalizeBooleanCellValue(value) === true;
+}
+
+function cycleBooleanGridCell(item: RowItem | undefined, actualColIdx: number, event?: MouseEvent) {
+  if (!item || !isBooleanGridCell(item, actualColIdx) || !canEditCellItem(item, actualColIdx)) return;
+  event?.stopPropagation();
+  const next = nextBooleanCellValue(item.data[actualColIdx], isBooleanGridColumnNullable(actualColIdx));
+  applyCellValue(item.id, actualColIdx, next === null ? null : next ? "true" : "false");
+}
 
 function cellEditInputModeForColumn(columnIndex: number): "decimal" | "numeric" | undefined {
   const dataType = normalizedColumnDataType(tableColumnForGridColumn(columnIndex));
@@ -3793,8 +3834,10 @@ const selection = useDataGridSelection({
 
 const {
   isSelectingAll,
+  isSelectingCells,
   selectedRange,
   selectedCells,
+  selectedCellKeys,
   selectedCellMatrix,
   selectedCellCount,
   hasCellSelection,
@@ -3829,8 +3872,21 @@ const multiRowCount = computed(() => {
   return 1;
 });
 
-const selectionSummary = computed(() => (hasCellSelection.value ? summarizeSelection(selectedCells.value) : null));
+// 框选拖拽中不物化 selectedCells / 不做数值汇总（大选区下这是 DOM 卡顿主因）
+const selectionSummary = computed(() => {
+  if (!hasCellSelection.value) return null;
+  if (isSelectingCells.value) {
+    return {
+      cellCount: selectedCellCount.value,
+      rowCount: multiRowCount.value,
+      numericCount: 0,
+      sum: 0,
+    };
+  }
+  return summarizeSelection(selectedCells.value);
+});
 const selectionSummarySumText = computed(() => {
+  if (isSelectingCells.value) return "…";
   const summary = selectionSummary.value;
   if (!summary) return "0";
   const sum = Object.is(summary.sum, -0) ? 0 : summary.sum;
@@ -3839,9 +3895,90 @@ const selectionSummarySumText = computed(() => {
 
 const isMultiRow = computed(() => multiRowCount.value > 1);
 
+// Navicat 风格选区形态：单个单元格细边框，多格范围浅色填充 + 一圈细外框；
+// 离散点选（Ctrl）退回逐格描边
+const selectionFramesData = computed(() =>
+  resolveDataGridSelectionFrames({
+    sparseCellCount: selectedCellKeys.value.size,
+    hasColumnSelection: hasColumnSelection.value,
+    selectedColumnIndexes: selectedColumnIndexes.value,
+    selectedRange: selectedRange.value,
+    rowCount: displayRowCount.value,
+  }),
+);
+const selectionUsesOuterFrame = computed(() => dataGridSelectionUsesOuterFrame(selectionFramesData.value.frames));
+// DOM 框选拖拽：overlay 只画外框（与 canvas strokeRect 一致），填充仍走格子 cell-selected
+const domSelectionDragOverlayActive = computed(() => {
+  if (!isSelectingCells.value || dataGridRenderMode.value === "canvas") return false;
+  const range = selectedRange.value;
+  if (!range) return false;
+  return range.startRow !== range.endRow || range.startCol !== range.endCol;
+});
+const domGridScrollTop = ref(0);
+
+function selectionFrameKindForCell(rowIndex: number, visibleColIdx: number): "single" | "range" | null {
+  const frames = selectionFramesData.value.frames;
+  if (frames.length === 0) return null;
+  // 框选热路径：已确定是多格外框时，选中格必为 range，避免再扫 frames
+  if (selectionUsesOuterFrame.value && frames.length === 1) {
+    const frame = frames[0]!;
+    if (rowIndex < frame.startRow || rowIndex > frame.endRow || visibleColIdx < frame.startCol || visibleColIdx > frame.endCol) return null;
+    return "range";
+  }
+  return dataGridSelectionFrameKindAtCell(frames, rowIndex, visibleColIdx);
+}
+
+// 行号的选区覆盖指示（Navicat 风格），但行选中（--selected）和行状态色（新增/编辑/删除）优先，
+// 与 canvas 渲染器的 rowNumberFill 优先级顺序保持一致
+function rowNumberShowsSelectionTint(item: RowItem): boolean {
+  if (isRowSelected(item.id)) return false;
+  if (item.status !== "clean") return false;
+  const frames = selectionFramesData.value.frames;
+  return frames.length > 0 && dataGridFrameCoversRow(frames, item.displayIndex);
+}
+
+// 多格范围的外框：松手后用单元格 bitmask class；拖拽中改由 overlay 画一圈外框（与 canvas 一致，文字仍在格子里）
+function selectionFrameEdgeClass(rowIndex: number, visibleColIdx: number): string {
+  if (domSelectionDragOverlayActive.value || !selectionUsesOuterFrame.value) return "";
+  const mask = dataGridSelectionEdgeMask(selectionFramesData.value.frames, rowIndex, visibleColIdx);
+  return mask === 0 ? "" : `cell-sel-frame-${mask}`;
+}
+
+const domSelectionDragOverlayStyle = computed((): CSSProperties | undefined => {
+  if (!domSelectionDragOverlayActive.value) return undefined;
+  const range = selectedRange.value;
+  if (!range) return undefined;
+  const startCol = range.startCol;
+  const endCol = range.endCol;
+  const startFrozen = startCol < frozenColumnCount.value;
+  const endFrozen = endCol < frozenColumnCount.value;
+  const left = rowNumberWidth.value + (renderedColumnOffsets.value[startCol] ?? 0) - (startFrozen ? 0 : gridHorizontalScrollLeft.value);
+  const right = rowNumberWidth.value + (renderedColumnOffsets.value[endCol] ?? 0) + (renderedColumnWidths.value[endCol] ?? 0) - (endFrozen ? 0 : gridHorizontalScrollLeft.value);
+  const top = range.startRow * CANVAS_DATA_GRID_ROW_HEIGHT - domGridScrollTop.value;
+  const bottom = (range.endRow + 1) * CANVAS_DATA_GRID_ROW_HEIGHT - domGridScrollTop.value;
+  const viewportWidth = gridViewportWidth.value;
+  const scroller = gridScrollerElement();
+  const viewportHeight = scroller?.clientHeight ?? 0;
+  const clippedLeft = Math.max(rowNumberWidth.value, left);
+  const clippedTop = Math.max(0, top);
+  const clippedRight = viewportWidth > 0 ? Math.min(viewportWidth, right) : right;
+  const clippedBottom = viewportHeight > 0 ? Math.min(viewportHeight, bottom) : bottom;
+  const width = clippedRight - clippedLeft;
+  const height = clippedBottom - clippedTop;
+  if (width < 1 || height < 1) return undefined;
+  return {
+    left: `${clippedLeft}px`,
+    top: `${clippedTop}px`,
+    width: `${width}px`,
+    height: `${height}px`,
+  };
+});
+
 function onCellMouseenter(rowIndex: number, visibleColIdx: number, actualColIdx: number) {
-  quickDownloadMenuCell.value = retainBinaryCellDownloadMenuForHover(quickDownloadMenuCell.value, { rowIndex, col: actualColIdx });
-  if (!isScrolling.value) hoveredDetailCell.value = { rowIndex, col: actualColIdx };
+  if (!isSelectingCells.value) {
+    quickDownloadMenuCell.value = retainBinaryCellDownloadMenuForHover(quickDownloadMenuCell.value, { rowIndex, col: actualColIdx });
+    if (!isScrolling.value) hoveredDetailCell.value = { rowIndex, col: actualColIdx };
+  }
   extendCellSelection(rowIndex, visibleColIdx);
 }
 
@@ -5133,7 +5270,9 @@ function onCanvasMouseMove(event: MouseEvent) {
   const next = hit && hitItem ? { rowIndex: hitItem.displayIndex, visibleColIdx: hit.rowNumber ? -1 : hit.visibleColIdx } : null;
   const actualColIdx = next ? visibleColumnIndexes.value[next.visibleColIdx] : undefined;
   if (canvasRef.value) {
-    canvasRef.value.style.cursor = hit?.rowNumber ? "default" : hitItem && actualColIdx !== undefined && canEditCellItem(hitItem, actualColIdx) ? "text" : "cell";
+    const overBooleanInteractive =
+      booleanCellsUseCheckbox.value && hit != null && !hit.rowNumber && hitItem != null && actualColIdx !== undefined && isBooleanGridCell(hitItem, actualColIdx) && canEditCellItem(hitItem, actualColIdx) && booleanInteractiveHitFromCanvasEvent(hitItem, hit, actualColIdx, event);
+    canvasRef.value.style.cursor = hit?.rowNumber ? "default" : overBooleanInteractive ? "pointer" : hitItem && actualColIdx !== undefined && canEditCellItem(hitItem, actualColIdx) ? "text" : "cell";
   }
   if (next?.rowIndex === canvasHoverCell.value?.rowIndex && next?.visibleColIdx === canvasHoverCell.value?.visibleColIdx) {
     return;
@@ -5176,6 +5315,43 @@ function clearCanvasDetailHover(event?: MouseEvent) {
   onCanvasMouseLeave();
 }
 
+function booleanCheckboxHitFromCanvasEvent(item: RowItem, hit: { rowIndex: number; visibleColIdx: number }, actualColIdx: number, event: MouseEvent): boolean {
+  if (item.data[actualColIdx] === null) return false;
+  const canvas = canvasRef.value;
+  const canvasRect = canvas?.getBoundingClientRect();
+  const cellRect = canvasCellViewportRect(hit.rowIndex, hit.visibleColIdx);
+  if (!canvasRect || !cellRect) return false;
+  return isPointInBooleanCheckbox({ x: event.clientX - canvasRect.left, y: event.clientY - canvasRect.top }, { left: cellRect.left, top: cellRect.top, width: cellRect.width, height: cellRect.height });
+}
+
+function booleanNullTextHitFromCanvasEvent(item: RowItem, hit: { rowIndex: number; visibleColIdx: number }, actualColIdx: number, event: MouseEvent): boolean {
+  if (item.data[actualColIdx] !== null) return false;
+  const canvas = canvasRef.value;
+  const canvasRect = canvas?.getBoundingClientRect();
+  const cellRect = canvasCellViewportRect(hit.rowIndex, hit.visibleColIdx);
+  if (!canvasRect || !cellRect) return false;
+  const text = firstLineCellDisplayValue(formatCellCached(item.data[actualColIdx], actualColIdx));
+  if (!text) return false;
+  const textWidth = measureCellTextWidthCached(text, `italic 400 ${tableFontSize.value}px ${tableFontFamily.value}`);
+  if (textWidth <= 0) return false;
+  const left = cellRect.left + (cellRect.width - textWidth) / 2 - 2;
+  const right = left + textWidth + 4;
+  const x = event.clientX - canvasRect.left;
+  const y = event.clientY - canvasRect.top;
+  return x >= left && x <= right && y >= cellRect.top && y <= cellRect.top + cellRect.height;
+}
+
+function booleanInteractiveHitFromCanvasEvent(item: RowItem, hit: { rowIndex: number; visibleColIdx: number }, actualColIdx: number, event: MouseEvent): boolean {
+  return item.data[actualColIdx] === null ? booleanNullTextHitFromCanvasEvent(item, hit, actualColIdx, event) : booleanCheckboxHitFromCanvasEvent(item, hit, actualColIdx, event);
+}
+
+function tryCycleBooleanCheckboxOnCanvasMouseDown(item: RowItem, hit: { rowIndex: number; visibleColIdx: number }, actualColIdx: number, event: MouseEvent): boolean {
+  if (!booleanCellsUseCheckbox.value || !isBooleanGridCell(item, actualColIdx) || !canEditCellItem(item, actualColIdx)) return false;
+  if (!booleanInteractiveHitFromCanvasEvent(item, hit, actualColIdx, event)) return false;
+  cycleBooleanGridCell(item, actualColIdx);
+  return true;
+}
+
 function onCanvasMouseDown(event: MouseEvent) {
   if (event.button !== 0) return;
   const hit = canvasHitTest(event);
@@ -5192,6 +5368,7 @@ function onCanvasMouseDown(event: MouseEvent) {
     onRowNumberMouseDown(item, event);
   } else {
     handleDataCellMousedown(item.displayIndex, hit.visibleColIdx, item.id, event);
+    if (actualColIdx !== undefined) tryCycleBooleanCheckboxOnCanvasMouseDown(item, hit, actualColIdx, event);
   }
   gridRef.value?.focus({ preventScroll: true });
   scheduleCanvasDraw();
@@ -5224,6 +5401,7 @@ function onCanvasDblClick(event: MouseEvent) {
   const actualColIdx = visibleColumnIndexes.value[hit.visibleColIdx];
   if (!item || actualColIdx === undefined) return;
   if (showReadonlyCellDetailsOnDblClick(item, item.displayIndex, hit.visibleColIdx, actualColIdx)) return;
+  if (booleanCellsUseCheckbox.value && isBooleanGridCell(item, actualColIdx) && canEditCellItem(item, actualColIdx)) return;
   startCellEdit(item.id, actualColIdx, canvasCellContentOverflows(item, actualColIdx, hit.visibleColIdx));
 }
 
@@ -5393,12 +5571,15 @@ function drawCanvasGrid() {
     isRowActive,
     rowCellsUseSelectionVisual,
     cellIsSelected,
+    selectionFrames: selectionFramesData.value.frames,
     cellCanHover: canEditCellItem,
     infiniteScrollEnabled: infiniteScrollEnabled.value,
     pageOffset: rowNumberPageOffset(),
     frozenColumnCount: frozenColumnCount.value,
     columnAligns: columnAligns.value,
     rightAlignedActionCell: canvasRightAlignedActionCell.value,
+    columnIsBoolean: isBooleanGridColumn,
+    booleanDisplayMode: booleanDisplayMode.value,
   });
 }
 
@@ -5413,6 +5594,7 @@ watch(
 );
 watch(showDataGridTopbar, () => nextTick(observeDataGridTopbarWidth), { immediate: true });
 watch(columnAligns, () => scheduleCanvasDraw());
+watch(booleanDisplayMode, () => scheduleCanvasDraw());
 watch(
   [
     displayRowRefs,
@@ -5933,6 +6115,7 @@ function onTransposeCellContext(rowIndex: number, actualColIdx: number, event: M
 }
 
 watch([selectedRange, showCellDetail, isEditingDetail], () => {
+  if (isSelectingCells.value) return;
   const selectedCell = currentSelectedCellPosition();
   const target = linkedCellDetailTarget({
     isOpen: showCellDetail.value,
@@ -7618,10 +7801,6 @@ let detailResizeStartY = 0;
 let detailResizeStartHeight = 0;
 let mongoJsonPreviewResizeStartX = 0;
 let mongoJsonPreviewResizeStartWidth = 0;
-const indexes = ref<IndexInfo[]>([]);
-const indexesLoaded = ref(false);
-const indexesLoading = ref(false);
-const indexesError = ref("");
 const currentIndexTableIdentity = computed(() =>
   columnIndexTableIdentity({
     connectionId: props.connectionId,
@@ -7921,6 +8100,10 @@ watch(
     triggers.value = [];
     triggersLoaded.value = false;
     triggersError.value = "";
+    // 表身份变更后，主动触发索引加载，确保索引指示器在切换表后立即可见
+    if (showIndexIndicatorsInHeader.value && canShowTableIndexes.value && currentIndexTableIdentity.value) {
+      void fetchIndexes();
+    }
     if (showTableInfo.value) selectTableInfoTab(activeTableInfoTab.value);
   },
 );
@@ -8958,6 +9141,8 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         'text-muted-foreground italic': cell.isNull,
                         'cell-selected': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
                         'cell-selected-dirty': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                        'cell-selected--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                        'cell-selected-dirty--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
                         'row-cell-selected': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
                         'row-cell-selected-dirty': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
                         'bg-primary/15': transposeRecordUsesActiveHighlight(cell.recordIndex) && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex] && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
@@ -9083,7 +9268,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 <div class="data-grid-header-row flex w-(--header-total-w) font-semibold text-foreground">
                   <div
                     class="data-grid-header-cell shrink-0 px-2 py-1.5 border-r w-(--row-num-w) border-border text-center text-muted-foreground select-none cursor-default hover:bg-gray-200 dark:hover:bg-gray-800 sticky left-0 z-20"
-                    :class="{ 'data-grid-header-cell--selected outline outline-primary -outline-offset-1': isSelectingAll }"
+                    :class="{ 'data-grid-header-cell--selected': isSelectingAll }"
                     @click="selectAllCells"
                   >
                     #
@@ -9599,174 +9784,198 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               </div>
 
               <!-- Virtual scrolled rows -->
-              <RecycleScroller
-                v-else-if="hasVisibleRows"
-                ref="scrollerRef"
-                class="data-grid-scroller dbx-data-grid-font-family flex-1 overflow-x-auto overscroll-none"
-                :class="{ 'is-scrolling': isScrolling, 'has-horizontal-scrollbar': hasGridHorizontalOverflow }"
-                :items="displayItems"
-                :item-size="DOM_DATA_GRID_ROW_HEIGHT"
-                :buffer="600"
-                :skip-hover="true"
-                key-field="id"
-                @scroll="onScrollerScroll"
-                @wheel="onDomGridWheel"
-              >
-                <template #default="{ item }">
-                  <div
-                    class="data-grid-row flex border-b border-border h-6.5 w-(--total-w)"
-                    :class="{
-                      'data-grid-row--deleted opacity-70': item.isDeleted,
-                      'data-grid-row--new': item.isNew && !isRowActive(item.displayIndex),
-                      'data-grid-row--draft': item.isDraft && !isRowActive(item.displayIndex),
-                      'data-grid-row--striped': !item.isNew && !item.isDraft && !item.isDeleted && !isRowActive(item.displayIndex) && item.displayIndex % 2 === 1,
-                      'active-row': isRowActive(item.displayIndex) && !item.isDeleted,
-                      'relative z-20 overflow-visible': editingCell?.rowId === item.id,
-                    }"
-                    :style="dataGridRowStyle(item)"
-                    :data-row-index="item.displayIndex"
-                  >
+              <div v-else-if="hasVisibleRows" class="relative min-h-0 flex-1">
+                <RecycleScroller
+                  ref="scrollerRef"
+                  class="data-grid-scroller dbx-data-grid-font-family h-full overflow-x-auto overscroll-none"
+                  :class="{ 'is-scrolling': isScrolling, 'has-horizontal-scrollbar': hasGridHorizontalOverflow }"
+                  :items="displayItems"
+                  :item-size="DOM_DATA_GRID_ROW_HEIGHT"
+                  :buffer="600"
+                  :skip-hover="true"
+                  key-field="id"
+                  @scroll="onScrollerScroll"
+                  @wheel="onDomGridWheel"
+                >
+                  <template #default="{ item }">
                     <div
-                      class="data-grid-row-number w-(--row-num-w) shrink-0 px-2 py-1 border-r text-center select-none cursor-default sticky left-0 z-10"
-                      :class="[rowNumberStatusClass(item), { 'data-grid-row-number--selected': isRowSelected(item.id) }]"
-                      @mousedown="onRowNumberMouseDown(item, $event)"
-                      @dblclick.stop="toggleTranspose(item.displayIndex)"
-                      @contextmenu="onRowContext(item.id, item.displayIndex)"
-                    >
-                      {{ rowNumberText(item) }}
-                    </div>
-                    <div class="shrink-0" :style="{ width: `${horizontalColumnWindowBeforeWidth}px` }" />
-                    <div
-                      v-for="col in renderedGridColumns"
-                      :key="col.actualColIdx"
-                      class="data-grid-cell group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none inline-block items-center tabular-nums"
-                      :style="renderedColumnStyle(col.visibleColIdx)"
+                      class="data-grid-row flex border-b border-border h-6.5 w-(--total-w)"
                       :class="{
-                        'data-grid-cell--frozen': col.visibleColIdx < frozenColumnCount,
-                        'data-grid-cell--frozen-separator': frozenColumnCount > 0 && col.visibleColIdx === frozenColumnCount - 1,
-                        'text-right': columnAligns[col.visibleColIdx] === 'right',
-                        'text-muted-foreground italic': isNull(item.data[col.actualColIdx]),
-                        'bg-yellow-500/10 cell-dirty': item.isDirtyCol[col.actualColIdx],
-                        'cell-selected': cellIsSelected(item.displayIndex, col.visibleColIdx) && !item.isDirtyCol[col.actualColIdx],
-                        'cell-selected-dirty': cellIsSelected(item.displayIndex, col.visibleColIdx) && item.isDirtyCol[col.actualColIdx],
-                        'row-cell-selected': rowCellsUseSelectionVisual(item.id) && !cellIsSelected(item.displayIndex, col.visibleColIdx) && !item.isDirtyCol[col.actualColIdx],
-                        'row-cell-selected-dirty': rowCellsUseSelectionVisual(item.id) && !cellIsSelected(item.displayIndex, col.visibleColIdx) && item.isDirtyCol[col.actualColIdx],
-                        'cell-search-match': cellIsSearchMatch(item.displayIndex, col.actualColIdx),
-                        'cell-current-search-match': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
-                        'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(item.displayIndex, col.actualColIdx),
-                        'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
-                        'tabular-nums': typeof item.data[col.actualColIdx] === 'number',
-                        'cursor-text hover:bg-gray-200 dark:hover:bg-gray-800': !isScrolling && canEditCellItem(item, col.actualColIdx),
-                        'line-through': item.isDeleted,
-                        'overflow-visible z-20 border-r-transparent': editingCell?.rowId === item.id && editingCell?.col === col.actualColIdx,
-                        'overflow-hidden': !(editingCell?.rowId === item.id && editingCell?.col === col.actualColIdx),
+                        'data-grid-row--deleted opacity-70': item.isDeleted,
+                        'data-grid-row--new': item.isNew && !isRowActive(item.displayIndex),
+                        'data-grid-row--draft': item.isDraft && !isRowActive(item.displayIndex),
+                        'data-grid-row--striped': !item.isNew && !item.isDraft && !item.isDeleted && !isRowActive(item.displayIndex) && item.displayIndex % 2 === 1,
+                        'active-row': isRowActive(item.displayIndex) && !item.isDeleted,
+                        'relative z-20 overflow-visible': editingCell?.rowId === item.id,
                       }"
-                      @mousedown="
-                        prepareDataCellMouseDown(item, col.actualColIdx);
-                        handleDataCellMousedown(item.displayIndex, col.visibleColIdx, item.id, $event);
-                      "
-                      @mouseenter="onCellMouseenter(item.displayIndex, col.visibleColIdx, col.actualColIdx)"
-                      @mouseleave="onCellMouseleave(item.displayIndex, col.actualColIdx)"
-                      @dblclick="onDomCellDblClick(item, item.displayIndex, col.visibleColIdx, col.actualColIdx, $event)"
-                      :data-visible-col-index="col.visibleColIdx"
-                      @contextmenu="onCellContext(item.id, item.displayIndex, col.actualColIdx, col.visibleColIdx, $event)"
+                      :style="dataGridRowStyle(item)"
+                      :data-row-index="item.displayIndex"
                     >
-                      <template v-if="editingCell?.rowId === item.id && editingCell?.col === col.actualColIdx">
-                        <TemporalCellEditor
-                          v-if="temporalEditorConfigForColumn(col.actualColIdx)"
-                          v-model="editValue"
-                          :kind="temporalEditorConfigForColumn(col.actualColIdx)!.kind"
-                          :fraction-precision="temporalEditorConfigForColumn(col.actualColIdx)!.fractionPrecision"
-                          @cancel="cancelEdit"
-                          @commit="commitGridEdit"
-                        />
-                        <EnumCellEditor
-                          v-else-if="isBooleanGridCell(item, col.actualColIdx)"
-                          v-model="booleanEditorModelValue"
-                          :values="BOOLEAN_CELL_EDITOR_VALUES"
-                          :nullable="isBooleanGridColumnNullable(col.actualColIdx)"
-                          :initial-null="isGridCellInitialNull(item.id, col.actualColIdx)"
-                          @cancel="cancelEdit"
-                          @commit="commitBooleanGridEdit"
-                        />
-                        <EnumCellEditor
-                          v-else-if="isEnumGridColumn(col.actualColIdx)"
-                          v-model="editValue"
-                          :values="enumValuesForGridColumn(col.actualColIdx)"
-                          :nullable="isEnumGridColumnNullable(col.actualColIdx)"
-                          :initial-null="isGridCellInitialNull(item.id, col.actualColIdx)"
-                          @cancel="cancelEdit"
-                          @commit="commitGridEdit"
-                        />
-                        <textarea
-                          v-else-if="cellUsesExpandedEditor(item.id, col.actualColIdx)"
-                          v-model="editValue"
-                          data-expanded-cell-editor="true"
-                          rows="1"
-                          :inputmode="cellEditInputModeForColumn(col.actualColIdx)"
-                          autocapitalize="off"
-                          autocorrect="off"
-                          spellcheck="false"
-                          class="cell-edit-input cell-edit-input--expanded absolute left-0 top-0 min-h-full bg-background px-2.5 py-1 leading-[18px] outline-none z-10"
-                          @blur="commitEditFromCellBlur"
-                          @click.stop
-                          @focus="onCellEditTextareaInput"
-                          @input="onCellEditTextareaInput"
-                          @keydown.stop="onCellEditKeydown"
-                          @paste.stop="onCellEditTextareaPaste"
-                        />
-                        <input
-                          v-else
-                          v-model="editValue"
-                          :inputmode="cellEditInputModeForColumn(col.actualColIdx)"
-                          autocapitalize="off"
-                          autocorrect="off"
-                          spellcheck="false"
-                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 leading-[22px] outline-none z-10"
-                          @blur="commitEditFromCellBlur"
-                          @click.stop
-                          @input="onCellEditTextareaInput"
-                          @keydown.stop="onCellEditKeydown"
-                          @paste.stop="onCellEditTextareaPaste"
-                        />
-                      </template>
-                      <template v-else>
-                        <template v-if="draftCellPlaceholder(item, col.actualColIdx)">
-                          <span class="text-muted-foreground/70 italic">{{ draftCellPlaceholder(item, col.actualColIdx) }}</span>
+                      <div
+                        class="data-grid-row-number w-(--row-num-w) shrink-0 px-2 py-1 border-r text-center select-none cursor-default sticky left-0 z-10"
+                        :class="[rowNumberStatusClass(item), { 'data-grid-row-number--selected': isRowSelected(item.id), 'data-grid-row-number--in-selection': rowNumberShowsSelectionTint(item) }]"
+                        @mousedown="onRowNumberMouseDown(item, $event)"
+                        @dblclick.stop="toggleTranspose(item.displayIndex)"
+                        @contextmenu="onRowContext(item.id, item.displayIndex)"
+                      >
+                        {{ rowNumberText(item) }}
+                      </div>
+                      <div class="shrink-0" :style="{ width: `${horizontalColumnWindowBeforeWidth}px` }" />
+                      <div
+                        v-for="col in renderedGridColumns"
+                        :key="col.actualColIdx"
+                        class="data-grid-cell group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none inline-block items-center tabular-nums"
+                        :style="renderedColumnStyle(col.visibleColIdx)"
+                        :class="[
+                          selectionFrameEdgeClass(item.displayIndex, col.visibleColIdx),
+                          {
+                            'data-grid-cell--frozen': col.visibleColIdx < frozenColumnCount,
+                            'data-grid-cell--frozen-separator': frozenColumnCount > 0 && col.visibleColIdx === frozenColumnCount - 1,
+                            'text-right': columnAligns[col.visibleColIdx] === 'right',
+                            'text-muted-foreground italic': isNull(item.data[col.actualColIdx]),
+                            'bg-yellow-500/10 cell-dirty': item.isDirtyCol[col.actualColIdx],
+                            'cell-selected': cellIsSelected(item.displayIndex, col.visibleColIdx) && !item.isDirtyCol[col.actualColIdx],
+                            'cell-selected-dirty': cellIsSelected(item.displayIndex, col.visibleColIdx) && item.isDirtyCol[col.actualColIdx],
+                            'cell-selected--single': !selectionUsesOuterFrame && selectionFrameKindForCell(item.displayIndex, col.visibleColIdx) === 'single' && cellIsSelected(item.displayIndex, col.visibleColIdx) && !item.isDirtyCol[col.actualColIdx],
+                            'cell-selected--sparse': selectionFramesData.sparse && cellIsSelected(item.displayIndex, col.visibleColIdx) && !item.isDirtyCol[col.actualColIdx],
+                            'cell-selected-dirty--sparse': selectionFramesData.sparse && cellIsSelected(item.displayIndex, col.visibleColIdx) && item.isDirtyCol[col.actualColIdx],
+                            'row-cell-selected': rowCellsUseSelectionVisual(item.id) && !cellIsSelected(item.displayIndex, col.visibleColIdx) && !item.isDirtyCol[col.actualColIdx],
+                            'row-cell-selected-dirty': rowCellsUseSelectionVisual(item.id) && !cellIsSelected(item.displayIndex, col.visibleColIdx) && item.isDirtyCol[col.actualColIdx],
+                            'cell-search-match': cellIsSearchMatch(item.displayIndex, col.actualColIdx),
+                            'cell-current-search-match': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
+                            'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(item.displayIndex, col.actualColIdx),
+                            'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
+                            'tabular-nums': typeof item.data[col.actualColIdx] === 'number',
+                            'cursor-text hover:bg-gray-200 dark:hover:bg-gray-800': !isScrolling && canEditCellItem(item, col.actualColIdx) && !(booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null),
+                            'cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800': !isScrolling && booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null && canEditCellItem(item, col.actualColIdx),
+                            'line-through': item.isDeleted,
+                            'overflow-visible z-20 border-r-transparent': editingCell?.rowId === item.id && editingCell?.col === col.actualColIdx,
+                            'overflow-hidden': !(editingCell?.rowId === item.id && editingCell?.col === col.actualColIdx),
+                          },
+                        ]"
+                        @mousedown="
+                          prepareDataCellMouseDown(item, col.actualColIdx);
+                          handleDataCellMousedown(item.displayIndex, col.visibleColIdx, item.id, $event);
+                        "
+                        @mouseenter="onCellMouseenter(item.displayIndex, col.visibleColIdx, col.actualColIdx)"
+                        @mouseleave="onCellMouseleave(item.displayIndex, col.actualColIdx)"
+                        @dblclick="onDomCellDblClick(item, item.displayIndex, col.visibleColIdx, col.actualColIdx, $event)"
+                        :data-visible-col-index="col.visibleColIdx"
+                        @contextmenu="onCellContext(item.id, item.displayIndex, col.actualColIdx, col.visibleColIdx, $event)"
+                      >
+                        <template v-if="editingCell?.rowId === item.id && editingCell?.col === col.actualColIdx">
+                          <TemporalCellEditor
+                            v-if="temporalEditorConfigForColumn(col.actualColIdx)"
+                            v-model="editValue"
+                            :kind="temporalEditorConfigForColumn(col.actualColIdx)!.kind"
+                            :fraction-precision="temporalEditorConfigForColumn(col.actualColIdx)!.fractionPrecision"
+                            @cancel="cancelEdit"
+                            @commit="commitGridEdit"
+                          />
+                          <EnumCellEditor
+                            v-else-if="isBooleanGridCell(item, col.actualColIdx)"
+                            v-model="booleanEditorModelValue"
+                            :values="BOOLEAN_CELL_EDITOR_VALUES"
+                            :nullable="isBooleanGridColumnNullable(col.actualColIdx)"
+                            :initial-null="isGridCellInitialNull(item.id, col.actualColIdx)"
+                            @cancel="cancelEdit"
+                            @commit="commitBooleanGridEdit"
+                          />
+                          <EnumCellEditor
+                            v-else-if="isEnumGridColumn(col.actualColIdx)"
+                            v-model="editValue"
+                            :values="enumValuesForGridColumn(col.actualColIdx)"
+                            :nullable="isEnumGridColumnNullable(col.actualColIdx)"
+                            :initial-null="isGridCellInitialNull(item.id, col.actualColIdx)"
+                            @cancel="cancelEdit"
+                            @commit="commitGridEdit"
+                          />
+                          <textarea
+                            v-else-if="cellUsesExpandedEditor(item.id, col.actualColIdx)"
+                            v-model="editValue"
+                            data-expanded-cell-editor="true"
+                            rows="1"
+                            :inputmode="cellEditInputModeForColumn(col.actualColIdx)"
+                            autocapitalize="off"
+                            autocorrect="off"
+                            spellcheck="false"
+                            class="cell-edit-input cell-edit-input--expanded absolute left-0 top-0 min-h-full bg-background px-2.5 py-1 leading-[18px] outline-none z-10"
+                            @blur="commitEditFromCellBlur"
+                            @click.stop
+                            @focus="onCellEditTextareaInput"
+                            @input="onCellEditTextareaInput"
+                            @keydown.stop="onCellEditKeydown"
+                            @paste.stop="onCellEditTextareaPaste"
+                          />
+                          <input
+                            v-else
+                            v-model="editValue"
+                            :inputmode="cellEditInputModeForColumn(col.actualColIdx)"
+                            autocapitalize="off"
+                            autocorrect="off"
+                            spellcheck="false"
+                            class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 leading-[22px] outline-none z-10"
+                            @blur="commitEditFromCellBlur"
+                            @click.stop
+                            @input="onCellEditTextareaInput"
+                            @keydown.stop="onCellEditKeydown"
+                            @paste.stop="onCellEditTextareaPaste"
+                          />
                         </template>
-                        <template v-else>{{ firstLineCellDisplayValue(formatCellCached(item.data[col.actualColIdx], col.actualColIdx)) }}</template>
-                        <div v-if="cellDetailButtonVisible(item.displayIndex, col.actualColIdx)" class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
-                          <LightDropdownMenu
-                            v-if="canQuickDownloadCellValue(item.displayIndex, col.actualColIdx)"
-                            :items="binaryCellDownloadMenuItems"
-                            :open="quickDownloadMenuOpenFor(item.displayIndex, col.actualColIdx)"
-                            align="end"
-                            content-class="w-44"
-                            :match-trigger-width="false"
-                            @update:open="(value: boolean) => handleQuickDownloadMenuOpenChange(value, item.displayIndex, col.actualColIdx)"
-                            @select="(mode: string) => downloadCellBinaryValue(item.displayIndex, col.actualColIdx, mode as BinaryCellDownloadMode)"
-                          >
-                            <template #trigger="{ open, toggle }">
-                              <button class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground" :title="t('grid.downloadBinaryValue')" :aria-expanded="open" @mousedown.stop @click.stop="toggle">
-                                <Upload class="h-3 w-3" />
-                              </button>
-                            </template>
-                          </LightDropdownMenu>
-                          <button
-                            class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
-                            :title="t('grid.cellDetails')"
-                            @mousedown.stop
-                            @click.stop="showCellDetailsForVisibleCell(item.displayIndex, col.visibleColIdx, col.actualColIdx)"
-                          >
-                            <Info class="h-3 w-3" />
-                          </button>
-                        </div>
-                      </template>
+                        <template v-else-if="booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] !== null && canEditCellItem(item, col.actualColIdx)">
+                          <div class="flex h-full items-center justify-center">
+                            <input
+                              type="checkbox"
+                              class="h-3.5 w-3.5 rounded border-border/70 bg-background text-primary focus:ring-0"
+                              :checked="booleanCellChecked(item.data[col.actualColIdx])"
+                              :disabled="!canEditCellItem(item, col.actualColIdx)"
+                              @mousedown.stop
+                              @click.stop="cycleBooleanGridCell(item, col.actualColIdx, $event)"
+                            />
+                          </div>
+                        </template>
+                        <template v-else-if="booleanCellsUseCheckbox && isBooleanGridCell(item, col.actualColIdx) && item.data[col.actualColIdx] === null && canEditCellItem(item, col.actualColIdx)">
+                          <span class="italic text-muted-foreground cursor-pointer select-none" @click.stop="cycleBooleanGridCell(item, col.actualColIdx, $event)">{{ firstLineCellDisplayValue(formatCellCached(item.data[col.actualColIdx], col.actualColIdx)) }}</span>
+                        </template>
+                        <template v-else>
+                          <template v-if="draftCellPlaceholder(item, col.actualColIdx)">
+                            <span class="text-muted-foreground/70 italic">{{ draftCellPlaceholder(item, col.actualColIdx) }}</span>
+                          </template>
+                          <template v-else>{{ firstLineCellDisplayValue(formatCellCached(item.data[col.actualColIdx], col.actualColIdx)) }}</template>
+                          <div v-if="cellDetailButtonVisible(item.displayIndex, col.actualColIdx)" class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
+                            <LightDropdownMenu
+                              v-if="canQuickDownloadCellValue(item.displayIndex, col.actualColIdx)"
+                              :items="binaryCellDownloadMenuItems"
+                              :open="quickDownloadMenuOpenFor(item.displayIndex, col.actualColIdx)"
+                              align="end"
+                              content-class="w-44"
+                              :match-trigger-width="false"
+                              @update:open="(value: boolean) => handleQuickDownloadMenuOpenChange(value, item.displayIndex, col.actualColIdx)"
+                              @select="(mode: string) => downloadCellBinaryValue(item.displayIndex, col.actualColIdx, mode as BinaryCellDownloadMode)"
+                            >
+                              <template #trigger="{ open, toggle }">
+                                <button class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground" :title="t('grid.downloadBinaryValue')" :aria-expanded="open" @mousedown.stop @click.stop="toggle">
+                                  <Upload class="h-3 w-3" />
+                                </button>
+                              </template>
+                            </LightDropdownMenu>
+                            <button
+                              class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
+                              :title="t('grid.cellDetails')"
+                              @mousedown.stop
+                              @click.stop="showCellDetailsForVisibleCell(item.displayIndex, col.visibleColIdx, col.actualColIdx)"
+                            >
+                              <Info class="h-3 w-3" />
+                            </button>
+                          </div>
+                        </template>
+                      </div>
+                      <div class="shrink-0" :style="{ width: `${horizontalColumnWindow.afterWidth}px` }" />
                     </div>
-                    <div class="shrink-0" :style="{ width: `${horizontalColumnWindow.afterWidth}px` }" />
-                  </div>
-                </template>
-              </RecycleScroller>
+                  </template>
+                </RecycleScroller>
+                <div v-if="domSelectionDragOverlayStyle" class="data-grid-selection-drag-overlay pointer-events-none absolute z-20" :style="domSelectionDragOverlayStyle" />
+              </div>
               <!-- Infinite scroll loading indicator for RecycleScroller -->
               <div v-if="infiniteScrollEnabled && infiniteScrollLoading && !gridSurfaceBusy" class="flex items-center justify-center py-2 text-xs text-muted-foreground">
                 <Loader2 class="w-3 h-3 animate-spin mr-1" />
@@ -10930,8 +11139,6 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 
 .cell-selected-dirty {
   background-color: var(--data-grid-cell-selected-dirty-bg) !important;
-  outline: 1px solid var(--data-grid-cell-selected-border);
-  outline-offset: -1px;
 }
 
 .row-cell-selected-dirty {
@@ -10954,17 +11161,121 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
   background-color: var(--data-grid-row-number-active-bg) !important;
 }
 
+/* 选区覆盖指示：选中单元格/范围时，覆盖到的行号淡色高亮（Navicat 风格）。
+ * 不用 !important：行选中（--selected）和活动行规则天然优先 */
+.data-grid-row-number--in-selection {
+  background-color: var(--data-grid-cell-selected-bg);
+}
+
 .data-grid-row-number--selected {
   background-color: var(--data-grid-row-number-selected-bg) !important;
   color: var(--foreground) !important;
   box-shadow: inset 3px 0 0 var(--data-grid-cell-selected-border);
 }
 
+/* 选中优先级高于活动行（与 canvas 的 resolveCanvasDataGridRowFill 一致），
+ * 否则选中且活动的行号在 DOM 里显示为更浅的活动行底色 */
+.active-row > .data-grid-row-number--selected {
+  background-color: var(--data-grid-row-number-selected-bg) !important;
+}
+
 .cell-selected {
   color: var(--foreground);
   background-color: var(--data-grid-cell-selected-single-bg) !important;
-  outline: 1px solid var(--data-grid-cell-selected-border);
+}
+
+/* 单个单元格：细边框（跟随主题色，与 canvas 一致） */
+.cell-selected--single {
+  outline: 1px solid var(--data-grid-cell-selected-single-border, var(--primary));
   outline-offset: -1px;
+}
+
+/* 离散点选（Ctrl 多选、transpose 视图）无法矩形化，退回逐格描边 */
+.cell-selected--sparse,
+.cell-selected-dirty--sparse {
+  outline: 1px solid var(--data-grid-cell-selected-single-border, var(--primary));
+  outline-offset: -1px;
+}
+
+/* DOM 框选拖拽外框：与 canvas 一样只描 1.5px 外框；填充仍由格子上的 cell-selected 负责（文字在底色之上） */
+.data-grid-selection-drag-overlay {
+  background-color: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--data-grid-cell-selected-single-border, var(--primary));
+}
+
+/* 多格选区外框：bitmask class（top=1,right=2,bottom=4,left=8），避免框选时写 inline box-shadow */
+.cell-sel-frame-1 {
+  box-shadow: inset 0 1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-2 {
+  box-shadow: inset -1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-3 {
+  box-shadow:
+    inset 0 1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset -1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-4 {
+  box-shadow: inset 0 -1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-5 {
+  box-shadow:
+    inset 0 1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 0 -1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-6 {
+  box-shadow:
+    inset -1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 0 -1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-7 {
+  box-shadow:
+    inset 0 1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset -1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 0 -1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-8 {
+  box-shadow: inset 1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-9 {
+  box-shadow:
+    inset 0 1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-10 {
+  box-shadow:
+    inset -1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-11 {
+  box-shadow:
+    inset 0 1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset -1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-12 {
+  box-shadow:
+    inset 0 -1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-13 {
+  box-shadow:
+    inset 0 1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 0 -1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-14 {
+  box-shadow:
+    inset -1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 0 -1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
+}
+.cell-sel-frame-15 {
+  box-shadow:
+    inset 0 1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset -1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 0 -1.5px 0 0 var(--data-grid-cell-selected-single-border, var(--primary)),
+    inset 1.5px 0 0 0 var(--data-grid-cell-selected-single-border, var(--primary));
 }
 
 .ddl-code :deep(.ddl-kw) {
