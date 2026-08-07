@@ -6,6 +6,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import { isSingleDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
+import { supportsConnectionScopedQueryExecution } from "@/lib/database/databaseFeatureSupport";
 import { supportsConnectionLevelSqlExecution } from "@/lib/connection/connectionLevelDatabaseBootstrap";
 import { classifySqlActivityKind } from "@/lib/history/historyActivityKind";
 import { sqlMetadataRefreshTarget } from "@/lib/sql/sqlMetadataRefresh";
@@ -18,12 +19,28 @@ import { expandSqlVariables } from "@/lib/sql/sqlVariables";
 import { enabledSqlParameterSyntaxes, resolveSqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
 import { assessProductionSql } from "@/lib/database/productionSafety";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
+import type { SqlExecutionDangerRequest } from "@/stores/sqlExecutionDangerStore";
 import type { ConnectionConfig, DatabaseType, QueryTab } from "@/types/database";
+import type { MultiDbTargetExecutionResult } from "@/types/sqlExecution";
+import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import type { SqlExecutionTargetContext } from "@/lib/database/sqlExecutionTargetRegistry";
 
 const DANGER_RE = /^\s*(DROP|DELETE|TRUNCATE|ALTER|UPDATE|MERGE|REPLACE)\b/i;
 
 interface SqlExecutionOptions {
   openInNewResultTab?: boolean;
+}
+
+interface TargetSqlExecutionInput {
+  tab: QueryTab;
+  connection: ConnectionConfig;
+  sql: string;
+  sourceOffset?: number;
+  blockDangerousRedisCommands?: boolean;
+  targetLabel?: string;
+  scopeId?: string;
+  isCancellationRequested?: () => boolean;
+  targetContext?: SqlExecutionTargetContext;
 }
 
 export function stripSqlComments(sql: string): string {
@@ -79,6 +96,7 @@ export function useSqlExecution(deps: {
   activeOutputView: Ref<"result" | "summary" | "explain" | "chart">;
   blockDangerousRedisCommands?: Ref<boolean>;
   onMissingDatabase?: () => void;
+  requestDangerConfirmation?: (request: SqlExecutionDangerRequest) => Promise<boolean>;
 }) {
   const { t } = useI18n();
   const queryStore = useQueryStore();
@@ -102,6 +120,7 @@ export function useSqlExecution(deps: {
   const pendingDangerKind = ref<"sql" | "redis">("sql");
   const pendingDangerSourceOffset = ref<number | undefined>();
   const pendingOpenInNewResultTab = ref(false);
+  let pendingSqlParameterContinuation: ((sql: string, sourceOffset?: number) => Promise<void> | void) | undefined;
 
   async function resolvedExecutableSql(source?: SqlExecutionOverride): Promise<{ sql: string; sourceOffset?: number }> {
     const atSetEnabled = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, deps.activeConnection.value?.db_type).atSet;
@@ -191,7 +210,7 @@ export function useSqlExecution(deps: {
     }
   }
 
-  function prepareSqlParameterDialog(sql: string, sourceOffset?: number, options: SqlExecutionOptions = {}): boolean {
+  function prepareSqlParameterDialog(sql: string, sourceOffset?: number, options: SqlExecutionOptions = {}, continuation?: (sql: string, sourceOffset?: number) => Promise<void> | void): boolean {
     const databaseType = deps.activeConnection.value?.db_type;
     const toggles = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, databaseType);
     const enabledSyntaxes = enabledSqlParameterSyntaxes(toggles);
@@ -203,8 +222,18 @@ export function useSqlExecution(deps: {
     sqlParameterEnabledSyntaxes.value = enabledSyntaxes;
     pendingSourceOffset.value = sourceOffset;
     pendingOpenInNewResultTab.value = options.openInNewResultTab === true;
+    pendingSqlParameterContinuation = continuation;
     showSqlParameterDialog.value = true;
     return true;
+  }
+
+  async function prepareMultiExecute(onReady: (sql: string, sourceOffset?: number) => Promise<void> | void): Promise<boolean> {
+    const tab = deps.activeTab.value;
+    const { sql, sourceOffset } = await resolvedExecutableSql();
+    if (!tab || !sql.trim()) return false;
+    if (supportsSqlTemplateParameters(deps.activeConnection.value, sql) && prepareSqlParameterDialog(sql, sourceOffset, {}, onReady)) return true;
+    await onReady(sql, sourceOffset);
+    return false;
   }
 
   async function doExecute(sql?: string, sourceOffset?: number, options: SqlExecutionOptions = {}) {
@@ -259,6 +288,118 @@ export function useSqlExecution(deps: {
       } else if (refreshTarget.scope === "database") {
         await connectionStore.refreshObjectListTreeNode(tab.connectionId, tab.database, refreshTarget.schema);
       }
+    }
+  }
+
+  async function executeTargetSql(input: TargetSqlExecutionInput): Promise<MultiDbTargetExecutionResult> {
+    const { tab, connection, sql, sourceOffset, targetLabel } = input;
+    const cancelRequested = () => input.isCancellationRequested?.() === true;
+    const tabCancelRequested = (count: number) => (tab.cancelRequestCount ?? 0) !== count;
+    if (cancelRequested()) return { status: "cancelled" };
+    if (!sql.trim()) return { status: "failed", errorMessage: t("explain.emptySql") };
+    if (requiresDatabaseSelection(tab, connection, sql)) {
+      return { status: "failed", errorMessage: t("editor.selectDatabaseRequired") };
+    }
+
+    const blockRedisCommands = input.blockDangerousRedisCommands !== false;
+    if (connection.db_type === "redis" && blockRedisCommands) {
+      const commands = sql
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      let highestSafety: "allowed" | "confirm" | "blocked" = "allowed";
+      for (const command of commands) {
+        const safety = classifyRedisCommandSafety(command);
+        if (safety === "blocked") {
+          highestSafety = "blocked";
+          break;
+        }
+        if (safety === "confirm") highestSafety = "confirm";
+      }
+      if (highestSafety === "blocked") {
+        return { status: "skipped", errorMessage: t("redis.blockedCommand", { command: "Redis" }) };
+      }
+      if (highestSafety === "confirm") {
+        const confirmed = await deps.requestDangerConfirmation?.({
+          sql,
+          kind: "redis",
+          connectionName: connection.name,
+          database: tab.database,
+          targetLabel,
+          databaseType: connection.db_type,
+          scopeId: input.scopeId,
+        });
+        if (cancelRequested()) return { status: "cancelled" };
+        if (!confirmed) return { status: "skipped", errorMessage: t("dangerDialog.cancel") };
+      }
+    }
+
+    const productionAssessment = assessProductionSql(sql, connection, tab.database);
+    if (productionAssessment.active && productionAssessment.isMutation) {
+      const confirmed = await productionSafetyStore.requestConfirmation({
+        sql,
+        connectionName: connection.name,
+        database: tab.database,
+        productionDatabases: productionAssessment.databases,
+        source: t("production.sourceMultiDbSql"),
+        scopeId: input.scopeId,
+      });
+      if (cancelRequested()) return { status: "cancelled" };
+      if (!confirmed) return { status: "skipped", errorMessage: t("dangerDialog.cancel") };
+    }
+
+    if (isDangerousSql(sql, connection.db_type) && settingsStore.editorSettings.confirmDangerousSqlExecution) {
+      const confirmed = await deps.requestDangerConfirmation?.({
+        sql,
+        kind: "sql",
+        connectionName: connection.name,
+        database: tab.database,
+        targetLabel,
+        databaseType: connection.db_type,
+        scopeId: input.scopeId,
+      });
+      if (cancelRequested()) return { status: "cancelled" };
+      if (!confirmed) return { status: "skipped", errorMessage: t("dangerDialog.cancel") };
+    }
+
+    if (cancelRequested()) return { status: "cancelled" };
+    const cancelRequestCount = tab.cancelRequestCount ?? 0;
+    const startedAt = Date.now();
+    try {
+      await queryStore.executeTabSql(tab.id, sql, {
+        resultBaseSql: sql,
+        ...(input.targetContext ? { targetContext: input.targetContext } : {}),
+        ...(sourceOffset !== undefined ? { sourceOffset } : {}),
+        ...(connection.db_type === "redis" ? { skipRedisSafetyCheck: !blockRedisCommands } : {}),
+      });
+      const latest = queryStore.tabs.find((candidate) => candidate.id === tab.id) ?? tab;
+      if (cancelRequested() || tabCancelRequested(cancelRequestCount)) return { status: "cancelled" };
+      const failure = firstQueryExecutionError(latest);
+      const errorMessage = failure ? String(failure.rows?.[0]?.[0] ?? t("common.failed")) : undefined;
+      const success = !failure;
+      historyStore.add({
+        connection_id: tab.connectionId,
+        connection_name: connection.name || "",
+        database: tab.database,
+        sql,
+        execution_time_ms: Date.now() - startedAt,
+        success,
+        error: errorMessage,
+        activity_kind: classifySqlActivityKind(sql),
+        operation: primarySqlOperation(sql),
+        affected_rows: success ? latest.result?.affected_rows : undefined,
+      });
+      if (success) {
+        const refreshTarget = sqlMetadataRefreshTarget(sql, latest.schema);
+        if (refreshTarget.scope === "connection") {
+          await connectionStore.loadDatabases(latest.connectionId, { force: true });
+        } else if (refreshTarget.scope === "database") {
+          await connectionStore.refreshObjectListTreeNode(latest.connectionId, latest.database, refreshTarget.schema);
+        }
+      }
+      return success ? { status: "success" } : { status: "failed", errorMessage };
+    } catch (error) {
+      return { status: "failed", errorMessage: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -320,7 +461,10 @@ export function useSqlExecution(deps: {
     const sourceOffset = pendingSourceOffset.value;
     pendingSourceOffset.value = undefined;
     pendingOpenInNewResultTab.value = false;
-    await continueExecute(sql, sourceOffset, { openInNewResultTab });
+    const continuation = pendingSqlParameterContinuation;
+    pendingSqlParameterContinuation = undefined;
+    if (continuation) await continuation(sql, sourceOffset);
+    else await continueExecute(sql, sourceOffset, { openInNewResultTab });
   }
 
   watch(showSqlParameterDialog, (open) => {
@@ -331,6 +475,7 @@ export function useSqlExecution(deps: {
     sqlParameterEnabledSyntaxes.value = [];
     pendingSourceOffset.value = undefined;
     pendingOpenInNewResultTab.value = false;
+    pendingSqlParameterContinuation = undefined;
   });
 
   watch(showDangerDialog, (open) => {
@@ -359,6 +504,8 @@ export function useSqlExecution(deps: {
     sqlParameterDatabaseType,
     sqlParameterEnabledSyntaxes,
     onSqlParametersConfirm,
+    prepareMultiExecute,
+    executeTargetSql,
     explainMode,
   };
 }
@@ -372,11 +519,12 @@ export function supportsSqlTemplateParameters(connection: Pick<ConnectionConfig,
 export function requiresDatabaseSelection(tab: QueryTab, connection: ConnectionConfig | undefined, _sql = ""): boolean {
   if (tab.mode !== "query") return false;
   if (!connection) return false;
+  const databaseType = effectiveDatabaseTypeForConnection(connection) ?? connection.db_type;
   if (tab.database) return false;
-  if (tab.database === "" && usesTreeSchemaMode(connection.db_type)) return false;
-  if (isSingleDatabase(connection.db_type)) return false;
+  if (tab.database === "" && usesTreeSchemaMode(databaseType)) return false;
+  if (isSingleDatabase(databaseType)) return false;
   // MySQL-compatible servers decide per statement whether a default database is required.
   // Keep interactive execution connection-scoped instead of rejecting valid qualified or constant queries.
   if (supportsConnectionLevelSqlExecution(connection)) return false;
-  return !["elasticsearch", "easysearch", "qdrant", "milvus", "weaviate", "chromadb", "zookeeper"].includes(connection.db_type);
+  return !supportsConnectionScopedQueryExecution(databaseType);
 }
