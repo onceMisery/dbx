@@ -1577,9 +1577,6 @@ async fn connect_with_local_timezone(url: &str, fallback_timeout: Duration, time
 /// across different servers, so the server's own address/port disambiguate
 /// (`inet_server_addr()` is NULL for Unix sockets, hence the fallback).
 type PostgresConnectionKey = (String, i32, i32);
-type PostgresNoticeBuffers = Mutex<HashMap<PostgresConnectionKey, Weak<Mutex<Vec<QueryMessage>>>>>;
-type PostgresClientKey = (Weak<deadpool_postgres::StatementCache>, Option<PostgresConnectionKey>);
-type PostgresClientKeys = Mutex<HashMap<usize, PostgresClientKey>>;
 
 const POSTGRES_CONNECTION_IDENTITY_SQL: &str = "SELECT pg_backend_pid(), \
      COALESCE(host(inet_server_addr()), 'unix'), \
