@@ -1894,7 +1894,10 @@ async function findExactSemanticDiagnosticTable(table: SqlTableReference): Promi
   if (!target) return null;
   const localMatches = connectionStore.lookupLocalCompletionTables(props.connectionId, target.database, table.name, MAX_COMPLETION_TABLES, target.schema, target.catalog);
   const localExact = localMatches.find((item) => completionTablesMatch(item, table));
-  if (localExact) return localExact;
+  if (localExact) {
+    cachedTables = mergeCompletionTables(cachedTables, [localExact]);
+    return localExact;
+  }
 
   const remoteMatches = await connectionStore.listCompletionTables(props.connectionId, target.database, table.name, MAX_COMPLETION_TABLES, target.schema, false, props.schema, target.catalog);
   cachedTables = mergeCompletionTables(cachedTables, remoteMatches);

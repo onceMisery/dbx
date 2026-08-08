@@ -125,6 +125,7 @@ import { RABBITMQ_MQ_TENANT, resolveMqSystemKindFromConnection } from "@/lib/mq/
 import { applySidebarDatabaseStorage, applySidebarTableStorage, sidebarDatabaseNames, supportsSidebarDatabaseStorage, supportsSidebarTableStorage, type SidebarTableStorageScope } from "@/lib/sidebar/sidebarDatabaseStorage";
 import { connectionHasConfiguredSidebarVisibleFilter, nacosVisibleNamespaceSummary, sidebarVisibleFilterSummary } from "@/lib/sidebar/sidebarVisibleFilterSummary";
 import { connectionCanConfigureSidebarVisibleDatabases } from "@/lib/sidebar/sidebarVisibleFilterMenu";
+import { isTdengineStableTableType } from "@/lib/table/tableEditing";
 
 const PINNED_TREE_NODES_STORAGE_KEY = "dbx-pinned-tree-nodes";
 const ACTIVE_CONNECTION_STORAGE_KEY = "dbx-active-connection";
@@ -1602,7 +1603,13 @@ export const useConnectionStore = defineStore("connection", () => {
       name: table.name,
       schema,
       type: sqlObjectNavigationTypeFromTableType(table.table_type),
+      ...completionStableTableType(table.table_type),
     }));
+  }
+
+  function completionStableTableType(tableType: string | null | undefined): Partial<Pick<SqlCompletionTable, "tableType">> {
+    if (!tableType || !isTdengineStableTableType(tableType)) return {};
+    return { tableType: tableType.trim() };
   }
 
   function sameSidebarObjectName(left: string | undefined, right: string | undefined): boolean {
@@ -5542,6 +5549,7 @@ export const useConnectionStore = defineStore("connection", () => {
           name: candidate.name,
           schema: candidate.schema ?? undefined,
           type: sqlObjectNavigationTypeFromTableType(candidate.data_type || candidate.kind),
+          ...completionStableTableType(candidate.data_type),
         };
         if (!withOracleMetadata) return table;
         return {
@@ -6022,6 +6030,7 @@ export const useConnectionStore = defineStore("connection", () => {
                   catalog,
                   schema,
                   type: sqlObjectNavigationTypeFromTableType(table.table_type),
+                  ...completionStableTableType(table.table_type),
                 }));
               } else {
                 results = lookupLocalCompletionTables(connectionId, database, normalizedFilter, limit, undefined, catalog);
@@ -6042,6 +6051,7 @@ export const useConnectionStore = defineStore("connection", () => {
                     catalog,
                     schema,
                     type: sqlObjectNavigationTypeFromTableType(table.table_type),
+                    ...completionStableTableType(table.table_type),
                   }));
                 } catch {
                   results = [];
@@ -6064,6 +6074,7 @@ export const useConnectionStore = defineStore("connection", () => {
               catalog,
               schema,
               type: sqlObjectNavigationTypeFromTableType(table.table_type),
+              ...completionStableTableType(table.table_type),
             }));
           } else {
             completionTablesCache.value[cacheKey] = lookupLocalCompletionTables(connectionId, database, normalizedFilter, limit, undefined, catalog);
@@ -6082,6 +6093,7 @@ export const useConnectionStore = defineStore("connection", () => {
           name: table.name,
           catalog,
           type: sqlObjectNavigationTypeFromTableType(table.table_type),
+          ...completionStableTableType(table.table_type),
         }));
         completionTablesCache.value[cacheKey] = limit ? completionTablesCache.value[cacheKey].slice(0, limit) : completionTablesCache.value[cacheKey];
         indexCompletionTables(connectionId, database, schema, completionTablesCache.value[cacheKey], catalog);
