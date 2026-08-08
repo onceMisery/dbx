@@ -320,7 +320,13 @@ impl LocalBackend {
         let desktop_settings = storage.load_desktop_settings().await.unwrap_or_default();
         let data_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
         let plugin_dir = local_plugin_dir(&desktop_settings, &data_dir);
-        let state = Arc::new(AppState::new_with_plugin_dir(storage, plugin_dir));
+        let agent_dir = local_agent_dir(&desktop_settings, &data_dir);
+        let state = Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
+            storage,
+            plugin_dir,
+            agent_dir,
+            env!("CARGO_PKG_VERSION"),
+        ));
         let config_map: HashMap<String, ConnectionConfig> =
             configs.into_iter().map(|config| (config.id.clone(), config)).collect();
         *state.configs.write().await = config_map;
@@ -363,6 +369,24 @@ fn local_plugin_dir(settings: &DesktopSettings, data_dir: &Path) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| legacy_driver_base.map(|base| base.join("plugins")))
         .unwrap_or_else(|| data_dir.join("plugins"))
+}
+
+fn local_agent_dir(settings: &DesktopSettings, data_dir: &Path) -> PathBuf {
+    let legacy_driver_base =
+        settings.driver_store_dir.as_ref().filter(|value| !value.trim().is_empty()).map(PathBuf::from);
+    settings
+        .agent_store_dir
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| legacy_driver_base.map(|base| base.join("agents")))
+        .unwrap_or_else(|| {
+            if std::env::var_os("DBX_DATA_DIR").filter(|value| !value.is_empty()).is_some() {
+                data_dir.join("agents")
+            } else {
+                dbx_core::connection::default_agent_dir()
+            }
+        })
 }
 
 #[async_trait]
@@ -1735,6 +1759,26 @@ mod tests {
         assert!(backend.state().plugins.find_driver("jdbc").unwrap().is_some());
     }
 
+    #[tokio::test]
+    async fn local_backend_uses_desktop_agent_directory() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let database_path = data_dir.path().join("dbx.db");
+        let agent_dir = data_dir.path().join("agents-custom");
+        let storage = Storage::open(&database_path).await.unwrap();
+        storage
+            .save_desktop_settings(&DesktopSettings {
+                agent_store_dir: Some(agent_dir.to_string_lossy().to_string()),
+                ..DesktopSettings::default()
+            })
+            .await
+            .unwrap();
+        drop(storage);
+
+        let backend = LocalBackend::open(&database_path).await.unwrap();
+
+        assert_eq!(backend.state().agent_manager.base_dir(), &agent_dir);
+    }
+
     #[test]
     fn local_plugin_directory_honors_desktop_storage_settings() {
         let data_dir = Path::new("C:/Users/user/AppData/Roaming/com.dbx.app");
@@ -1747,6 +1791,17 @@ mod tests {
 
         assert_eq!(local_plugin_dir(&explicit, data_dir), PathBuf::from("D:/DBX/plugins-custom"));
         assert_eq!(local_plugin_dir(&legacy, data_dir), PathBuf::from("D:/DBX/drivers/plugins"));
+    }
+
+    #[test]
+    fn local_agent_directory_honors_desktop_storage_settings() {
+        let data_dir = Path::new("C:/Users/user/AppData/Roaming/com.dbx.app");
+        let explicit =
+            DesktopSettings { agent_store_dir: Some("D:/DBX/agents-custom".to_string()), ..DesktopSettings::default() };
+        let legacy = DesktopSettings { driver_store_dir: Some("D:/DBX/drivers".to_string()), ..Default::default() };
+
+        assert_eq!(local_agent_dir(&explicit, data_dir), PathBuf::from("D:/DBX/agents-custom"));
+        assert_eq!(local_agent_dir(&legacy, data_dir), PathBuf::from("D:/DBX/drivers/agents"));
     }
 
     struct StubBackend;

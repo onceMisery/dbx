@@ -109,7 +109,7 @@ import { normalizeRedisDatabaseAliases, redisDatabaseAlias, redisDatabaseLabel }
 import { appendAgentDriverUpdateHint, hasAgentDriverUpdate, hasInstalledAgentVersion, type AgentDriverInstallState } from "@/lib/connection/agentDriverInstallHint";
 import { appendConnectionErrorHints } from "@/lib/connection/connectionErrorHints";
 import { appendVisibleDatabaseSelection } from "@/lib/connection/connectionVisibleDatabases";
-import { filterNacosNamespacesForSidebar } from "@/lib/nacos/nacosNamespaceVisibility";
+import { filterNacosNamespacesForSidebar, normalizeNacosNamespacesForDisplay } from "@/lib/nacos/nacosNamespaceVisibility";
 import { configuredDatabaseProductName, connectionConfigFingerprint, normalizeDatabaseConnectionInfo } from "@/lib/connection/connectionDatabaseInfo";
 import { createMetadataLoadTrace, logMetadataLoadTrace, MetadataLoadCoordinator, type MetadataLoadTraceLogger } from "@/lib/metadata/metadataLoadCoordinator";
 import type { MetadataScopeInput } from "@/lib/metadata/metadataLoadScope";
@@ -123,7 +123,7 @@ import i18n from "@/i18n";
 import type { MqAdminConfig } from "@/types/mq";
 import { RABBITMQ_MQ_TENANT, resolveMqSystemKindFromConnection } from "@/lib/mq/mqConsoleDefaults";
 import { applySidebarDatabaseStorage, applySidebarTableStorage, sidebarDatabaseNames, supportsSidebarDatabaseStorage, supportsSidebarTableStorage, type SidebarTableStorageScope } from "@/lib/sidebar/sidebarDatabaseStorage";
-import { connectionHasConfiguredSidebarVisibleFilter, sidebarVisibleFilterSummary } from "@/lib/sidebar/sidebarVisibleFilterSummary";
+import { connectionHasConfiguredSidebarVisibleFilter, nacosVisibleNamespaceSummary, sidebarVisibleFilterSummary } from "@/lib/sidebar/sidebarVisibleFilterSummary";
 import { connectionCanConfigureSidebarVisibleDatabases } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 
 const PINNED_TREE_NODES_STORAGE_KEY = "dbx-pinned-tree-nodes";
@@ -2590,6 +2590,7 @@ export const useConnectionStore = defineStore("connection", () => {
 
   function getSidebarVisibleFilterSummary(connectionId: string) {
     const config = getConfig(connectionId);
+    if (config?.db_type === "nacos") return nacosVisibleNamespaceSummary(config, primaryVisibleObjectNames.value[connectionId]);
     return config ? sidebarVisibleFilterSummary(config, primaryVisibleObjectNames.value[connectionId]) : null;
   }
 
@@ -3409,18 +3410,15 @@ export const useConnectionStore = defineStore("connection", () => {
     node.isLoading = true;
     try {
       await ensureConnected(connectionId);
-      const { mqttGetTopicTree } = await import("@/lib/backend/api");
-      const topicTree = (await mqttGetTopicTree(connectionId)) as { name: string; fullPath: string; children?: unknown[]; isLeaf: boolean };
-      const topicNodes = mqttTopicTreeToSidebarNodes(connectionId, topicTree);
-      // Always prepend a synthetic console entry so users can open the MQTT admin
-      // even when no topics are subscribed yet.
+      // MQTT subscription state belongs to the console. The global sidebar only
+      // exposes a single navigation entry and must not keep a second topic tree.
       const consoleNode: TreeNode = {
         id: `${connectionId}:mqtt-topic:__console__`,
         label: "MQTT 控制台",
         type: "mqtt-topic" as const,
         connectionId,
-        children: topicNodes.length > 0 ? topicNodes : [],
-        isExpanded: topicNodes.length > 0,
+        children: [],
+        isExpanded: false,
       };
       setChildren(node, [consoleNode]);
       node.isExpanded = true;
@@ -3430,18 +3428,6 @@ export const useConnectionStore = defineStore("connection", () => {
     } finally {
       node.isLoading = false;
     }
-  }
-
-  function mqttTopicTreeToSidebarNodes(connectionId: string, tree: { name: string; fullPath: string; children?: unknown[]; isLeaf: boolean }): TreeNode[] {
-    const children = tree.children ?? [];
-    return children.map((child: any) => ({
-      id: `${connectionId}:mqtt-topic:${child.fullPath}`,
-      label: child.isLeaf ? child.name : `${child.name}/`,
-      type: "mqtt-topic",
-      connectionId,
-      children: child.children?.length > 0 ? mqttTopicTreeToSidebarNodes(connectionId, child) : [],
-      isExpanded: false,
-    })) as TreeNode[];
   }
 
   async function loadMqTenants(connectionId: string, options?: LoadTreeOptions) {
@@ -3508,7 +3494,7 @@ export const useConnectionStore = defineStore("connection", () => {
       load = reclaimTreeNodeLoad(load, node);
       if (useCachedChildren(node, options, load)) return;
 
-      const namespaces = await api.nacosListNamespaces(connectionId);
+      const namespaces = normalizeNacosNamespacesForDisplay(await api.nacosListNamespaces(connectionId));
       const visibleNamespaces = filterNacosNamespacesForSidebar(namespaces, getConfig(connectionId)?.visible_databases);
       const sorted = [...visibleNamespaces].sort((left, right) => {
         const leftLabel = left.namespaceShowName || left.namespace || "public";
@@ -3517,6 +3503,10 @@ export const useConnectionStore = defineStore("connection", () => {
       });
       const targetNode = treeNodeLoadTarget(load);
       if (!targetNode) return;
+      recordPrimaryVisibleObjectNames(
+        connectionId,
+        namespaces.map((namespace) => namespace.namespace),
+      );
       setChildren(
         targetNode,
         sorted.map((namespace) => {

@@ -1588,8 +1588,10 @@ const POSTGRES_CONNECTION_IDENTITY_SQL: &str = "SELECT pg_backend_pid(), \
 /// Notice buffers for live connections, keyed by connection identity. Entries
 /// are weak so they disappear once the pooled connection (and its driver
 /// task) is dropped.
-fn postgres_notice_buffers() -> &'static PostgresNoticeBuffers {
-    static BUFFERS: OnceLock<PostgresNoticeBuffers> = OnceLock::new();
+type PostgresNoticeBuffers = HashMap<PostgresConnectionKey, Weak<Mutex<Vec<QueryMessage>>>>;
+
+fn postgres_notice_buffers() -> &'static Mutex<PostgresNoticeBuffers> {
+    static BUFFERS: OnceLock<Mutex<PostgresNoticeBuffers>> = OnceLock::new();
     BUFFERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1602,8 +1604,10 @@ fn postgres_notice_buffers() -> &'static PostgresNoticeBuffers {
 /// never be retried from `drain_postgres_notices`, which can run inside the
 /// read-only transaction used for EXPLAIN, where a failing query would abort
 /// the user's statement.
-fn postgres_client_keys() -> &'static PostgresClientKeys {
-    static KEYS: OnceLock<PostgresClientKeys> = OnceLock::new();
+type PostgresClientKeys = HashMap<usize, (Weak<deadpool_postgres::StatementCache>, Option<PostgresConnectionKey>)>;
+
+fn postgres_client_keys() -> &'static Mutex<PostgresClientKeys> {
+    static KEYS: OnceLock<Mutex<PostgresClientKeys>> = OnceLock::new();
     KEYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
