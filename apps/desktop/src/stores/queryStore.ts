@@ -2884,11 +2884,16 @@ export const useQueryStore = defineStore("query", () => {
   function reorderTab(id: string, targetId: string, position: "before" | "after") {
     const fromIdx = tabs.value.findIndex((t) => t.id === id);
     const toIdx = tabs.value.findIndex((t) => t.id === targetId);
-    if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return;
-    const [tab] = tabs.value.splice(fromIdx, 1);
-    const newToIdx = tabs.value.findIndex((t) => t.id === targetId);
-    tabs.value.splice(newToIdx + (position === "after" ? 1 : 0), 0, tab);
-    tabs.value = orderPinnedFirst(tabs.value, (item) => !!item.pinned);
+    if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return false;
+
+    const reordered = [...tabs.value];
+    const [tab] = reordered.splice(fromIdx, 1);
+    const newToIdx = reordered.findIndex((t) => t.id === targetId);
+    reordered.splice(newToIdx + (position === "after" ? 1 : 0), 0, tab);
+    const nextTabs = orderPinnedFirst(reordered, (item) => !!item.pinned);
+    if (nextTabs.every((item, index) => item.id === tabs.value[index]?.id)) return false;
+    tabs.value = nextTabs;
+    return true;
   }
 
   function persistSavedSqlExecutionTarget(tab: QueryTab, options: UpdateExecutionTargetOptions) {
@@ -3746,8 +3751,7 @@ export const useQueryStore = defineStore("query", () => {
       const targetDatabase = targetContext?.scope === "connection" ? "" : (contextDatabase ?? executionTarget?.database ?? tab.database);
       const executionDatabase = dataTabExecutionDatabase(conn, targetDatabase, executionCatalog);
       const useAgentCursor = usesAgentCursorForQuery(conn?.db_type);
-      const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
-      const settingsStore = useSettingsStore();
+      const queryTimeoutSecs = queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs);
       const statementExecution = tab.mode === "query" ? createBatchSqlExecution(executionId, tab.sql, sql, effectiveDbType, options?.sourceOffset) : undefined;
       tab.batchSqlExecution = statementExecution && (tab.autoCommit !== false || statementExecution.total === 1) ? statementExecution : undefined;
       if (tab.batchSqlExecution) liveBatchSqlExecutions.set(tab, tab.batchSqlExecution);
@@ -4607,7 +4611,7 @@ export const useQueryStore = defineStore("query", () => {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab) return { ok: false as const, reason: "empty" as const };
     const conn = useConnectionStore().getConfig(tab.connectionId);
-    const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
+    const queryTimeoutSecs = queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs);
     const executionId = uuid();
 
     tab.isExplaining = true;
@@ -5288,7 +5292,7 @@ export const useQueryStore = defineStore("query", () => {
       const primaryKeys = tab.tableMeta ? tab.tableMeta.primaryKeys : tableMeta.primaryKeys;
       const sortOrder = tab.resultSortColumn && tab.resultSortDirection ? `${quoteTableDataIdentifier(effectiveDbType, tab.resultSortColumn, identifierQuote)} ${tab.resultSortDirection.toUpperCase()}` : undefined;
       const orderBy = tab.orderByInput?.trim() || sortOrder;
-      const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
+      const queryTimeoutSecs = queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs);
       const executionDatabase = dataTabExecutionDatabase(conn, tab.database, tableMeta.catalog);
       const rows: QueryResult["rows"] = [];
       let columns: string[] = [];
@@ -5356,7 +5360,9 @@ export const useQueryStore = defineStore("query", () => {
     const conn = connStore.getConfig(location.connectionId);
     const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
     const executionDatabase = dataTabExecutionDatabase(conn, location.database, location.catalog);
-    const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
+    // main 引入全局查询超时：queryTimeoutSecsForConnection 现需传入全局默认值；
+    // settingsStore 取 defineStore 顶层声明的实例（本函数无局部覆盖）。
+    const queryTimeoutSecs = queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs);
     const useAgentCursor = usesAgentCursorForQuery(conn?.db_type);
     const queryBaseSql = queryResultBaseSql(tab);
     const exportSettings = useSettingsStore().editorSettings;
@@ -5525,7 +5531,7 @@ export const useQueryStore = defineStore("query", () => {
       pageSize: settings.exportBatchSize,
       rowLimit,
       totalRows,
-      timeoutSecs: queryTimeoutSecsForConnection(conn),
+      timeoutSecs: queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs),
       keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
       clientSessionId,
       executionId: uuid(),
@@ -5561,7 +5567,7 @@ export const useQueryStore = defineStore("query", () => {
       pageSize: settings.exportBatchSize,
       rowLimit: settings.exportRowLimitEnabled ? settings.exportRowLimit : null,
       totalRows: null,
-      timeoutSecs: queryTimeoutSecsForConnection(conn),
+      timeoutSecs: queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs),
       keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
       clientSessionId: `${tabClientSessionId(tab, "export")}:${exportId}`,
       executionId: uuid(),

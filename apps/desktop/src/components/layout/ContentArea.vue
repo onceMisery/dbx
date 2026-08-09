@@ -1418,7 +1418,7 @@ defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, hand
                     <div>{{ t("executionSummary.statement") }}</div>
                     <div>{{ t("executionSummary.sql") }}</div>
                     <div>{{ t("executionSummary.status") }}</div>
-                    <div class="text-right">{{ t("executionSummary.affected") }}</div>
+                    <div class="text-right">{{ t("executionSummary.rows") }}</div>
                     <div class="text-right">{{ t("executionSummary.time") }}</div>
                   </div>
                   <div v-for="item in summaryItems" :key="item.statementIndex" class="relative grid w-full grid-cols-[4rem_minmax(14rem,1fr)_7rem_7rem_6rem] items-center border-b px-3 py-2 text-left text-xs last:border-b-0">
@@ -1461,7 +1461,7 @@ defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, hand
                         {{ t(`executionSummary.statuses.${item.status}`) }}
                       </span>
                     </div>
-                    <div class="pointer-events-none relative z-[1] text-right tabular-nums">{{ item.status === "pending" || item.status === "running" || item.status === "skipped" ? "—" : item.affectedRows.toLocaleString() }}</div>
+                    <div class="pointer-events-none relative z-[1] text-right tabular-nums">{{ item.status === "pending" || item.status === "running" || item.status === "skipped" ? "—" : item.rowCount.toLocaleString() }}</div>
                     <div class="pointer-events-none relative z-[1] text-right tabular-nums">{{ item.executionTimeMs > 0 || item.status === "success" || item.status === "error" ? `${item.executionTimeMs}ms` : "—" }}</div>
                   </div>
                 </div>
