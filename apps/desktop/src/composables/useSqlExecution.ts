@@ -436,7 +436,13 @@ export function useSqlExecution(deps: {
           await connectionStore.refreshObjectListTreeNode(executionTab.connectionId, executionTab.database, refreshTarget.schema);
         }
       }
-      deps.activeOutputView.value = success && (latest.result?.columns.length || latest.results?.some((result) => result.columns.length)) ? "result" : "summary";
+      // 多库 worker 路径（workerId 存在）下不切主编辑器输出视图：并行 Promise.all
+      // 会让多个 worker 几乎同时改这个共享 ref，导致主视图在 result/summary 间反复
+      // 跳动（闪烁/竞态）。worker 结果已由 captureMultiDbExecutionWorkerResult 记录
+      // 到 source tab 的 result run 并通过 projectResultRun 投影显示，无需再切主视图。
+      if (!workerId) {
+        deps.activeOutputView.value = success && (latest.result?.columns.length || latest.results?.some((result) => result.columns.length)) ? "result" : "summary";
+      }
       return finish(success ? { status: "success", errorMessage } : { status: "failed", errorMessage });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);

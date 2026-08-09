@@ -3683,7 +3683,6 @@ export interface TableExportRequest {
   connectionId: string;
   database: string;
   schema?: string;
-  catalog?: string;
   identifierQuote?: string;
   tableName: string;
   filePath: string;
