@@ -792,7 +792,7 @@ watch(
             </div>
           </div>
         </div>
-        <DialogFooter class="shrink-0 border-t px-5 py-3">
+        <DialogFooter class="mx-0 mb-0 shrink-0 border-t px-5 py-3">
           <Button variant="outline" @click="manageGroups = false">{{ t("common.close") }}</Button>
         </DialogFooter>
       </div>
