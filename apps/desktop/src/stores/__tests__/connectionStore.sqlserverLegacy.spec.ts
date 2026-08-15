@@ -73,7 +73,7 @@ describe("connectionStore SQL Server legacy compatibility", () => {
     const installAgent = vi.fn().mockResolvedValue(undefined);
     const config = sqlServerNativeConnectionWithDisabledEncryption();
     config.driver_profile = "sqlserver-legacy";
-    config.driver_label = "SQL Server TLS 1.0 compatibility component";
+    config.driver_label = "SQL Server TLS 1.0 Compatibility Driver";
     config.url_params = "";
 
     vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => true }));

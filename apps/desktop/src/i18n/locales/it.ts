@@ -708,11 +708,11 @@ export default withEnglishFallback({
     test: "Test",
     testing: "Verifica in corso...",
     copyTestResult: "Copia risultato test",
-    sqlServerLegacyCompatibilityComponent: "Componente di compatibilità TLS 1.0 per SQL Server",
+    sqlServerLegacyCompatibilityComponent: "Driver di compatibilità TLS 1.0 per SQL Server",
     sqlServerDriverModeAuto: "Automatico",
     sqlServerDriverModeTls10: "TLS 1.0",
     sqlServerTransportModeHint:
-      "Automatico usa il driver integrato e può ripiegare sulla crittografia del solo accesso o sul trasporto non crittografato per i server meno recenti. TLS 1.0 usa il componente Java con encrypt=true, trustServerCertificate=true e sslProtocol=TLSv1 come valori predefiniti; i parametri avanzati espliciti hanno la precedenza. Questo processo di compatibilità dedicato abilita gli algoritmi TLS legacy all'avvio, quindi tutte le sessioni condividono il criterio di sicurezza meno restrittivo, incluse quelle che richiedono TLSv1.2 o encrypt=false. Non corregge credenziali non valide o l'errore SQL Server 18456. Usa questo componente solo su reti attendibili, VPN o tunnel SSH.",
+      "Automatico usa il driver integrato e può ripiegare sulla crittografia del solo accesso o sul trasporto non crittografato per i server meno recenti. TLS 1.0 usa il driver di compatibilità Java con encrypt=true, trustServerCertificate=true e sslProtocol=TLSv1 come valori predefiniti; i parametri avanzati espliciti hanno la precedenza. Questo processo di compatibilità dedicato abilita gli algoritmi TLS legacy all'avvio, quindi tutte le sessioni condividono il criterio di sicurezza meno restrittivo, incluse quelle che richiedono TLSv1.2 o encrypt=false. Non corregge credenziali non valide o l'errore SQL Server 18456. Usa questo driver solo su reti attendibili, VPN o tunnel SSH.",
     gaussdbConnectionMode: "Modalità di connessione",
     gaussdbConnectionModeNative: "Compatibile con PostgreSQL (driver integrato)",
     gaussdbConnectionModeMJdbc: "Modalità M (driver JDBC del fornitore)",

@@ -709,11 +709,11 @@ export default withEnglishFallback({
     test: "Probar",
     testing: "Probando...",
     copyTestResult: "Copiar resultado de prueba",
-    sqlServerLegacyCompatibilityComponent: "Componente de compatibilidad TLS 1.0 de SQL Server",
+    sqlServerLegacyCompatibilityComponent: "Controlador de compatibilidad TLS 1.0 de SQL Server",
     sqlServerDriverModeAuto: "Automático",
     sqlServerDriverModeTls10: "TLS 1.0",
     sqlServerTransportModeHint:
-      "Automático usa el controlador integrado y puede recurrir al cifrado solo durante el inicio de sesión o al transporte sin cifrar para servidores antiguos. TLS 1.0 usa el componente de compatibilidad Java con encrypt=true, trustServerCertificate=true y sslProtocol=TLSv1 de forma predeterminada; los parámetros avanzados explícitos tienen prioridad. Este proceso de compatibilidad dedicado habilita algoritmos TLS heredados al iniciarse, por lo que todas las sesiones comparten la política de seguridad relajada, incluso las que solicitan TLSv1.2 o encrypt=false. No corrige credenciales no válidas ni el error 18456 de SQL Server. Usa este componente solo en redes de confianza, VPN o túneles SSH.",
+      "Automático usa el controlador integrado y puede recurrir al cifrado solo durante el inicio de sesión o al transporte sin cifrar para servidores antiguos. TLS 1.0 usa el controlador de compatibilidad Java con encrypt=true, trustServerCertificate=true y sslProtocol=TLSv1 de forma predeterminada; los parámetros avanzados explícitos tienen prioridad. Este proceso de compatibilidad dedicado habilita algoritmos TLS heredados al iniciarse, por lo que todas las sesiones comparten la política de seguridad relajada, incluso las que solicitan TLSv1.2 o encrypt=false. No corrige credenciales no válidas ni el error 18456 de SQL Server. Usa este controlador solo en redes de confianza, VPN o túneles SSH.",
     gaussdbConnectionMode: "Modo de conexión",
     gaussdbConnectionModeNative: "Compatible con PostgreSQL (controlador integrado)",
     gaussdbConnectionModeMJdbc: "Modo M (controlador JDBC del proveedor)",

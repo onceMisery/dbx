@@ -39,7 +39,7 @@ pub const PRESTOSQL_JDBC_DRIVER_CLASS: &str = "io.prestosql.jdbc.PrestoDriver";
 pub const GAUSSDB_M_JDBC_DRIVER_PROFILE: &str = "gaussdb-m";
 pub const GAUSSDB_M_JDBC_DRIVER_CLASS: &str = "com.huawei.gaussdb.jdbc.Driver";
 const SQLSERVER_LEGACY_DRIVER_INSTALL_HINT: &str =
-    "Install the SQL Server TLS 1.0 compatibility component from Driver Manager, or open the connection settings and select TLS 1.0 mode again.";
+    "Install the SQL Server TLS 1.0 Compatibility Driver from Driver Manager, or open the connection settings and select TLS 1.0 mode again.";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
@@ -1230,7 +1230,7 @@ impl AppState {
                 .map_err(|err| sqlserver_legacy_driver_error(&err))?;
             client.disconnect().await.ok();
             return Ok(ConnectionTestResult::success(
-                "Connection successful (via SQL Server legacy compatibility driver)",
+                "Connection successful (via SQL Server TLS 1.0 Compatibility Driver)",
             )
             .with_database_info(database_info_from_protocol_value(&response)));
         }

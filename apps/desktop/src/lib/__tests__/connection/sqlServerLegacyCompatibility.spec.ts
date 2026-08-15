@@ -111,7 +111,7 @@ describe("SQL Server legacy compatibility", () => {
 
     setSqlServerLegacyCompatibilityConfig(config, true);
     expect(config.driver_profile).toBe("sqlserver-legacy");
-    expect(config.driver_label).toBe("SQL Server TLS 1.0 compatibility component");
+    expect(config.driver_label).toBe("SQL Server TLS 1.0 Compatibility Driver");
     expect(config.url_params).toBe("applicationName=dbx&encrypt=false");
 
     setSqlServerLegacyCompatibilityConfig(config, false);

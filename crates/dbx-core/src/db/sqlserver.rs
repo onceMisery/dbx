@@ -27,7 +27,7 @@ use tracing_subscriber::Layer;
 pub type SqlServerClient = Client<Compat<TcpStream>>;
 pub const SQLSERVER_DRIVER_PANIC_ERROR_PREFIX: &str = "SQL Server driver panic:";
 pub const SQLSERVER_LEGACY_DRIVER_PROFILE: &str = "sqlserver-legacy";
-pub const SQLSERVER_LEGACY_DRIVER_LABEL: &str = "SQL Server TLS 1.0 compatibility component";
+pub const SQLSERVER_LEGACY_DRIVER_LABEL: &str = "SQL Server TLS 1.0 Compatibility Driver";
 const SQLSERVER_DEFAULT_PORT: u16 = 1433;
 const SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX: &str = "SQL Server unsafe result type:";
 const SQLSERVER_RESULT_TYPE_PROBE_SQL: &str = "\

@@ -44,14 +44,14 @@ const EXTRA_AGENT_LABELS: &[(&str, &str)] = &[
     ("kafka", "Apache Kafka"),
     ("rocketmq", "Apache RocketMQ"),
     ("rabbitmq", "RabbitMQ"),
-    ("sqlserver-legacy", "SQL Server TLS 1.0 compatibility component"),
+    ("sqlserver-legacy", "SQL Server TLS 1.0 Compatibility Driver"),
 ];
 const EXTRA_DRIVER_STORE_ENTRIES: &[(&str, &str)] = &[
     ("duckdb", "DuckDB"),
     ("kafka", "Apache Kafka"),
     ("rocketmq", "Apache RocketMQ"),
     ("rabbitmq", "RabbitMQ"),
-    ("sqlserver-legacy", "SQL Server TLS 1.0 compatibility component"),
+    ("sqlserver-legacy", "SQL Server TLS 1.0 Compatibility Driver"),
 ];
 
 const AGENT_CATALOG: &[AgentCatalogEntry] = &[

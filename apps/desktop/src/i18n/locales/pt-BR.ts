@@ -709,11 +709,11 @@ export default withEnglishFallback({
     test: "Testar",
     testing: "Testando...",
     copyTestResult: "Copiar resultado do teste",
-    sqlServerLegacyCompatibilityComponent: "Componente de compatibilidade TLS 1.0 do SQL Server",
+    sqlServerLegacyCompatibilityComponent: "Driver de compatibilidade TLS 1.0 do SQL Server",
     sqlServerDriverModeAuto: "Automático",
     sqlServerDriverModeTls10: "TLS 1.0",
     sqlServerTransportModeHint:
-      "Automático usa o driver integrado e pode recorrer à criptografia apenas no login ou ao transporte sem criptografia para servidores antigos. TLS 1.0 usa o componente Java com encrypt=true, trustServerCertificate=true e sslProtocol=TLSv1 como padrões; parâmetros avançados explícitos têm prioridade. Este processo de compatibilidade dedicado habilita algoritmos TLS legados na inicialização, portanto todas as sessões compartilham a política de segurança relaxada, inclusive as que solicitam TLSv1.2 ou encrypt=false. Isso não corrige credenciais inválidas nem o erro 18456 do SQL Server. Use este componente apenas em redes confiáveis, VPNs ou túneis SSH.",
+      "Automático usa o driver integrado e pode recorrer à criptografia apenas no login ou ao transporte sem criptografia para servidores antigos. TLS 1.0 usa o driver de compatibilidade Java com encrypt=true, trustServerCertificate=true e sslProtocol=TLSv1 como padrões; parâmetros avançados explícitos têm prioridade. Este processo de compatibilidade dedicado habilita algoritmos TLS legados na inicialização, portanto todas as sessões compartilham a política de segurança relaxada, inclusive as que solicitam TLSv1.2 ou encrypt=false. Isso não corrige credenciais inválidas nem o erro 18456 do SQL Server. Use este driver apenas em redes confiáveis, VPNs ou túneis SSH.",
     gaussdbConnectionMode: "Modo de conexão",
     gaussdbConnectionModeNative: "Compatível com PostgreSQL (driver integrado)",
     gaussdbConnectionModeMJdbc: "Modo M (driver JDBC do fornecedor)",

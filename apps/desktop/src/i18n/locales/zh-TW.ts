@@ -708,11 +708,11 @@ export default withEnglishFallback({
     test: "測試",
     testing: "測試中……",
     copyTestResult: "複製測試結果",
-    sqlServerLegacyCompatibilityComponent: "SQL Server TLS 1.0 相容元件",
+    sqlServerLegacyCompatibilityComponent: "SQL Server TLS 1.0 相容驅動程式",
     sqlServerDriverModeAuto: "自動",
     sqlServerDriverModeTls10: "TLS 1.0",
     sqlServerTransportModeHint:
-      "自動模式使用內建驅動程式，並可為舊版伺服器降級至僅登入階段加密或未加密傳輸。TLS 1.0 模式使用 Java 相容元件，預設為 encrypt=true、trustServerCertificate=true、sslProtocol=TLSv1；使用者明確指定的進階參數優先。此專用相容程序會在啟動時啟用舊版 TLS 演算法，因此所有工作階段都共用放寬後的安全原則，包括明確要求 TLSv1.2 或 encrypt=false 的工作階段。此模式無法解決認證資料錯誤或 SQL Server 18456 錯誤。僅應在受信任的網路、VPN 或 SSH 通道中使用此元件。",
+      "自動模式使用內建驅動程式，並可為舊版伺服器降級至僅登入階段加密或未加密傳輸。TLS 1.0 模式使用 Java 相容驅動程式，預設為 encrypt=true、trustServerCertificate=true、sslProtocol=TLSv1；使用者明確指定的進階參數優先。此專用相容程序會在啟動時啟用舊版 TLS 演算法，因此所有工作階段都共用放寬後的安全原則，包括明確要求 TLSv1.2 或 encrypt=false 的工作階段。此模式無法解決認證資料錯誤或 SQL Server 18456 錯誤。僅應在受信任的網路、VPN 或 SSH 通道中使用此驅動程式。",
     gaussdbConnectionMode: "連線模式",
     gaussdbConnectionModeNative: "PostgreSQL 相容（內建驅動程式）",
     gaussdbConnectionModeMJdbc: "M 模式（原廠 JDBC 驅動程式）",

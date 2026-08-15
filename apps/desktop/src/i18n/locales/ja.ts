@@ -674,11 +674,11 @@ export default withEnglishFallback({
     test: "テスト",
     testing: "テスト中...",
     copyTestResult: "テスト結果をコピー",
-    sqlServerLegacyCompatibilityComponent: "SQL Server TLS 1.0 互換コンポーネント",
+    sqlServerLegacyCompatibilityComponent: "SQL Server TLS 1.0 互換ドライバー",
     sqlServerDriverModeAuto: "自動",
     sqlServerDriverModeTls10: "TLS 1.0",
     sqlServerTransportModeHint:
-      "自動は内蔵ドライバーを使用し、古いサーバーではログイン時のみの暗号化または暗号化されていない通信に切り替わることがあります。TLS 1.0 は Java 互換コンポーネントを使用し、既定値は encrypt=true、trustServerCertificate=true、sslProtocol=TLSv1 です。明示した詳細パラメーターが優先されます。この専用互換プロセスは起動時に旧式 TLS アルゴリズムを有効にするため、TLSv1.2 または encrypt=false を要求するセッションを含め、すべてのセッションが緩和されたセキュリティポリシーを共有します。無効な資格情報や SQL Server エラー 18456 は解決しません。信頼できるネットワーク、VPN、SSH トンネルでのみ使用してください。",
+      "自動は内蔵ドライバーを使用し、古いサーバーではログイン時のみの暗号化または暗号化されていない通信に切り替わることがあります。TLS 1.0 は Java 互換ドライバーを使用し、既定値は encrypt=true、trustServerCertificate=true、sslProtocol=TLSv1 です。明示した詳細パラメーターが優先されます。この専用互換プロセスは起動時に旧式 TLS アルゴリズムを有効にするため、TLSv1.2 または encrypt=false を要求するセッションを含め、すべてのセッションが緩和されたセキュリティポリシーを共有します。無効な資格情報や SQL Server エラー 18456 は解決しません。信頼できるネットワーク、VPN、SSH トンネルでのみ使用してください。",
     gaussdbConnectionMode: "接続モード",
     gaussdbConnectionModeNative: "PostgreSQL 互換（内蔵ドライバー）",
     gaussdbConnectionModeMJdbc: "M モード（ベンダー JDBC ドライバー）",

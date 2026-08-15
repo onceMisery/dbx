@@ -1,7 +1,7 @@
 import type { ConnectionConfig } from "@/types/database";
 
 export const SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY = "sqlserver-legacy";
-export const SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_LABEL = "SQL Server TLS 1.0 compatibility component";
+export const SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_LABEL = "SQL Server TLS 1.0 Compatibility Driver";
 export const SQLSERVER_NATIVE_DRIVER_PROFILE = "sqlserver";
 export const SQLSERVER_NATIVE_DRIVER_LABEL = "SQL Server";
 
