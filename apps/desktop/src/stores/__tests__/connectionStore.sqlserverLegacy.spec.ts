@@ -41,7 +41,7 @@ describe("connectionStore SQL Server legacy compatibility", () => {
     setActivePinia(createPinia());
   });
 
-  it("migrates historical disabled-encryption configs and installs the legacy component", async () => {
+  it("keeps historical disabled-encryption configs on the native driver", async () => {
     const connectDb = vi.fn().mockResolvedValue("sqlserver-1");
     const installAgent = vi.fn().mockResolvedValue(undefined);
 
@@ -56,13 +56,13 @@ describe("connectionStore SQL Server legacy compatibility", () => {
     const store = useConnectionStore();
     await store.connect(sqlServerNativeConnectionWithDisabledEncryption());
 
-    expect(installAgent).toHaveBeenCalledWith("sqlserver-legacy");
+    expect(installAgent).not.toHaveBeenCalled();
     expect(connectDb).toHaveBeenCalledTimes(1);
     expect(connectDb).toHaveBeenCalledWith(
       expect.objectContaining({
-        driver_profile: "sqlserver-legacy",
-        driver_label: "SQL Server legacy compatibility component",
-        url_params: "",
+        driver_profile: "sqlserver",
+        driver_label: "SQL Server",
+        url_params: "sqlserverEncryption=disabled",
       }),
       expect.any(Number),
     );
@@ -73,7 +73,7 @@ describe("connectionStore SQL Server legacy compatibility", () => {
     const installAgent = vi.fn().mockResolvedValue(undefined);
     const config = sqlServerNativeConnectionWithDisabledEncryption();
     config.driver_profile = "sqlserver-legacy";
-    config.driver_label = "SQL Server legacy compatibility component";
+    config.driver_label = "SQL Server TLS 1.0 compatibility component";
     config.url_params = "";
 
     vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => true }));

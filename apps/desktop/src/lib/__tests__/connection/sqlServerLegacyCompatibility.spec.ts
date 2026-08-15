@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   isSqlServerNativeEncryptionDisabled,
+  isSqlServerLegacyTlsUnsupportedFailure,
+  isSqlServerTlsHandshakeFailure,
   migrateSqlServerLegacyCompatibilityConfig,
   requiresSqlServerLegacyCompatibilityComponent,
   setSqlServerLegacyCompatibilityConfig,
@@ -44,14 +46,14 @@ describe("SQL Server legacy compatibility", () => {
     expect(setSqlServerNativeEncryptionDisabled("applicationName=dbx;sqlserverEncryption=disabled", false)).toBe("applicationName=dbx");
   });
 
-  it("migrates historical disabled-encryption connections to the legacy driver profile", () => {
+  it("keeps historical disabled-encryption connections on the native driver profile", () => {
     const config = connectionConfig("sqlserverEncryption=disabled");
     migrateSqlServerLegacyCompatibilityConfig(config);
 
-    expect(sqlServerUsesLegacyCompatibility(config)).toBe(true);
-    expect(requiresSqlServerLegacyCompatibilityComponent(config)).toBe(true);
-    expect(config.driver_label).toBe("SQL Server legacy compatibility component");
-    expect(config.url_params).toBe("");
+    expect(sqlServerUsesLegacyCompatibility(config)).toBe(false);
+    expect(requiresSqlServerLegacyCompatibilityComponent(config)).toBe(false);
+    expect(config.driver_label).toBe("SQL Server");
+    expect(config.url_params).toBe("sqlserverEncryption=disabled");
     expect(
       requiresSqlServerLegacyCompatibilityComponent({
         ...config,
@@ -61,22 +63,22 @@ describe("SQL Server legacy compatibility", () => {
     ).toBe(false);
   });
 
-  it("preserves unrelated params while migrating the historical compatibility flag", () => {
+  it("preserves unrelated params with the historical compatibility flag", () => {
     const config = connectionConfig("applicationName=dbx;sqlserverEncryption=off;encrypt=false");
 
     migrateSqlServerLegacyCompatibilityConfig(config);
 
-    expect(config.driver_profile).toBe("sqlserver-legacy");
-    expect(config.url_params).toBe("applicationName=dbx;encrypt=false");
+    expect(config.driver_profile).toBe("sqlserver");
+    expect(config.url_params).toBe("applicationName=dbx;sqlserverEncryption=off;encrypt=false");
   });
 
-  it("preserves semicolons and special characters inside braced values during migration", () => {
+  it("preserves semicolons and special characters inside braced values", () => {
     const config = connectionConfig("applicationName={DBX; Client};password=50%;sqlserverEncryption=disabled;encrypt=false");
 
     migrateSqlServerLegacyCompatibilityConfig(config);
 
-    expect(config.driver_profile).toBe("sqlserver-legacy");
-    expect(config.url_params).toBe("applicationName={DBX; Client};password=50%;encrypt=false");
+    expect(config.driver_profile).toBe("sqlserver");
+    expect(config.url_params).toBe("applicationName={DBX; Client};password=50%;sqlserverEncryption=disabled;encrypt=false");
   });
 
   it("keeps escaped closing braces from exposing separators inside braced values", () => {
@@ -84,7 +86,7 @@ describe("SQL Server legacy compatibility", () => {
 
     migrateSqlServerLegacyCompatibilityConfig(config);
 
-    expect(config.url_params).toBe("applicationName={DBX}}; Client};encrypt=false");
+    expect(config.url_params).toBe("applicationName={DBX}}; Client};sqlserverEncryption=disabled;encrypt=false");
   });
 
   it("keeps generic JDBC encrypt=false on the native driver", () => {
@@ -109,12 +111,23 @@ describe("SQL Server legacy compatibility", () => {
 
     setSqlServerLegacyCompatibilityConfig(config, true);
     expect(config.driver_profile).toBe("sqlserver-legacy");
-    expect(config.driver_label).toBe("SQL Server legacy compatibility component");
+    expect(config.driver_label).toBe("SQL Server TLS 1.0 compatibility component");
     expect(config.url_params).toBe("applicationName=dbx&encrypt=false");
 
     setSqlServerLegacyCompatibilityConfig(config, false);
     expect(config.driver_profile).toBe("sqlserver");
     expect(config.driver_label).toBe("SQL Server");
     expect(config.url_params).toBe("applicationName=dbx&encrypt=false");
+  });
+
+  it("recommends TLS 1.0 only for transport-only native failures", () => {
+    expect(isSqlServerTlsHandshakeFailure("SQL Server connection failed: TLS handshake EOF")).toBe(true);
+    expect(isSqlServerTlsHandshakeFailure("SQL Server TLS handshake EOF\nLogin failed for user (18456)")).toBe(false);
+  });
+
+  it("recognizes SSL-unsupported legacy driver failures", () => {
+    expect(isSqlServerLegacyTlsUnsupportedFailure("The server is not configured to support SSL")).toBe(true);
+    expect(isSqlServerLegacyTlsUnsupportedFailure("\u670d\u52a1\u5668\u672a\u914d\u7f6e\u4e3a\u652f\u6301 SSL")).toBe(true);
+    expect(isSqlServerLegacyTlsUnsupportedFailure("TLS handshake EOF")).toBe(false);
   });
 });

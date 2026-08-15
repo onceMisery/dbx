@@ -28,6 +28,9 @@ import java.util.Set;
 
 public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
     private static final String TLS_DISABLED_ALGORITHMS_KEY = "jdk.tls.disabledAlgorithms";
+    private static final String DEFAULT_ENCRYPT = "true";
+    private static final String DEFAULT_TRUST_SERVER_CERTIFICATE = "true";
+    private static final String DEFAULT_SSL_PROTOCOL = "TLSv1";
     private static final Set<String> LEGACY_TLS_ALGORITHMS_TO_ALLOW = Set.of(
         "TLSV1",
         "TLSV1.1",
@@ -49,6 +52,14 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
         "TRUSTSERVERCERTIFICATE",
         "SSLPROTOCOL"
     );
+    private static final Set<String> DISABLED_ENCRYPTION_VALUES = Set.of(
+        "DISABLED",
+        "DISABLE",
+        "FALSE",
+        "0",
+        "OFF",
+        "NO"
+    );
     private static final JdbcAgentProfile PROFILE = new JdbcAgentProfile(
         "com.microsoft.sqlserver.jdbc.SQLServerDriver",
         "jdbc:sqlserver://{host}:{port};databaseName={database};",
@@ -60,8 +71,8 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
 
     public SqlServerLegacyAgent() {
         super(PROFILE);
-        // AbstractJdbcAgent loads the JDBC driver before building the URL, so relax
-        // the legacy TLS policy here before the driver can initialize JSSE.
+        // JSSE caches disabled algorithms on first use. Relax the dedicated
+        // compatibility process before any session can load the JDBC driver.
         enableLegacyTlsAlgorithms();
     }
 
@@ -75,7 +86,7 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
         try {
             return super.openConnection(params);
         } catch (SQLException error) {
-            throw withLegacyTlsDiagnostics(error);
+            throw withLegacyTlsDiagnostics(error, params);
         }
     }
 
@@ -199,9 +210,7 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
 
     static String legacyTlsUrl(ConnectParams params) {
         Map<String, String> properties = baseConnectionProperties(params);
-        properties.put("encrypt", "true");
-        properties.put("trustServerCertificate", "true");
-        properties.put("sslProtocol", "TLSv1");
+        properties.putAll(resolvedTransportProperties(params));
         return appendProperties(baseJdbcUrl(params), properties);
     }
 
@@ -224,11 +233,17 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
     }
 
     static String legacyTlsDiagnostics() {
+        return legacyTlsDiagnostics(defaultTransportProperties());
+    }
+
+    private static String legacyTlsDiagnostics(Map<String, String> transportProperties) {
         String disabledAlgorithms = Security.getProperty(TLS_DISABLED_ALGORITHMS_KEY);
         return "DBX SQL Server legacy TLS diagnostics: java=" + System.getProperty("java.version", "unknown")
             + ", javaVendor=" + System.getProperty("java.vendor", "unknown")
             + ", jdbc=" + jdbcDriverVersion()
-            + ", sslProtocol=TLSv1"
+            + ", encrypt=" + transportProperties.get("encrypt")
+            + ", trustServerCertificate=" + transportProperties.get("trustServerCertificate")
+            + ", sslProtocol=" + transportProperties.get("sslProtocol")
             + ", tlsV1Disabled=" + isDisabled(disabledAlgorithms, "TLSV1")
             + ", tlsRsaDisabled=" + isDisabled(disabledAlgorithms, "TLS_RSA_*")
             + ", rsaPkcs1Sha1HandshakeDisabled="
@@ -238,13 +253,44 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
     }
 
     static SQLException withLegacyTlsDiagnostics(SQLException error) {
+        return withLegacyTlsDiagnostics(error, defaultTransportProperties());
+    }
+
+    static SQLException withLegacyTlsDiagnostics(SQLException error, ConnectParams params) {
+        return withLegacyTlsDiagnostics(error, resolvedTransportProperties(params));
+    }
+
+    private static SQLException withLegacyTlsDiagnostics(
+        SQLException error,
+        Map<String, String> transportProperties
+    ) {
         String message = error.getMessage() == null ? error.toString() : error.getMessage();
+        String guidance = serverDoesNotSupportSsl(message) && encryptionEnabled(transportProperties.get("encrypt"))
+            ? "\n\nThe resolved SQL Server JDBC settings request encrypted transport (encrypt="
+                + transportProperties.get("encrypt")
+                + ", sslProtocol="
+                + transportProperties.get("sslProtocol")
+                + "). The server or intermediary must support that protocol. "
+                + "Use Auto/native mode for login-only encryption or unencrypted transport."
+            : "";
         return new SQLException(
-            message + "\n\n" + legacyTlsDiagnostics(),
+            message + guidance + "\n\n" + legacyTlsDiagnostics(transportProperties),
             error.getSQLState(),
             error.getErrorCode(),
             error
         );
+    }
+
+    private static boolean serverDoesNotSupportSsl(String message) {
+        String normalized = message.toLowerCase(Locale.ROOT);
+        return normalized.contains("server is not configured to support ssl")
+            || normalized.contains("server does not support ssl")
+            || normalized.contains("server does not support encryption")
+            || normalized.contains("\u670d\u52a1\u5668\u672a\u914d\u7f6e\u4e3a\u652f\u6301 ssl");
+    }
+
+    private static boolean encryptionEnabled(String value) {
+        return value == null || !DISABLED_ENCRYPTION_VALUES.contains(value.trim().toUpperCase(Locale.ROOT));
     }
 
     private static boolean isDisabled(String disabledAlgorithms, String algorithm) {
@@ -330,14 +376,13 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
     }
 
     private static String sanitizeSqlServerUrl(String value) {
-        String trimmed = trimSqlServerUrl(value);
-        String[] parts = trimmed.split(";");
-        if (parts.length <= 1) {
-            return trimmed;
+        List<String> parts = splitSqlServerProperties(trimSqlServerUrl(value), false);
+        if (parts.size() <= 1) {
+            return parts.isEmpty() ? "" : parts.get(0).trim();
         }
-        StringBuilder result = new StringBuilder(parts[0].trim());
-        for (int i = 1; i < parts.length; i++) {
-            String part = parts[i].trim();
+        StringBuilder result = new StringBuilder(parts.get(0).trim());
+        for (int i = 1; i < parts.size(); i++) {
+            String part = parts.get(i).trim();
             if (part.isEmpty()) {
                 continue;
             }
@@ -361,7 +406,7 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
             return properties;
         }
 
-        for (String pair : urlParams.trim().split("[&;]")) {
+        for (String pair : splitSqlServerProperties(urlParams, true)) {
             String value = pair.trim();
             while (value.startsWith("?") || value.startsWith("&") || value.startsWith(";")) {
                 value = value.substring(1).trim();
@@ -381,6 +426,134 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
             properties.put(key, value.substring(separator + 1).trim());
         }
         return properties;
+    }
+
+    private static Map<String, String> resolvedTransportProperties(ConnectParams params) {
+        TransportOverrides resolved = new TransportOverrides();
+        resolved.apply(transportOverrides(params.getConnection_string(), false));
+        resolved.apply(transportOverrides(params.getUrl_params(), true));
+        return resolved.withDefaults();
+    }
+
+    private static Map<String, String> defaultTransportProperties() {
+        return new TransportOverrides().withDefaults();
+    }
+
+    private static TransportOverrides transportOverrides(String source, boolean splitAmpersand) {
+        TransportOverrides overrides = new TransportOverrides();
+        if (source == null || source.trim().isEmpty()) {
+            return overrides;
+        }
+
+        for (String part : splitSqlServerProperties(source, splitAmpersand)) {
+            int separator = part.indexOf('=');
+            if (separator <= 0) {
+                continue;
+            }
+            String key = part.substring(0, separator).trim().toUpperCase(Locale.ROOT);
+            String value = part.substring(separator + 1).trim();
+            overrides.accept(key, value);
+        }
+        overrides.finishSource();
+        return overrides;
+    }
+
+    private static List<String> splitSqlServerProperties(String value, boolean splitAmpersand) {
+        String source = value == null ? "" : value.trim();
+        while (!source.isEmpty() && (source.charAt(0) == '?' || source.charAt(0) == '&' || source.charAt(0) == ';')) {
+            source = source.substring(1).trim();
+        }
+        if (source.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<String> parts = new ArrayList<>();
+        int start = 0;
+        boolean inBraces = false;
+        for (int index = 0; index < source.length(); index++) {
+            char current = source.charAt(index);
+            if (inBraces) {
+                if (current == '}' && index + 1 < source.length() && source.charAt(index + 1) == '}') {
+                    index++;
+                } else if (current == '}') {
+                    inBraces = false;
+                }
+            } else if (current == '{') {
+                inBraces = true;
+            } else if (current == ';' || (splitAmpersand && current == '&')) {
+                parts.add(source.substring(start, index));
+                start = index + 1;
+            }
+        }
+        parts.add(source.substring(start));
+        return parts;
+    }
+
+    private static final class TransportOverrides {
+        private String encrypt;
+        private String aliasEncrypt;
+        private String trustServerCertificate;
+        private String sslProtocol;
+        private boolean hasEncrypt;
+        private boolean hasTrustServerCertificate;
+        private boolean hasSslProtocol;
+
+        private void accept(String key, String value) {
+            switch (key) {
+                case "ENCRYPT":
+                    encrypt = value;
+                    hasEncrypt = true;
+                    break;
+                case "SQLSERVERENCRYPTION":
+                    if (DISABLED_ENCRYPTION_VALUES.contains(value.toUpperCase(Locale.ROOT))) {
+                        aliasEncrypt = "false";
+                    }
+                    break;
+                case "TRUSTSERVERCERTIFICATE":
+                    trustServerCertificate = value;
+                    hasTrustServerCertificate = true;
+                    break;
+                case "SSLPROTOCOL":
+                    sslProtocol = value;
+                    hasSslProtocol = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        private void finishSource() {
+            if (!hasEncrypt && aliasEncrypt != null) {
+                encrypt = aliasEncrypt;
+                hasEncrypt = true;
+            }
+        }
+
+        private void apply(TransportOverrides overrides) {
+            if (overrides.hasEncrypt) {
+                encrypt = overrides.encrypt;
+                hasEncrypt = true;
+            }
+            if (overrides.hasTrustServerCertificate) {
+                trustServerCertificate = overrides.trustServerCertificate;
+                hasTrustServerCertificate = true;
+            }
+            if (overrides.hasSslProtocol) {
+                sslProtocol = overrides.sslProtocol;
+                hasSslProtocol = true;
+            }
+        }
+
+        private Map<String, String> withDefaults() {
+            Map<String, String> properties = new LinkedHashMap<>();
+            properties.put("encrypt", hasEncrypt ? encrypt : DEFAULT_ENCRYPT);
+            properties.put(
+                "trustServerCertificate",
+                hasTrustServerCertificate ? trustServerCertificate : DEFAULT_TRUST_SERVER_CERTIFICATE
+            );
+            properties.put("sslProtocol", hasSslProtocol ? sslProtocol : DEFAULT_SSL_PROTOCOL);
+            return properties;
+        }
     }
 
     private static String appendProperties(String base, Map<String, String> properties) {

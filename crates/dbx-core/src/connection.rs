@@ -39,7 +39,7 @@ pub const PRESTOSQL_JDBC_DRIVER_CLASS: &str = "io.prestosql.jdbc.PrestoDriver";
 pub const GAUSSDB_M_JDBC_DRIVER_PROFILE: &str = "gaussdb-m";
 pub const GAUSSDB_M_JDBC_DRIVER_CLASS: &str = "com.huawei.gaussdb.jdbc.Driver";
 const SQLSERVER_LEGACY_DRIVER_INSTALL_HINT: &str =
-    "Install the SQL Server legacy compatibility component from Driver Manager, or open the connection settings and enable SQL Server legacy compatibility mode again.";
+    "Install the SQL Server TLS 1.0 compatibility component from Driver Manager, or open the connection settings and select TLS 1.0 mode again.";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
@@ -1235,13 +1235,14 @@ impl AppState {
             .with_database_info(database_info_from_protocol_value(&response)));
         }
 
-        db::sqlserver::connect_with_port_explicit(
+        db::sqlserver::connect_with_port_explicit_and_params(
             host,
             port,
             config.sqlserver_port_explicit(),
             &config.username,
             &config.password,
             config.database.as_deref(),
+            config.url_params.as_deref(),
             connect_timeout,
         )
         .await?;
@@ -1275,13 +1276,14 @@ impl AppState {
             return Ok(PoolKind::agent(client));
         }
 
-        let client = db::sqlserver::connect_with_port_explicit(
+        let client = db::sqlserver::connect_with_port_explicit_and_params(
             host,
             port,
             config.sqlserver_port_explicit(),
             &config.username,
             &config.password,
             config.database.as_deref(),
+            config.url_params.as_deref(),
             connect_timeout,
         )
         .await?;
@@ -5729,13 +5731,13 @@ mod tests {
     }
 
     #[test]
-    fn sqlserver_legacy_url_param_requires_canonicalization_before_agent_driver_selection() {
+    fn sqlserver_disabled_encryption_url_param_does_not_select_agent_driver() {
         let mut config = mysql_config(Some("master"));
         config.db_type = DatabaseType::SqlServer;
         config.url_params = Some("applicationName=dbx;sqlserverEncryption=disabled".to_string());
 
         assert!(!sqlserver_uses_legacy_driver(&config));
-        assert!(sqlserver_uses_legacy_driver(&config.canonicalized()));
+        assert!(!sqlserver_uses_legacy_driver(&config.canonicalized()));
     }
 
     #[test]
@@ -5745,7 +5747,7 @@ mod tests {
         );
 
         assert!(message.contains("Driver Manager"));
-        assert!(message.contains("enable SQL Server legacy compatibility mode again"));
+        assert!(message.contains("select TLS 1.0 mode again"));
     }
 
     #[test]

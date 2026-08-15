@@ -27,7 +27,7 @@ use tracing_subscriber::Layer;
 pub type SqlServerClient = Client<Compat<TcpStream>>;
 pub const SQLSERVER_DRIVER_PANIC_ERROR_PREFIX: &str = "SQL Server driver panic:";
 pub const SQLSERVER_LEGACY_DRIVER_PROFILE: &str = "sqlserver-legacy";
-pub const SQLSERVER_LEGACY_DRIVER_LABEL: &str = "SQL Server legacy compatibility component";
+pub const SQLSERVER_LEGACY_DRIVER_LABEL: &str = "SQL Server TLS 1.0 compatibility component";
 const SQLSERVER_DEFAULT_PORT: u16 = 1433;
 const SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX: &str = "SQL Server unsafe result type:";
 const SQLSERVER_RESULT_TYPE_PROBE_SQL: &str = "\
@@ -78,10 +78,111 @@ const SQLSERVER_LEGACY_ENCRYPTION_LEVEL: tiberius::EncryptionLevel = tiberius::E
 // Some very old SQL Server setups only accepted DBX <= 0.5.48 because the fallback
 // advertised no encryption support at all. Keep it as the last-resort compatibility path.
 const SQLSERVER_UNSUPPORTED_ENCRYPTION_LEVEL: tiberius::EncryptionLevel = tiberius::EncryptionLevel::NotSupported;
-const SQLSERVER_LEGACY_ENCRYPTION_FALLBACKS: [(&str, tiberius::EncryptionLevel); 2] = [
-    ("login-only encryption", SQLSERVER_LEGACY_ENCRYPTION_LEVEL),
-    ("no-encryption compatibility fallback", SQLSERVER_UNSUPPORTED_ENCRYPTION_LEVEL),
-];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlServerNativeTransportPolicy {
+    Auto,
+    Compatibility,
+}
+
+impl SqlServerNativeTransportPolicy {
+    fn modes(self) -> &'static [SqlServerTransportMode] {
+        const AUTO: &[SqlServerTransportMode] = &[
+            SqlServerTransportMode::Required,
+            SqlServerTransportMode::LoginOnly,
+            SqlServerTransportMode::NoEncryption,
+        ];
+        const COMPATIBILITY: &[SqlServerTransportMode] =
+            &[SqlServerTransportMode::LoginOnly, SqlServerTransportMode::NoEncryption];
+        match self {
+            Self::Auto => AUTO,
+            Self::Compatibility => COMPATIBILITY,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlServerTransportMode {
+    Required,
+    LoginOnly,
+    NoEncryption,
+}
+
+impl SqlServerTransportMode {
+    fn encryption(self) -> tiberius::EncryptionLevel {
+        match self {
+            Self::Required => tiberius::EncryptionLevel::Required,
+            Self::LoginOnly => SQLSERVER_LEGACY_ENCRYPTION_LEVEL,
+            Self::NoEncryption => SQLSERVER_UNSUPPORTED_ENCRYPTION_LEVEL,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Required => "required encryption",
+            Self::LoginOnly => "login-only encryption",
+            Self::NoEncryption => "no encryption",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlServerConnectFailureKind {
+    TlsNegotiation,
+    Transport,
+    Server,
+    Authentication,
+    Timeout,
+    Configuration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerConnectAttemptFailure {
+    mode: SqlServerTransportMode,
+    kind: SqlServerConnectFailureKind,
+    message: String,
+    vendor_code: Option<u32>,
+}
+
+impl SqlServerConnectAttemptFailure {
+    fn tls(mode: SqlServerTransportMode, message: impl Into<String>) -> Self {
+        Self::new(mode, SqlServerConnectFailureKind::TlsNegotiation, message, None)
+    }
+
+    fn transport(mode: SqlServerTransportMode, message: impl Into<String>) -> Self {
+        Self::new(mode, SqlServerConnectFailureKind::Transport, message, None)
+    }
+
+    fn server(mode: SqlServerTransportMode, message: impl Into<String>, vendor_code: Option<u32>) -> Self {
+        let kind = if vendor_code == Some(18456) {
+            SqlServerConnectFailureKind::Authentication
+        } else {
+            SqlServerConnectFailureKind::Server
+        };
+        Self::new(mode, kind, message, vendor_code)
+    }
+
+    fn timeout(mode: SqlServerTransportMode, message: impl Into<String>) -> Self {
+        Self::new(mode, SqlServerConnectFailureKind::Timeout, message, None)
+    }
+
+    fn configuration(mode: SqlServerTransportMode, message: impl Into<String>) -> Self {
+        Self::new(mode, SqlServerConnectFailureKind::Configuration, message, None)
+    }
+
+    fn new(
+        mode: SqlServerTransportMode,
+        kind: SqlServerConnectFailureKind,
+        message: impl Into<String>,
+        vendor_code: Option<u32>,
+    ) -> Self {
+        Self { mode, kind, message: message.into(), vendor_code }
+    }
+
+    fn allows_transport_downgrade(&self) -> bool {
+        matches!(self.kind, SqlServerConnectFailureKind::TlsNegotiation | SqlServerConnectFailureKind::Transport)
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SqlServerColumnMetadata {
@@ -176,7 +277,7 @@ pub async fn connect(
     _url_params: Option<&str>,
     timeout: Duration,
 ) -> Result<SqlServerClient, String> {
-    connect_with_port_explicit(host, port, false, user, pass, database, timeout).await
+    connect_with_port_explicit_and_params(host, port, false, user, pass, database, _url_params, timeout).await
 }
 
 pub async fn connect_with_port_explicit(
@@ -188,50 +289,43 @@ pub async fn connect_with_port_explicit(
     database: Option<&str>,
     timeout: Duration,
 ) -> Result<SqlServerClient, String> {
-    match try_connect(host, port, port_explicit, user, pass, database, tiberius::EncryptionLevel::Required, timeout)
-        .await
-    {
-        Ok(client) => Ok(client),
-        Err(encrypted_error) => {
-            try_connect_legacy_sqlserver_encryption(host, port, port_explicit, user, pass, database, timeout)
-                .await
-                .map_err(|plain_error| {
-                    if is_sqlserver_tls_handshake_error(&encrypted_error) {
-                        format!(
-                        "{encrypted_error}\n\nThis may be caused by an old SQL Server TLS/encryption configuration. \
-                         If you are connecting to SQL Server 2008/2008 R2/2012 or another legacy instance, \
-                         try SQL Server legacy compatibility mode. It first behaves like encrypt=false and, \
-                         when explicitly enabled, DBX can also fall back to the SQL Server legacy compatibility \
-                         driver for TLS 1.0 encrypted transport. Only use this mode on trusted networks, VPNs, \
-                         or SSH tunnels.\n\n\
-                         Automatic native legacy fallback also failed: {plain_error}"
-                    )
-                    } else {
-                        plain_error
-                    }
-                })
-        }
-    }
+    connect_with_port_explicit_and_params(host, port, port_explicit, user, pass, database, None, timeout).await
 }
 
-async fn try_connect_legacy_sqlserver_encryption(
+pub async fn connect_with_port_explicit_and_params(
     host: &str,
     port: u16,
     port_explicit: bool,
     user: &str,
     pass: &str,
     database: Option<&str>,
+    url_params: Option<&str>,
     timeout: Duration,
 ) -> Result<SqlServerClient, String> {
-    let mut errors = Vec::new();
-    for (label, encryption) in SQLSERVER_LEGACY_ENCRYPTION_FALLBACKS {
-        match try_connect(host, port, port_explicit, user, pass, database, encryption, timeout).await {
+    let policy = sqlserver_native_transport_policy(url_params);
+    let mut failures = Vec::new();
+    for mode in policy.modes().iter().copied() {
+        match try_connect(host, port, port_explicit, user, pass, database, mode, timeout).await {
             Ok(client) => return Ok(client),
-            Err(error) => errors.push(format!("{label} failed: {error}")),
+            Err(error) => {
+                let can_downgrade = error.allows_transport_downgrade();
+                failures.push(error);
+                if !can_downgrade {
+                    break;
+                }
+            }
         }
     }
 
-    Err(errors.join("\n"))
+    Err(render_sqlserver_connect_failures(&failures))
+}
+
+fn sqlserver_native_transport_policy(url_params: Option<&str>) -> SqlServerNativeTransportPolicy {
+    if sqlserver_native_encryption_disabled(url_params) {
+        SqlServerNativeTransportPolicy::Compatibility
+    } else {
+        SqlServerNativeTransportPolicy::Auto
+    }
 }
 
 pub fn sqlserver_native_encryption_disabled(url_params: Option<&str>) -> bool {
@@ -239,17 +333,94 @@ pub fn sqlserver_native_encryption_disabled(url_params: Option<&str>) -> bool {
         return false;
     };
 
-    params.trim_start_matches('?').split(['&', ';']).filter_map(|pair| pair.split_once('=')).any(|(key, value)| {
-        let key = key.trim();
-        let value = value.trim().to_ascii_lowercase();
-        let disabled = matches!(value.as_str(), "disabled" | "disable" | "false" | "0" | "off" | "no");
-        (key.eq_ignore_ascii_case("sqlserverEncryption") || key.eq_ignore_ascii_case("encrypt")) && disabled
+    split_sqlserver_properties(params.trim_start_matches('?')).filter_map(|pair| pair.split_once('=')).any(
+        |(key, value)| {
+            let key = key.trim();
+            let value = value.trim().to_ascii_lowercase();
+            let disabled = matches!(value.as_str(), "disabled" | "disable" | "false" | "0" | "off" | "no");
+            (key.eq_ignore_ascii_case("sqlserverEncryption") || key.eq_ignore_ascii_case("encrypt")) && disabled
+        },
+    )
+}
+
+fn split_sqlserver_properties(value: &str) -> impl Iterator<Item = &str> {
+    let mut separators = Vec::new();
+    let mut in_braces = false;
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, current)) = chars.next() {
+        if in_braces {
+            if current == '}' {
+                if chars.peek().is_some_and(|(_, next)| *next == '}') {
+                    chars.next();
+                } else {
+                    in_braces = false;
+                }
+            }
+        } else if current == '{' {
+            in_braces = true;
+        } else if matches!(current, ';' | '&') {
+            separators.push(index);
+        }
+    }
+
+    let mut start = 0;
+    separators.into_iter().chain(std::iter::once(value.len())).map(move |end| {
+        let part = &value[start..end];
+        start = end.saturating_add(1);
+        part
     })
 }
 
 fn is_sqlserver_tls_handshake_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("tls") && (error.contains("handshake") || error.contains("eof") || error.contains("performing i/o"))
+}
+
+fn sqlserver_should_suggest_tls1_legacy_driver(failures: &[SqlServerConnectAttemptFailure]) -> bool {
+    !failures.is_empty() && failures.iter().all(SqlServerConnectAttemptFailure::allows_transport_downgrade)
+}
+
+fn render_sqlserver_connect_failures(failures: &[SqlServerConnectAttemptFailure]) -> String {
+    let Some(primary) = failures.last() else {
+        return "SQL Server connection failed without diagnostic details".to_string();
+    };
+
+    let prior = &failures[..failures.len().saturating_sub(1)];
+    let mut message = if primary.kind == SqlServerConnectFailureKind::Authentication {
+        let transport = match primary.mode {
+            SqlServerTransportMode::NoEncryption => "an unencrypted TDS connection",
+            SqlServerTransportMode::LoginOnly => "a login-only encrypted connection",
+            SqlServerTransportMode::Required => "an encrypted connection",
+        };
+        format!(
+            "SQL Server accepted {transport} but rejected authentication:\n{}\n\nVerify the username and password, SQL Server authentication mode, login status, default database access, and any JumpServer account/asset mapping.",
+            primary.message
+        )
+    } else {
+        primary.message.clone()
+    };
+
+    if !prior.is_empty() {
+        let details = prior
+            .iter()
+            .map(|failure| format!("{} failed: {}", failure.mode.label(), failure.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if primary.kind == SqlServerConnectFailureKind::Authentication {
+            message.push_str("\n\nEarlier encrypted attempts failed before SQL Server authentication:\n");
+        } else {
+            message.push_str("\n\nEarlier connection attempts:\n");
+        }
+        message.push_str(&details);
+    }
+
+    if sqlserver_should_suggest_tls1_legacy_driver(failures) {
+        message.push_str(
+            "\n\nThis endpoint failed every native transport negotiation attempt. If the server supports TLS 1.0 but not modern TLS, try the explicit SQL Server TLS 1.0 compatibility driver. It requires server-side TLS 1.0 support and cannot fix invalid credentials. Use login-only or unencrypted transport only on trusted networks, VPNs, or SSH tunnels.",
+        );
+    }
+
+    message
 }
 
 async fn try_connect(
@@ -259,9 +430,9 @@ async fn try_connect(
     user: &str,
     pass: &str,
     database: Option<&str>,
-    encryption: tiberius::EncryptionLevel,
+    mode: SqlServerTransportMode,
     timeout: Duration,
-) -> Result<SqlServerClient, String> {
+) -> Result<SqlServerClient, SqlServerConnectAttemptFailure> {
     let mut config = Config::new();
     let endpoint = sqlserver_endpoint(host);
     let uses_named_instance_resolution = sqlserver_uses_named_instance_resolution(&endpoint, port, port_explicit);
@@ -276,23 +447,60 @@ async fn try_connect(
         config.database(db);
     }
     config.trust_cert();
-    config.encryption(encryption);
+    config.encryption(mode.encryption());
 
     let tcp = if uses_named_instance_resolution {
         tokio::time::timeout(timeout, TcpStream::connect_named(&config))
             .await
-            .map_err(|_| format!("SQL Server connection timed out ({}s)", timeout.as_secs()))?
-            .map_err(|e| format!("SQL Server connection failed: {e}"))?
+            .map_err(|_| {
+                SqlServerConnectAttemptFailure::timeout(
+                    mode,
+                    format!("SQL Server connection timed out ({}s)", timeout.as_secs()),
+                )
+            })?
+            .map_err(|e| {
+                SqlServerConnectAttemptFailure::transport(mode, format!("SQL Server connection failed: {e}"))
+            })?
     } else {
         tokio::time::timeout(timeout, TcpStream::connect(config.get_addr()))
             .await
-            .map_err(|_| format!("SQL Server connection timed out ({}s)", timeout.as_secs()))?
-            .map_err(|e| format!("SQL Server connection failed: {e}"))?
+            .map_err(|_| {
+                SqlServerConnectAttemptFailure::timeout(
+                    mode,
+                    format!("SQL Server connection timed out ({}s)", timeout.as_secs()),
+                )
+            })?
+            .map_err(|e| {
+                SqlServerConnectAttemptFailure::transport(mode, format!("SQL Server connection failed: {e}"))
+            })?
     };
     tokio::time::timeout(timeout, Client::connect(config, tcp.compat_write()))
         .await
-        .map_err(|_| format!("SQL Server handshake timed out ({}s)", timeout.as_secs()))?
-        .map_err(|e| format!("SQL Server connection failed: {e}"))
+        .map_err(|_| {
+            SqlServerConnectAttemptFailure::timeout(
+                mode,
+                format!("SQL Server handshake timed out ({}s)", timeout.as_secs()),
+            )
+        })?
+        .map_err(|error| classify_sqlserver_connect_error(mode, error))
+}
+
+fn classify_sqlserver_connect_error(
+    mode: SqlServerTransportMode,
+    error: tiberius::error::Error,
+) -> SqlServerConnectAttemptFailure {
+    let message = format!("SQL Server connection failed: {error}");
+    match error {
+        tiberius::error::Error::Server(token) => {
+            SqlServerConnectAttemptFailure::server(mode, message, Some(token.code()))
+        }
+        tiberius::error::Error::Tls(_) => SqlServerConnectAttemptFailure::tls(mode, message),
+        tiberius::error::Error::Io { .. } if is_sqlserver_tls_handshake_error(&message) => {
+            SqlServerConnectAttemptFailure::tls(mode, message)
+        }
+        tiberius::error::Error::Io { .. } => SqlServerConnectAttemptFailure::transport(mode, message),
+        _ => SqlServerConnectAttemptFailure::configuration(mode, message),
+    }
 }
 
 fn row_to_json(row: &tiberius::Row) -> Vec<serde_json::Value> {
@@ -3667,6 +3875,16 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_native_encryption_flag_ignores_transport_text_inside_braced_values() {
+        assert!(!super::sqlserver_native_encryption_disabled(Some("applicationName={DBX;encrypt=false;role=ops}")));
+        assert!(!super::sqlserver_native_encryption_disabled(Some(
+            "applicationName={DBX&sqlserverEncryption=disabled&role=ops}"
+        )));
+        assert!(!super::sqlserver_native_encryption_disabled(Some("applicationName={DBX}};encrypt=false;Client}")));
+        assert!(super::sqlserver_native_encryption_disabled(Some("applicationName={DBX;Client};encrypt=false")));
+    }
+
+    #[test]
     fn sqlserver_legacy_encryption_modes_cover_jdbc_and_no_encryption_fallback() {
         assert_eq!(super::SQLSERVER_LEGACY_ENCRYPTION_LEVEL, tiberius::EncryptionLevel::Off);
         assert_eq!(super::SQLSERVER_UNSUPPORTED_ENCRYPTION_LEVEL, tiberius::EncryptionLevel::NotSupported);
@@ -3674,7 +3892,11 @@ mod tests {
 
     #[test]
     fn sqlserver_automatic_fallback_preserves_v48_no_encryption_compatibility() {
-        let levels = super::SQLSERVER_LEGACY_ENCRYPTION_FALLBACKS.map(|(_, encryption)| encryption);
+        let levels = super::SqlServerNativeTransportPolicy::Compatibility
+            .modes()
+            .iter()
+            .map(|mode| mode.encryption())
+            .collect::<Vec<_>>();
         assert_eq!(levels, [tiberius::EncryptionLevel::Off, tiberius::EncryptionLevel::NotSupported]);
     }
 
@@ -3685,6 +3907,89 @@ mod tests {
         ));
         assert!(super::is_sqlserver_tls_handshake_error("TLS handshake failed: unexpected EOF"));
         assert!(!super::is_sqlserver_tls_handshake_error("SQL Server connection failed: Login failed for user"));
+    }
+
+    #[test]
+    fn sqlserver_native_transport_policy_preserves_auto_and_explicit_compatibility_order() {
+        assert_eq!(
+            super::SqlServerNativeTransportPolicy::Auto.modes(),
+            &[
+                super::SqlServerTransportMode::Required,
+                super::SqlServerTransportMode::LoginOnly,
+                super::SqlServerTransportMode::NoEncryption,
+            ]
+        );
+        assert_eq!(
+            super::SqlServerNativeTransportPolicy::Compatibility.modes(),
+            &[super::SqlServerTransportMode::LoginOnly, super::SqlServerTransportMode::NoEncryption]
+        );
+        assert_eq!(
+            super::sqlserver_native_transport_policy(Some("applicationName=dbx;encrypt=false")),
+            super::SqlServerNativeTransportPolicy::Compatibility
+        );
+    }
+
+    #[test]
+    fn sqlserver_native_fallback_only_continues_after_transport_or_tls_failure() {
+        assert!(super::SqlServerConnectAttemptFailure::tls(
+            super::SqlServerTransportMode::Required,
+            "tls handshake eof"
+        )
+        .allows_transport_downgrade());
+        assert!(super::SqlServerConnectAttemptFailure::transport(
+            super::SqlServerTransportMode::Required,
+            "connection reset"
+        )
+        .allows_transport_downgrade());
+        assert!(!super::SqlServerConnectAttemptFailure::server(
+            super::SqlServerTransportMode::NoEncryption,
+            "Login failed for user",
+            Some(18456)
+        )
+        .allows_transport_downgrade());
+    }
+
+    #[test]
+    fn sqlserver_authentication_failure_outranks_earlier_tls_failures() {
+        let failures = vec![
+            super::SqlServerConnectAttemptFailure::tls(super::SqlServerTransportMode::Required, "tls handshake eof"),
+            super::SqlServerConnectAttemptFailure::tls(super::SqlServerTransportMode::LoginOnly, "tls handshake eof"),
+            super::SqlServerConnectAttemptFailure::server(
+                super::SqlServerTransportMode::NoEncryption,
+                "Token error: 'Login failed for user' on server jumpserver (code: 18456, state: 1, class: 14)",
+                Some(18456),
+            ),
+        ];
+
+        let message = super::render_sqlserver_connect_failures(&failures);
+
+        assert!(message.starts_with("SQL Server accepted an unencrypted TDS connection but rejected authentication"));
+        assert!(message.contains("Login failed for user"));
+        assert!(message.contains("Earlier encrypted attempts failed"));
+        assert!(!message.contains("try SQL Server legacy compatibility mode"));
+    }
+
+    #[test]
+    fn sqlserver_tls1_legacy_hint_requires_transport_only_native_failures() {
+        let transport_only = vec![
+            super::SqlServerConnectAttemptFailure::tls(super::SqlServerTransportMode::Required, "tls handshake eof"),
+            super::SqlServerConnectAttemptFailure::tls(super::SqlServerTransportMode::LoginOnly, "tls handshake eof"),
+            super::SqlServerConnectAttemptFailure::transport(
+                super::SqlServerTransportMode::NoEncryption,
+                "connection reset",
+            ),
+        ];
+        let reached_server = vec![
+            transport_only[0].clone(),
+            super::SqlServerConnectAttemptFailure::server(
+                super::SqlServerTransportMode::NoEncryption,
+                "Login failed for user",
+                Some(18456),
+            ),
+        ];
+
+        assert!(super::sqlserver_should_suggest_tls1_legacy_driver(&transport_only));
+        assert!(!super::sqlserver_should_suggest_tls1_legacy_driver(&reached_server));
     }
 
     #[test]

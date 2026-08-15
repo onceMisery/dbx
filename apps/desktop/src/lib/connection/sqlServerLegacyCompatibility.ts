@@ -1,7 +1,7 @@
 import type { ConnectionConfig } from "@/types/database";
 
 export const SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY = "sqlserver-legacy";
-export const SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_LABEL = "SQL Server legacy compatibility component";
+export const SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_LABEL = "SQL Server TLS 1.0 compatibility component";
 export const SQLSERVER_NATIVE_DRIVER_PROFILE = "sqlserver";
 export const SQLSERVER_NATIVE_DRIVER_LABEL = "SQL Server";
 
@@ -31,62 +31,6 @@ export function setSqlServerNativeEncryptionDisabled(params: string | undefined,
   return parsed.toString();
 }
 
-interface SqlServerJdbcParamPart {
-  separator: "" | "&" | ";";
-  value: string;
-}
-
-function splitSqlServerJdbcParams(params: string | undefined): SqlServerJdbcParamPart[] {
-  const source = (params || "").trim().replace(/^\?/, "");
-  const parts: SqlServerJdbcParamPart[] = [];
-  let separator: SqlServerJdbcParamPart["separator"] = "";
-  let start = 0;
-  let inBraces = false;
-
-  // SQL Server JDBC values use braces to contain separators and `}}` to escape a closing brace.
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index];
-    if (inBraces) {
-      if (char === "}" && source[index + 1] === "}") {
-        index += 1;
-      } else if (char === "}") {
-        inBraces = false;
-      }
-    } else if (char === "{") {
-      inBraces = true;
-    } else if (char === "&" || char === ";") {
-      parts.push({ separator, value: source.slice(start, index) });
-      separator = char;
-      start = index + 1;
-    }
-  }
-
-  parts.push({ separator, value: source.slice(start) });
-  return parts;
-}
-
-function isSqlServerLegacyCompatibilityPart(part: string): boolean {
-  const separatorIndex = part.indexOf("=");
-  if (separatorIndex < 0) return false;
-  const key = part.slice(0, separatorIndex).trim().toLowerCase();
-  const value = part
-    .slice(separatorIndex + 1)
-    .trim()
-    .toLowerCase();
-  return key === "sqlserverencryption" && SQLSERVER_ENCRYPTION_DISABLED_VALUES.has(value);
-}
-
-function isSqlServerLegacyCompatibilitySetting(params: string | undefined): boolean {
-  return splitSqlServerJdbcParams(params).some((part) => isSqlServerLegacyCompatibilityPart(part.value));
-}
-
-function removeSqlServerLegacyCompatibilitySetting(params: string | undefined): string {
-  return splitSqlServerJdbcParams(params)
-    .filter((part) => part.value.trim() && !isSqlServerLegacyCompatibilityPart(part.value))
-    .map((part, index) => `${index === 0 ? "" : part.separator}${part.value}`)
-    .join("");
-}
-
 export function sqlServerUsesLegacyCompatibility(config: Pick<ConnectionConfig, "db_type" | "driver_profile">): boolean {
   return config.db_type === "sqlserver" && config.driver_profile === SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY;
 }
@@ -96,10 +40,19 @@ export function setSqlServerLegacyCompatibilityConfig(config: Pick<ConnectionCon
   config.driver_label = enabled ? SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_LABEL : SQLSERVER_NATIVE_DRIVER_LABEL;
 }
 
-export function migrateSqlServerLegacyCompatibilityConfig(config: Pick<ConnectionConfig, "db_type" | "driver_label" | "driver_profile" | "url_params">): void {
-  if (config.db_type !== "sqlserver" || !isSqlServerLegacyCompatibilitySetting(config.url_params)) return;
-  setSqlServerLegacyCompatibilityConfig(config, true);
-  config.url_params = removeSqlServerLegacyCompatibilitySetting(config.url_params);
+export function migrateSqlServerLegacyCompatibilityConfig(_config: Pick<ConnectionConfig, "db_type" | "driver_label" | "driver_profile" | "url_params">): void {
+  // Historical disabled-encryption parameters are native transport policy, not a TLS 1.0 driver selection.
+}
+
+export function isSqlServerTlsHandshakeFailure(message: string): boolean {
+  const text = message.toLowerCase();
+  const reachedAuthentication = text.includes("18456") || text.includes("login failed") || text.includes("authentication failed") || text.includes("\u767b\u5f55\u5931\u8d25") || text.includes("\u8eab\u4efd\u9a8c\u8bc1");
+  return !reachedAuthentication && text.includes("sql server") && text.includes("tls") && (text.includes("handshake") || text.includes("eof") || text.includes("performing i/o"));
+}
+
+export function isSqlServerLegacyTlsUnsupportedFailure(message: string): boolean {
+  const text = message.toLowerCase();
+  return text.includes("server is not configured to support ssl") || text.includes("server does not support ssl") || text.includes("server does not support encryption") || text.includes("\u670d\u52a1\u5668\u672a\u914d\u7f6e\u4e3a\u652f\u6301 ssl");
 }
 
 export function requiresSqlServerLegacyCompatibilityComponent(config: ConnectionConfig): boolean {

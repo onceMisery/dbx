@@ -133,7 +133,7 @@ fn driver_store_entries_do_not_repeat_agent_keys() {
     assert_eq!(entries.iter().filter(|(key, _)| *key == "gbase8a").count(), 1);
     assert_eq!(entries.iter().filter(|(key, _)| *key == "gbase8s").count(), 1);
     assert_eq!(entries.iter().filter(|(key, _)| *key == "sqlserver-legacy").count(), 1);
-    assert_eq!(agent_catalog::label_for_key("sqlserver-legacy"), Some("SQL Server legacy compatibility component"));
+    assert_eq!(agent_catalog::label_for_key("sqlserver-legacy"), Some("SQL Server TLS 1.0 compatibility component"));
 }
 
 #[test]

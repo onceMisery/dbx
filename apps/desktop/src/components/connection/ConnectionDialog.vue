@@ -68,7 +68,7 @@ import { normalizeRocketmqNamesrvAddr } from "@/lib/connection/rocketmqNamesrv";
 import { normalizeRabbitmqAddresses } from "@/lib/connection/rabbitmqAddresses";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressForOperation, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
-import { requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
+import { isSqlServerLegacyTlsUnsupportedFailure, isSqlServerTlsHandshakeFailure, requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
 import { normalizeNacosEndpoint, normalizeNacosMetricsUrl, parseNacosManagedNamespaces } from "@/lib/nacos/nacosAdmin";
 import { loadReadableNacosNamespaces, nacosNamespaceIdentity, normalizeNacosNamespaceSelection } from "@/lib/nacos/nacosNamespaceVisibility";
 import {
@@ -2001,11 +2001,6 @@ async function setSqlServerDriverMode(mode: "auto" | "legacy") {
   }
 }
 
-function isSqlServerTlsHandshakeFailure(message: string): boolean {
-  const text = message.toLowerCase();
-  return text.includes("sql server") && text.includes("tls") && (text.includes("handshake") || text.includes("eof") || text.includes("performing i/o"));
-}
-
 function clearTestedConnectionInfo() {
   testedConfigFingerprint.value = "";
   testedConfigId.value = "";
@@ -3554,8 +3549,8 @@ async function testConnection() {
     if (runId !== testRunId) return;
     const rawMessage = mongodbAuthFailureHint(errorMessage(e));
     const message = config ? connectionErrorWithDriverUpdateHint(config, rawMessage) : rawMessage;
-    const shouldShowSqlServerLegacyMode = config?.db_type === "sqlserver" && !sqlServerUsesLegacyCompatibility(config) && isSqlServerTlsHandshakeFailure(message);
-    if (shouldShowSqlServerLegacyMode) {
+    const shouldShowSqlServerDriverMode = config?.db_type === "sqlserver" && ((!sqlServerUsesLegacyCompatibility(config) && isSqlServerTlsHandshakeFailure(message)) || (sqlServerUsesLegacyCompatibility(config) && isSqlServerLegacyTlsUnsupportedFailure(message)));
+    if (shouldShowSqlServerDriverMode) {
       configTab.value = "advanced";
     }
     clearTestedConnectionInfo();
@@ -6957,14 +6952,14 @@ function openExternalUrl(url: string) {
                   <div v-if="form.db_type === 'sqlserver'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">{{ t("connection.driverMode") }}</Label>
                     <div class="col-span-3 flex items-center gap-2">
-                      <Button size="sm" :variant="sqlServerDriverMode === 'legacy' ? 'outline' : 'default'" :disabled="agentInstallRunning" @click="setSqlServerDriverMode('auto')">{{ t("connection.mongoDriverAuto") }}</Button>
-                      <Button size="sm" :variant="sqlServerDriverMode === 'legacy' ? 'default' : 'outline'" :disabled="agentInstallRunning" @click="setSqlServerDriverMode('legacy')">{{ t("connection.mongoDriverLegacy") }}</Button>
+                      <Button size="sm" :variant="sqlServerDriverMode === 'legacy' ? 'outline' : 'default'" :disabled="agentInstallRunning" @click="setSqlServerDriverMode('auto')">{{ t("connection.sqlServerDriverModeAuto") }}</Button>
+                      <Button size="sm" :variant="sqlServerDriverMode === 'legacy' ? 'default' : 'outline'" :disabled="agentInstallRunning" @click="setSqlServerDriverMode('legacy')">{{ t("connection.sqlServerDriverModeTls10") }}</Button>
                       <Tooltip>
                         <TooltipTrigger as-child>
                           <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
                         </TooltipTrigger>
                         <TooltipContent side="top" align="center" class="max-w-[320px] whitespace-pre-line text-xs leading-relaxed">
-                          {{ t("connection.sqlServerLegacyCompatibilityModeHint") }}
+                          {{ t("connection.sqlServerTransportModeHint") }}
                         </TooltipContent>
                       </Tooltip>
                     </div>

@@ -58,7 +58,26 @@ class SqlServerLegacyAgentTest {
     }
 
     @Test
-    void legacyTlsUrlUsesSqlServerTlsV1Properties() {
+    void sslUnsupportedErrorsDirectUsersToNativeAutoMode() {
+        SQLException original = new SQLException(
+            "\u5e94\u7528\u7a0b\u5e8f\u8981\u6c42\u52a0\u5bc6\uff0c\u4f46\u670d\u52a1\u5668\u672a\u914d\u7f6e\u4e3a\u652f\u6301 SSL\u3002",
+            "08S01",
+            0
+        );
+
+        SQLException error = SqlServerLegacyAgent.withLegacyTlsDiagnostics(original);
+
+        Assertions.assertEquals("08S01", error.getSQLState());
+        Assertions.assertEquals(0, error.getErrorCode());
+        Assertions.assertSame(original, error.getCause());
+        Assertions.assertTrue(error.getMessage().contains("request encrypted transport"));
+        Assertions.assertTrue(error.getMessage().contains("encrypt=true, sslProtocol=TLSv1"));
+        Assertions.assertTrue(error.getMessage().contains("Use Auto/native mode"));
+        Assertions.assertTrue(error.getMessage().contains("login-only encryption or unencrypted transport"));
+    }
+
+    @Test
+    void legacyTlsUrlHonorsExplicitTransportProperties() {
         ConnectParams params = new ConnectParams(
             "db.example.com",
             14330,
@@ -71,9 +90,66 @@ class SqlServerLegacyAgentTest {
         );
 
         Assertions.assertEquals(
-            "jdbc:sqlserver://db.example.com:14330;databaseName=appdb;applicationName=dbx;encrypt=true;trustServerCertificate=true;sslProtocol=TLSv1",
+            "jdbc:sqlserver://db.example.com:14330;databaseName=appdb;applicationName=dbx;encrypt=false;trustServerCertificate=false;sslProtocol=TLSv1.2",
             SqlServerLegacyAgent.legacyTlsUrl(params)
         );
+    }
+
+    @Test
+    void legacyTlsUrlAppliesDefaultsOnlyToMissingTransportProperties() {
+        Assertions.assertTrue(
+            SqlServerLegacyAgent.legacyTlsUrl(connectParams("encrypt=false", ""))
+                .endsWith(";encrypt=false;trustServerCertificate=true;sslProtocol=TLSv1")
+        );
+        Assertions.assertTrue(
+            SqlServerLegacyAgent.legacyTlsUrl(connectParams("trustServerCertificate=false", ""))
+                .endsWith(";encrypt=true;trustServerCertificate=false;sslProtocol=TLSv1")
+        );
+        Assertions.assertTrue(
+            SqlServerLegacyAgent.legacyTlsUrl(connectParams("sslProtocol=TLSv1.2", ""))
+                .endsWith(";encrypt=true;trustServerCertificate=true;sslProtocol=TLSv1.2")
+        );
+    }
+
+    @Test
+    void legacyTlsUrlUsesUrlParamsPrecedenceAndPreservesBracedValues() {
+        ConnectParams params = connectParams(
+            "workstationID={Ops; Blue};sqlserverEncryption=disabled;trustServerCertificate=false;sslProtocol=TLSv1.2",
+            "jdbc:sqlserver://db.example.com:1433;databaseName=custom;applicationName={DBX}}; Client};encrypt=true;trustServerCertificate=true;sslProtocol=TLSv1"
+        );
+
+        Assertions.assertEquals(
+            "jdbc:sqlserver://db.example.com:1433;databaseName=custom;applicationName={DBX}}; Client};workstationID={Ops; Blue};encrypt=false;trustServerCertificate=false;sslProtocol=TLSv1.2",
+            SqlServerLegacyAgent.legacyTlsUrl(params)
+        );
+    }
+
+    @Test
+    void standardEncryptOutranksHistoricalAliasWithinOneSource() {
+        String url = SqlServerLegacyAgent.legacyTlsUrl(
+            connectParams("sqlserverEncryption=disabled;encrypt=true", "")
+        );
+
+        Assertions.assertTrue(url.endsWith(";encrypt=true;trustServerCertificate=true;sslProtocol=TLSv1"));
+        Assertions.assertFalse(url.toLowerCase().contains("sqlserverencryption"));
+    }
+
+    @Test
+    void noEncryptionDiagnosticsDoNotClaimAnEncryptedTransportRequirement() {
+        SQLException original = new SQLException(
+            "The server is not configured to support SSL.",
+            "08S01",
+            0
+        );
+
+        SQLException error = SqlServerLegacyAgent.withLegacyTlsDiagnostics(
+            original,
+            connectParams("encrypt=false", "")
+        );
+
+        Assertions.assertFalse(error.getMessage().contains("request encrypted transport"));
+        Assertions.assertTrue(error.getMessage().contains("encrypt=false"));
+        Assertions.assertSame(original, error.getCause());
     }
 
     @Test
@@ -148,7 +224,7 @@ class SqlServerLegacyAgentTest {
         );
 
         Assertions.assertEquals(
-            "jdbc:sqlserver://db.example.com:1433;databaseName=custom;applicationName=dbx;encrypt=true;trustServerCertificate=true;sslProtocol=TLSv1",
+            "jdbc:sqlserver://db.example.com:1433;databaseName=custom;applicationName=dbx;encrypt=false;trustServerCertificate=false;sslProtocol=TLSv1.2",
             SqlServerLegacyAgent.legacyTlsUrl(params)
         );
     }
@@ -200,6 +276,19 @@ class SqlServerLegacyAgentTest {
         Assertions.assertEquals(
             baseDdl,
             SqlServerLegacyAgent.appendTableCommentDdl(baseDdl, "dbo", "Users", "   ")
+        );
+    }
+
+    private static ConnectParams connectParams(String urlParams, String connectionString) {
+        return new ConnectParams(
+            "db.example.com",
+            1433,
+            "appdb",
+            "sa",
+            "secret",
+            urlParams,
+            connectionString,
+            false
         );
     }
 }

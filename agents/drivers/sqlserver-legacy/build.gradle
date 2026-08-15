@@ -5,7 +5,7 @@ dependencies {
 tasks.named('shadowJar') {
     manifest {
         attributes(
-            'Agent-Label': 'SQL Server legacy compatibility component',
+            'Agent-Label': 'SQL Server TLS 1.0 compatibility component',
             'Main-Class': 'com.dbx.agent.sqlserverlegacy.SqlServerLegacyAgent'
         )
     }
