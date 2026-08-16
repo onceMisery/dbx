@@ -1234,17 +1234,17 @@ final class JdbcConnectionPoolRegistry implements AutoCloseable {
         }
 
         private static void throwCheckoutFailure(Throwable error) throws SQLException {
-            if (error instanceof AgentRpcError rpcError) {
-                throw rpcError;
+            if (error instanceof AgentRpcError) {
+                throw (AgentRpcError) error;
             }
-            if (error instanceof SQLException sqlError) {
-                throw sqlError;
+            if (error instanceof SQLException) {
+                throw (SQLException) error;
             }
-            if (error instanceof RuntimeException runtimeError) {
-                throw runtimeError;
+            if (error instanceof RuntimeException) {
+                throw (RuntimeException) error;
             }
-            if (error instanceof Error fatal) {
-                throw fatal;
+            if (error instanceof Error) {
+                throw (Error) error;
             }
             throw new SQLException("Failed to checkout JDBC connection", error);
         }
@@ -1532,8 +1532,8 @@ final class JdbcConnectionPoolRegistry implements AutoCloseable {
             } catch (ExecutionException error) {
                 if (preserveCompletedFailure) {
                     Throwable cause = error.getCause();
-                    if (cause instanceof SQLException sqlError) {
-                        throw sqlError;
+                    if (cause instanceof SQLException) {
+                        throw (SQLException) cause;
                     }
                     throw new SQLException("JDBC physical operation failed: " + operation, cause);
                 }
@@ -1642,11 +1642,11 @@ final class JdbcConnectionPoolRegistry implements AutoCloseable {
         }
 
         private static void throwOpenFailure(Throwable error) throws Exception {
-            if (error instanceof Error fatal) {
-                throw fatal;
+            if (error instanceof Error) {
+                throw (Error) error;
             }
-            if (error instanceof Exception exception) {
-                throw exception;
+            if (error instanceof Exception) {
+                throw (Exception) error;
             }
             throw new SQLException("Failed to open JDBC connection", error);
         }
@@ -1746,8 +1746,8 @@ final class JdbcConnectionPoolRegistry implements AutoCloseable {
                         return method.invoke(connection, arguments);
                     } catch (InvocationTargetException error) {
                         Throwable cause = error.getCause();
-                        if (cause instanceof SQLException sqlError) {
-                            setupAttempt.recordFailure(sqlError);
+                        if (cause instanceof SQLException) {
+                            setupAttempt.recordFailure((SQLException) cause);
                         }
                         throw cause;
                     }
@@ -1813,9 +1813,12 @@ final class JdbcConnectionPoolRegistry implements AutoCloseable {
             if (type.isInstance(current)) {
                 return true;
             }
-            if (current instanceof SQLException sqlError && sqlError.getNextException() != null
-                && contains(sqlError.getNextException(), type, visited)) {
-                return true;
+            if (current instanceof SQLException) {
+                SQLException sqlError = (SQLException) current;
+                if (sqlError.getNextException() != null
+                    && contains(sqlError.getNextException(), type, visited)) {
+                    return true;
+                }
             }
             current = current.getCause();
         }

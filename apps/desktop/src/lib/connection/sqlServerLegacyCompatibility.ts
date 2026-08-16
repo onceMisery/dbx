@@ -2,8 +2,11 @@ import type { ConnectionConfig } from "@/types/database";
 
 export const SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY = "sqlserver-legacy";
 export const SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_LABEL = "SQL Server TLS 1.0 Compatibility Driver";
+export const SQLSERVER_2008_DRIVER_KEY = "sqlserver-2008";
+export const SQLSERVER_2008_DRIVER_LABEL = "SQL Server 2008/2008 R2 Legacy Driver";
 export const SQLSERVER_NATIVE_DRIVER_PROFILE = "sqlserver";
 export const SQLSERVER_NATIVE_DRIVER_LABEL = "SQL Server";
+export type SqlServerDriverMode = "auto" | "tls10" | "sqlserver2008";
 
 const SQLSERVER_ENCRYPTION_DISABLED_VALUES = new Set(["disabled", "disable", "false", "0", "off", "no"]);
 
@@ -35,9 +38,31 @@ export function sqlServerUsesLegacyCompatibility(config: Pick<ConnectionConfig, 
   return config.db_type === "sqlserver" && config.driver_profile === SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY;
 }
 
+export function sqlServerUses2008Driver(config: Pick<ConnectionConfig, "db_type" | "driver_profile">): boolean {
+  return config.db_type === "sqlserver" && config.driver_profile === SQLSERVER_2008_DRIVER_KEY;
+}
+
+export function sqlServerDriverModeForConfig(config: Pick<ConnectionConfig, "db_type" | "driver_profile">): SqlServerDriverMode {
+  if (sqlServerUses2008Driver(config)) return "sqlserver2008";
+  if (sqlServerUsesLegacyCompatibility(config)) return "tls10";
+  return "auto";
+}
+
+export function setSqlServerDriverModeConfig(config: Pick<ConnectionConfig, "driver_label" | "driver_profile">, mode: SqlServerDriverMode): void {
+  if (mode === "sqlserver2008") {
+    config.driver_profile = SQLSERVER_2008_DRIVER_KEY;
+    config.driver_label = SQLSERVER_2008_DRIVER_LABEL;
+  } else if (mode === "tls10") {
+    config.driver_profile = SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY;
+    config.driver_label = SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_LABEL;
+  } else {
+    config.driver_profile = SQLSERVER_NATIVE_DRIVER_PROFILE;
+    config.driver_label = SQLSERVER_NATIVE_DRIVER_LABEL;
+  }
+}
+
 export function setSqlServerLegacyCompatibilityConfig(config: Pick<ConnectionConfig, "driver_label" | "driver_profile">, enabled: boolean): void {
-  config.driver_profile = enabled ? SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY : SQLSERVER_NATIVE_DRIVER_PROFILE;
-  config.driver_label = enabled ? SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_LABEL : SQLSERVER_NATIVE_DRIVER_LABEL;
+  setSqlServerDriverModeConfig(config, enabled ? "tls10" : "auto");
 }
 
 export function migrateSqlServerLegacyCompatibilityConfig(_config: Pick<ConnectionConfig, "db_type" | "driver_label" | "driver_profile" | "url_params">): void {
@@ -56,5 +81,11 @@ export function isSqlServerLegacyTlsUnsupportedFailure(message: string): boolean
 }
 
 export function requiresSqlServerLegacyCompatibilityComponent(config: ConnectionConfig): boolean {
-  return sqlServerUsesLegacyCompatibility(config);
+  return requiredSqlServerCompatibilityDriverKey(config) !== undefined;
+}
+
+export function requiredSqlServerCompatibilityDriverKey(config: Pick<ConnectionConfig, "db_type" | "driver_profile">): string | undefined {
+  if (sqlServerUses2008Driver(config)) return SQLSERVER_2008_DRIVER_KEY;
+  if (sqlServerUsesLegacyCompatibility(config)) return SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY;
+  return undefined;
 }

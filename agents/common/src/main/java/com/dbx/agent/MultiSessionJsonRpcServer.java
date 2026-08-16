@@ -181,11 +181,12 @@ public final class MultiSessionJsonRpcServer implements AutoCloseable {
             session = new Session(sessionHandlerFactory.get());
         } else {
             DatabaseAgent agent = agentFactory.get();
-            if (poolRegistry.isEnabled()
-                && agent instanceof AbstractJdbcAgent jdbcAgent
-                && jdbcAgent.supportsConnectionPooling()) {
-                jdbcAgent.attachConnectionPoolRegistry(poolRegistry);
-                ensureMaintenanceStarted();
+            if (poolRegistry.isEnabled() && agent instanceof AbstractJdbcAgent) {
+                AbstractJdbcAgent jdbcAgent = (AbstractJdbcAgent) agent;
+                if (jdbcAgent.supportsConnectionPooling()) {
+                    jdbcAgent.attachConnectionPoolRegistry(poolRegistry);
+                    ensureMaintenanceStarted();
+                }
             }
             session = new Session(new JsonRpcServer(agent));
         }

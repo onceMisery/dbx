@@ -46,11 +46,13 @@ DBX 的 Agent 驱动 —— 通过 JDBC 和原生数据库驱动支持各种数�
 | zookeeper | Apache ZooKeeper | go-zookeeper 原生 Agent |
 | rabbitmq | RabbitMQ | amqp091-go 原生 agent |
 | rocketmq | Apache RocketMQ | rocketmq-admin-go 原生 agent |
+| sqlserver-legacy | SQL Server TLS 1.0 服务端 | Microsoft JDBC 13.2 兼容 Agent |
+| sqlserver-2008 | SQL Server 2008/2008 R2 | Microsoft JDBC 6.2 兼容 Agent |
 
 
 ## 多 JRE 支持
 
-多数 Java agent 以 JRE 21 为目标。原生 agent（如 `cassandra`、`duckdb`、`hive`、`iotdb`、`oracle`、`kingbase`、`tdengine`、`xugu`、`rabbitmq`、`rocketmq` 和 `zookeeper`）不需要 JRE。对 Java agent，DBX 会自动下载并管理 JRE 21 安装。
+多数 Java agent 以 JRE 21 为目标。独立登记的 `sqlserver-2008` 兼容配置使用 Microsoft JDBC 6.2 和托管的 Temurin JRE 8，使驱动与运行时组合符合 Microsoft 文档中的 SQL Server 2008 支持矩阵。该 JRE 发布 Windows x64、Linux x64、Linux ARM64 和 macOS x64 版本；Temurin 8 不提供 Windows ARM64 或 macOS ARM64 JRE 产物。原生 agent（如 `cassandra`、`duckdb`、`hive`、`iotdb`、`oracle`、`kingbase`、`tdengine`、`xugu`、`rabbitmq`、`rocketmq` 和 `zookeeper`）不需要 JRE。对 Java agent，DBX 会自动下载并管理匹配的运行时。
 
 ## JDBC 连接池
 

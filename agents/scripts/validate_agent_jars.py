@@ -36,6 +36,16 @@ def validate_agent_jars(root: Path) -> list[str]:
                 class_entry = main_class.replace(".", "/") + ".class"
                 if class_entry not in archive.namelist():
                     problems.append(f"{relative}: Main-Class class not found: {class_entry}")
+                elif module == "sqlserver-2008":
+                    class_bytes = archive.read(class_entry)
+                    if len(class_bytes) < 8 or class_bytes[:4] != b"\xca\xfe\xba\xbe":
+                        problems.append(f"{relative}: invalid Main-Class bytecode: {class_entry}")
+                    else:
+                        class_major_version = int.from_bytes(class_bytes[6:8], "big")
+                        if class_major_version > 52:
+                            problems.append(
+                                f"{relative}: SQL Server 2008 agent requires Java 8 bytecode, got class major {class_major_version}"
+                            )
                 if not manifest.get("Agent-Label"):
                     problems.append(f"{relative}: missing Agent-Label manifest attribute")
         except zipfile.BadZipFile:

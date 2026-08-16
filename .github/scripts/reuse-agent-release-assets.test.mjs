@@ -42,6 +42,24 @@ test("collects complete reusable Java, native, and JRE assets", () => {
   assert.deepEqual(plan.driverAssets.map((asset) => asset.moduleName), ["access", ...Array(6).fill("kingbase")]);
 });
 
+test("allows a legacy JRE to publish only the platforms provided by its vendor", () => {
+  const legacyPlatforms = ["macos-x64", "linux-aarch64", "linux-x64", "windows-x64"];
+  const jre = Object.fromEntries(
+    legacyPlatforms.map((platform, index) => [platform, artifact(`dbx-jre-8-${platform}.tar.zst`, String(index + 1))]),
+  );
+  const registry = { drivers: {}, jres: { 8: { version: "8u502-b07", platforms: jre } } };
+
+  const plan = collectReusableAssetPlan({
+    registry,
+    release: releaseFor(Object.values(jre)),
+    versions: {},
+    modules: [],
+    reuseJre: true,
+  });
+
+  assert.equal(plan.jreAssets.length, 4);
+});
+
 test("rejects an incomplete reusable native platform set", () => {
   const native = Object.fromEntries(
     platforms.slice(1).map((platform, index) => [platform, artifact(`dbx-agent-vastbase-0.1.38-${platform}.tar.zst`, String(index + 1))]),

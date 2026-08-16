@@ -1,0 +1,18 @@
+sourceSets {
+    main.java.srcDirs = ['src/main/java', '../sqlserver-legacy/src/main/java']
+}
+
+dependencies {
+    implementation 'com.microsoft.sqlserver:mssql-jdbc:6.2.2.jre8'
+    implementation 'com.zaxxer:HikariCP:4.0.3'
+    runtimeOnly 'org.slf4j:slf4j-nop:1.7.36'
+}
+
+tasks.named('shadowJar') {
+    manifest {
+        attributes(
+            'Agent-Label': 'SQL Server 2008/2008 R2 Legacy Driver',
+            'Main-Class': 'com.dbx.agent.sqlserver2008.SqlServer2008Agent'
+        )
+    }
+}

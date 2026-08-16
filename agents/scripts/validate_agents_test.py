@@ -357,6 +357,8 @@ class ValidateAgentsTest(unittest.TestCase):
                     strategy:
                       matrix:
                         include:
+                          - jre-key: "8"
+                            java-version: "8"
                           - jre-key: "21"
                             java-version: "21"
                             modules: "java.base,jdk.security.auth,jdk.security.jgss,jdk.crypto.ec"
@@ -365,12 +367,16 @@ class ValidateAgentsTest(unittest.TestCase):
                     )
                     detect_jre_key() {
                       case "$name" in
+                        sqlserver-2008) echo "8" ;;
                         *) echo "21" ;;
                       esac
                     }
                     cat > release/agent-registry.json <<EOF
                     {
                       "jres": {
+                        "8": {
+                          "version": "8u502-b07"
+                        },
                         "21": {
                           "version": "21.0.11"
                         }
@@ -415,6 +421,9 @@ class ValidateAgentsTest(unittest.TestCase):
             self.assertEqual(
                 [
                     "release workflow must build the default JRE with key 21",
+                    "release workflow must build the SQL Server 2008 JRE with key 8",
+                    "SQL Server 2008 agent must use JRE key 8",
+                    "registry must publish Java 8 under JRE key 8",
                     "agents must use JRE key 21",
                     "registry must publish Java 21 under JRE key 21",
                     "release workflow JRE must include jdk.security.auth for Kafka Kerberos LoginModule support",
@@ -465,6 +474,35 @@ class ValidateAgentsTest(unittest.TestCase):
                     "Main-Class: com.dbx.agent.h2.H2Agent\n\n",
                 )
                 archive.writestr("com/dbx/agent/h2/H2Agent.class", b"class-bytes")
+
+            self.assertEqual([], validate_agent_jars.validate_agent_jars(root))
+
+    def test_sqlserver_2008_jar_validation_requires_java_8_bytecode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jar = root / "drivers/sqlserver-2008/build/libs/dbx-agent-sqlserver-2008.jar"
+            jar.parent.mkdir(parents=True)
+            manifest = (
+                "Manifest-Version: 1.0\n"
+                "Agent-Label: SQL Server 2008/2008 R2 Legacy Driver\n"
+                "Main-Class: com.dbx.agent.sqlserver2008.SqlServer2008Agent\n\n"
+            )
+            class_entry = "com/dbx/agent/sqlserver2008/SqlServer2008Agent.class"
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("META-INF/MANIFEST.MF", manifest)
+                archive.writestr(class_entry, b"\xca\xfe\xba\xbe\x00\x00\x00\x41")
+
+            self.assertEqual(
+                [
+                    f"{jar.relative_to(root)}: "
+                    "SQL Server 2008 agent requires Java 8 bytecode, got class major 65"
+                ],
+                validate_agent_jars.validate_agent_jars(root),
+            )
+
+            with zipfile.ZipFile(jar, "w") as archive:
+                archive.writestr("META-INF/MANIFEST.MF", manifest)
+                archive.writestr(class_entry, b"\xca\xfe\xba\xbe\x00\x00\x00\x34")
 
             self.assertEqual([], validate_agent_jars.validate_agent_jars(root))
 

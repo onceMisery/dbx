@@ -75,7 +75,7 @@ import { simpleModeEmptyShellNeedsConfirmedLoad, treeNodeLoadedChildrenContentPr
 import { shouldMarkDisconnected } from "@/lib/connection/connectionHealth";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
 import { loadTimeoutInheritanceBackup, saveTimeoutInheritanceBackup } from "@/lib/connection/timeoutInheritanceBackup";
-import { migrateSqlServerLegacyCompatibilityConfig, requiresSqlServerLegacyCompatibilityComponent, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
+import { migrateSqlServerLegacyCompatibilityConfig, requiredSqlServerCompatibilityDriverKey } from "@/lib/connection/sqlServerLegacyCompatibility";
 import { gaussdbMTypeDisplayName } from "@/lib/table/postgresDataTypeHelp";
 import { deleteTabResultSnapshotsForOwner } from "@/lib/tabs/tabResultCache";
 import { disposeSqlServerActivityTracesForConnection, hasSqlServerActivityTraceForConnection } from "@/lib/sqlserver/sqlServerActivityTraceRuntime";
@@ -2916,9 +2916,10 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   async function ensureSqlServerLegacyCompatibilityComponentInstalled(config: ConnectionConfig) {
-    if (!requiresSqlServerLegacyCompatibilityComponent(config)) return;
-    if (await api.isAgentInstalled(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY)) return;
-    await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY);
+    const driverKey = requiredSqlServerCompatibilityDriverKey(config);
+    if (!driverKey) return;
+    if (await api.isAgentInstalled(driverKey)) return;
+    await api.installAgent(driverKey);
   }
 
   async function setDefaultDatabase(connectionId: string, database: string) {

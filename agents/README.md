@@ -46,11 +46,13 @@ Each agent runs as a standalone process and communicates with DBX via stdin/stdo
 | zookeeper | Apache ZooKeeper | go-zookeeper native agent |
 | rabbitmq | RabbitMQ | amqp091-go native agent |
 | rocketmq | Apache RocketMQ | rocketmq-admin-go native agent |
+| sqlserver-legacy | SQL Server TLS 1.0 endpoints | Microsoft JDBC 13.2 compatibility agent |
+| sqlserver-2008 | SQL Server 2008/2008 R2 | Microsoft JDBC 6.2 compatibility agent |
 
 
 ## Multi-JRE Support
 
-Most Java agents target JRE 21. Native agents, such as `cassandra`, `duckdb`, `hive`, `iotdb`, `oracle`, `kingbase`, `tdengine`, `xugu`, `rabbitmq`, `rocketmq`, and `zookeeper`, do not require a JRE. DBX downloads and manages the JRE 21 installation automatically for Java agents.
+Most Java agents target JRE 21. The separately registered `sqlserver-2008` compatibility profile uses Microsoft JDBC 6.2 and a managed Temurin JRE 8 so that the driver/runtime pairing remains within Microsoft's documented SQL Server 2008 support matrix. Its managed JRE is published for Windows x64, Linux x64, Linux ARM64, and macOS x64; Temurin 8 JRE artifacts are not available for Windows ARM64 or macOS ARM64. Native agents, such as `cassandra`, `duckdb`, `hive`, `iotdb`, `oracle`, `kingbase`, `tdengine`, `xugu`, `rabbitmq`, `rocketmq`, and `zookeeper`, do not require a JRE. DBX downloads and manages the matching runtime automatically for Java agents.
 
 ## JDBC Connection Pooling
 

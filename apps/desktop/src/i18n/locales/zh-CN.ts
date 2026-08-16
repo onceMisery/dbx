@@ -816,10 +816,12 @@ export default withEnglishFallback({
     testing: "测试中...",
     copyTestResult: "复制测试结果",
     sqlServerLegacyCompatibilityComponent: "SQL Server TLS 1.0 兼容驱动",
+    sqlServer2008CompatibilityComponent: "SQL Server 2008/2008 R2 旧版驱动",
     sqlServerDriverModeAuto: "自动",
     sqlServerDriverModeTls10: "TLS 1.0",
+    sqlServerDriverMode2008: "SQL Server 2008",
     sqlServerTransportModeHint:
-      "自动模式使用内置驱动，并可为旧版服务端降级到仅登录阶段加密或不加密传输。TLS 1.0 模式使用 Java 兼容驱动，默认设置为 encrypt=true、trustServerCertificate=true、sslProtocol=TLSv1；用户明确指定的高级参数优先。此独立兼容进程会在启动时启用旧版 TLS 算法，因此所有会话都共享放宽后的安全策略，包括明确请求 TLSv1.2 或 encrypt=false 的会话。此模式不能解决凭据错误或 SQL Server 18456 错误。仅应在可信网络、VPN 或 SSH 隧道中使用该驱动。",
+      "自动模式使用内置驱动，并可降级到仅登录阶段加密或不加密传输。TLS 1.0 模式使用当前 Microsoft JDBC 驱动和放宽后的 TLS 策略，并遵循用户明确指定的高级传输参数。SQL Server 2008 模式使用 Microsoft JDBC 6.2 和独立 Java 8 运行时；该驱动不支持 sslProtocol，因此此模式下需移除该参数。两种兼容模式都不能解决凭据错误或 SQL Server 18456 错误。仅应在可信网络、VPN 或 SSH 隧道中使用旧版驱动。",
     gaussdbConnectionMode: "连接模式",
     gaussdbConnectionModeNative: "PostgreSQL 兼容（内置驱动）",
     gaussdbConnectionModeMJdbc: "M 模式（厂商 JDBC 驱动）",

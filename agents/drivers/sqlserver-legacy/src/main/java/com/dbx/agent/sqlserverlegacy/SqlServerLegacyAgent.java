@@ -19,6 +19,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -26,12 +27,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
+public class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
     private static final String TLS_DISABLED_ALGORITHMS_KEY = "jdk.tls.disabledAlgorithms";
     private static final String DEFAULT_ENCRYPT = "true";
     private static final String DEFAULT_TRUST_SERVER_CERTIFICATE = "true";
     private static final String DEFAULT_SSL_PROTOCOL = "TLSv1";
-    private static final Set<String> LEGACY_TLS_ALGORITHMS_TO_ALLOW = Set.of(
+    private static final Set<String> LEGACY_TLS_ALGORITHMS_TO_ALLOW = immutableSet(
         "TLSV1",
         "TLSV1.1",
         "DTLSV1.0",
@@ -46,13 +47,13 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
         "DH KEYSIZE < 1024",
         "RSA KEYSIZE < 1024"
     );
-    private static final Set<String> INTERNAL_URL_PARAMS = Set.of(
+    private static final Set<String> INTERNAL_URL_PARAMS = immutableSet(
         "SQLSERVERENCRYPTION",
         "ENCRYPT",
         "TRUSTSERVERCERTIFICATE",
         "SSLPROTOCOL"
     );
-    private static final Set<String> DISABLED_ENCRYPTION_VALUES = Set.of(
+    private static final Set<String> DISABLED_ENCRYPTION_VALUES = immutableSet(
         "DISABLED",
         "DISABLE",
         "FALSE",
@@ -65,7 +66,7 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
         "jdbc:sqlserver://{host}:{port};databaseName={database};",
         1433,
         true,
-        Set.of("INFORMATION_SCHEMA", "SYS"),
+        immutableSet("INFORMATION_SCHEMA", "SYS"),
         Arrays.asList("TABLE", "VIEW", "SYSTEM TABLE")
     );
 
@@ -210,8 +211,12 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
 
     static String legacyTlsUrl(ConnectParams params) {
         Map<String, String> properties = baseConnectionProperties(params);
-        properties.putAll(resolvedTransportProperties(params));
+        properties.putAll(effectiveTransportProperties(params));
         return appendProperties(baseJdbcUrl(params), properties);
+    }
+
+    private static Set<String> immutableSet(String... values) {
+        return Collections.unmodifiableSet(new HashSet<>(Arrays.asList(values)));
     }
 
     static String relaxedDisabledAlgorithms(String current) {
@@ -243,7 +248,7 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
             + ", jdbc=" + jdbcDriverVersion()
             + ", encrypt=" + transportProperties.get("encrypt")
             + ", trustServerCertificate=" + transportProperties.get("trustServerCertificate")
-            + ", sslProtocol=" + transportProperties.get("sslProtocol")
+            + ", sslProtocol=" + transportProtocolDescription(transportProperties)
             + ", tlsV1Disabled=" + isDisabled(disabledAlgorithms, "TLSV1")
             + ", tlsRsaDisabled=" + isDisabled(disabledAlgorithms, "TLS_RSA_*")
             + ", rsaPkcs1Sha1HandshakeDisabled="
@@ -257,7 +262,7 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
     }
 
     static SQLException withLegacyTlsDiagnostics(SQLException error, ConnectParams params) {
-        return withLegacyTlsDiagnostics(error, resolvedTransportProperties(params));
+        return withLegacyTlsDiagnostics(error, effectiveTransportProperties(params));
     }
 
     private static SQLException withLegacyTlsDiagnostics(
@@ -269,7 +274,7 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
             ? "\n\nThe resolved SQL Server JDBC settings request encrypted transport (encrypt="
                 + transportProperties.get("encrypt")
                 + ", sslProtocol="
-                + transportProperties.get("sslProtocol")
+                + transportProtocolDescription(transportProperties)
                 + "). The server or intermediary must support that protocol. "
                 + "Use Auto/native mode for login-only encryption or unencrypted transport."
             : "";
@@ -303,6 +308,33 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
             }
         }
         return false;
+    }
+
+    private static String transportProtocolDescription(Map<String, String> transportProperties) {
+        String protocol = transportProperties.get("sslProtocol");
+        return protocol == null ? "JSSE-default" : protocol;
+    }
+
+    static int jdbcDriverMajorVersion() {
+        try {
+            return DriverManager.getDriver("jdbc:sqlserver://localhost").getMajorVersion();
+        } catch (SQLException ignored) {
+            return -1;
+        }
+    }
+
+    static int jdbcDriverMinorVersion() {
+        try {
+            return DriverManager.getDriver("jdbc:sqlserver://localhost").getMinorVersion();
+        } catch (SQLException ignored) {
+            return -1;
+        }
+    }
+
+    static boolean jdbcSupportsSslProtocolProperty() {
+        int major = jdbcDriverMajorVersion();
+        int minor = jdbcDriverMinorVersion();
+        return major > 6 || (major == 6 && minor >= 4);
     }
 
     private static String jdbcDriverVersion() {
@@ -428,15 +460,35 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
         return properties;
     }
 
-    private static Map<String, String> resolvedTransportProperties(ConnectParams params) {
+    private static Map<String, String> effectiveTransportProperties(ConnectParams params) {
+        TransportOverrides resolved = resolvedTransportOverrides(params);
+        Map<String, String> properties = resolved.withDefaults();
+        if (jdbcSupportsSslProtocolProperty()) {
+            return properties;
+        }
+        if (resolved.hasSslProtocol) {
+            throw new IllegalArgumentException(
+                "mssql-jdbc 6.2 does not support the sslProtocol connection property. "
+                    + "Remove sslProtocol when using the SQL Server 2008/2008 R2 legacy driver."
+            );
+        }
+        properties.remove("sslProtocol");
+        return properties;
+    }
+
+    private static TransportOverrides resolvedTransportOverrides(ConnectParams params) {
         TransportOverrides resolved = new TransportOverrides();
         resolved.apply(transportOverrides(params.getConnection_string(), false));
         resolved.apply(transportOverrides(params.getUrl_params(), true));
-        return resolved.withDefaults();
+        return resolved;
     }
 
     private static Map<String, String> defaultTransportProperties() {
-        return new TransportOverrides().withDefaults();
+        Map<String, String> properties = new TransportOverrides().withDefaults();
+        if (!jdbcSupportsSslProtocolProperty()) {
+            properties.remove("sslProtocol");
+        }
+        return properties;
     }
 
     private static TransportOverrides transportOverrides(String source, boolean splitAmpersand) {

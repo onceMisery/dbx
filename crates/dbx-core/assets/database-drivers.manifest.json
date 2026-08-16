@@ -245,6 +245,10 @@
         {
           "profile": "sqlserver-legacy",
           "agentKey": "sqlserver-legacy"
+        },
+        {
+          "profile": "sqlserver-2008",
+          "agentKey": "sqlserver-2008"
         }
       ],
       "capabilities": {

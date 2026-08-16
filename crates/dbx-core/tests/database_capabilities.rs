@@ -119,6 +119,7 @@ fn maps_agent_database_types_to_driver_keys() {
     assert_eq!(agent_key(&DatabaseType::Oracle, Some("oracle-legacy")), Some("oracle"));
     assert_eq!(agent_key(&DatabaseType::Oracle, Some("oracle-10g")), Some("oracle"));
     assert_eq!(agent_key(&DatabaseType::SqlServer, Some("sqlserver-legacy")), Some("sqlserver-legacy"));
+    assert_eq!(agent_key(&DatabaseType::SqlServer, Some("sqlserver-2008")), Some("sqlserver-2008"));
     assert_eq!(agent_key(&DatabaseType::SqlServer, None), None);
     assert_eq!(agent_key(&DatabaseType::Postgres, None), None);
 }
@@ -133,7 +134,9 @@ fn driver_store_entries_do_not_repeat_agent_keys() {
     assert_eq!(entries.iter().filter(|(key, _)| *key == "gbase8a").count(), 1);
     assert_eq!(entries.iter().filter(|(key, _)| *key == "gbase8s").count(), 1);
     assert_eq!(entries.iter().filter(|(key, _)| *key == "sqlserver-legacy").count(), 1);
+    assert_eq!(entries.iter().filter(|(key, _)| *key == "sqlserver-2008").count(), 1);
     assert_eq!(agent_catalog::label_for_key("sqlserver-legacy"), Some("SQL Server TLS 1.0 Compatibility Driver"));
+    assert_eq!(agent_catalog::label_for_key("sqlserver-2008"), Some("SQL Server 2008/2008 R2 Legacy Driver"));
 }
 
 #[test]

@@ -70,7 +70,7 @@ describe("AGENT_DRIVER_CATEGORY_MAP integrity", () => {
   it("covers all known agent driver keys with no stale entries", () => {
     // Golden set — mirrors the store-visible entries in agent_catalog.rs
     // plus EXTRA_DRIVER_STORE_ENTRIES (duckdb, kafka, rocketmq,
-    // rabbitmq, sqlserver-legacy) and the built-in JDBC driver rows.
+    // rabbitmq, sqlserver-legacy, sqlserver-2008) and the built-in JDBC driver rows.
     // When an Agent driver is added to the catalog its key MUST appear here;
     // removing a key from the map without removing it from the list below
     // will fail this test.
@@ -81,6 +81,7 @@ describe("AGENT_DRIVER_CATEGORY_MAP integrity", () => {
       "informix",
       "iris",
       "oracle",
+      "sqlserver-2008",
       "sqlserver-legacy",
       // analytics
       "bigquery",

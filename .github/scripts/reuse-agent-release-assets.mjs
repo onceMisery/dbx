@@ -104,9 +104,9 @@ export function collectReusableAssetPlan({ registry, release, versions, modules,
   if (reuseJre) {
     for (const [jreKey, jre] of Object.entries(registry.jres ?? {})) {
       const platforms = Object.keys(jre.platforms ?? {}).sort();
-      const missingPlatforms = PLATFORMS.filter((platform) => !platforms.includes(platform));
       const extraPlatforms = platforms.filter((platform) => !PLATFORMS.includes(platform));
-      if (missingPlatforms.length > 0 || extraPlatforms.length > 0) {
+      const missingPlatforms = PLATFORMS.filter((platform) => !platforms.includes(platform));
+      if (platforms.length === 0 || extraPlatforms.length > 0 || (jreKey === "21" && missingPlatforms.length > 0)) {
         throw new Error(
           `Previous JRE ${jreKey} artifacts are incomplete: missing=${missingPlatforms.join(",") || "none"}, extra=${extraPlatforms.join(",") || "none"}`,
         );

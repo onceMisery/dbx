@@ -40,6 +40,8 @@ pub const GAUSSDB_M_JDBC_DRIVER_PROFILE: &str = "gaussdb-m";
 pub const GAUSSDB_M_JDBC_DRIVER_CLASS: &str = "com.huawei.gaussdb.jdbc.Driver";
 const SQLSERVER_LEGACY_DRIVER_INSTALL_HINT: &str =
     "Install the SQL Server TLS 1.0 Compatibility Driver from Driver Manager, or open the connection settings and select TLS 1.0 mode again.";
+const SQLSERVER_2008_DRIVER_INSTALL_HINT: &str =
+    "Install the SQL Server 2008/2008 R2 Legacy Driver from Driver Manager, or open the connection settings and select SQL Server 2008 mode again.";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
@@ -681,23 +683,46 @@ pub fn gaussdb_m_jdbc_config_for_endpoint(config: &ConnectionConfig, host: &str,
 
 pub fn sqlserver_legacy_agent_config(config: &ConnectionConfig) -> ConnectionConfig {
     let mut legacy_config = config.clone();
-    legacy_config.driver_profile = Some(db::sqlserver::SQLSERVER_LEGACY_DRIVER_PROFILE.to_string());
-    legacy_config.driver_label = Some(db::sqlserver::SQLSERVER_LEGACY_DRIVER_LABEL.to_string());
+    let sqlserver_2008 = config
+        .driver_profile
+        .as_deref()
+        .is_some_and(|profile| profile.eq_ignore_ascii_case(db::sqlserver::SQLSERVER_2008_DRIVER_PROFILE));
+    legacy_config.driver_profile = Some(
+        if sqlserver_2008 {
+            db::sqlserver::SQLSERVER_2008_DRIVER_PROFILE
+        } else {
+            db::sqlserver::SQLSERVER_LEGACY_DRIVER_PROFILE
+        }
+        .to_string(),
+    );
+    legacy_config.driver_label = Some(
+        if sqlserver_2008 {
+            db::sqlserver::SQLSERVER_2008_DRIVER_LABEL
+        } else {
+            db::sqlserver::SQLSERVER_LEGACY_DRIVER_LABEL
+        }
+        .to_string(),
+    );
     legacy_config
 }
 
 pub fn sqlserver_uses_legacy_driver(config: &ConnectionConfig) -> bool {
-    config
-        .driver_profile
-        .as_deref()
-        .is_some_and(|profile| profile.eq_ignore_ascii_case(db::sqlserver::SQLSERVER_LEGACY_DRIVER_PROFILE))
+    config.driver_profile.as_deref().is_some_and(|profile| {
+        profile.eq_ignore_ascii_case(db::sqlserver::SQLSERVER_LEGACY_DRIVER_PROFILE)
+            || profile.eq_ignore_ascii_case(db::sqlserver::SQLSERVER_2008_DRIVER_PROFILE)
+    })
 }
 
 pub fn sqlserver_legacy_driver_error(agent_error: &str) -> String {
     // This mapper handles both AgentManager launch strings and Agent call errors, so context
     // must remain before any structured-error compatibility marker.
     if agent_error.contains("driver is not installed") {
-        crate::db::agent_driver::append_legacy_error_context(agent_error, SQLSERVER_LEGACY_DRIVER_INSTALL_HINT)
+        let hint = if agent_error.contains(db::sqlserver::SQLSERVER_2008_DRIVER_PROFILE) {
+            SQLSERVER_2008_DRIVER_INSTALL_HINT
+        } else {
+            SQLSERVER_LEGACY_DRIVER_INSTALL_HINT
+        };
+        crate::db::agent_driver::append_legacy_error_context(agent_error, hint)
     } else {
         agent_error.to_string()
     }
@@ -1229,10 +1254,10 @@ impl AppState {
                 .await
                 .map_err(|err| sqlserver_legacy_driver_error(&err))?;
             client.disconnect().await.ok();
-            return Ok(ConnectionTestResult::success(
-                "Connection successful (via SQL Server TLS 1.0 Compatibility Driver)",
-            )
-            .with_database_info(database_info_from_protocol_value(&response)));
+            let driver_label =
+                legacy_config.driver_label.as_deref().unwrap_or(db::sqlserver::SQLSERVER_LEGACY_DRIVER_LABEL);
+            return Ok(ConnectionTestResult::success(format!("Connection successful (via {driver_label})"))
+                .with_database_info(database_info_from_protocol_value(&response)));
         }
 
         db::sqlserver::connect_with_port_explicit_and_params(
@@ -5741,6 +5766,19 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_2008_agent_config_preserves_the_dedicated_profile() {
+        let mut config = mysql_config(Some("master"));
+        config.db_type = DatabaseType::SqlServer;
+        config.driver_profile = Some(crate::db::sqlserver::SQLSERVER_2008_DRIVER_PROFILE.to_string());
+
+        let legacy = sqlserver_legacy_agent_config(&config);
+
+        assert_eq!(legacy.driver_profile.as_deref(), Some(crate::db::sqlserver::SQLSERVER_2008_DRIVER_PROFILE));
+        assert_eq!(legacy.driver_label.as_deref(), Some(crate::db::sqlserver::SQLSERVER_2008_DRIVER_LABEL));
+        assert!(sqlserver_uses_legacy_driver(&legacy));
+    }
+
+    #[test]
     fn sqlserver_legacy_driver_error_mentions_driver_manager_when_missing() {
         let message = sqlserver_legacy_driver_error(
             "sqlserver-legacy driver is not installed. Please install it from the Driver Manager.",
@@ -5748,6 +5786,16 @@ mod tests {
 
         assert!(message.contains("Driver Manager"));
         assert!(message.contains("select TLS 1.0 mode again"));
+    }
+
+    #[test]
+    fn sqlserver_2008_driver_error_mentions_the_matching_mode_when_missing() {
+        let message = sqlserver_legacy_driver_error(
+            "sqlserver-2008 driver is not installed. Please install it from the Driver Manager.",
+        );
+
+        assert!(message.contains("Driver Manager"));
+        assert!(message.contains("select SQL Server 2008 mode again"));
     }
 
     #[test]

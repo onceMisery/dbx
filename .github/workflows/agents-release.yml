@@ -846,6 +846,9 @@ jobs:
     strategy:
       matrix:
         include:
+          - jre-key: "8"
+            java-version: "8"
+            modules: ""
           - jre-key: "21"
             java-version: "21"
             modules: "java.base,java.sql,java.sql.rowset,java.naming,java.management,java.desktop,java.security.jgss,java.security.sasl,jdk.security.auth,jdk.security.jgss,jdk.charsets,jdk.unsupported,java.scripting,java.compiler,jdk.crypto.ec"
@@ -862,6 +865,37 @@ jobs:
           MODULES="${{ matrix.modules }}"
           JLINK_OPTS="--strip-debug --no-header-files --no-man-pages --compress=zip-6"
           JRE_KEY="${{ matrix.jre-key }}"
+
+          if [ "$JRE_KEY" = "8" ]; then
+            declare -A LEGACY_PLATFORMS=(
+              ["macos-x64"]="mac/x64/tar.gz"
+              ["linux-aarch64"]="linux/aarch64/tar.gz"
+              ["linux-x64"]="linux/x64/tar.gz"
+              ["windows-x64"]="windows/x64/zip"
+            )
+            for platform in "${!LEGACY_PLATFORMS[@]}"; do
+              IFS=/ read -r os arch archive_type <<< "${LEGACY_PLATFORMS[$platform]}"
+              endpoint="https://api.adoptium.net/v3/binary/version/jdk8u502-b07/${os}/${arch}/jre/hotspot/normal/eclipse?project=jdk"
+              rm -rf jre-download dbx-jre
+              mkdir -p jre-download
+              if [ "$archive_type" = "zip" ]; then
+                curl --fail --location --retry 5 -o jre.zip "$endpoint"
+                unzip -q jre.zip -d jre-download
+                rm -f jre.zip
+              else
+                curl --fail --location --retry 5 -o jre.tar.gz "$endpoint"
+                tar xzf jre.tar.gz -C jre-download
+                rm -f jre.tar.gz
+              fi
+              root=$(find jre-download -mindepth 1 -maxdepth 1 -type d | head -n 1)
+              [ -n "$root" ] || { echo "Temurin 8 archive has no runtime root for $platform"; exit 1; }
+              mv "$root" dbx-jre
+              tar cf - dbx-jre | zstd -q -19 -T0 -o dbx-jre-${JRE_KEY}-${platform}.tar.zst
+            done
+            rm -rf jre-download dbx-jre
+            ls -lh dbx-jre-*.tar.zst
+            exit 0
+          fi
 
           jlink --add-modules $MODULES $JLINK_OPTS --output dbx-jre
           tar cf - dbx-jre | zstd -q -19 -T0 -o dbx-jre-${JRE_KEY}-linux-x64.tar.zst
@@ -1125,10 +1159,12 @@ jobs:
           detect_jre_key() {
             local name="$1"
             case "$name" in
+              sqlserver-2008) echo "8" ;;
               *) echo "21" ;;
             esac
           }
 
+          JRE8_PLATFORMS=$(generate_jre_platforms "8")
           JRE21_PLATFORMS=$(generate_jre_platforms "21")
 
           DRIVERS=""
@@ -1160,6 +1196,12 @@ jobs:
           cat > release/agent-registry.json <<EOF
           {
             "jres": {
+              "8": {
+                "version": "8u502-b07",
+                "platforms": {
+          ${JRE8_PLATFORMS}
+                }
+              },
               "21": {
                 "version": "21.0.12+kerberos.ec.2",
                 "platforms": {

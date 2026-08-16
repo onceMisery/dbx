@@ -191,10 +191,13 @@ final class AgentRpcError extends RuntimeException {
     }
 
     private static String operationOutcome(String stage) {
-        return switch (stage) {
-            case "request", "checkout", "connect", "validate" -> "not_started";
-            default -> "unknown";
-        };
+        if ("request".equals(stage)
+            || "checkout".equals(stage)
+            || "connect".equals(stage)
+            || "validate".equals(stage)) {
+            return "not_started";
+        }
+        return "unknown";
     }
 
     private static String safeSqlState(String sqlState) {
@@ -216,11 +219,11 @@ final class AgentRpcError extends RuntimeException {
                 safe.append(character);
             }
         }
-        return safe.isEmpty() ? null : safe.toString();
+        return safe.length() == 0 ? null : safe.toString();
     }
 
     private static void addDiagnostic(JsonObject data, String name, String value) {
-        if (value != null && !value.isBlank()) {
+        if (value != null && !value.trim().isEmpty()) {
             data.addProperty(name, value);
         }
     }

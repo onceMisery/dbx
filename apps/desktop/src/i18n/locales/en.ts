@@ -892,10 +892,12 @@ export default {
     testing: "Testing...",
     copyTestResult: "Copy test result",
     sqlServerLegacyCompatibilityComponent: "SQL Server TLS 1.0 Compatibility Driver",
+    sqlServer2008CompatibilityComponent: "SQL Server 2008/2008 R2 Legacy Driver",
     sqlServerDriverModeAuto: "Auto",
     sqlServerDriverModeTls10: "TLS 1.0",
+    sqlServerDriverMode2008: "SQL Server 2008",
     sqlServerTransportModeHint:
-      "Auto uses the built-in driver and may fall back to login-only encryption or unencrypted transport for legacy endpoints. TLS 1.0 uses the Java compatibility driver and defaults to encrypt=true, trustServerCertificate=true, and sslProtocol=TLSv1; explicit advanced connection parameters override those defaults. This dedicated compatibility process enables legacy TLS algorithms at startup, so every session shares the relaxed security policy, including sessions that request TLSv1.2 or encrypt=false. It does not fix invalid credentials or SQL Server error 18456. Use this driver only on trusted networks, VPNs, or SSH tunnels.",
+      "Auto uses the built-in driver and may fall back to login-only encryption or unencrypted transport. TLS 1.0 uses the current Microsoft JDBC driver with relaxed TLS policy and honors explicit advanced transport parameters. SQL Server 2008 uses Microsoft JDBC 6.2 with a dedicated Java 8 runtime; that driver does not support sslProtocol, so remove that parameter in this mode. Neither compatibility mode fixes invalid credentials or SQL Server error 18456. Use legacy drivers only on trusted networks, VPNs, or SSH tunnels.",
     gaussdbConnectionMode: "Connection mode",
     gaussdbConnectionModeNative: "PostgreSQL compatible (built-in driver)",
     gaussdbConnectionModeMJdbc: "M mode (vendor JDBC driver)",

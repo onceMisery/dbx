@@ -92,6 +92,29 @@ describe("connectionStore SQL Server legacy compatibility", () => {
     expect(connectDb).toHaveBeenCalledWith(expect.objectContaining({ driver_profile: "sqlserver-legacy" }), expect.any(Number));
   });
 
+  it("installs the dedicated SQL Server 2008 driver for a persisted 2008 profile", async () => {
+    const connectDb = vi.fn().mockResolvedValue("sqlserver-1");
+    const installAgent = vi.fn().mockResolvedValue(undefined);
+    const config = sqlServerNativeConnectionWithDisabledEncryption();
+    config.driver_profile = "sqlserver-2008";
+    config.driver_label = "SQL Server 2008/2008 R2 Legacy Driver";
+    config.url_params = "";
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => true }));
+    vi.doMock("@/lib/backend/api", () => ({
+      connectDb,
+      installAgent,
+      isAgentInstalled: vi.fn().mockResolvedValue(false),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    await store.connect(config);
+
+    expect(installAgent).toHaveBeenCalledWith("sqlserver-2008");
+    expect(connectDb).toHaveBeenCalledWith(expect.objectContaining({ driver_profile: "sqlserver-2008" }), expect.any(Number));
+  });
+
   it("does not install or retry legacy after a TLS error followed by SQL Server 18456", async () => {
     const connectDb = vi.fn().mockRejectedValue(new Error("TLS negotiation failed\nSQL Server error 18456: Login failed"));
     const installAgent = vi.fn().mockResolvedValue(undefined);

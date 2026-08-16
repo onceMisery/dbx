@@ -68,7 +68,16 @@ import { normalizeRocketmqNamesrvAddr } from "@/lib/connection/rocketmqNamesrv";
 import { normalizeRabbitmqAddresses } from "@/lib/connection/rabbitmqAddresses";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressForOperation, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
-import { isSqlServerLegacyTlsUnsupportedFailure, isSqlServerTlsHandshakeFailure, requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
+import {
+  isSqlServerLegacyTlsUnsupportedFailure,
+  isSqlServerTlsHandshakeFailure,
+  requiredSqlServerCompatibilityDriverKey,
+  setSqlServerDriverModeConfig,
+  sqlServerDriverModeForConfig,
+  SQLSERVER_2008_DRIVER_KEY,
+  SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY,
+  type SqlServerDriverMode,
+} from "@/lib/connection/sqlServerLegacyCompatibility";
 import { normalizeNacosEndpoint, normalizeNacosMetricsUrl, parseNacosManagedNamespaces } from "@/lib/nacos/nacosAdmin";
 import { loadReadableNacosNamespaces, nacosNamespaceIdentity, normalizeNacosNamespaceSelection } from "@/lib/nacos/nacosNamespaceVisibility";
 import {
@@ -1899,8 +1908,9 @@ function formatInstallSize(bytes: number): string {
 }
 
 async function ensureRequiredAgentDriverInstalled(config: ConnectionConfig): Promise<void> {
-  if (requiresSqlServerLegacyCompatibilityComponent(config)) {
-    await installSqlServerLegacyCompatibilityComponentIfNeeded();
+  const sqlServerDriverKey = requiredSqlServerCompatibilityDriverKey(config);
+  if (sqlServerDriverKey) {
+    await installSqlServerCompatibilityComponentIfNeeded(sqlServerDriverKey);
   }
 
   const driverKey = agentDriverInstallKey(config.db_type, config.driver_profile);
@@ -1966,13 +1976,13 @@ async function ensureRequiredGaussdbMJdbcRuntime(config: ConnectionConfig): Prom
   await api.installJdbcPlugin();
 }
 
-async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<boolean> {
-  if (await api.isAgentInstalled(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY)) return true;
+async function installSqlServerCompatibilityComponentIfNeeded(driverKey: string): Promise<boolean> {
+  if (await api.isAgentInstalled(driverKey)) return true;
 
-  const label = t("connection.sqlServerLegacyCompatibilityComponent");
-  beginAgentDriverInstall(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, label);
+  const label = driverKey === SQLSERVER_2008_DRIVER_KEY ? t("connection.sqlServer2008CompatibilityComponent") : t("connection.sqlServerLegacyCompatibilityComponent");
+  beginAgentDriverInstall(driverKey, label);
   try {
-    await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY, agentInstallOperationId.value ?? undefined);
+    await api.installAgent(driverKey, agentInstallOperationId.value ?? undefined);
     await refreshLocalAgentDrivers();
     finishAgentDriverInstall();
   } catch (error) {
@@ -1983,21 +1993,22 @@ async function installSqlServerLegacyCompatibilityComponentIfNeeded(): Promise<b
   return true;
 }
 
-async function setSqlServerDriverMode(mode: "auto" | "legacy") {
+async function setSqlServerDriverMode(mode: SqlServerDriverMode) {
   if (form.value.db_type !== "sqlserver") return;
   // The connection test may still be using the previous compatibility mode.
   resetTestState();
   if (mode === "auto") {
-    setSqlServerLegacyCompatibilityConfig(form.value, false);
+    setSqlServerDriverModeConfig(form.value, "auto");
     return;
   }
 
+  const driverKey = mode === "sqlserver2008" ? SQLSERVER_2008_DRIVER_KEY : SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY;
   try {
-    await installSqlServerLegacyCompatibilityComponentIfNeeded();
-    setSqlServerLegacyCompatibilityConfig(form.value, true);
+    await installSqlServerCompatibilityComponentIfNeeded(driverKey);
+    setSqlServerDriverModeConfig(form.value, mode);
     testResult.value = null;
   } catch {
-    setSqlServerLegacyCompatibilityConfig(form.value, false);
+    setSqlServerDriverModeConfig(form.value, "auto");
   }
 }
 
@@ -3427,7 +3438,7 @@ const agentInstallProgressLabel = computed(() => {
   return `${label} ${formatInstallSize(progress.downloaded ?? 0)} / ${formatInstallSize(progress.total)} (${agentInstallPercent.value ?? 0}%)`;
 });
 const canCloseAgentInstallDialog = computed(() => !agentInstallRunning.value || !!agentInstallError.value);
-const sqlServerDriverMode = computed<"auto" | "legacy">(() => (sqlServerUsesLegacyCompatibility(form.value) ? "legacy" : "auto"));
+const sqlServerDriverMode = computed<SqlServerDriverMode>(() => sqlServerDriverModeForConfig(form.value));
 const shouldUseWideConnectionDialog = computed(() => dialogStep.value === "config" && (canChooseVisibleDatabases.value || canChooseVisibleNacosNamespaces.value || (canChooseVisibleSchemas.value && !visibleFilterUsesSchemas.value)));
 const connectionDialogContentClass = computed(() => {
   if (dialogStep.value === "select") return "connection-dialog-content--picker sm:h-[720px] sm:max-w-[880px]";
@@ -3549,7 +3560,8 @@ async function testConnection() {
     if (runId !== testRunId) return;
     const rawMessage = mongodbAuthFailureHint(errorMessage(e));
     const message = config ? connectionErrorWithDriverUpdateHint(config, rawMessage) : rawMessage;
-    const shouldShowSqlServerDriverMode = config?.db_type === "sqlserver" && ((!sqlServerUsesLegacyCompatibility(config) && isSqlServerTlsHandshakeFailure(message)) || (sqlServerUsesLegacyCompatibility(config) && isSqlServerLegacyTlsUnsupportedFailure(message)));
+    const selectedSqlServerCompatibilityMode = config?.db_type === "sqlserver" && sqlServerDriverModeForConfig(config) !== "auto";
+    const shouldShowSqlServerDriverMode = config?.db_type === "sqlserver" && ((!selectedSqlServerCompatibilityMode && isSqlServerTlsHandshakeFailure(message)) || (selectedSqlServerCompatibilityMode && isSqlServerLegacyTlsUnsupportedFailure(message)));
     if (shouldShowSqlServerDriverMode) {
       configTab.value = "advanced";
     }
@@ -6952,8 +6964,9 @@ function openExternalUrl(url: string) {
                   <div v-if="form.db_type === 'sqlserver'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelSmallClass">{{ t("connection.driverMode") }}</Label>
                     <div class="col-span-3 flex items-center gap-2">
-                      <Button size="sm" :variant="sqlServerDriverMode === 'legacy' ? 'outline' : 'default'" :disabled="agentInstallRunning" @click="setSqlServerDriverMode('auto')">{{ t("connection.sqlServerDriverModeAuto") }}</Button>
-                      <Button size="sm" :variant="sqlServerDriverMode === 'legacy' ? 'default' : 'outline'" :disabled="agentInstallRunning" @click="setSqlServerDriverMode('legacy')">{{ t("connection.sqlServerDriverModeTls10") }}</Button>
+                      <Button size="sm" :variant="sqlServerDriverMode === 'auto' ? 'default' : 'outline'" :disabled="agentInstallRunning" @click="setSqlServerDriverMode('auto')">{{ t("connection.sqlServerDriverModeAuto") }}</Button>
+                      <Button size="sm" :variant="sqlServerDriverMode === 'tls10' ? 'default' : 'outline'" :disabled="agentInstallRunning" @click="setSqlServerDriverMode('tls10')">{{ t("connection.sqlServerDriverModeTls10") }}</Button>
+                      <Button size="sm" :variant="sqlServerDriverMode === 'sqlserver2008' ? 'default' : 'outline'" :disabled="agentInstallRunning" @click="setSqlServerDriverMode('sqlserver2008')">{{ t("connection.sqlServerDriverMode2008") }}</Button>
                       <Tooltip>
                         <TooltipTrigger as-child>
                           <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />

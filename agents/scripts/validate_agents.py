@@ -30,6 +30,7 @@ NATIVE_ONLY_AGENT_MODULES = {
 AUTO_VERSIONED_NATIVE_MODULES = {"duckdb"}
 JDBC_ARCHITECTURE_ALLOWLIST = {
     "h2-legacy": "reuses the H2 agent implementation with an isolated legacy driver version",
+    "sqlserver-2008": "reuses the SQL Server compatibility agent with an isolated JDBC 6.2 and Java 8 runtime",
     "access": "shared lifecycle with a test-only non-creating Access URL",
     "dameng": "shared lifecycle with protocol-safe driver loading and native explain access",
     "informix": "shared lifecycle with contextual connection error reporting",
@@ -255,6 +256,18 @@ def validate_release_runtime_keys(root: Path) -> list[str]:
         (
             rf'java-version:\s*"{DEFAULT_AGENT_JRE_KEY}"',
             f"release workflow must build the default JRE from Java {DEFAULT_AGENT_JRE_KEY}",
+        ),
+        (
+            r'jre-key:\s*"8"',
+            "release workflow must build the SQL Server 2008 JRE with key 8",
+        ),
+        (
+            r'sqlserver-2008\)\s*echo\s*"8"',
+            "SQL Server 2008 agent must use JRE key 8",
+        ),
+        (
+            r'"8":\s*\{\s*"version":\s*"8u',
+            "registry must publish Java 8 under JRE key 8",
         ),
         (
             rf'\*\)\s*echo\s*"{DEFAULT_AGENT_JRE_KEY}"',

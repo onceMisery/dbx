@@ -4,10 +4,13 @@ import {
   isSqlServerLegacyTlsUnsupportedFailure,
   isSqlServerTlsHandshakeFailure,
   migrateSqlServerLegacyCompatibilityConfig,
+  requiredSqlServerCompatibilityDriverKey,
   requiresSqlServerLegacyCompatibilityComponent,
+  setSqlServerDriverModeConfig,
   setSqlServerLegacyCompatibilityConfig,
   setSqlServerNativeEncryptionDisabled,
   sqlServerUsesLegacyCompatibility,
+  sqlServerUses2008Driver,
 } from "@/lib/connection/sqlServerLegacyCompatibility";
 import type { ConnectionConfig } from "@/types/database";
 
@@ -117,6 +120,19 @@ describe("SQL Server legacy compatibility", () => {
     setSqlServerLegacyCompatibilityConfig(config, false);
     expect(config.driver_profile).toBe("sqlserver");
     expect(config.driver_label).toBe("SQL Server");
+    expect(config.url_params).toBe("applicationName=dbx&encrypt=false");
+  });
+
+  it("selects the independently packaged SQL Server 2008 driver", () => {
+    const config = connectionConfig("applicationName=dbx&encrypt=false");
+
+    setSqlServerDriverModeConfig(config, "sqlserver2008");
+
+    expect(sqlServerUses2008Driver(config)).toBe(true);
+    expect(sqlServerUsesLegacyCompatibility(config)).toBe(false);
+    expect(config.driver_profile).toBe("sqlserver-2008");
+    expect(config.driver_label).toBe("SQL Server 2008/2008 R2 Legacy Driver");
+    expect(requiredSqlServerCompatibilityDriverKey(config)).toBe("sqlserver-2008");
     expect(config.url_params).toBe("applicationName=dbx&encrypt=false");
   });
 

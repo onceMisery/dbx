@@ -54,6 +54,7 @@ export const AGENT_DRIVER_CATEGORY_MAP: Readonly<Record<string, DriverCategoryKe
   saphana: "analytics",
   snowflake: "analytics",
   spark: "analytics",
+  "sqlserver-2008": "sql",
   "sqlserver-legacy": "sql",
   sundb: "domestic",
   tdengine: "timeseries",

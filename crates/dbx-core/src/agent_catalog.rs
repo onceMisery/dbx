@@ -45,6 +45,7 @@ const EXTRA_AGENT_LABELS: &[(&str, &str)] = &[
     ("rocketmq", "Apache RocketMQ"),
     ("rabbitmq", "RabbitMQ"),
     ("sqlserver-legacy", "SQL Server TLS 1.0 Compatibility Driver"),
+    ("sqlserver-2008", "SQL Server 2008/2008 R2 Legacy Driver"),
 ];
 const EXTRA_DRIVER_STORE_ENTRIES: &[(&str, &str)] = &[
     ("duckdb", "DuckDB"),
@@ -52,6 +53,7 @@ const EXTRA_DRIVER_STORE_ENTRIES: &[(&str, &str)] = &[
     ("rocketmq", "Apache RocketMQ"),
     ("rabbitmq", "RabbitMQ"),
     ("sqlserver-legacy", "SQL Server TLS 1.0 Compatibility Driver"),
+    ("sqlserver-2008", "SQL Server 2008/2008 R2 Legacy Driver"),
 ];
 
 const AGENT_CATALOG: &[AgentCatalogEntry] = &[
@@ -340,9 +342,11 @@ pub fn agent_key(db_type: &DatabaseType, driver_profile: Option<&str>) -> Option
         };
     }
     if *db_type == DatabaseType::SqlServer {
-        return driver_profile
-            .is_some_and(|profile| profile.eq_ignore_ascii_case("sqlserver-legacy"))
-            .then_some("sqlserver-legacy");
+        return match driver_profile {
+            Some(profile) if profile.eq_ignore_ascii_case("sqlserver-legacy") => Some("sqlserver-legacy"),
+            Some(profile) if profile.eq_ignore_ascii_case("sqlserver-2008") => Some("sqlserver-2008"),
+            _ => None,
+        };
     }
     let entry = entry_for_db_type(db_type)?;
     if let Some(driver_profile) = driver_profile {

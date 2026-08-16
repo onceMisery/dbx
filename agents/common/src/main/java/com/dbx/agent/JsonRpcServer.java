@@ -402,8 +402,11 @@ public final class JsonRpcServer {
     }
 
     private AbstractJdbcAgent pooledJdbcAgent() {
-        if (agent instanceof AbstractJdbcAgent jdbcAgent && jdbcAgent.usesConnectionPool()) {
-            return jdbcAgent;
+        if (agent instanceof AbstractJdbcAgent) {
+            AbstractJdbcAgent jdbcAgent = (AbstractJdbcAgent) agent;
+            if (jdbcAgent.usesConnectionPool()) {
+                return jdbcAgent;
+            }
         }
         return null;
     }
