@@ -1121,6 +1121,8 @@ export default withEnglishFallback({
     mqttClientCertPath: "用戶端憑證路徑",
     mqttClientKeyPath: "用戶端私鑰路徑",
     mqttNoLocal: "禁止本機轉送",
+    sqlServer2008CompatibilityComponent: "SQL Server 2008/2008 R2 舊版驅動",
+    sqlServerDriverMode2008: "SQL Server 2008",
   },
   editor: {
     duckdbDraining: "上一筆 DuckDB 查詢仍在停止，請稍後重試。",

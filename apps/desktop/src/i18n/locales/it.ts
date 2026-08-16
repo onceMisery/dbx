@@ -1121,6 +1121,8 @@ export default withEnglishFallback({
     mqttNoLocal: "Disabilita inoltro locale",
     doltShowSystemTables: "Mostra le tabelle integrate di Dolt",
     doltShowSystemTablesHint: "Mostra le tabelle di controllo versione integrate di Dolt nell'elenco delle tabelle della connessione corrente.",
+    sqlServer2008CompatibilityComponent: "Driver legacy per SQL Server 2008/2008 R2",
+    sqlServerDriverMode2008: "SQL Server 2008",
   },
   editor: {
     duckdbDraining: "La query DuckDB precedente è ancora in fase di arresto. Riprova a breve.",

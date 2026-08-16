@@ -1123,6 +1123,8 @@ export default withEnglishFallback({
     mqttNoLocal: "Prohibir reenvío local",
     doltShowSystemTables: "Mostrar tablas integradas de Dolt",
     doltShowSystemTablesHint: "Muestra las tablas integradas de control de versiones de Dolt en la lista de tablas de la conexión actual.",
+    sqlServer2008CompatibilityComponent: "Controlador heredado de SQL Server 2008/2008 R2",
+    sqlServerDriverMode2008: "SQL Server 2008",
   },
   editor: {
     duckdbDraining: "La consulta anterior de DuckDB aún se está deteniendo. Vuelva a intentarlo en breve.",

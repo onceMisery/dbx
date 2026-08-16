@@ -1142,6 +1142,8 @@ export default withEnglishFallback({
     mqttNoLocal: "ローカル転送禁止",
     doltShowSystemTables: "Dolt 組み込みテーブルを表示",
     doltShowSystemTablesHint: "現在の接続のテーブルリストに Dolt 組み込みのバージョン管理テーブルを表示します。",
+    sqlServer2008CompatibilityComponent: "SQL Server 2008/2008 R2 旧版ドライバ",
+    sqlServerDriverMode2008: "SQL Server 2008",
   },
   editor: {
     duckdbDraining: "前回の DuckDB クエリはまだ停止処理中です。しばらくしてから再試行してください。",
