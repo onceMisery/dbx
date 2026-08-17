@@ -127,6 +127,28 @@ describe("settings search", () => {
     expect(searchSettings(entries, "hidden in the background", "en").map((entry) => entry.id)).toEqual(["appearance-tray"]);
   });
 
+  it("indexes the metadata cache memory limit under data settings", () => {
+    expect(SETTINGS_SEARCH_DEFINITIONS).toContainEqual(
+      expect.objectContaining({
+        id: "data-metadata-cache",
+        category: "data",
+        titleKey: "settings.metadataCacheMemoryLimit",
+        targetId: "data",
+      }),
+    );
+  });
+
+  it("renders the metadata cache memory limit in the data settings section", () => {
+    const dataSectionStart = settingsDialogSource.indexOf("activeSettingsTab === 'data'");
+    const nextSectionStart = settingsDialogSource.indexOf("activeSettingsTab === 'shortcuts'", dataSectionStart);
+    const metadataCacheControl = settingsDialogSource.indexOf('id="metadata-cache-memory-limit"');
+
+    expect(dataSectionStart).toBeGreaterThan(-1);
+    expect(nextSectionStart).toBeGreaterThan(dataSectionStart);
+    expect(metadataCacheControl).toBeGreaterThan(dataSectionStart);
+    expect(metadataCacheControl).toBeLessThan(nextSectionStart);
+  });
+
   it("activates result buttons through click for keyboard and assistive technology", () => {
     expect(settingsDialogSource).toMatch(/role="option"[\s\S]*?@mousedown\.prevent[\s\S]*?@click="void selectSettingsSearchResult\(result\)"/);
   });
