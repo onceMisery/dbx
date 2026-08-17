@@ -5433,6 +5433,7 @@ export default withEnglishFallback({
     updateDownloadSourceOfficial: "官方來源（建議）",
     updateDownloadSourceCnb: "CNB",
     exportSection: "匯出",
+    performanceSection: "效能",
     exportBatchSize: "匯出批次大小",
     dateTimeSection: "日期與時間",
     globalDateTimeDisplayFormat: "全域顯示格式",

@@ -6174,6 +6174,7 @@ export default {
     queryExportKeysetOptimizationEnabled: "Try keyset optimization",
     queryExportKeysetOptimizationEnabledDescription: "Only applies to safely recognized single-table queries; complex queries automatically fall back.",
     exportSection: "Export",
+    performanceSection: "Performance",
     shortcutExecuteSql: "Execute SQL",
     shortcutExecuteSqlInNewResultTab: "Execute SQL in new result tab",
     shortcutFind: "Find",

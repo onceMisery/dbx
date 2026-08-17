@@ -5866,6 +5866,7 @@ export default withEnglishFallback({
     queryExportKeysetOptimizationEnabled: "Prova ottimizzazione keyset",
     queryExportKeysetOptimizationEnabledDescription: "Si applica solo a query a tabella singola riconosciute in sicurezza; le query complesse ricadono automaticamente.",
     exportSection: "Esportazione",
+    performanceSection: "Prestazioni",
     shortcutExecuteSql: "Esegui SQL",
     shortcutExecuteSqlInNewResultTab: "Esegui SQL in una nuova scheda dei risultati",
     shortcutFind: "Trova",

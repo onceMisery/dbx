@@ -5881,6 +5881,7 @@ export default withEnglishFallback({
     exportBatchSize: "エクスポートバッチサイズ",
     exportBatchSizeDescription: "テーブルデータエクスポート時のバッチあたりの取得行数（100〜100000）。",
     exportSection: "エクスポート",
+    performanceSection: "パフォーマンス",
     shortcutExecuteSql: "SQLを実行",
     shortcutExecuteSqlInNewResultTab: "新しい結果タブでSQLを実行",
     shortcutFind: "検索",

@@ -130,23 +130,40 @@ describe("settings search", () => {
   it("indexes the metadata cache memory limit under data settings", () => {
     expect(SETTINGS_SEARCH_DEFINITIONS).toContainEqual(
       expect.objectContaining({
+        id: "data-performance",
+        category: "data",
+        titleKey: "settings.performanceSection",
+        targetId: "data-performance",
+      }),
+    );
+    expect(SETTINGS_SEARCH_DEFINITIONS).toContainEqual(
+      expect.objectContaining({
         id: "data-metadata-cache",
         category: "data",
         titleKey: "settings.metadataCacheMemoryLimit",
-        targetId: "data",
+        targetId: "data-performance",
       }),
     );
   });
 
-  it("renders the metadata cache memory limit in the data settings section", () => {
-    const dataSectionStart = settingsDialogSource.indexOf("activeSettingsTab === 'data'");
-    const nextSectionStart = settingsDialogSource.indexOf("activeSettingsTab === 'shortcuts'", dataSectionStart);
+  it("renders the metadata cache memory limit in a performance section after export", () => {
+    const exportSectionStart = settingsDialogSource.indexOf('t("settings.exportSection")');
+    const performanceSectionStart = settingsDialogSource.indexOf('data-settings-search-id="data-performance"');
+    const tableStructureSectionStart = settingsDialogSource.indexOf('t("settings.tableStructureSection")');
     const metadataCacheControl = settingsDialogSource.indexOf('id="metadata-cache-memory-limit"');
 
-    expect(dataSectionStart).toBeGreaterThan(-1);
-    expect(nextSectionStart).toBeGreaterThan(dataSectionStart);
-    expect(metadataCacheControl).toBeGreaterThan(dataSectionStart);
-    expect(metadataCacheControl).toBeLessThan(nextSectionStart);
+    expect(exportSectionStart).toBeGreaterThan(-1);
+    expect(performanceSectionStart).toBeGreaterThan(exportSectionStart);
+    expect(tableStructureSectionStart).toBeGreaterThan(performanceSectionStart);
+    expect(metadataCacheControl).toBeGreaterThan(performanceSectionStart);
+    expect(metadataCacheControl).toBeLessThan(tableStructureSectionStart);
+  });
+
+  it("defines the performance section title in every supported locale", () => {
+    for (const locale of ["zh-CN", "zh-TW", "en", "es", "it", "ja", "ko", "pt-BR"]) {
+      const source = readFileSync(new URL(`../../../i18n/locales/${locale}.ts`, import.meta.url), "utf8");
+      expect(source, locale).toContain("performanceSection:");
+    }
   });
 
   it("activates result buttons through click for keyboard and assistive technology", () => {

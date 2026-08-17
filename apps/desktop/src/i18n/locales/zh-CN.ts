@@ -6159,6 +6159,7 @@ export default withEnglishFallback({
     queryExportKeysetOptimizationEnabled: "尝试 keyset 优化",
     queryExportKeysetOptimizationEnabledDescription: "仅对可安全识别的单表查询生效，复杂查询会自动回退。",
     exportSection: "导出",
+    performanceSection: "性能",
     shortcutExecuteSql: "执行 SQL",
     shortcutExecuteSqlInNewResultTab: "在新结果标签页中执行 SQL",
     shortcutFind: "查找",

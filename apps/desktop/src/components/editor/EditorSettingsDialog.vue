@@ -4989,19 +4989,6 @@ onUnmounted(() => {
 
             <!-- Data Tab -->
             <section v-else-if="activeSettingsTab === 'data'" data-settings-search-id="data" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('data')]">
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
-                <div class="min-w-0 space-y-1">
-                  <Label for="metadata-cache-memory-limit">{{ t("settings.metadataCacheMemoryLimit") }}</Label>
-                  <p class="text-xs text-muted-foreground">
-                    {{ t("settings.metadataCacheMemoryLimitDescription") }}
-                  </p>
-                </div>
-                <div class="flex shrink-0 items-center gap-2">
-                  <Input id="metadata-cache-memory-limit" v-model.number="editMetadataCacheMaxMemoryMb" type="number" :min="METADATA_CACHE_MIN_MEMORY_MB" :max="METADATA_CACHE_HARD_MAX_MEMORY_MB" :step="16" class="h-8 w-24 text-right" />
-                  <span class="text-xs text-muted-foreground">MB</span>
-                </div>
-              </div>
-
               <div class="space-y-3">
                 <div class="text-sm font-medium text-muted-foreground">
                   {{ t("settings.dataGridDisplay") }}
@@ -5383,6 +5370,26 @@ onUnmounted(() => {
                     </p>
                   </div>
                   <Switch id="query-export-keyset-enabled" v-model="editQueryExportKeysetOptimizationEnabled" class="mt-0.5" />
+                </div>
+              </div>
+
+              <Separator />
+
+              <div data-settings-search-id="data-performance" :class="['space-y-3', settingsSearchTargetClass('data-performance')]">
+                <div class="text-sm font-medium text-muted-foreground">
+                  {{ t("settings.performanceSection") }}
+                </div>
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="min-w-0 space-y-1">
+                    <Label for="metadata-cache-memory-limit">{{ t("settings.metadataCacheMemoryLimit") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.metadataCacheMemoryLimitDescription") }}
+                    </p>
+                  </div>
+                  <div class="flex shrink-0 items-center gap-2">
+                    <Input id="metadata-cache-memory-limit" v-model.number="editMetadataCacheMaxMemoryMb" type="number" :min="METADATA_CACHE_MIN_MEMORY_MB" :max="METADATA_CACHE_HARD_MAX_MEMORY_MB" :step="16" class="h-8 w-24 text-right" />
+                    <span class="text-xs text-muted-foreground">MB</span>
+                  </div>
                 </div>
               </div>
 

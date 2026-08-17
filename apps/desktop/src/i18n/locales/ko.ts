@@ -5605,6 +5605,7 @@ export default withEnglishFallback({
     queryExportKeysetOptimizationEnabled: "키셋 최적화 시도",
     queryExportKeysetOptimizationEnabledDescription: "안전하게 인식된 단일 테이블 쿼리에만 적용되며 복잡한 쿼리는 자동으로 폴백됩니다.",
     exportSection: "내보내기",
+    performanceSection: "성능",
     shortcutExecuteSql: "SQL 실행",
     shortcutExecuteSqlInNewResultTab: "새 결과 탭에서 SQL 실행",
     shortcutFind: "찾기",
