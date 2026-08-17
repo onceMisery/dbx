@@ -128,6 +128,33 @@ describe("useSqlExecution", () => {
     setActivePinia(createPinia());
   });
 
+  it("invalidates object metadata after successful connection-level DDL", async () => {
+    const sql = "CREATE DATABASE app_db";
+    const activeTab = ref<QueryTab | undefined>({ ...queryTab(), sql });
+    const activeConnection = ref<ConnectionConfig | undefined>(connection("mysql"));
+    const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
+    const queryStore = useQueryStore();
+    const connectionStore = useConnectionStore();
+    vi.spyOn(queryStore, "executeCurrentSql").mockImplementation(async () => {
+      if (activeTab.value) activeTab.value.result = { columns: [], rows: [], affected_rows: 1, execution_time_ms: 1 };
+    });
+    vi.spyOn(useHistoryStore(), "add").mockResolvedValue(undefined);
+    const invalidateMetadata = vi.spyOn(connectionStore, "invalidateMetadataCache");
+    const loadDatabases = vi.spyOn(connectionStore, "loadDatabases").mockResolvedValue(undefined);
+
+    const execution = useSqlExecution({
+      activeTab: computed(() => activeTab.value),
+      activeConnection: computed(() => activeConnection.value),
+      executableSql: computed(() => sql),
+      activeOutputView,
+    });
+
+    await execution.tryExecute();
+
+    expect(invalidateMetadata).toHaveBeenCalledWith("conn-1");
+    expect(loadDatabases).toHaveBeenCalledWith("conn-1", { force: true });
+  });
+
   it("sends every placeholder syntax and @set unchanged when substitution is disabled", async () => {
     const sql = ["@set tenant = 42;", "SELECT ?, :named, ${shell}, #{mybatis}, @sqlserver, @tenant;"].join("\n");
     const activeTab = ref<QueryTab | undefined>({ ...queryTab("app"), sql });

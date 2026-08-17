@@ -5851,6 +5851,8 @@ export default {
     updateDownloadSourceCnb: "CNB",
     debugLoggingEnabled: "Enable debug logs",
     debugLoggingEnabledDescription: "Record more detailed local user-side diagnostic logs while troubleshooting reports. Disabled by default.",
+    metadataCacheMemoryLimit: "Metadata memory cache limit",
+    metadataCacheMemoryLimitDescription: "Defaults to 64 MB. Keep it at or below 256 MB when possible; the hard limit is 512 MB. Covers DDL, columns, indexes, foreign keys, triggers, and comments.",
     duckDbWorkerProcessIsolation: "DuckDB process isolation mode (Experimental)",
     duckDbWorkerProcessIsolationDescription: "Runs DuckDB queries in a separate worker process. If a long query does not respond to cancellation, DBX can stop the worker process to release the database file lock.",
     duckDbWorkerMaxProcesses: "DuckDB max concurrent workers",

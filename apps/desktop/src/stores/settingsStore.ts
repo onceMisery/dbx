@@ -23,6 +23,7 @@ import { normalizeSqlVariableSyntaxOverrides, type SqlVariableSyntaxOverrides } 
 import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS, normalizeTableColumnTemplateFields } from "@/lib/table/tableColumnTemplates";
 import { type DataTabReuseMode, DEFAULT_DATA_TAB_REUSE_MODE, normalizeDataTabReuseMode } from "@/lib/tabs/dataTabReuseMode";
 import { normalizeCompletionTriggerMode, type SqlCompletionTriggerMode } from "@/lib/sql/sqlCompletionTriggerPolicy";
+import { configureMetadataRuntimeCache, METADATA_CACHE_DEFAULT_MEMORY_MB, normalizeMetadataCacheMemoryMb } from "@/lib/metadata/metadataRuntimeCache";
 import type { AiApiStyle, AiAssistantMode, AiAuthMethod, AiChatSelectionState, AiConfig, AiConfigItem, AiConfiguredModel, AiEffortLevel, AiEffortSelection, AiModelEffortPreference, AiProvider, AiReasoningLevel, AiTestConnectionResult } from "@/types/ai";
 import type { SqlSnippet, TableInfoTab } from "@/types/database";
 
@@ -34,6 +35,7 @@ export interface DesktopSettings {
   quit_on_close: boolean;
   close_action_prompted: boolean;
   debug_logging_enabled: boolean;
+  metadata_cache_max_memory_mb: number;
   duckdb_worker_process_isolation: boolean;
   duckdb_worker_max_processes: number;
   saved_sql_sync_dir?: string | null;
@@ -70,6 +72,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   quit_on_close: false,
   close_action_prompted: false,
   debug_logging_enabled: false,
+  metadata_cache_max_memory_mb: METADATA_CACHE_DEFAULT_MEMORY_MB,
   duckdb_worker_process_isolation: false,
   duckdb_worker_max_processes: DUCKDB_WORKER_MAX_PROCESSES_DEFAULT,
   saved_sql_sync_dir: null,
@@ -105,6 +108,7 @@ export function normalizeDesktopSettings(settings: Partial<DesktopSettings> | nu
     quit_on_close: settings?.quit_on_close ?? DEFAULT_DESKTOP_SETTINGS.quit_on_close,
     close_action_prompted: settings?.close_action_prompted ?? DEFAULT_DESKTOP_SETTINGS.close_action_prompted,
     debug_logging_enabled: settings?.debug_logging_enabled ?? DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled,
+    metadata_cache_max_memory_mb: normalizeMetadataCacheMemoryMb(settings?.metadata_cache_max_memory_mb),
     duckdb_worker_process_isolation: settings?.duckdb_worker_process_isolation ?? DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation,
     duckdb_worker_max_processes: normalizeDuckDbWorkerMaxProcesses(settings?.duckdb_worker_max_processes),
     saved_sql_sync_dir: settings?.saved_sql_sync_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.saved_sql_sync_dir,
@@ -1389,6 +1393,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (isDesktopSettingsLoaded.value) return;
     desktopSettings.value = normalizeDesktopSettings(await api.loadDesktopSettings().catch(() => null));
     setDebugLoggingEnabled(desktopSettings.value.debug_logging_enabled);
+    configureMetadataRuntimeCache(desktopSettings.value.metadata_cache_max_memory_mb);
     isDesktopSettingsLoaded.value = true;
   }
 
@@ -1400,11 +1405,13 @@ export const useSettingsStore = defineStore("settings", () => {
     };
     desktopSettings.value = normalizeDesktopSettings(next);
     setDebugLoggingEnabled(desktopSettings.value.debug_logging_enabled);
+    configureMetadataRuntimeCache(desktopSettings.value.metadata_cache_max_memory_mb);
     try {
       await api.saveDesktopSettings(desktopSettings.value);
     } catch (error) {
       desktopSettings.value = previous;
       setDebugLoggingEnabled(previous.debug_logging_enabled);
+      configureMetadataRuntimeCache(previous.metadata_cache_max_memory_mb);
       throw error;
     }
   }

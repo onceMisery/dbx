@@ -5922,6 +5922,7 @@ pub async fn checkout_postgres_client(
             })?
             .map_err(|e| {
                 let elapsed = start.elapsed().as_millis();
+                let wait_timeout = matches!(&e, PoolError::Timeout(deadpool_postgres::TimeoutType::Wait));
                 let err = pg_pool_error_to_string(e);
                 log::warn!(
                     "[db:pool.checkout:error] elapsed_ms={} timeout_ms={} error={}",
@@ -5929,7 +5930,11 @@ pub async fn checkout_postgres_client(
                     checkout_timeout.as_millis(),
                     err
                 );
-                format!("PostgreSQL connection pool checkout failed: {err}")
+                if wait_timeout {
+                    format!("PostgreSQL connection pool checkout timed out ({}s)", checkout_timeout.as_secs())
+                } else {
+                    format!("PostgreSQL connection pool checkout failed: {err}")
+                }
             })
     };
 

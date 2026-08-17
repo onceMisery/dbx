@@ -192,6 +192,8 @@ pub struct DesktopSettings {
     pub close_action_prompted: bool,
     #[serde(default)]
     pub debug_logging_enabled: bool,
+    #[serde(default = "default_metadata_cache_max_memory_mb")]
+    pub metadata_cache_max_memory_mb: usize,
     #[serde(default)]
     pub duckdb_worker_process_isolation: bool,
     #[serde(default = "default_duckdb_worker_max_processes")]
@@ -244,6 +246,31 @@ pub const DUCKDB_WORKER_MAX_PROCESSES_MIN: usize = 1;
 pub const DUCKDB_WORKER_MAX_PROCESSES_MAX: usize = 16;
 pub const DUCKDB_WORKER_MAX_PROCESSES_DEFAULT: usize = 4;
 
+pub const METADATA_CACHE_MEMORY_MIN_MB: usize = 16;
+pub const METADATA_CACHE_MEMORY_RECOMMENDED_MAX_MB: usize = 256;
+pub const METADATA_CACHE_MEMORY_HARD_MAX_MB: usize = 512;
+pub const METADATA_CACHE_MEMORY_DEFAULT_MB: usize = 64;
+
+pub fn default_metadata_cache_max_memory_mb() -> usize {
+    METADATA_CACHE_MEMORY_DEFAULT_MB
+}
+
+pub fn normalize_metadata_cache_max_memory_mb(value: usize) -> usize {
+    if value > METADATA_CACHE_MEMORY_HARD_MAX_MB {
+        log::warn!(
+            "Metadata cache memory limit {value} MB exceeds the hard limit; falling back to {METADATA_CACHE_MEMORY_DEFAULT_MB} MB"
+        );
+        METADATA_CACHE_MEMORY_DEFAULT_MB
+    } else {
+        if value > METADATA_CACHE_MEMORY_RECOMMENDED_MAX_MB {
+            log::warn!(
+                "Metadata cache memory limit {value} MB exceeds the recommended {METADATA_CACHE_MEMORY_RECOMMENDED_MAX_MB} MB"
+            );
+        }
+        value.clamp(METADATA_CACHE_MEMORY_MIN_MB, METADATA_CACHE_MEMORY_HARD_MAX_MB)
+    }
+}
+
 pub fn default_duckdb_worker_max_processes() -> usize {
     DUCKDB_WORKER_MAX_PROCESSES_DEFAULT
 }
@@ -260,6 +287,7 @@ impl Default for DesktopSettings {
             quit_on_close: false,
             close_action_prompted: false,
             debug_logging_enabled: false,
+            metadata_cache_max_memory_mb: default_metadata_cache_max_memory_mb(),
             duckdb_worker_process_isolation: false,
             duckdb_worker_max_processes: default_duckdb_worker_max_processes(),
             saved_sql_sync_dir: None,
@@ -1539,6 +1567,12 @@ impl Storage {
             serde_json::Value::Bool(desktop_settings.debug_logging_enabled),
         );
         settings.insert(
+            "metadata_cache_max_memory_mb".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(normalize_metadata_cache_max_memory_mb(
+                desktop_settings.metadata_cache_max_memory_mb,
+            ))),
+        );
+        settings.insert(
             "duckdb_worker_process_isolation".to_string(),
             serde_json::Value::Bool(desktop_settings.duckdb_worker_process_isolation),
         );
@@ -1608,6 +1642,12 @@ impl Storage {
                 .get("debug_logging_enabled")
                 .and_then(|value| value.as_bool())
                 .unwrap_or_else(|| DesktopSettings::default().debug_logging_enabled),
+            metadata_cache_max_memory_mb: settings
+                .get("metadata_cache_max_memory_mb")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .map(normalize_metadata_cache_max_memory_mb)
+                .unwrap_or_else(|| DesktopSettings::default().metadata_cache_max_memory_mb),
             duckdb_worker_process_isolation: settings
                 .get("duckdb_worker_process_isolation")
                 .and_then(|value| value.as_bool())
@@ -5240,6 +5280,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn metadata_cache_memory_budget_is_bounded() {
+        assert_eq!(super::normalize_metadata_cache_max_memory_mb(1), 16);
+        assert_eq!(super::normalize_metadata_cache_max_memory_mb(256), 256);
+        assert_eq!(super::normalize_metadata_cache_max_memory_mb(512), 512);
+        assert_eq!(super::normalize_metadata_cache_max_memory_mb(513), 64);
+    }
+
     #[tokio::test]
     async fn desktop_settings_preserve_existing_password_hash() {
         let path = temp_db_path("desktop-settings-preserve-password");
@@ -5253,6 +5301,7 @@ mod tests {
                 quit_on_close: true,
                 close_action_prompted: false,
                 debug_logging_enabled: true,
+                metadata_cache_max_memory_mb: 128,
                 duckdb_worker_process_isolation: false,
                 duckdb_worker_max_processes: DesktopSettings::default().duckdb_worker_max_processes,
                 saved_sql_sync_dir: None,
@@ -5273,6 +5322,7 @@ mod tests {
                 quit_on_close: true,
                 close_action_prompted: false,
                 debug_logging_enabled: true,
+                metadata_cache_max_memory_mb: 128,
                 duckdb_worker_process_isolation: false,
                 duckdb_worker_max_processes: DesktopSettings::default().duckdb_worker_max_processes,
                 saved_sql_sync_dir: None,

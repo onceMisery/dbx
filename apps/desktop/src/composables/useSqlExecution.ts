@@ -327,6 +327,7 @@ export function useSqlExecution(deps: {
     if (success) {
       const refreshTarget = sqlMetadataRefreshTarget(sql, tab.schema);
       if (refreshTarget.scope === "connection") {
+        connectionStore.invalidateMetadataCache(tab.connectionId);
         await connectionStore.loadDatabases(tab.connectionId, { force: true });
       } else if (refreshTarget.scope === "database") {
         await connectionStore.refreshObjectListTreeNode(tab.connectionId, tab.database, refreshTarget.schema);
@@ -468,6 +469,7 @@ export function useSqlExecution(deps: {
       if (success) {
         const refreshTarget = sqlMetadataRefreshTarget(sql, executionTab.schema);
         if (refreshTarget.scope === "connection") {
+          connectionStore.invalidateMetadataCache(executionTab.connectionId);
           await connectionStore.loadDatabases(executionTab.connectionId, { force: true });
         } else if (refreshTarget.scope === "database") {
           await connectionStore.refreshObjectListTreeNode(executionTab.connectionId, executionTab.database, refreshTarget.schema);

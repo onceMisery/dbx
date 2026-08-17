@@ -155,6 +155,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "appearance-quit", category: "appearance", titleKey: "settings.quitOnClose", descriptionKey: "settings.quitOnCloseDescription", targetId: "appearance", visible: desktopOnly },
   { id: "appearance-updates", category: "appearance", titleKey: "settings.updateNotificationsEnabled", descriptionKey: "settings.updateNotificationsEnabledDescription", targetId: "appearance" },
   { id: "appearance-debug-logs", category: "appearance", titleKey: "settings.debugLoggingEnabled", descriptionKey: "settings.debugLoggingEnabledDescription", targetId: "appearance", visible: desktopOnly },
+  { id: "appearance-metadata-cache", category: "appearance", titleKey: "settings.metadataCacheMemoryLimit", descriptionKey: "settings.metadataCacheMemoryLimitDescription", targetId: "appearance" },
   { id: "navigation", category: "navigation", titleKey: "settings.navigationTab", targetId: "navigation" },
   { id: "navigation-sidebar", category: "navigation", titleKey: "settings.sidebarActivation", targetId: "navigation" },
   { id: "navigation-routine-source", category: "navigation", titleKey: "settings.routineSourceOpenMode", descriptionKey: "settings.routineSourceOpenModeDescription", targetId: "navigation" },

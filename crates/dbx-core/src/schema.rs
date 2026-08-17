@@ -1,7 +1,7 @@
 use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
 use crate::connection::{
     connection_url_for_endpoint, database_connection_config, gaussdb_uses_m_jdbc_driver, task_client_session_id,
-    AppState, MysqlMode, PoolKind,
+    uses_metadata_gate, AppState, MysqlMode, PoolKind, METADATA_POOL_ACQUIRE_TIMEOUT,
 };
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
@@ -31,6 +31,10 @@ macro_rules! dispatch_mysql {
             $mysql($p $(, $arg)*).await
         }
     };
+}
+
+async fn clone_metadata_pool(state: &AppState, pool_key: &str) -> Option<PoolKind> {
+    state.connections.read().await.get(pool_key).and_then(PoolKind::clone_for_metadata)
 }
 
 struct EphemeralAgentMetadataSession {
@@ -68,10 +72,23 @@ macro_rules! try_sqlserver {
     ($connections:expr, $pool_key:expr, $method:ident $(, $arg:expr)*) => {
         if let Some(client) = extract_pool!(&$connections, $pool_key, SqlServer) {
             drop($connections);
-            let mut client = client.lock().await;
+            let mut client = lock_sqlserver_metadata_client(&client).await?;
             return db::sqlserver::$method(&mut client $(, $arg)*).await;
         }
     };
+}
+
+async fn lock_sqlserver_metadata_client<'a>(
+    client: &'a Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>,
+) -> Result<tokio::sync::MutexGuard<'a, db::sqlserver::SqlServerClient>, String> {
+    lock_metadata_mutex_with_timeout(client, METADATA_POOL_ACQUIRE_TIMEOUT).await
+}
+
+async fn lock_metadata_mutex_with_timeout<T>(
+    client: &Arc<tokio::sync::Mutex<T>>,
+    timeout: Duration,
+) -> Result<tokio::sync::MutexGuard<'_, T>, String> {
+    tokio::time::timeout(timeout, client.lock()).await.map_err(|_| crate::query::METADATA_POOL_BUSY_ERROR.to_string())
 }
 
 const ORACLE_TABLE_COMMENT_BATCH_SIZE: usize = 500;
@@ -195,6 +212,17 @@ pub async fn list_database_storage_core(
     connection_id: &str,
     database_names: &[String],
 ) -> Result<Vec<db::DatabaseStorageInfo>, String> {
+    retry_metadata_connection(state, connection_id, None, || {
+        list_database_storage_once(state, connection_id, database_names)
+    })
+    .await
+}
+
+async fn list_database_storage_once(
+    state: &AppState,
+    connection_id: &str,
+    database_names: &[String],
+) -> Result<Vec<db::DatabaseStorageInfo>, String> {
     const DATABASE_STORAGE_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_DATABASE_STORAGE_NAMES: usize = 2048;
 
@@ -244,10 +272,11 @@ pub async fn list_sqlserver_linked_servers_core(
     state: &AppState,
     connection_id: &str,
 ) -> Result<Vec<db::LinkedServerInfo>, String> {
+    let _metadata_permit = state.acquire_metadata_permit(connection_id, None, DatabaseType::SqlServer, None).await?;
     let connections = state.connections.read().await;
     if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
         drop(connections);
-        let mut client = client.lock().await;
+        let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_linked_servers(&mut client).await;
     }
     Ok(vec![])
@@ -307,10 +336,11 @@ pub async fn list_sqlserver_linked_server_catalogs_core(
     connection_id: &str,
     server: &str,
 ) -> Result<Vec<db::DatabaseInfo>, String> {
+    let _metadata_permit = state.acquire_metadata_permit(connection_id, None, DatabaseType::SqlServer, None).await?;
     let connections = state.connections.read().await;
     if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
         drop(connections);
-        let mut client = client.lock().await;
+        let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_linked_server_catalogs(&mut client, server).await;
     }
     Ok(vec![])
@@ -322,10 +352,11 @@ pub async fn list_sqlserver_linked_server_schemas_core(
     server: &str,
     catalog: &str,
 ) -> Result<Vec<String>, String> {
+    let _metadata_permit = state.acquire_metadata_permit(connection_id, None, DatabaseType::SqlServer, None).await?;
     let connections = state.connections.read().await;
     if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
         drop(connections);
-        let mut client = client.lock().await;
+        let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_linked_server_schemas(&mut client, server, catalog).await;
     }
     Ok(vec![])
@@ -341,10 +372,11 @@ pub async fn list_sqlserver_linked_server_tables_core(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<db::TableInfo>, String> {
+    let _metadata_permit = state.acquire_metadata_permit(connection_id, None, DatabaseType::SqlServer, None).await?;
     let connections = state.connections.read().await;
     if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
         drop(connections);
-        let mut client = client.lock().await;
+        let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_linked_server_tables(&mut client, server, catalog, schema, filter, limit, offset)
             .await;
     }
@@ -367,14 +399,17 @@ pub async fn list_sqlserver_linked_server_tables_core(
 /// use the MySQL protocol, so this is a defensive no-op); the caller's
 /// flat-sidebar fallback then renders the standard database list.
 pub async fn list_doris_catalogs_core(state: &AppState, connection_id: &str) -> Result<Vec<db::CatalogInfo>, String> {
+    retry_metadata_connection(state, connection_id, None, || list_doris_catalogs_once(state, connection_id)).await
+}
+
+async fn list_doris_catalogs_once(state: &AppState, connection_id: &str) -> Result<Vec<db::CatalogInfo>, String> {
     let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, None, None).await?;
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    if let Some(PoolKind::Mysql(p, _)) = connections.get(&pool_key) {
+    if let Some(PoolKind::Mysql(p, _)) = clone_metadata_pool(state, &pool_key).await {
         return if db_config.as_ref().is_some_and(db::starrocks::is_config) {
-            db::starrocks::list_catalogs(p).await
+            db::starrocks::list_catalogs(&p).await
         } else {
-            db::doris::list_catalogs(p).await
+            db::doris::list_catalogs(&p).await
         };
     }
     Ok(vec![])
@@ -390,11 +425,21 @@ pub async fn list_doris_catalog_databases_core(
     connection_id: &str,
     catalog: &str,
 ) -> Result<Vec<db::DatabaseInfo>, String> {
+    retry_metadata_connection(state, connection_id, None, || {
+        list_doris_catalog_databases_once(state, connection_id, catalog)
+    })
+    .await
+}
+
+async fn list_doris_catalog_databases_once(
+    state: &AppState,
+    connection_id: &str,
+    catalog: &str,
+) -> Result<Vec<db::DatabaseInfo>, String> {
     let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, None, None).await?;
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    let PoolKind::Mysql(p, _) = &pool else {
         return Ok(vec![]);
     };
     let databases = if db_config.as_ref().is_some_and(db::starrocks::is_config) {
@@ -434,11 +479,37 @@ pub async fn list_doris_catalog_tables_core(
     object_types: Option<&[String]>,
     table_name_filter: Option<&TableNameFilter>,
 ) -> Result<Vec<db::TableInfo>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || {
+        list_doris_catalog_tables_once(
+            state,
+            connection_id,
+            catalog,
+            database,
+            filter,
+            limit,
+            offset,
+            object_types,
+            table_name_filter,
+        )
+    })
+    .await
+}
+
+async fn list_doris_catalog_tables_once(
+    state: &AppState,
+    connection_id: &str,
+    catalog: &str,
+    database: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<&[String]>,
+    table_name_filter: Option<&TableNameFilter>,
+) -> Result<Vec<db::TableInfo>, String> {
     let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, None, None).await?;
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    let PoolKind::Mysql(p, _) = &pool else {
         return Ok(vec![]);
     };
     let tables = if db_config.as_ref().is_some_and(db::starrocks::is_config) {
@@ -457,11 +528,23 @@ pub async fn get_doris_catalog_columns_core(
     database: &str,
     table: &str,
 ) -> Result<Vec<db::ColumnInfo>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || {
+        get_doris_catalog_columns_once(state, connection_id, catalog, database, table)
+    })
+    .await
+}
+
+async fn get_doris_catalog_columns_once(
+    state: &AppState,
+    connection_id: &str,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<Vec<db::ColumnInfo>, String> {
     let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, None, None).await?;
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    let PoolKind::Mysql(p, _) = &pool else {
         return Ok(vec![]);
     };
     let columns = if db_config.as_ref().is_some_and(db::starrocks::is_config) {
@@ -480,11 +563,23 @@ pub async fn get_doris_catalog_table_ddl_core(
     database: &str,
     table: &str,
 ) -> Result<String, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || {
+        get_doris_catalog_table_ddl_once(state, connection_id, catalog, database, table)
+    })
+    .await
+}
+
+async fn get_doris_catalog_table_ddl_once(
+    state: &AppState,
+    connection_id: &str,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<String, String> {
     let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, None, None).await?;
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    let PoolKind::Mysql(p, _) = &pool else {
         return Err("DDL not supported for this connection".to_string());
     };
     if db_config.as_ref().is_some_and(db::starrocks::is_config) {
@@ -502,11 +597,23 @@ pub async fn list_doris_catalog_indexes_core(
     database: &str,
     table: &str,
 ) -> Result<Vec<db::IndexInfo>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || {
+        list_doris_catalog_indexes_once(state, connection_id, catalog, database, table)
+    })
+    .await
+}
+
+async fn list_doris_catalog_indexes_once(
+    state: &AppState,
+    connection_id: &str,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<Vec<db::IndexInfo>, String> {
     let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, None, None).await?;
     let db_config = connection_config(state, connection_id).await;
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    let PoolKind::Mysql(p, _) = pool else {
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    let PoolKind::Mysql(p, _) = &pool else {
         return Ok(vec![]);
     };
     if db_config.as_ref().is_some_and(db::starrocks::is_config) {
@@ -603,8 +710,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         }
         try_sqlserver!(connections, connection_id, list_databases);
         if let Some(client) = extract_pool!(&connections, connection_id, Agent) {
-            let is_mongo =
-                state.configs.read().await.get(connection_id).is_some_and(|c| c.db_type == DatabaseType::MongoDb);
+            let is_mongo = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::MongoDb);
             if is_mongo {
                 drop(connections);
                 let dbs = crate::mongo_ops::mongo_list_databases_core(state, connection_id).await?;
@@ -618,10 +724,9 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
 
     let db_config = connection_config(state, connection_id).await;
     let mysql_database_list_timeout = mysql_database_list_timeout(db_config.as_ref());
-    let connections = state.connections.read().await;
-    let pool = connections.get(connection_id).ok_or("Connection not found")?;
+    let pool = clone_metadata_pool(state, connection_id).await.ok_or("Connection not found")?;
 
-    match pool {
+    match &pool {
         PoolKind::Mysql(p, mode)
             if *mode != MysqlMode::OceanBaseOracle && db_config.as_ref().is_some_and(db::dolt::is_config) =>
         {
@@ -640,11 +745,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         PoolKind::Turso(client) => db::turso_driver::list_databases(client).await,
         PoolKind::HBase(client) => db::hbase_driver::list_namespaces(client).await,
         #[cfg(feature = "duckdb-sidecar")]
-        PoolKind::DuckDbWorker(client) => {
-            let client = client.clone();
-            drop(connections);
-            client.list_databases().await
-        }
+        PoolKind::DuckDbWorker(client) => client.list_databases().await,
         PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_databases(client).await,
         _ => Ok(vec![]),
     }
@@ -661,7 +762,7 @@ async fn list_database_metadata_once(state: &AppState, connection_id: &str) -> R
     let connections = state.connections.read().await;
     if let Some(client) = extract_pool!(&connections, connection_id, SqlServer) {
         drop(connections);
-        let mut client = client.lock().await;
+        let mut client = lock_sqlserver_metadata_client(&client).await?;
         return db::sqlserver::list_database_metadata(&mut client).await;
     }
     if let Some(PoolKind::Mysql(pool, mode)) = connections.get(connection_id) {
@@ -717,11 +818,8 @@ async fn list_schema_infos_once(
     let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
     let db_config = connection_config(state, connection_id).await;
     let show_system_schemas = db_config.as_ref().is_some_and(|config| config.show_system_schemas);
-    {
-        let connections = state.connections.read().await;
-        if let Some(PoolKind::Postgres(pool)) = connections.get(&pool_key) {
-            return db::postgres::list_schema_infos_with_system(pool, show_system_schemas).await;
-        }
+    if let Some(PoolKind::Postgres(pool)) = clone_metadata_pool(state, &pool_key).await {
+        return db::postgres::list_schema_infos_with_system(&pool, show_system_schemas).await;
     }
 
     let schemas = list_schemas_once(state, connection_id, database, false).await?;
@@ -866,10 +964,9 @@ async fn list_schemas_once(
         }
     }
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-    match pool {
+    match &pool {
         PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => db::ob_oracle::list_schemas(p)
             .await
             .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
@@ -878,9 +975,7 @@ async fn list_schemas_once(
             .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
-            let client = client.clone();
             let database = database.to_string();
-            drop(connections);
             client
                 .list_schemas(database)
                 .await
@@ -1085,10 +1180,9 @@ async fn get_table_comment_core_for_session(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Mysql(p, mode)
                 if *mode != MysqlMode::OceanBaseOracle
                     && !db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata)
@@ -1955,7 +2049,7 @@ async fn list_tables_once(
         if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
             if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
                 drop(connections);
-                let mut client = client.lock().await;
+                let mut client = lock_sqlserver_metadata_client(&client).await?;
                 return db::sqlserver::list_linked_server_tables(
                     &mut client,
                     &linked.server,
@@ -1972,7 +2066,7 @@ async fn list_tables_once(
         if object_types.is_some() || table_name_filter.is_some_and(|filter| !filter.is_empty()) {
             if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
                 drop(connections);
-                let mut client = client.lock().await;
+                let mut client = lock_sqlserver_metadata_client(&client).await?;
                 return db::sqlserver::list_tables(&mut client, schema, filter, None, None)
                     .await
                     .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
@@ -2156,10 +2250,9 @@ async fn list_tables_once(
         }
     }
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-    match pool {
+    match &pool {
         PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(db::starrocks::is_config) => {
             db::starrocks::list_tables(p, database)
                 .await
@@ -3282,8 +3375,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_retry_recovers_missing_pool_only_as_transient_state() {
-        assert!(is_retryable_metadata_error("Pool not found"));
+    fn metadata_retry_excludes_pool_saturation_from_reconnects() {
+        assert!(!is_retryable_metadata_error("Pool not found"));
+        assert!(!is_retryable_metadata_error(crate::query::METADATA_POOL_BUSY_ERROR));
         assert!(is_retryable_metadata_error("connection reset by peer"));
         assert!(is_retryable_metadata_error("Agent RPC error (-1): dm.jdbc.driver.DMException: 网络通信异常"));
         assert!(is_retryable_metadata_error(
@@ -3300,6 +3394,78 @@ mod tests {
         ));
         assert!(!is_retryable_metadata_error("Unknown column 'email' in 'field list'"));
         assert!(!is_retryable_metadata_error("Access denied for user"));
+    }
+
+    #[tokio::test]
+    async fn metadata_pool_races_retry_once_and_saturation_returns_busy() {
+        let dir = std::env::temp_dir().join(format!("dbx-schema-metadata-pool-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = crate::storage::Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = crate::connection::AppState::new(storage);
+        state.configs.write().await.insert("conn".to_string(), test_connection_config(DatabaseType::Mysql));
+
+        let mut recovered_attempts = 0;
+        let recovered = super::retry_metadata_connection_for_session(&state, "conn", Some("app"), None, || {
+            recovered_attempts += 1;
+            let attempt = recovered_attempts;
+            async move {
+                if attempt == 1 {
+                    Err("Pool not found".to_string())
+                } else {
+                    Ok("loaded")
+                }
+            }
+        })
+        .await;
+        assert_eq!(recovered, Ok("loaded"));
+        assert_eq!(recovered_attempts, 2);
+
+        let mut missing_attempts = 0;
+        let missing = super::retry_metadata_connection_for_session(&state, "conn", Some("app"), None, || {
+            missing_attempts += 1;
+            async { Err::<(), _>("Pool not found".to_string()) }
+        })
+        .await;
+        assert_eq!(missing.err().as_deref(), Some(crate::query::METADATA_POOL_BUSY_ERROR));
+        assert_eq!(missing_attempts, 2);
+
+        let mut saturation_attempts = 0;
+        let saturated = super::retry_metadata_connection_for_session(&state, "conn", Some("app"), None, || {
+            saturation_attempts += 1;
+            async { Err::<(), _>("MySQL get connection timed out".to_string()) }
+        })
+        .await;
+        assert_eq!(saturated.err().as_deref(), Some(crate::query::METADATA_POOL_BUSY_ERROR));
+        assert_eq!(saturation_attempts, 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn sqlserver_metadata_mutex_contention_returns_busy_after_timeout() {
+        let client = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let _held = client.lock().await;
+        let result = super::lock_metadata_mutex_with_timeout(&client, Duration::from_millis(1)).await;
+        assert_eq!(result.err().as_deref(), Some(crate::query::METADATA_POOL_BUSY_ERROR));
+    }
+
+    #[tokio::test]
+    async fn metadata_pool_snapshot_releases_global_connections_lock() {
+        let dir = std::env::temp_dir().join(format!("dbx-schema-metadata-snapshot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = crate::storage::Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = crate::connection::AppState::new(storage);
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert("conn".to_string(), super::PoolKind::Sqlite(pool));
+
+        let snapshot = super::clone_metadata_pool(&state, "conn").await.expect("metadata pool snapshot");
+        let write_guard = state.connections.try_write().expect("snapshot must not retain the global pool-map lock");
+
+        assert!(matches!(snapshot, super::PoolKind::Sqlite(_)));
+        drop(write_guard);
+        drop(snapshot);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4793,8 +4959,8 @@ pub async fn completion_assistant_search_core(
         {
             let connections = state.connections.read().await;
             if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
-                let db_config = connection_config(state, &request.connection_id).await;
                 drop(connections);
+                let db_config = connection_config(state, &request.connection_id).await;
                 let mut client = client.lock().await;
                 match client
                     .completion_assistant_search::<db::CompletionAssistantResponse>(
@@ -5030,8 +5196,9 @@ async fn list_object_statistics_once(
         drop(connections);
         return db::victoriametrics_driver::list_object_statistics(&client).await;
     }
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    match pool {
+    drop(connections);
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    match &pool {
         PoolKind::Mysql(p, mode) => {
             if *mode == MysqlMode::OceanBaseOracle || db_config.as_ref().is_some_and(db::manticoresearch::is_config) {
                 Ok(vec![])
@@ -5111,7 +5278,7 @@ async fn list_objects_once(
         }
         if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = lock_sqlserver_metadata_client(&client).await?;
             return db::sqlserver::list_objects(&mut client, schema).await.map(unpaged_object_list);
         }
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
@@ -5225,10 +5392,9 @@ async fn list_objects_once(
         }
     }
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-    match pool {
+    match &pool {
         PoolKind::Mysql(p, mode) => {
             // Note: mysql and ob_oracle take different second args (database vs schema)
             if *mode == MysqlMode::OceanBaseOracle {
@@ -5260,31 +5426,28 @@ async fn list_objects_once(
                 .await
                 .map(unpaged_object_list)
         }
-        _ => {
-            drop(connections);
-            Ok(unpaged_object_list(
-                list_tables_core(state, connection_id, database, schema, None, None, None, None, None)
-                    .await?
-                    .into_iter()
-                    .map(|table| db::ObjectInfo {
-                        name: table.name,
-                        object_type: table.table_type,
-                        schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
-                        valid: None,
-                        signature: None,
-                        custom_type_kind: None,
-                        has_members: None,
-                        comment: table.comment,
-                        created_at: None,
-                        updated_at: None,
-                        parent_schema: table.parent_schema,
-                        parent_name: table.parent_name,
-                        trigger: None,
-                        xugu_type_members_expandable: None,
-                    })
-                    .collect(),
-            ))
-        }
+        _ => Ok(unpaged_object_list(
+            list_tables_core(state, connection_id, database, schema, None, None, None, None, None)
+                .await?
+                .into_iter()
+                .map(|table| db::ObjectInfo {
+                    name: table.name,
+                    object_type: table.table_type,
+                    schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
+                    valid: None,
+                    signature: None,
+                    custom_type_kind: None,
+                    has_members: None,
+                    comment: table.comment,
+                    created_at: None,
+                    updated_at: None,
+                    parent_schema: table.parent_schema,
+                    parent_name: table.parent_name,
+                    trigger: None,
+                    xugu_type_members_expandable: None,
+                })
+                .collect(),
+        )),
     }
 }
 
@@ -5373,8 +5536,9 @@ async fn list_completion_objects_once(
         return Ok(filter_completion_objects(objects));
     }
 
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    match pool {
+    drop(connections);
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    match &pool {
         PoolKind::Mysql(p, mode) if *mode != MysqlMode::OceanBaseOracle => {
             db::mysql::list_completion_objects(p, database).await
         }
@@ -5391,7 +5555,6 @@ async fn list_completion_objects_once(
             db::postgres::list_objects(p, schema, true, true, false).await.map(filter_completion_objects)
         }
         PoolKind::SqlServer(_) => {
-            drop(connections);
             let outcome =
                 list_objects_once(state, connection_id, database, schema, None, None, None, None, None).await?;
             Ok(filter_completion_objects(outcome.objects))
@@ -5464,9 +5627,42 @@ where
         let configs = state.configs.read().await;
         configs.get(connection_id).map(|config| config.db_type)
     };
+    let _metadata_permit = match db_type.filter(|db_type| uses_metadata_gate(*db_type)) {
+        Some(db_type) => {
+            Some(state.acquire_metadata_permit(connection_id, database, db_type, client_session_id).await?)
+        }
+        None => None,
+    };
     let mut retried = false;
+    let mut missing_pool_retry = false;
     loop {
         let result = operation().await;
+        if result.as_ref().err().is_some_and(|error| error == "Pool not found") {
+            if !missing_pool_retry {
+                missing_pool_retry = true;
+                log::debug!(
+                    "[metadata:pool:missing-retry] connection_id={} database={}",
+                    connection_id,
+                    database.unwrap_or_default()
+                );
+                continue;
+            }
+            log::warn!(
+                "[metadata:pool:missing] connection_id={} database={}",
+                connection_id,
+                database.unwrap_or_default()
+            );
+            return Err(crate::query::METADATA_POOL_BUSY_ERROR.to_string());
+        }
+        if result.as_ref().err().is_some_and(|error| crate::query::is_pool_saturation_error(error)) {
+            log::warn!(
+                "[metadata:pool:saturation] connection_id={} database={} error={}",
+                connection_id,
+                database.unwrap_or_default(),
+                result.as_ref().err().map(String::as_str).unwrap_or_default()
+            );
+            return Err(crate::query::METADATA_POOL_BUSY_ERROR.to_string());
+        }
         let recovery =
             result.as_ref().err().map(|error| metadata_recovery(db_type, error, retried)).unwrap_or_default();
         match recovery.action {
@@ -5592,7 +5788,7 @@ fn is_retryable_metadata_error(error: &str) -> bool {
         return RecoveryPolicy::decide(&error, RecoveryScope::ReadOnlyMetadata { retried: false })
             == RecoveryDecision::RetryReadOnlyMetadata;
     }
-    error == "Pool not found" || crate::query::is_connection_error(error)
+    crate::query::is_connection_error(error)
 }
 
 pub async fn get_columns_core(
@@ -5748,7 +5944,7 @@ async fn get_columns_core_for_session_inner(
             if let Some(linked) = crate::sql_dialect::parse_sqlserver_linked_schema_ref(schema) {
                 if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
                     drop(connections);
-                    let mut client = client.lock().await;
+                    let mut client = lock_sqlserver_metadata_client(&client).await?;
                     return db::sqlserver::get_linked_server_columns(
                         &mut client,
                         &linked.server,
@@ -5872,10 +6068,9 @@ async fn get_columns_core_for_session_inner(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(db::manticoresearch::is_config) => {
                 let metadata_database = mysql_show_metadata_database_for_config(db_config.as_ref(), database);
                 db::manticoresearch::get_columns(p, metadata_database, table).await.map(deduplicate_column_infos)
@@ -6072,10 +6267,9 @@ async fn list_indexes_core_for_session(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Mysql(p, mode) => {
                 if db_config.as_ref().is_some_and(db::manticoresearch::is_config) {
                     return db::manticoresearch::list_indexes(p, table).await;
@@ -6160,10 +6354,9 @@ async fn list_foreign_keys_core_for_session(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Mysql(p, mode) => {
                 if *mode == MysqlMode::OceanBaseOracle {
                     db::ob_oracle::list_foreign_keys(p, schema, table).await
@@ -6206,10 +6399,9 @@ pub async fn list_triggers_core(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Mysql(p, mode) => {
                 if *mode == MysqlMode::OceanBaseOracle {
                     db::ob_oracle::list_triggers(p, schema, table).await
@@ -6361,10 +6553,9 @@ pub async fn list_functions_core(
 ) -> Result<Vec<db::FunctionInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Postgres(p) => db::postgres::list_functions(p, schema).await,
             _ => Ok(vec![]),
         }
@@ -6382,10 +6573,9 @@ pub async fn list_sequences_core(
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         let db_config = connection_config(state, connection_id).await;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_opengauss_family_config) => {
                 db::postgres::list_opengauss_sequences(p, schema, with_last_values).await
             }
@@ -6404,10 +6594,9 @@ pub async fn list_rules_core(
 ) -> Result<Vec<db::RuleInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Postgres(p) => db::postgres::list_rules(p, schema).await,
             _ => Ok(vec![]),
         }
@@ -6433,10 +6622,9 @@ pub async fn list_extensions_core(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Postgres(p) => db::postgres::list_extensions(p, schema).await,
             _ => Ok(vec![]),
         }
@@ -6465,10 +6653,9 @@ pub async fn list_available_extensions_core(
             }
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Postgres(p) => db::postgres::list_available_extensions(p).await,
             _ => Ok(vec![]),
         }
@@ -6484,10 +6671,9 @@ pub async fn list_owners_core(
 ) -> Result<Vec<db::OwnerInfo>, String> {
     retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
-        let connections = state.connections.read().await;
-        let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-        match pool {
+        match &pool {
             PoolKind::Postgres(p) => db::postgres::list_owners(p, schema).await,
             _ => Ok(vec![]),
         }
@@ -6709,7 +6895,7 @@ async fn get_table_ddl_once(
         }
         if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = lock_sqlserver_metadata_client(&client).await?;
             return build_sqlserver_ddl(&mut client, schema, table).await;
         }
         if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
@@ -6771,10 +6957,9 @@ async fn get_table_ddl_once(
         }
     }
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
-    match pool {
+    match &pool {
         PoolKind::Mysql(p, _) => mysql_ddl(p, mysql_table_metadata_catalog(database, schema), table).await,
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_opengauss_family_config) => {
             match opengauss_table_ddl(p, schema, table).await {
@@ -7567,9 +7752,8 @@ async fn get_custom_type_details_once(
                 .await;
         }
     }
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
-    match pool {
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    match &pool {
         PoolKind::Postgres(p) => db::postgres::get_custom_type_details(p, schema, name).await,
         _ => Err("custom type details are not supported for this connection type".to_string()),
     }
@@ -7662,7 +7846,7 @@ async fn get_object_source_once(
         }
         if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
             drop(connections);
-            let mut client = client.lock().await;
+            let mut client = lock_sqlserver_metadata_client(&client).await?;
             let result =
                 db::sqlserver::execute_query(&mut client, &sqlserver_object_source_sql(schema, name, &object_type))
                     .await;

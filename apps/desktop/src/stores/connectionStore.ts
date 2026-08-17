@@ -130,7 +130,9 @@ import { createMetadataLoadTrace, logMetadataLoadTrace, MetadataLoadCoordinator,
 import type { MetadataScopeInput } from "@/lib/metadata/metadataLoadScope";
 import { MetadataResultCache, type MetadataCacheInvalidation } from "@/lib/metadata/metadataResultCache";
 import { invalidateTableMetadataCache } from "@/lib/metadata/tableMetadataCache";
-import { invalidateObjectDdlCache } from "@/lib/metadata/objectDdlCache";
+import { cancelObjectDdlLoadsForConnection, cancelObjectDdlLoadsForDatabase, invalidateObjectDdlCache } from "@/lib/metadata/objectDdlCache";
+import { cancelObjectMetadataLoadsForConnection, cancelObjectMetadataLoadsForDatabase } from "@/lib/metadata/objectMetadataCache";
+import { clearMetadataRuntimeCacheForConnection, clearMetadataRuntimeCacheForDatabase } from "@/lib/metadata/metadataRuntimeCache";
 import { invalidateObjectBrowserRowsCache } from "@/lib/table/objectBrowserRowsCache";
 import { MetadataTaskLimiter } from "@/lib/metadata/metadataTaskLimiter";
 import { buildCustomTypeTreeChildren } from "@/lib/sidebar/customTypeTree";
@@ -3322,6 +3324,8 @@ export const useConnectionStore = defineStore("connection", () => {
     clearConnectionHealthCheck(connectionId);
     if (activeConnectionId.value === connectionId) activeConnectionId.value = null;
     invalidateCompletionCache(connectionId);
+    cancelObjectDdlLoadsForConnection(connectionId);
+    cancelObjectMetadataLoadsForConnection(connectionId);
     await disconnectRequest;
     return true;
   }
@@ -3345,6 +3349,9 @@ export const useConnectionStore = defineStore("connection", () => {
       node.children = [];
     }
     clearConnectionRootMetadataLoad(connectionId);
+    cancelObjectDdlLoadsForConnection(connectionId);
+    cancelObjectMetadataLoadsForConnection(connectionId);
+    clearMetadataRuntimeCacheForConnection(connectionId);
     // Disconnecting only tears down the live session. Keep the schema snapshot so
     // reconnecting can render databases and table names before the remote refresh.
     clearLoadedChildrenCache(connectionId, { deletePersisted: false });
@@ -3387,7 +3394,10 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function closeDatabaseConnection(connectionId: string, database: string) {
     if (hasSqlServerActivityTraceForConnection(connectionId, database)) await disposeSqlServerActivityTracesForConnection(connectionId, database);
+    cancelObjectDdlLoadsForDatabase(connectionId, database);
+    cancelObjectMetadataLoadsForDatabase(connectionId, database);
     await api.closeDatabaseConnection(connectionId, database);
+    clearMetadataRuntimeCacheForDatabase(connectionId, database);
     const { useQueryStore } = await import("@/stores/queryStore");
     const queryStore = useQueryStore();
     switch (settingsStore.editorSettings.disconnectTabHandlingMode) {
@@ -3425,6 +3435,9 @@ export const useConnectionStore = defineStore("connection", () => {
         return;
       } catch {
         // Backend pool is dead — remove from connectedIds and reconnect
+        cancelObjectDdlLoadsForConnection(connectionId);
+        cancelObjectMetadataLoadsForConnection(connectionId);
+        clearMetadataRuntimeCacheForConnection(connectionId);
         connectedIds.value.delete(connectionId);
         clearPrimaryVisibleObjectNames(connectionId);
         clearConnectionHealthCheck(connectionId);

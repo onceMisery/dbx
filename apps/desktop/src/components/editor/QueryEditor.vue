@@ -2612,7 +2612,7 @@ async function resolveSqlHoverTooltip(currentView: EditorViewType, pos: number) 
         try {
           const [columnsResult, indexesResult] = await Promise.all([
             loadObjectMetadataFacet(objectMetadataRequest, "columns", () => api.getColumns(props.connectionId!, hoverDatabase, hoverSchema, table.name, hoverScope.catalog)),
-            loadObjectMetadataFacet(objectMetadataRequest, "indexes", () => api.listIndexes(props.connectionId!, hoverDatabase, hoverSchema, table.name, hoverScope.catalog).catch(() => [])),
+            loadObjectMetadataFacet(objectMetadataRequest, "indexes", () => api.listIndexes(props.connectionId!, hoverDatabase, hoverSchema, table.name, hoverScope.catalog)).catch(() => ({ value: [] as IndexInfo[], cacheStatus: "remote" as const })),
           ]);
           fullColumns = columnsResult.value;
           fullIndexes = indexesResult.value;

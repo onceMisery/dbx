@@ -5837,6 +5837,8 @@ export default withEnglishFallback({
     updateDownloadSourceCnb: "CNB",
     debugLoggingEnabled: "启用调试日志",
     debugLoggingEnabledDescription: "开启后在本机记录更详细的用户侧诊断日志，反馈问题时可临时开启；默认关闭。",
+    metadataCacheMemoryLimit: "元数据内存缓存上限",
+    metadataCacheMemoryLimitDescription: "默认 64 MB，建议不超过 256 MB，最大 512 MB。用于 DDL、字段、索引、外键、触发器和注释缓存。",
     duckDbWorkerProcessIsolation: "DuckDB 进程隔离模式（实验性）",
     duckDbWorkerProcessIsolationDescription: "将 DuckDB 查询放到独立 worker 进程中运行。停止长查询时，如果 DuckDB 未及时响应取消请求，DBX 会结束 worker 进程以释放数据库文件锁。",
     duckDbWorkerMaxProcesses: "DuckDB 最大并发 worker 数",
