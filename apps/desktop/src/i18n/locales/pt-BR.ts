@@ -5594,6 +5594,8 @@ export default withEnglishFallback({
     updateDownloadSourceCnb: "CNB",
     debugLoggingEnabled: "Ativar logs de depuração",
     debugLoggingEnabledDescription: "Registra logs locais de diagnóstico do lado do usuário ao investigar relatos. Desativado por padrão.",
+    metadataCacheMemoryLimit: "Limite de memória do cache de metadados",
+    metadataCacheMemoryLimitDescription: "O padrão é 64 MB; recomenda-se no máximo 256 MB, com limite máximo de 512 MB. Abrange o cache de DDL, colunas, índices, chaves estrangeiras, gatilhos e comentários.",
     duckDbWorkerProcessIsolation: "Modo de isolamento de processo do DuckDB (experimental)",
     duckDbWorkerProcessIsolationDescription: "Executa consultas DuckDB em um processo worker separado. Se uma consulta longa não responder ao cancelamento, o DBX pode encerrar o processo worker para liberar o bloqueio do arquivo de banco de dados.",
     duckDbWorkerMaxProcesses: "Máximo de workers simultâneos do DuckDB",

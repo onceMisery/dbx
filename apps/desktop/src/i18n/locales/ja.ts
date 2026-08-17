@@ -5627,6 +5627,8 @@ export default withEnglishFallback({
     updateNotificationsEnabledDescription: "無効時、DBXはアプリやドライバーのアップデートを自動確認せず、アップデートバッジも表示しません。手動確認は引き続き利用可能です。",
     debugLoggingEnabled: "デバッグログを有効にする",
     debugLoggingEnabledDescription: "トラブルシューティング時に、より詳細なローカル診断ログを記録します。デフォルトでは無効です。",
+    metadataCacheMemoryLimit: "メタデータメモリキャッシュ上限",
+    metadataCacheMemoryLimitDescription: "デフォルトは64 MB、256 MB以下を推奨、最大512 MBです。DDL、フィールド、インデックス、外部キー、トリガー、コメントのキャッシュに使用されます。",
     duckDbWorkerProcessIsolation: "DuckDB プロセス分離モード（実験的）",
     duckDbWorkerProcessIsolationDescription: "DuckDB クエリを独立した worker プロセスで実行します。長時間クエリがキャンセルに応答しない場合、DBX は worker プロセスを停止してデータベースファイルのロックを解放できます。",
     duckDbWorkerMaxProcesses: "DuckDB の最大同時 worker 数",

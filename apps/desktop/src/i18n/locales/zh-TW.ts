@@ -4914,6 +4914,8 @@ export default withEnglishFallback({
     updateNotificationsEnabledDescription: "關閉後，DBX 不會自動檢查應用程式和驅動程式更新，也不會顯示更新紅點；仍可手動檢查更新。",
     debugLoggingEnabled: "啟用偵錯日誌",
     debugLoggingEnabledDescription: "開啟後在本機記錄更詳細的使用者側診斷日誌，回報問題時可暫時開啟；預設關閉。",
+    metadataCacheMemoryLimit: "中繼資料記憶體快取上限",
+    metadataCacheMemoryLimitDescription: "預設為 64 MB，建議不超過 256 MB，最大為 512 MB。用於快取 DDL、欄位、索引、外部索引鍵、觸發程序及註解。",
     duckDbWorkerProcessIsolation: "DuckDB 進程隔離模式（實驗性）",
     duckDbWorkerProcessIsolationDescription: "將 DuckDB 查詢放到獨立 worker 進程中執行。停止長查詢時，如果 DuckDB 未及時回應取消請求，DBX 會結束 worker 進程以釋放資料庫檔案鎖。",
     duckDbWorkerMaxProcesses: "DuckDB 最大並行 worker 數",
