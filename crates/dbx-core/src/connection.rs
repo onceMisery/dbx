@@ -294,7 +294,7 @@ pub(crate) fn metadata_concurrency_limit(db_type: DatabaseType, max_connections:
     if db_type == DatabaseType::SqlServer {
         METADATA_POOL_SQLSERVER_LIMIT
     } else {
-        max_connections.saturating_sub(2).max(1).min(METADATA_POOL_DEFAULT_LIMIT)
+        max_connections.saturating_sub(2).clamp(1, METADATA_POOL_DEFAULT_LIMIT)
     }
 }
 
