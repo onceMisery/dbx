@@ -3575,11 +3575,13 @@ impl Storage {
         let json: Option<String> = self
             .with_conn(move |conn| {
                 let transaction = conn.transaction().map_err(|error| error.to_string())?;
-                prune_schema_cache(&transaction, SchemaCachePolicy::default(), now_ms)?;
                 let json = transaction
-                    .query_row("SELECT payload_json FROM schema_cache WHERE cache_key = ?1", [&cache_key], |row| {
-                        row.get(0)
-                    })
+                    .query_row(
+                        "SELECT payload_json FROM schema_cache
+                         WHERE cache_key = ?1 AND updated_at_ms > ?2",
+                        params![cache_key, now_ms.saturating_sub(SCHEMA_CACHE_MAX_AGE_MILLIS.max(0))],
+                        |row| row.get(0),
+                    )
                     .optional()
                     .map_err(|error| error.to_string())?;
                 if json.is_some() {
@@ -4322,7 +4324,7 @@ mod tests {
     };
     use crate::saved_sql::SavedSqlFile;
     use rusqlite::Connection;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -5474,7 +5476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_cache_deletes_expired_rows_instead_of_only_ignoring_them() {
+    async fn schema_cache_prunes_expired_rows_on_write_without_maintaining_during_reads() {
         let path = temp_db_path("schema-cache-ttl-prune");
         let storage = Storage::open(&path).await.unwrap();
         storage
@@ -5496,7 +5498,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(storage.load_schema_cache("object-ddl:v1:conn-a:db:public:missing::TABLE:").await.unwrap(), None);
+        assert_eq!(storage.load_schema_cache("object-ddl:v1:conn-a:db:public:old::TABLE:").await.unwrap(), None);
         let remaining = storage
             .with_conn(|conn| {
                 conn.query_row("SELECT COUNT(*) FROM schema_cache", [], |row| row.get::<_, i64>(0))
@@ -5504,7 +5506,23 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(remaining, 0);
+        assert_eq!(remaining, 1, "L2 reads must remain indexed point lookups without global maintenance");
+
+        storage
+            .save_schema_cache(
+                "object-ddl:v1:conn-a:db:public:new::TABLE:",
+                &serde_json::json!({ "version": 1, "ddl": "new" }),
+            )
+            .await
+            .unwrap();
+        let remaining = storage
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM schema_cache", [], |row| row.get::<_, i64>(0))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1, "the next write must prune the expired row");
 
         let _ = std::fs::remove_file(path);
     }
@@ -5583,6 +5601,64 @@ mod tests {
         assert!(storage.load_schema_cache(first).await.unwrap().is_some());
         assert_eq!(storage.load_schema_cache(second).await.unwrap(), None);
         assert!(storage.load_schema_cache(newest).await.unwrap().is_some());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn schema_cache_50k_point_reads_stay_below_performance_gate() {
+        const ENTRY_COUNT: usize = 50_000;
+        const SAMPLE_COUNT: usize = 40;
+        let path = temp_db_path("schema-cache-50k-read-performance");
+        let storage = Storage::open(&path).await.unwrap();
+        storage
+            .with_conn(|conn| {
+                let transaction = conn.transaction().map_err(|error| error.to_string())?;
+                {
+                    let mut statement = transaction
+                        .prepare(
+                            "INSERT INTO schema_cache (
+                                cache_key, payload_json, updated_at, updated_at_ms,
+                                last_accessed_at_ms, byte_size, owner_id
+                             ) VALUES (?1, ?2, datetime('now'), ?3, ?3, ?4, ?5)",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    for index in 0..ENTRY_COUNT {
+                        let cache_key =
+                            format!("object-meta:v1:conn-{}:db:public:table-{index}::TABLE:columns:", index % 32);
+                        let payload = format!(r#"{{"version":1,"value":{index}}}"#);
+                        statement
+                            .execute(rusqlite::params![
+                                cache_key,
+                                payload,
+                                super::unix_timestamp_millis(),
+                                32_i64,
+                                format!("conn-{}", index % 32),
+                            ])
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                transaction.commit().map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+
+        let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+        for sample in 0..SAMPLE_COUNT {
+            let index = sample * (ENTRY_COUNT / SAMPLE_COUNT);
+            let cache_key = format!("object-meta:v1:conn-{}:db:public:table-{index}::TABLE:columns:", index % 32);
+            let started = Instant::now();
+            assert!(storage.load_schema_cache(&cache_key).await.unwrap().is_some());
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let total = samples.iter().copied().sum::<Duration>();
+        let average = total / SAMPLE_COUNT as u32;
+        let p95 = samples[(SAMPLE_COUNT * 95 / 100).saturating_sub(1)];
+        eprintln!("schema_cache_50k_point_reads average={average:?} p95={p95:?}");
+
+        assert!(average < Duration::from_millis(20), "50k L2 point-read average {average:?} exceeded 20 ms");
+        assert!(p95 < Duration::from_millis(50), "50k L2 point-read P95 {p95:?} exceeded 50 ms");
 
         let _ = std::fs::remove_file(path);
     }

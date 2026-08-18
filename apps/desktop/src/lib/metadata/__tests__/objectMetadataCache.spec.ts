@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/backend/api", () => mocks);
 
-import { cancelObjectMetadataLoadsForConnection, invalidateObjectMetadataCache, loadObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
+import { cancelObjectMetadataLoadsForConnection, getObjectMetadataCacheDebugStateForTests, invalidateObjectMetadataCache, loadObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
 import { clearMetadataRuntimeCache } from "@/lib/metadata/metadataRuntimeCache";
 
 const request = { connectionId: "c1", database: "app", schema: "public", tableName: "users", catalog: "analytics" } as const;
@@ -202,6 +202,14 @@ describe("objectMetadataCache", () => {
     await invalidation;
     expect(loaderA).not.toHaveBeenCalled();
     expect(loaderB).toHaveBeenCalledTimes(1);
+  });
+
+  it("reclaims invalidation state after long-running multi-object refreshes", async () => {
+    for (let index = 0; index < 2_000; index += 1) {
+      await invalidateObjectMetadataCache({ ...request, tableName: `history_${index}` });
+    }
+
+    expect(getObjectMetadataCacheDebugStateForTests()).toEqual({ activeReads: 0 });
   });
 
   it("makes a concurrent normal facet read wait for a force refresh", async () => {

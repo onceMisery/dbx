@@ -1,4 +1,5 @@
 import * as api from "@/lib/backend/api";
+import { ActiveCacheReadTracker } from "./activeCacheReadTracker";
 import type { ObjectSourceKind } from "@/types/database";
 import type { MetadataCacheInvalidation } from "./metadataResultCache";
 import { invalidateObjectMetadataCache } from "./objectMetadataCache";
@@ -17,7 +18,6 @@ interface ObjectDdlCacheEnvelope {
 interface InFlightDdlLoad {
   force: boolean;
   invalidated: boolean;
-  generation: number;
   promise: Promise<string>;
 }
 
@@ -36,8 +36,7 @@ export interface ObjectDdlLoadResult {
 }
 
 const remoteLoads = new Map<string, InFlightDdlLoad>();
-let nextCacheGeneration = 0;
-const cacheGenerationsByPrefix = new Map<string, number>();
+const activeCacheReads = new ActiveCacheReadTracker();
 const pendingInvalidations = new Map<string, Promise<void>>();
 const pendingWrites = new Map<string, Promise<void>>();
 
@@ -99,24 +98,6 @@ async function waitForPendingInvalidations(cacheKey: string): Promise<void> {
   if (pending.length) await Promise.all(pending);
 }
 
-function currentGeneration(cacheKey: string): number {
-  let generation = 0;
-  for (const [prefix, prefixGeneration] of cacheGenerationsByPrefix) {
-    if (cacheKey.startsWith(prefix)) generation = Math.max(generation, prefixGeneration);
-  }
-  return generation;
-}
-
-function bumpGeneration(prefix: string): number {
-  nextCacheGeneration += 1;
-  cacheGenerationsByPrefix.set(prefix, nextCacheGeneration);
-  return nextCacheGeneration;
-}
-
-function bumpGenerationsForPrefix(prefix: string): void {
-  bumpGeneration(prefix);
-}
-
 function invalidateRemoteLoad(cacheKey: string): void {
   const entry = remoteLoads.get(cacheKey);
   if (!entry) return;
@@ -161,16 +142,16 @@ async function loadRemoteDdl(request: ObjectDdlRequest, cacheKey: string, force:
   if (existing && (!force || existing.force)) return existing.promise;
   if (existing) invalidateRemoteLoad(cacheKey);
 
-  const entry: InFlightDdlLoad = { force, invalidated: false, generation: currentGeneration(cacheKey), promise: Promise.resolve("") };
+  const entry: InFlightDdlLoad = { force, invalidated: false, promise: Promise.resolve("") };
   recordMetadataCacheRemoteMiss(cacheKey);
   entry.promise = api
     .getTableDisplayDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog)
     .then((ddl) => {
-      const current = !entry.invalidated && currentGeneration(cacheKey) === entry.generation;
+      const current = !entry.invalidated;
       if (current && ddl.length <= MAX_PERSISTED_DDL_CHARS) {
         const envelope: ObjectDdlCacheEnvelope = { version: 1, cachedAt: new Date().toISOString(), ddl };
         setMetadataRuntimeCache(cacheKey, ddl, request.connectionId);
-        persistSchemaCache(cacheKey, envelope, () => entry.invalidated || currentGeneration(cacheKey) !== entry.generation);
+        persistSchemaCache(cacheKey, envelope, () => entry.invalidated);
       } else if (current) {
         setMetadataRuntimeCache(cacheKey, ddl, request.connectionId);
       }
@@ -189,7 +170,7 @@ export async function loadObjectDdl(request: ObjectDdlRequest, options?: { force
     const existing = remoteLoads.get(cacheKey);
     if (existing?.force) return { ddl: await existing.promise, cacheStatus: "remote" };
     invalidateRemoteLoad(cacheKey);
-    bumpGeneration(cacheKey);
+    activeCacheReads.invalidatePrefix(cacheKey);
     invalidateMetadataRuntimeCachePrefix(cacheKey);
     const priorInvalidations = waitForPendingInvalidations(cacheKey);
     const deletion = invalidatePersistedPrefix(cacheKey);
@@ -201,9 +182,17 @@ export async function loadObjectDdl(request: ObjectDdlRequest, options?: { force
   if (!options?.force) {
     const runtime = getMetadataRuntimeCache<string>(cacheKey);
     if (runtime) return { ddl: runtime.value, cacheStatus: "memory" };
-    const generation = currentGeneration(cacheKey);
-    const cached = decodeCachedDdl(await loadSchemaCacheSafe<unknown>(cacheKey));
-    if (generation !== currentGeneration(cacheKey)) return { ddl: await loadRemoteDdl(request, cacheKey, false), cacheStatus: "remote" };
+    const readToken = activeCacheReads.begin(cacheKey);
+    let cached: string | null;
+    try {
+      cached = decodeCachedDdl(await loadSchemaCacheSafe<unknown>(cacheKey));
+    } finally {
+      activeCacheReads.finish(readToken);
+    }
+    if (readToken.invalidated) {
+      await waitForPendingInvalidations(cacheKey);
+      return { ddl: await loadRemoteDdl(request, cacheKey, false), cacheStatus: "remote" };
+    }
     if (cached !== null) {
       recordMetadataCacheL2Hit(cacheKey, cached);
       setMetadataRuntimeCache(cacheKey, cached, request.connectionId);
@@ -216,7 +205,7 @@ export async function loadObjectDdl(request: ObjectDdlRequest, options?: { force
 
 export async function invalidateObjectDdlCache(match: MetadataCacheInvalidation): Promise<void> {
   const prefix = invalidationPrefix(match);
-  bumpGenerationsForPrefix(prefix);
+  activeCacheReads.invalidatePrefix(prefix);
   for (const cacheKey of [...remoteLoads.keys()]) if (cacheKey.startsWith(prefix)) invalidateRemoteLoad(cacheKey);
   invalidateMetadataRuntimeCachePrefix(prefix);
 
@@ -226,7 +215,7 @@ export async function invalidateObjectDdlCache(match: MetadataCacheInvalidation)
 
 export async function invalidateObjectDdl(request: ObjectDdlRequest): Promise<void> {
   const cacheKey = objectDdlCacheKey(request);
-  bumpGeneration(cacheKey);
+  activeCacheReads.invalidatePrefix(cacheKey);
   invalidateRemoteLoad(cacheKey);
   invalidateMetadataRuntimeCachePrefix(cacheKey);
   await Promise.all([
@@ -243,14 +232,18 @@ export async function invalidateObjectDdl(request: ObjectDdlRequest): Promise<vo
 /** Invalidate active loads for a disconnected connection without deleting its persisted snapshot. */
 export function cancelObjectDdlLoadsForConnection(connectionId: string): void {
   const prefix = `${OBJECT_DDL_CACHE_PREFIX}:${cacheSegment(connectionId)}:`;
-  bumpGenerationsForPrefix(prefix);
+  activeCacheReads.invalidatePrefix(prefix);
   for (const cacheKey of [...remoteLoads.keys()]) if (cacheKey.startsWith(prefix)) invalidateRemoteLoad(cacheKey);
   invalidateMetadataRuntimeCachePrefix(prefix);
 }
 
 export function cancelObjectDdlLoadsForDatabase(connectionId: string, database: string): void {
   const prefix = `${OBJECT_DDL_CACHE_PREFIX}:${cacheSegment(connectionId)}:${cacheSegment(database)}:`;
-  bumpGenerationsForPrefix(prefix);
+  activeCacheReads.invalidatePrefix(prefix);
   for (const cacheKey of [...remoteLoads.keys()]) if (cacheKey.startsWith(prefix)) invalidateRemoteLoad(cacheKey);
   invalidateMetadataRuntimeCachePrefix(prefix);
+}
+
+export function getObjectDdlCacheDebugStateForTests(): { activeReads: number } {
+  return { activeReads: activeCacheReads.activeCount };
 }

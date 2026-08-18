@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/backend/api", () => mocks);
 
-import { cancelObjectDdlLoadsForConnection, invalidateObjectDdl, invalidateObjectDdlCache, loadObjectDdl, objectDdlCacheKey } from "@/lib/metadata/objectDdlCache";
+import { cancelObjectDdlLoadsForConnection, getObjectDdlCacheDebugStateForTests, invalidateObjectDdl, invalidateObjectDdlCache, loadObjectDdl, objectDdlCacheKey } from "@/lib/metadata/objectDdlCache";
 import { clearMetadataRuntimeCache } from "@/lib/metadata/metadataRuntimeCache";
 
 const request = { connectionId: "c1", database: "app", schema: "public", tableName: "users", catalog: "analytics" } as const;
@@ -213,6 +213,14 @@ describe("objectDdlCache", () => {
     await expect(loadB).resolves.toEqual({ ddl: "remote billing", cacheStatus: "remote" });
     await invalidation;
     expect(mocks.getTableDisplayDdl).toHaveBeenCalledTimes(1);
+  });
+
+  it("reclaims invalidation state after long-running multi-object refreshes", async () => {
+    for (let index = 0; index < 2_000; index += 1) {
+      await invalidateObjectDdlCache({ ...request, tableName: `history_${index}` });
+    }
+
+    expect(getObjectDdlCacheDebugStateForTests()).toEqual({ activeReads: 0 });
   });
 
   it("makes a concurrent normal read wait for a force refresh", async () => {

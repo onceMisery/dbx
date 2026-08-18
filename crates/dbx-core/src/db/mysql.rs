@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::future::Future;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -29,7 +30,40 @@ use crate::types::{
 
 use super::file_validator::validate_file_path;
 
-pub type MySqlPool = mysql_async::Pool;
+/// DBX-owned MySQL pool handle. The driver does not expose its configured
+/// maximum, so retain that value beside the driver pool for checkout phase
+/// classification instead of guessing it from aggregate metrics.
+#[derive(Debug, Clone)]
+pub struct MySqlPool {
+    inner: mysql_async::Pool,
+    max_connections: usize,
+}
+
+impl MySqlPool {
+    pub(crate) fn new<O>(opts: O, max_connections: usize) -> Self
+    where
+        mysql_async::Opts: TryFrom<O>,
+        <mysql_async::Opts as TryFrom<O>>::Error: std::error::Error,
+    {
+        Self { inner: mysql_async::Pool::new(opts), max_connections: max_connections.max(1) }
+    }
+
+    pub(crate) fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    pub async fn disconnect(self) -> Result<(), mysql_async::Error> {
+        self.inner.disconnect().await
+    }
+}
+
+impl Deref for MySqlPool {
+    type Target = mysql_async::Pool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 const MYSQL_TCP_KEEPALIVE_MS: u32 = 30_000;
 const MYSQL_SQL_PACKET_MARGIN_MAX_BYTES: usize = 64 * 1024;
 
@@ -1243,7 +1277,7 @@ fn create_pool(
         // to paths explicitly supplied by the user instead of enabling arbitrary reads.
         builder = builder.local_infile_handler(Some(mysql_async::WhiteListFsHandler::new(local_infile_paths)));
     }
-    Ok(MySqlPool::new(builder))
+    Ok(MySqlPool::new(builder, max_connections))
 }
 
 fn mysql_async_tcp_host(host: &str) -> &str {
@@ -3914,21 +3948,18 @@ pub async fn get_conn_with_health_check_with_cancel(
 pub(crate) struct MysqlCheckoutSnapshot {
     pub(crate) connection_count: usize,
     pub(crate) connections_in_pool: usize,
-    pub(crate) connections_in_use: usize,
-    pub(crate) active_wait_requests: usize,
+    pub(crate) max_connections: usize,
 }
 
 pub(crate) type MysqlCheckoutStage = super::PoolCheckoutStage;
 
 pub(crate) fn classify_mysql_checkout_stage(snapshot: MysqlCheckoutSnapshot) -> MysqlCheckoutStage {
-    if snapshot.active_wait_requests > 0
-        || (snapshot.connection_count > 0 && snapshot.connections_in_use >= snapshot.connection_count)
-    {
-        MysqlCheckoutStage::Wait
-    } else if snapshot.connections_in_pool > 0 {
+    if snapshot.connections_in_pool > 0 {
         MysqlCheckoutStage::Recycle
-    } else {
+    } else if snapshot.connection_count < snapshot.max_connections {
         MysqlCheckoutStage::Create
+    } else {
+        MysqlCheckoutStage::Wait
     }
 }
 
@@ -3938,8 +3969,7 @@ fn mysql_checkout_snapshot(pool: &MySqlPool) -> MysqlCheckoutSnapshot {
     MysqlCheckoutSnapshot {
         connection_count: metrics.connection_count.load(Ordering::Relaxed),
         connections_in_pool: metrics.connections_in_pool.load(Ordering::Relaxed),
-        connections_in_use: metrics.connections_in_use.load(Ordering::Relaxed),
-        active_wait_requests: metrics.active_wait_requests.load(Ordering::Relaxed),
+        max_connections: pool.max_connections(),
     }
 }
 
@@ -3947,19 +3977,14 @@ pub(crate) async fn checkout_mysql_conn(
     pool: &MySqlPool,
     timeout: Duration,
 ) -> Result<mysql_async::Conn, super::PoolCheckoutError> {
-    let snapshot = mysql_checkout_snapshot(pool);
+    // Capture the phase before entering the driver future. The phase is tied
+    // to this checkout's capacity decision, not to a later aggregate metric
+    // snapshot that may already include another request.
+    let stage = classify_mysql_checkout_stage(mysql_checkout_snapshot(pool));
     match tokio::time::timeout(timeout, pool.get_conn()).await {
         Ok(Ok(conn)) => Ok(conn),
-        Ok(Err(error)) => Err(super::PoolCheckoutError::Failed {
-            database: "MySQL",
-            stage: classify_mysql_checkout_stage(snapshot),
-            detail: error.to_string(),
-        }),
-        Err(_) => Err(super::PoolCheckoutError::Timeout {
-            database: "MySQL",
-            stage: classify_mysql_checkout_stage(mysql_checkout_snapshot(pool)),
-            timeout,
-        }),
+        Ok(Err(error)) => Err(super::PoolCheckoutError::Failed { database: "MySQL", stage, detail: error.to_string() }),
+        Err(_) => Err(super::PoolCheckoutError::Timeout { database: "MySQL", stage, timeout }),
     }
 }
 
@@ -5430,8 +5455,7 @@ mod tests {
             classify_mysql_checkout_stage(MysqlCheckoutSnapshot {
                 connection_count: 1,
                 connections_in_pool: 0,
-                connections_in_use: 1,
-                active_wait_requests: 1
+                max_connections: 1,
             }),
             MysqlCheckoutStage::Wait
         );
@@ -5442,13 +5466,67 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>()).await.is_err());
         assert_eq!(
             classify_mysql_checkout_stage(MysqlCheckoutSnapshot {
-                connection_count: 1,
+                connection_count: 0,
                 connections_in_pool: 0,
-                connections_in_use: 0,
-                active_wait_requests: 0
+                max_connections: 2,
             }),
             MysqlCheckoutStage::Create
         );
+    }
+
+    #[tokio::test]
+    async fn mysql_checkout_fault_injection_preserves_create_stage_when_handshake_hangs() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let pool_options =
+            mysql_async::PoolOpts::new().with_constraints(mysql_async::PoolConstraints::new(1, 2).unwrap());
+        let options = mysql_async::OptsBuilder::default()
+            .ip_or_hostname(address.ip().to_string())
+            .tcp_port(address.port())
+            .user(Some("fault-injection"))
+            .pass(Some("fault-injection"))
+            .pool_opts(Some(pool_options));
+        let pool = MySqlPool::new(options, 2);
+
+        let error = checkout_mysql_conn(&pool, Duration::from_millis(50)).await.unwrap_err();
+
+        assert!(matches!(error, super::super::PoolCheckoutError::Timeout { stage: MysqlCheckoutStage::Create, .. }));
+        server.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), pool.disconnect()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_REVIEW_MYSQL_* environment variables"]
+    async fn mysql_checkout_fault_injection_preserves_wait_stage_when_real_pool_is_full() {
+        let host = std::env::var("DBX_REVIEW_MYSQL_HOST").expect("DBX_REVIEW_MYSQL_HOST is required");
+        let port = std::env::var("DBX_REVIEW_MYSQL_PORT").expect("DBX_REVIEW_MYSQL_PORT is required");
+        let user = std::env::var("DBX_REVIEW_MYSQL_USER").expect("DBX_REVIEW_MYSQL_USER is required");
+        let password = std::env::var("DBX_REVIEW_MYSQL_PASSWORD").expect("DBX_REVIEW_MYSQL_PASSWORD is required");
+        let database = std::env::var("DBX_REVIEW_MYSQL_DATABASE").expect("DBX_REVIEW_MYSQL_DATABASE is required");
+        let pool_options =
+            mysql_async::PoolOpts::new().with_constraints(mysql_async::PoolConstraints::new(1, 1).unwrap());
+        let options = mysql_async::OptsBuilder::default()
+            .ip_or_hostname(host)
+            .tcp_port(port.parse().expect("DBX_REVIEW_MYSQL_PORT must be a valid port"))
+            .user(Some(user))
+            .pass(Some(password))
+            .db_name(Some(database))
+            .pool_opts(Some(pool_options));
+        let pool = MySqlPool::new(options, 1);
+        let held_connection = tokio::time::timeout(Duration::from_secs(10), pool.get_conn())
+            .await
+            .expect("real MySQL checkout timed out")
+            .expect("real MySQL checkout failed");
+
+        let error = checkout_mysql_conn(&pool, Duration::from_millis(50)).await.unwrap_err();
+
+        assert!(matches!(error, super::super::PoolCheckoutError::Timeout { stage: MysqlCheckoutStage::Wait, .. }));
+        drop(held_connection);
+        let _ = tokio::time::timeout(Duration::from_secs(2), pool.disconnect()).await;
     }
 
     #[tokio::test]
