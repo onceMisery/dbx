@@ -40,10 +40,7 @@ pub const METADATA_POOL_BUSY_ERROR: &str = "DBX metadata pool is busy; please re
 /// shared-pool reconnect.
 pub fn is_pool_saturation_error(err: &str) -> bool {
     let lower = err.to_lowercase();
-    lower == "mysql get connection timed out"
-        || lower.contains("postgresql connection pool checkout timed out")
-        || lower.contains("postgresql connection pool checkout failed: timeout occurred while waiting for a slot")
-        || lower.contains("dbx metadata pool is busy")
+    lower.contains("connection pool checkout timed out [stage=wait") || lower.contains("dbx metadata pool is busy")
 }
 /// Fallback when a Mongo connection hits the generic SQL executor instead of the shell path.
 /// Wording must match packages/mongo-shell `MONGO_SHELL_COMMAND_HINT`
@@ -6924,34 +6921,35 @@ for line in sys.stdin:
         assert!(is_connection_error("pool create timeout"));
         assert!(is_connection_error("pool recycle timeout"));
         // checkout helper timeout messages
-        assert!(!is_connection_error("PostgreSQL connection pool checkout timed out (5s)"));
-        assert!(!is_connection_error(
-            "PostgreSQL connection pool checkout failed: Timeout occurred while waiting for a slot to become available"
-        ));
-        assert!(is_connection_error(
-            "PostgreSQL connection pool checkout failed: Timeout occurred while creating a new object"
-        ));
-        assert!(!is_connection_error("MySQL get connection timed out"));
+        assert!(!is_connection_error("PostgreSQL connection pool checkout timed out [stage=wait, timeout_ms=5000]"));
+        assert!(is_connection_error("PostgreSQL connection pool checkout timed out [stage=create, timeout_ms=5000]"));
+        assert!(is_connection_error("PostgreSQL connection pool checkout timed out [stage=recycle, timeout_ms=5000]"));
+        assert!(!is_connection_error("MySQL connection pool checkout timed out [stage=wait, timeout_ms=5000]"));
         assert!(!is_connection_error(METADATA_POOL_BUSY_ERROR));
         assert!(is_connection_error("MySQL ping timed out"));
         assert!(is_connection_error("MySQL kill connection checkout timed out"));
         assert!(is_connection_error("MySQL KILL QUERY timed out"));
 
-        assert!(is_pool_saturation_error("PostgreSQL connection pool checkout timed out (5s)"));
         assert!(is_pool_saturation_error(
-            "PostgreSQL connection pool checkout failed: Timeout occurred while waiting for a slot to become available"
+            "PostgreSQL connection pool checkout timed out [stage=wait, timeout_ms=5000]"
         ));
+        assert!(is_pool_saturation_error("MySQL connection pool checkout timed out [stage=wait, timeout_ms=5000]"));
         assert!(!is_pool_saturation_error(
-            "PostgreSQL connection pool checkout failed: Timeout occurred while creating a new object"
+            "PostgreSQL connection pool checkout timed out [stage=create, timeout_ms=5000]"
         ));
-        assert!(is_pool_saturation_error("MySQL get connection timed out"));
         assert!(is_pool_saturation_error(METADATA_POOL_BUSY_ERROR));
         assert_eq!(
-            pool_error_action(Some(DatabaseType::Mysql), "MySQL get connection timed out"),
+            pool_error_action(
+                Some(DatabaseType::Mysql),
+                "MySQL connection pool checkout timed out [stage=wait, timeout_ms=5000]"
+            ),
             PoolErrorAction::Keep
         );
         assert_eq!(
-            pool_error_action(Some(DatabaseType::Postgres), "PostgreSQL connection pool checkout timed out (5s)"),
+            pool_error_action(
+                Some(DatabaseType::Postgres),
+                "PostgreSQL connection pool checkout timed out [stage=wait, timeout_ms=5000]"
+            ),
             PoolErrorAction::Keep
         );
     }

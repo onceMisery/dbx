@@ -189,6 +189,32 @@ describe("objectDdlCache", () => {
     expect(mocks.saveSchemaCache).toHaveBeenCalledWith(objectDdlCacheKey(request), expect.objectContaining({ ddl: "fresh ddl" }));
   });
 
+  it("refreshing object B does not invalidate object A's concurrent disk read", async () => {
+    const requestA = { ...request, tableName: "accounts" };
+    const requestB = { ...request, tableName: "billing" };
+    let releaseA: (value: unknown) => void = () => {};
+    let releaseB: (value: unknown) => void = () => {};
+    mocks.loadSchemaCache.mockImplementation((cacheKey: string) => {
+      return new Promise((resolve) => {
+        if (cacheKey === objectDdlCacheKey(requestA)) releaseA = resolve;
+        if (cacheKey === objectDdlCacheKey(requestB)) releaseB = resolve;
+      });
+    });
+    mocks.getTableDisplayDdl.mockImplementation(async (_connectionId: string, _database: string, _schema: string, tableName: string) => `remote ${tableName}`);
+
+    const loadA = loadObjectDdl(requestA);
+    const loadB = loadObjectDdl(requestB);
+    await vi.waitFor(() => expect(mocks.loadSchemaCache).toHaveBeenCalledTimes(2));
+    const invalidation = invalidateObjectDdl(requestB);
+    releaseA({ version: 1, cachedAt: new Date().toISOString(), ddl: "cached accounts" });
+    releaseB({ version: 1, cachedAt: new Date().toISOString(), ddl: "stale billing" });
+
+    await expect(loadA).resolves.toEqual({ ddl: "cached accounts", cacheStatus: "disk" });
+    await expect(loadB).resolves.toEqual({ ddl: "remote billing", cacheStatus: "remote" });
+    await invalidation;
+    expect(mocks.getTableDisplayDdl).toHaveBeenCalledTimes(1);
+  });
+
   it("makes a concurrent normal read wait for a force refresh", async () => {
     mocks.getTableDisplayDdl.mockResolvedValueOnce("old ddl");
     await loadObjectDdl(request);

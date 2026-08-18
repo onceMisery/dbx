@@ -3141,18 +3141,18 @@ impl AppState {
                 PoolKind::Mysql(pool, _) => {
                     let pool = pool.clone();
                     drop(connections);
-                    match tokio::time::timeout(HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT, pool.get_conn()).await {
+                    match db::mysql::checkout_mysql_conn(&pool, HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT).await {
                         // Pool saturation means active work, not a dead connection. Removing this pool would
                         // start a competing reconnect while foreground queries and metadata are still running.
-                        Err(_) => {
-                            log::debug!("MySQL connection pool '{pool_key}' is busy; skipping health probe");
+                        Err(err) if err.is_pool_saturation() => {
+                            log::debug!("MySQL connection pool '{pool_key}' is busy; skipping health probe: {err}");
                             false
                         }
-                        Ok(Err(err)) => {
+                        Err(err) => {
                             log::warn!("MySQL connection pool '{pool_key}' is stale: {err}");
                             true
                         }
-                        Ok(Ok(mut conn)) => {
+                        Ok(mut conn) => {
                             let timeout = crate::db::connection_timeout();
                             match tokio::time::timeout(timeout, conn.ping()).await {
                                 Ok(Ok(())) => false,
@@ -3172,8 +3172,14 @@ impl AppState {
                     let pool = pool.clone();
                     drop(connections);
                     let timeout = crate::db::connection_timeout();
-                    match tokio::time::timeout(HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT, pool.get()).await {
-                        Ok(Ok(client)) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
+                    match db::postgres::checkout_postgres_client_classified(
+                        &pool,
+                        None,
+                        HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(client) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
                             Ok(Ok(_)) => false,
                             Ok(Err(err)) => {
                                 log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
@@ -3184,13 +3190,15 @@ impl AppState {
                                 true
                             }
                         },
-                        Ok(Err(err)) => {
+                        Err(err) if err.is_pool_saturation() => {
+                            log::debug!(
+                                "PostgreSQL connection pool '{pool_key}' is busy; skipping health probe: {err}"
+                            );
+                            false
+                        }
+                        Err(err) => {
                             log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
                             true
-                        }
-                        Err(_) => {
-                            log::debug!("PostgreSQL connection pool '{pool_key}' is busy; skipping health probe");
-                            false
                         }
                     }
                 }
@@ -4164,31 +4172,29 @@ impl AppState {
                         false
                     }
                 },
-                PoolKind::Postgres(p) => match tokio::time::timeout(timeout, p.get()).await {
-                    Ok(Ok(client)) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
-                        Ok(Ok(_)) => true,
-                        Ok(Err(e)) => {
-                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
+                PoolKind::Postgres(p) => {
+                    match db::postgres::checkout_postgres_client_classified(p, None, timeout).await {
+                        Ok(client) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
+                            Ok(Ok(_)) => true,
+                            Ok(Err(e)) => {
+                                log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
+                                false
+                            }
+                            Err(_) => {
+                                log::warn!("PostgreSQL connection pool '{key}' is unhealthy: health check timed out");
+                                false
+                            }
+                        },
+                        Err(error) if error.is_pool_saturation() => {
+                            log::debug!("PostgreSQL connection pool '{key}' is busy; skipping health probe: {error}");
+                            true
+                        }
+                        Err(error) => {
+                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {error}");
                             false
                         }
-                        Err(_) => {
-                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: health check timed out");
-                            false
-                        }
-                    },
-                    Ok(Err(deadpool_postgres::PoolError::Timeout(deadpool_postgres::TimeoutType::Wait))) => {
-                        log::debug!("PostgreSQL connection pool '{key}' is busy; skipping health probe");
-                        true
                     }
-                    Ok(Err(e)) => {
-                        log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
-                        false
-                    }
-                    Err(_) => {
-                        log::debug!("PostgreSQL connection pool '{key}' is busy; skipping health probe");
-                        true
-                    }
-                },
+                }
                 PoolKind::SqlServer(client) => {
                     let mut client = client.lock().await;
                     match db::sqlserver::test_connection(&mut client).await {

@@ -3432,7 +3432,7 @@ mod tests {
         let mut saturation_attempts = 0;
         let saturated = super::retry_metadata_connection_for_session(&state, "conn", Some("app"), None, || {
             saturation_attempts += 1;
-            async { Err::<(), _>("MySQL get connection timed out".to_string()) }
+            async { Err::<(), _>("MySQL connection pool checkout timed out [stage=wait, timeout_ms=500]".to_string()) }
         })
         .await;
         assert_eq!(saturated.err().as_deref(), Some(crate::query::METADATA_POOL_BUSY_ERROR));

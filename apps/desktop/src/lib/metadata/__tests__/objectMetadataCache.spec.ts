@@ -173,6 +173,37 @@ describe("objectMetadataCache", () => {
     expect(mocks.saveSchemaCache).toHaveBeenCalledWith(expect.stringContaining("object-meta:v1:c1:app:public:users:"), expect.objectContaining({ value: ["fresh"] }));
   });
 
+  it("refreshing object B does not invalidate object A's concurrent facet read", async () => {
+    const requestA = { ...request, tableName: "accounts" };
+    const requestB = { ...request, tableName: "billing" };
+    let releaseA: (value: unknown) => void = () => {};
+    let releaseB: (value: unknown) => void = () => {};
+    let diskReads = 0;
+    mocks.loadSchemaCache.mockImplementation((cacheKey: string) => {
+      diskReads += 1;
+      if (diskReads > 2) return Promise.resolve(null);
+      return new Promise((resolve) => {
+        if (cacheKey.includes(":accounts:")) releaseA = resolve;
+        if (cacheKey.includes(":billing:")) releaseB = resolve;
+      });
+    });
+    const loaderA = vi.fn().mockResolvedValue(["remote accounts"]);
+    const loaderB = vi.fn().mockResolvedValue(["remote billing"]);
+
+    const loadA = loadObjectMetadataFacet(requestA, "columns", loaderA);
+    const loadB = loadObjectMetadataFacet(requestB, "columns", loaderB);
+    await vi.waitFor(() => expect(mocks.loadSchemaCache).toHaveBeenCalledTimes(2));
+    const invalidation = invalidateObjectMetadataCache(requestB);
+    releaseA({ version: 1, cachedAt: new Date().toISOString(), value: ["cached accounts"] });
+    releaseB({ version: 1, cachedAt: new Date().toISOString(), value: ["stale billing"] });
+
+    await expect(loadA).resolves.toEqual({ value: ["cached accounts"], cacheStatus: "disk" });
+    await expect(loadB).resolves.toEqual({ value: ["remote billing"], cacheStatus: "remote" });
+    await invalidation;
+    expect(loaderA).not.toHaveBeenCalled();
+    expect(loaderB).toHaveBeenCalledTimes(1);
+  });
+
   it("makes a concurrent normal facet read wait for a force refresh", async () => {
     const loader = vi.fn().mockResolvedValueOnce(["old"]);
     await loadObjectMetadataFacet(request, "indexes", loader);

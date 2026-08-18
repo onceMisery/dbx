@@ -5900,45 +5900,70 @@ async fn execute_postgres_user_query(
 
 /// PostgreSQL pool checkout with timeout and cancel token support.
 /// When the checkout phase is stuck, the cancel token can terminate the wait early.
-/// The timeout error message includes "checkout timed out" to ensure is_connection_error can classify it correctly.
-pub async fn checkout_postgres_client(
+pub(crate) type PostgresCheckoutStage = super::PoolCheckoutStage;
+
+pub(crate) fn classify_postgres_checkout_stage(status: deadpool_postgres::Status) -> PostgresCheckoutStage {
+    if status.waiting > 0 || (status.available == 0 && status.size >= status.max_size) {
+        PostgresCheckoutStage::Wait
+    } else if status.available > 0 {
+        PostgresCheckoutStage::Recycle
+    } else if status.size < status.max_size {
+        PostgresCheckoutStage::Create
+    } else {
+        PostgresCheckoutStage::Unknown
+    }
+}
+
+fn postgres_pool_error_stage(error: &PoolError) -> PostgresCheckoutStage {
+    match error {
+        PoolError::Timeout(deadpool_postgres::TimeoutType::Wait) => PostgresCheckoutStage::Wait,
+        PoolError::Timeout(deadpool_postgres::TimeoutType::Create) => PostgresCheckoutStage::Create,
+        PoolError::Timeout(deadpool_postgres::TimeoutType::Recycle) => PostgresCheckoutStage::Recycle,
+        PoolError::Backend(_) | PoolError::PostCreateHook(_) => PostgresCheckoutStage::Create,
+        PoolError::Closed | PoolError::NoRuntimeSpecified => PostgresCheckoutStage::Unknown,
+    }
+}
+
+pub(crate) async fn checkout_postgres_client_classified(
     pool: &Pool,
     cancel_token: Option<&CancellationToken>,
     checkout_timeout: Duration,
-) -> Result<deadpool_postgres::Object, String> {
-    let checkout_timeout = effective_postgres_checkout_timeout(pool, checkout_timeout);
+) -> Result<deadpool_postgres::Object, super::PoolCheckoutError> {
     let start = Instant::now();
     let get_future = async {
-        tokio::time::timeout(checkout_timeout, pool.get())
-            .await
-            .map_err(|_| {
-                let elapsed = start.elapsed().as_millis();
+        match tokio::time::timeout(checkout_timeout, pool.get()).await {
+            Ok(Ok(client)) => Ok(client),
+            Ok(Err(error)) => {
+                let stage = postgres_pool_error_stage(&error);
+                let timed_out = matches!(&error, PoolError::Timeout(_));
+                let detail = pg_pool_error_to_string(error);
                 log::warn!(
-                    "[db:pool.checkout:error] elapsed_ms={} timeout_ms={} error=checkout timed out",
-                    elapsed,
-                    checkout_timeout.as_millis()
-                );
-                format!("PostgreSQL connection pool checkout timed out ({}s)", checkout_timeout.as_secs())
-            })?
-            .map_err(|e| {
-                let elapsed = start.elapsed().as_millis();
-                let wait_timeout = matches!(&e, PoolError::Timeout(deadpool_postgres::TimeoutType::Wait));
-                let err = pg_pool_error_to_string(e);
-                log::warn!(
-                    "[db:pool.checkout:error] elapsed_ms={} timeout_ms={} error={}",
-                    elapsed,
+                    "[db:pool.checkout:error] elapsed_ms={} timeout_ms={} stage={} error={}",
+                    start.elapsed().as_millis(),
                     checkout_timeout.as_millis(),
-                    err
+                    stage.as_str(),
+                    detail
                 );
-                if wait_timeout {
-                    format!("PostgreSQL connection pool checkout timed out ({}s)", checkout_timeout.as_secs())
+                if timed_out {
+                    Err(super::PoolCheckoutError::Timeout { database: "PostgreSQL", stage, timeout: checkout_timeout })
                 } else {
-                    format!("PostgreSQL connection pool checkout failed: {err}")
+                    Err(super::PoolCheckoutError::Failed { database: "PostgreSQL", stage, detail })
                 }
-            })
+            }
+            Err(_) => {
+                let stage = classify_postgres_checkout_stage(pool.status());
+                log::warn!(
+                    "[db:pool.checkout:error] elapsed_ms={} timeout_ms={} stage={} error=checkout timed out",
+                    start.elapsed().as_millis(),
+                    checkout_timeout.as_millis(),
+                    stage.as_str()
+                );
+                Err(super::PoolCheckoutError::Timeout { database: "PostgreSQL", stage, timeout: checkout_timeout })
+            }
+        }
     };
 
-    let result = match cancel_token {
+    match cancel_token {
         Some(token) => tokio::select! {
             biased;
             _ = token.cancelled() => {
@@ -5947,12 +5972,24 @@ pub async fn checkout_postgres_client(
                     start.elapsed().as_millis(),
                     checkout_timeout.as_millis()
                 );
-                return Err(crate::query::canceled_error());
+                Err(super::PoolCheckoutError::Canceled)
             }
             result = get_future => result,
         },
         None => get_future.await,
-    };
+    }
+}
+
+pub async fn checkout_postgres_client(
+    pool: &Pool,
+    cancel_token: Option<&CancellationToken>,
+    checkout_timeout: Duration,
+) -> Result<deadpool_postgres::Object, String> {
+    let checkout_timeout = effective_postgres_checkout_timeout(pool, checkout_timeout);
+    let start = Instant::now();
+    let result = checkout_postgres_client_classified(pool, cancel_token, checkout_timeout)
+        .await
+        .map_err(|error| error.to_string());
     if let Ok(client) = &result {
         log::debug!(
             "[db:pool.checkout:done] elapsed_ms={} timeout_ms={}",
@@ -8766,6 +8803,43 @@ mod tests {
 
         assert_eq!(effective_postgres_checkout_timeout(&pool, Duration::from_secs(5)), Duration::from_secs(10));
         assert_eq!(effective_postgres_checkout_timeout(&pool, Duration::from_secs(15)), Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn postgres_checkout_fault_injection_classifies_full_pool_as_wait() {
+        assert!(tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>()).await.is_err());
+        assert_eq!(
+            classify_postgres_checkout_stage(deadpool_postgres::Status {
+                max_size: 1,
+                size: 1,
+                available: 0,
+                waiting: 1
+            }),
+            PostgresCheckoutStage::Wait
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_checkout_fault_injection_preserves_create_and_recycle_stages() {
+        assert!(tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>()).await.is_err());
+        assert_eq!(
+            classify_postgres_checkout_stage(deadpool_postgres::Status {
+                max_size: 2,
+                size: 1,
+                available: 0,
+                waiting: 0
+            }),
+            PostgresCheckoutStage::Create
+        );
+        assert_eq!(
+            classify_postgres_checkout_stage(deadpool_postgres::Status {
+                max_size: 1,
+                size: 1,
+                available: 1,
+                waiting: 0
+            }),
+            PostgresCheckoutStage::Recycle
+        );
     }
 
     #[tokio::test]

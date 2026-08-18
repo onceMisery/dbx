@@ -9,6 +9,7 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -3909,13 +3910,65 @@ pub async fn get_conn_with_health_check_with_cancel(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MysqlCheckoutSnapshot {
+    pub(crate) connection_count: usize,
+    pub(crate) connections_in_pool: usize,
+    pub(crate) connections_in_use: usize,
+    pub(crate) active_wait_requests: usize,
+}
+
+pub(crate) type MysqlCheckoutStage = super::PoolCheckoutStage;
+
+pub(crate) fn classify_mysql_checkout_stage(snapshot: MysqlCheckoutSnapshot) -> MysqlCheckoutStage {
+    if snapshot.active_wait_requests > 0
+        || (snapshot.connection_count > 0 && snapshot.connections_in_use >= snapshot.connection_count)
+    {
+        MysqlCheckoutStage::Wait
+    } else if snapshot.connections_in_pool > 0 {
+        MysqlCheckoutStage::Recycle
+    } else {
+        MysqlCheckoutStage::Create
+    }
+}
+
+fn mysql_checkout_snapshot(pool: &MySqlPool) -> MysqlCheckoutSnapshot {
+    let metrics = pool.metrics();
+    use std::sync::atomic::Ordering;
+    MysqlCheckoutSnapshot {
+        connection_count: metrics.connection_count.load(Ordering::Relaxed),
+        connections_in_pool: metrics.connections_in_pool.load(Ordering::Relaxed),
+        connections_in_use: metrics.connections_in_use.load(Ordering::Relaxed),
+        active_wait_requests: metrics.active_wait_requests.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) async fn checkout_mysql_conn(
+    pool: &MySqlPool,
+    timeout: Duration,
+) -> Result<mysql_async::Conn, super::PoolCheckoutError> {
+    let snapshot = mysql_checkout_snapshot(pool);
+    match tokio::time::timeout(timeout, pool.get_conn()).await {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(error)) => Err(super::PoolCheckoutError::Failed {
+            database: "MySQL",
+            stage: classify_mysql_checkout_stage(snapshot),
+            detail: error.to_string(),
+        }),
+        Err(_) => Err(super::PoolCheckoutError::Timeout {
+            database: "MySQL",
+            stage: classify_mysql_checkout_stage(mysql_checkout_snapshot(pool)),
+            timeout,
+        }),
+    }
+}
+
 async fn get_conn_with_timeout_and_cancel(
     pool: &MySqlPool,
     timeout: Duration,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<mysql_async::Conn, String> {
-    let get_future =
-        connection_result_with_timeout(timeout, async { pool.get_conn().await.map_err(|error| error.to_string()) });
+    let get_future = async { checkout_mysql_conn(pool, timeout).await.map_err(|error| error.to_string()) };
 
     match cancel_token {
         Some(token) => {
@@ -3930,9 +3983,10 @@ async fn get_conn_with_timeout_and_cancel(
 }
 
 pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<mysql_async::Conn, String> {
-    connection_result_with_timeout(timeout, async { pool.get_conn().await.map_err(|error| error.to_string()) }).await
+    checkout_mysql_conn(pool, timeout).await.map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 async fn connection_result_with_timeout<T, F>(timeout: Duration, future: F) -> Result<T, String>
 where
     F: Future<Output = Result<T, String>>,
@@ -5357,16 +5411,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             Ok::<_, String>("connection")
         });
-        let configured_five = connection_result_with_timeout(Duration::from_millis(50), async {
-            tokio::time::sleep(Duration::from_millis(60)).await;
-            Ok::<_, String>("connection")
-        });
+        let configured_five = connection_result_with_timeout(
+            Duration::from_millis(10),
+            std::future::pending::<Result<&'static str, String>>(),
+        );
 
         let (exact, adjacent, configured_five) = tokio::join!(exact, adjacent, configured_five);
 
         assert_eq!(exact, Ok("connection"));
         assert_eq!(adjacent, Ok("connection"));
         assert_eq!(configured_five, Err("MySQL get connection timed out".to_string()));
+    }
+
+    #[tokio::test]
+    async fn mysql_checkout_fault_injection_classifies_full_pool_as_wait() {
+        assert!(tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>()).await.is_err());
+        assert_eq!(
+            classify_mysql_checkout_stage(MysqlCheckoutSnapshot {
+                connection_count: 1,
+                connections_in_pool: 0,
+                connections_in_use: 1,
+                active_wait_requests: 1
+            }),
+            MysqlCheckoutStage::Wait
+        );
+    }
+
+    #[tokio::test]
+    async fn mysql_checkout_fault_injection_classifies_hung_connection_create() {
+        assert!(tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>()).await.is_err());
+        assert_eq!(
+            classify_mysql_checkout_stage(MysqlCheckoutSnapshot {
+                connection_count: 1,
+                connections_in_pool: 0,
+                connections_in_use: 0,
+                active_wait_requests: 0
+            }),
+            MysqlCheckoutStage::Create
+        );
     }
 
     #[tokio::test]

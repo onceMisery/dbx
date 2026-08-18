@@ -21,7 +21,8 @@ interface InFlightLoad<T> {
 }
 
 const inFlightLoads = new Map<string, InFlightLoad<unknown>>();
-let cacheGeneration = 0;
+let nextCacheGeneration = 0;
+const cacheGenerationsByPrefix = new Map<string, number>();
 const pendingInvalidations = new Map<string, Promise<void>>();
 const pendingWrites = new Map<string, Promise<void>>();
 
@@ -85,17 +86,22 @@ async function waitForPendingInvalidations(cacheKey: string): Promise<void> {
   if (pending.length) await Promise.all(pending);
 }
 
-function currentGeneration(): number {
-  return cacheGeneration;
+function currentGeneration(cacheKey: string): number {
+  let generation = 0;
+  for (const [prefix, prefixGeneration] of cacheGenerationsByPrefix) {
+    if (cacheKey.startsWith(prefix)) generation = Math.max(generation, prefixGeneration);
+  }
+  return generation;
 }
 
-function bumpGeneration(): number {
-  cacheGeneration += 1;
-  return cacheGeneration;
+function bumpGeneration(prefix: string): number {
+  nextCacheGeneration += 1;
+  cacheGenerationsByPrefix.set(prefix, nextCacheGeneration);
+  return nextCacheGeneration;
 }
 
-function bumpGenerationsForPrefix(_prefix: string): void {
-  bumpGeneration();
+function bumpGenerationsForPrefix(prefix: string): void {
+  bumpGeneration(prefix);
 }
 
 function invalidateInFlightLoad(cacheKey: string): void {
@@ -143,7 +149,7 @@ export async function loadObjectMetadataFacet<T>(request: ObjectDdlRequest, face
     const existing = inFlightLoads.get(cacheKey);
     if (existing?.force) return { value: (await existing.promise) as T, cacheStatus: "remote" };
     invalidateInFlightLoad(cacheKey);
-    bumpGeneration();
+    bumpGeneration(cacheKey);
     invalidateMetadataRuntimeCachePrefix(cacheKey);
     const priorInvalidations = waitForPendingInvalidations(cacheKey);
     const deletion = invalidatePersistedPrefix(cacheKey);
@@ -155,9 +161,9 @@ export async function loadObjectMetadataFacet<T>(request: ObjectDdlRequest, face
   if (!options?.force) {
     const runtime = getMetadataRuntimeCache<T>(cacheKey);
     if (runtime) return { value: runtime.value, cacheStatus: "memory" };
-    const generation = currentGeneration();
+    const generation = currentGeneration(cacheKey);
     const cached = decodeEnvelope<T>(await loadSchemaCacheSafe<unknown>(cacheKey));
-    if (generation !== currentGeneration()) {
+    if (generation !== currentGeneration(cacheKey)) {
       const value = await loadObjectMetadataFacet(request, facet, loader, { force: false });
       return { value: value.value, cacheStatus: "remote" };
     }
@@ -172,7 +178,7 @@ export async function loadObjectMetadataFacet<T>(request: ObjectDdlRequest, face
   if (existing && (!options?.force || existing.force)) return { value: (await existing.promise) as T, cacheStatus: "remote" };
   if (existing) invalidateInFlightLoad(cacheKey);
 
-  const entry: InFlightLoad<T> = { force: options?.force === true, invalidated: false, generation: currentGeneration(), promise: Promise.resolve(undefined as T) };
+  const entry: InFlightLoad<T> = { force: options?.force === true, invalidated: false, generation: currentGeneration(cacheKey), promise: Promise.resolve(undefined as T) };
   recordMetadataCacheRemoteMiss(cacheKey);
   entry.promise = loader()
     .then((value) => {
@@ -181,11 +187,11 @@ export async function loadObjectMetadataFacet<T>(request: ObjectDdlRequest, face
       // transient failure into a successful cache hit.
       if (value === undefined) return value;
       const serialized = JSON.stringify(value);
-      const current = !entry.invalidated && currentGeneration() === entry.generation;
+      const current = !entry.invalidated && currentGeneration(cacheKey) === entry.generation;
       if (current) setMetadataRuntimeCache(cacheKey, value, request.connectionId);
       if (current && serialized !== undefined && serialized.length <= MAX_PERSISTED_METADATA_CHARS) {
         const envelope: ObjectMetadataCacheEnvelope<T> = { version: 1, cachedAt: new Date().toISOString(), value };
-        persistSchemaCache(cacheKey, envelope, () => entry.invalidated || currentGeneration() !== entry.generation);
+        persistSchemaCache(cacheKey, envelope, () => entry.invalidated || currentGeneration(cacheKey) !== entry.generation);
       }
       return value;
     })

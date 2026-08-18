@@ -379,7 +379,11 @@ const SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS schema_cache (
         cache_key TEXT PRIMARY KEY,
         payload_json TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL DEFAULT 0,
+        last_accessed_at_ms INTEGER NOT NULL DEFAULT 0,
+        byte_size INTEGER NOT NULL DEFAULT 0,
+        owner_id TEXT NOT NULL DEFAULT ''
     )",
     "CREATE TABLE IF NOT EXISTS tab_runtime_cache (
         cache_key TEXT PRIMARY KEY,
@@ -480,6 +484,7 @@ impl Storage {
             ensure_history_columns_sync(conn)?;
             ensure_saved_sql_columns_sync(conn)?;
             ensure_tab_runtime_cache_columns_sync(conn)?;
+            ensure_schema_cache_columns_sync(conn)?;
             ensure_ai_configs_columns_sync(conn)?;
             ensure_state_store_columns_sync(conn)?;
             Ok(())
@@ -511,6 +516,52 @@ fn inspect_sqlite_db_file(path: &Path) -> Result<SqliteDbFileState, String> {
     } else {
         Ok(SqliteDbFileState::Invalid)
     }
+}
+
+fn ensure_schema_cache_columns_sync(conn: &Connection) -> Result<(), String> {
+    let mut columns = HashSet::new();
+    let mut statement = conn.prepare("PRAGMA table_info(schema_cache)").map_err(|error| error.to_string())?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1)).map_err(|error| error.to_string())?;
+    for row in rows {
+        columns.insert(row.map_err(|error| error.to_string())?);
+    }
+
+    for (name, definition) in [
+        ("updated_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_accessed_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("byte_size", "INTEGER NOT NULL DEFAULT 0"),
+        ("owner_id", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        if !columns.contains(name) {
+            conn.execute(&format!("ALTER TABLE schema_cache ADD COLUMN {name} {definition}"), [])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    conn.execute(
+        "UPDATE schema_cache
+         SET byte_size = length(payload_json)
+         WHERE byte_size = 0 AND payload_json IS NOT NULL",
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    conn.execute(
+        "UPDATE schema_cache
+         SET updated_at_ms = COALESCE(CAST(strftime('%s', updated_at) AS INTEGER) * 1000, 0),
+             last_accessed_at_ms = COALESCE(CAST(strftime('%s', updated_at) AS INTEGER) * 1000, 0)
+         WHERE updated_at_ms = 0",
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_schema_cache_updated_at_ms ON schema_cache (updated_at_ms)", [])
+        .map_err(|error| error.to_string())?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_schema_cache_owner_lru
+         ON schema_cache (owner_id, last_accessed_at_ms, updated_at_ms, cache_key)",
+        [],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn open_read_only_sqlite(path: &Path) -> Result<Connection, String> {
@@ -3382,31 +3433,165 @@ impl Storage {
 
 // Schema cache
 
+const SCHEMA_CACHE_MAX_TOTAL_BYTES: i64 = 256 * 1024 * 1024;
+const SCHEMA_CACHE_MAX_CONNECTION_BYTES: i64 = 64 * 1024 * 1024;
+const SCHEMA_CACHE_MAX_ENTRIES: usize = 50_000;
+const SCHEMA_CACHE_MAX_AGE_MILLIS: i64 = 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy)]
+struct SchemaCachePolicy {
+    max_total_bytes: i64,
+    max_connection_bytes: i64,
+    max_entries: usize,
+    max_age_millis: i64,
+}
+
+impl Default for SchemaCachePolicy {
+    fn default() -> Self {
+        Self {
+            max_total_bytes: SCHEMA_CACHE_MAX_TOTAL_BYTES,
+            max_connection_bytes: SCHEMA_CACHE_MAX_CONNECTION_BYTES,
+            max_entries: SCHEMA_CACHE_MAX_ENTRIES,
+            max_age_millis: SCHEMA_CACHE_MAX_AGE_MILLIS,
+        }
+    }
+}
+
+fn schema_cache_owner(cache_key: &str) -> &str {
+    let mut parts = cache_key.split(':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("object-ddl" | "object-meta"), Some("v1"), Some(owner)) => owner,
+        _ => "",
+    }
+}
+
+fn delete_oldest_schema_cache_entry(conn: &Connection, owner_id: Option<&str>) -> Result<bool, String> {
+    let deleted = match owner_id {
+        Some(owner_id) => conn.execute(
+            "DELETE FROM schema_cache
+             WHERE cache_key = (
+                 SELECT cache_key FROM schema_cache WHERE owner_id = ?1
+                 ORDER BY last_accessed_at_ms ASC, updated_at_ms ASC, cache_key ASC LIMIT 1
+             )",
+            [owner_id],
+        ),
+        None => conn.execute(
+            "DELETE FROM schema_cache
+             WHERE cache_key = (
+                 SELECT cache_key FROM schema_cache
+                 ORDER BY last_accessed_at_ms ASC, updated_at_ms ASC, cache_key ASC LIMIT 1
+             )",
+            [],
+        ),
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(deleted > 0)
+}
+
+fn prune_schema_cache(conn: &Connection, policy: SchemaCachePolicy, now_ms: i64) -> Result<(), String> {
+    let expires_before = now_ms.saturating_sub(policy.max_age_millis.max(0));
+    conn.execute("DELETE FROM schema_cache WHERE updated_at_ms = 0 OR updated_at_ms <= ?1", [expires_before])
+        .map_err(|error| error.to_string())?;
+
+    loop {
+        let over_budget_owner: Option<String> = conn
+            .query_row(
+                "SELECT owner_id FROM schema_cache
+                 GROUP BY owner_id
+                 HAVING SUM(byte_size) > ?1
+                 ORDER BY SUM(byte_size) DESC, owner_id ASC
+                 LIMIT 1",
+                [policy.max_connection_bytes.max(0)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(owner_id) = over_budget_owner else {
+            break;
+        };
+        if !delete_oldest_schema_cache_entry(conn, Some(&owner_id))? {
+            break;
+        }
+    }
+
+    loop {
+        let (entry_count, total_bytes): (i64, i64) = conn
+            .query_row("SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM schema_cache", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        if entry_count <= policy.max_entries as i64 && total_bytes <= policy.max_total_bytes.max(0) {
+            break;
+        }
+        if !delete_oldest_schema_cache_entry(conn, None)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl Storage {
     pub async fn save_schema_cache(&self, cache_key: &str, payload: &serde_json::Value) -> Result<(), String> {
+        self.save_schema_cache_with_policy(cache_key, payload, SchemaCachePolicy::default()).await
+    }
+
+    async fn save_schema_cache_with_policy(
+        &self,
+        cache_key: &str,
+        payload: &serde_json::Value,
+        policy: SchemaCachePolicy,
+    ) -> Result<(), String> {
         let cache_key = cache_key.to_string();
         let json = serde_json::to_string(payload).map_err(|e| e.to_string())?;
+        let byte_size = json.len().min(i64::MAX as usize) as i64;
+        let owner_id = schema_cache_owner(&cache_key).to_string();
+        let now_ms = unix_timestamp_millis();
         self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_cache (cache_key, payload_json, updated_at) \
-                 VALUES (?1, ?2, datetime('now'))",
-                params![cache_key, json],
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            let transaction = conn.transaction().map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO schema_cache (
+                         cache_key, payload_json, updated_at, updated_at_ms, last_accessed_at_ms, byte_size, owner_id
+                     ) VALUES (?1, ?2, datetime('now'), ?3, ?3, ?4, ?5)
+                     ON CONFLICT(cache_key) DO UPDATE SET
+                         payload_json = excluded.payload_json,
+                         updated_at = excluded.updated_at,
+                         updated_at_ms = excluded.updated_at_ms,
+                         last_accessed_at_ms = excluded.last_accessed_at_ms,
+                         byte_size = excluded.byte_size,
+                         owner_id = excluded.owner_id",
+                    params![cache_key, json, now_ms, byte_size, owner_id],
+                )
+                .map_err(|error| error.to_string())?;
+            prune_schema_cache(&transaction, policy, now_ms)?;
+            transaction.commit().map_err(|error| error.to_string())
         })
         .await
     }
 
     pub async fn load_schema_cache(&self, cache_key: &str) -> Result<Option<serde_json::Value>, String> {
         let cache_key = cache_key.to_string();
+        let now_ms = unix_timestamp_millis();
         let json: Option<String> = self
             .with_conn(move |conn| {
-                conn.query_row("SELECT payload_json FROM schema_cache WHERE cache_key = ?1", [cache_key], |row| {
-                    row.get(0)
-                })
-                .optional()
-                .map_err(|e| e.to_string())
+                let transaction = conn.transaction().map_err(|error| error.to_string())?;
+                prune_schema_cache(&transaction, SchemaCachePolicy::default(), now_ms)?;
+                let json = transaction
+                    .query_row("SELECT payload_json FROM schema_cache WHERE cache_key = ?1", [&cache_key], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                if json.is_some() {
+                    transaction
+                        .execute(
+                            "UPDATE schema_cache SET last_accessed_at_ms = ?2 WHERE cache_key = ?1",
+                            params![cache_key, now_ms],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                transaction.commit().map_err(|error| error.to_string())?;
+                Ok(json)
             })
             .await?;
         json.map(|value| serde_json::from_str(&value).map_err(|e| e.to_string())).transpose()
@@ -5286,6 +5471,120 @@ mod tests {
         assert_eq!(super::normalize_metadata_cache_max_memory_mb(256), 256);
         assert_eq!(super::normalize_metadata_cache_max_memory_mb(512), 512);
         assert_eq!(super::normalize_metadata_cache_max_memory_mb(513), 64);
+    }
+
+    #[tokio::test]
+    async fn schema_cache_deletes_expired_rows_instead_of_only_ignoring_them() {
+        let path = temp_db_path("schema-cache-ttl-prune");
+        let storage = Storage::open(&path).await.unwrap();
+        storage
+            .save_schema_cache(
+                "object-ddl:v1:conn-a:db:public:old::TABLE:",
+                &serde_json::json!({ "version": 1, "ddl": "old" }),
+            )
+            .await
+            .unwrap();
+        storage
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE schema_cache SET updated_at = datetime('now', '-25 hours'), updated_at_ms = CAST(strftime('%s', 'now', '-25 hours') AS INTEGER) * 1000",
+                    [],
+                )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(storage.load_schema_cache("object-ddl:v1:conn-a:db:public:missing::TABLE:").await.unwrap(), None);
+        let remaining = storage
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM schema_cache", [], |row| row.get::<_, i64>(0))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn schema_cache_budget_covers_multiple_connections_objects_and_facets() {
+        let path = temp_db_path("schema-cache-capacity");
+        let storage = Storage::open(&path).await.unwrap();
+        let policy = super::SchemaCachePolicy {
+            max_total_bytes: 1_100,
+            max_connection_bytes: 700,
+            max_entries: 5,
+            max_age_millis: 86_400_000,
+        };
+        let payload = serde_json::json!({ "value": "x".repeat(180) });
+        let keys = [
+            "object-ddl:v1:conn-a:db:public:accounts::TABLE:",
+            "object-meta:v1:conn-a:db:public:accounts::TABLE:columns:",
+            "object-meta:v1:conn-a:db:public:billing::TABLE:indexes:",
+            "object-ddl:v1:conn-b:db:public:events::TABLE:",
+            "object-meta:v1:conn-b:db:public:events::TABLE:triggers:",
+            "object-meta:v1:conn-c:db:public:audit::TABLE:comment:",
+        ];
+        for key in keys {
+            storage.save_schema_cache_with_policy(key, &payload, policy).await.unwrap();
+        }
+
+        let (entries, bytes, conn_a_bytes) = storage
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(byte_size), 0), COALESCE(SUM(CASE WHEN owner_id = 'conn-a' THEN byte_size ELSE 0 END), 0) FROM schema_cache",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+        assert!(entries <= policy.max_entries as i64);
+        assert!(bytes <= policy.max_total_bytes);
+        assert!(conn_a_bytes <= policy.max_connection_bytes);
+        assert!(storage.load_schema_cache(keys.last().unwrap()).await.unwrap().is_some());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn schema_cache_lru_keeps_recently_accessed_entries() {
+        let path = temp_db_path("schema-cache-lru");
+        let storage = Storage::open(&path).await.unwrap();
+        let policy = super::SchemaCachePolicy {
+            max_total_bytes: i64::MAX,
+            max_connection_bytes: i64::MAX,
+            max_entries: 2,
+            max_age_millis: 86_400_000,
+        };
+        let first = "object-ddl:v1:conn-a:db:public:first::TABLE:";
+        let second = "object-meta:v1:conn-b:db:public:second::TABLE:columns:";
+        let newest = "object-meta:v1:conn-c:db:public:newest::TABLE:indexes:";
+        storage.save_schema_cache_with_policy(first, &serde_json::json!({ "value": 1 }), policy).await.unwrap();
+        storage.save_schema_cache_with_policy(second, &serde_json::json!({ "value": 2 }), policy).await.unwrap();
+        storage
+            .with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE schema_cache SET last_accessed_at_ms = CASE cache_key WHEN ?1 THEN 1 ELSE 2 END",
+                    rusqlite::params![first],
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+        assert!(storage.load_schema_cache(first).await.unwrap().is_some());
+        storage.save_schema_cache_with_policy(newest, &serde_json::json!({ "value": 3 }), policy).await.unwrap();
+
+        assert!(storage.load_schema_cache(first).await.unwrap().is_some());
+        assert_eq!(storage.load_schema_cache(second).await.unwrap(), None);
+        assert!(storage.load_schema_cache(newest).await.unwrap().is_some());
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
