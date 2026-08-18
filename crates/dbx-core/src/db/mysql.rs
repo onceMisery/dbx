@@ -48,10 +48,6 @@ impl MySqlPool {
         Self { inner: mysql_async::Pool::new(opts), max_connections: max_connections.max(1) }
     }
 
-    pub(crate) fn max_connections(&self) -> usize {
-        self.max_connections
-    }
-
     pub async fn disconnect(self) -> Result<(), mysql_async::Error> {
         self.inner.disconnect().await
     }
@@ -62,6 +58,32 @@ impl Deref for MySqlPool {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+#[doc(hidden)]
+pub trait MySqlPoolAccess {
+    fn driver_pool(&self) -> &mysql_async::Pool;
+    fn checkout_max_connections(&self) -> Option<usize>;
+}
+
+impl MySqlPoolAccess for MySqlPool {
+    fn driver_pool(&self) -> &mysql_async::Pool {
+        &self.inner
+    }
+
+    fn checkout_max_connections(&self) -> Option<usize> {
+        Some(self.max_connections)
+    }
+}
+
+impl MySqlPoolAccess for mysql_async::Pool {
+    fn driver_pool(&self) -> &mysql_async::Pool {
+        self
+    }
+
+    fn checkout_max_connections(&self) -> Option<usize> {
+        None
     }
 }
 const MYSQL_TCP_KEEPALIVE_MS: u32 = 30_000;
@@ -3638,7 +3660,10 @@ fn parse_mysql_enum_values(column_type: &str) -> Option<Vec<String>> {
     }
 }
 
-pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+pub async fn get_columns<P>(pool: &P, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String>
+where
+    P: MySqlPoolAccess + ?Sized,
+{
     let sql = columns_sql(database, table);
     let mut conn = get_conn_with_health_check(pool).await?;
     let result = match conn.query_iter(&sql).await {
@@ -3710,7 +3735,10 @@ pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Resul
     Ok(columns)
 }
 
-pub async fn get_columns_show(pool: &MySqlPool, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+pub async fn get_columns_show<P>(pool: &P, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String>
+where
+    P: MySqlPoolAccess + ?Sized,
+{
     let sql = show_columns_sql(database, table, true);
     let mut conn = get_conn_with_health_check(pool).await?;
     let rows: Vec<mysql_async::Row> = match conn.query_iter(&sql).await {
@@ -3887,23 +3915,32 @@ pub(super) fn skip_mysql_quoted(sql: &str, start: usize, quote: u8) -> usize {
 
 /// Get a connection from the pool with a health check. If the connection is dead
 /// (e.g. after app was backgrounded), it tries again with a fresh connection.
-pub async fn get_conn_with_health_check(pool: &MySqlPool) -> Result<mysql_async::Conn, String> {
+pub async fn get_conn_with_health_check<P>(pool: &P) -> Result<mysql_async::Conn, String>
+where
+    P: MySqlPoolAccess + ?Sized,
+{
     get_conn_with_health_check_with_timeout(pool, super::connection_timeout()).await
 }
 
-pub async fn get_conn_with_health_check_with_timeout(
-    pool: &MySqlPool,
+pub async fn get_conn_with_health_check_with_timeout<P>(
+    pool: &P,
     timeout: Duration,
-) -> Result<mysql_async::Conn, String> {
+) -> Result<mysql_async::Conn, String>
+where
+    P: MySqlPoolAccess + ?Sized,
+{
     get_conn_with_health_check_with_cancel(pool, timeout, timeout, None).await
 }
 
-pub async fn get_conn_with_health_check_with_cancel(
-    pool: &MySqlPool,
+pub async fn get_conn_with_health_check_with_cancel<P>(
+    pool: &P,
     timeout: Duration,
     cleanup_timeout: Duration,
     cancel_token: Option<&CancellationToken>,
-) -> Result<mysql_async::Conn, String> {
+) -> Result<mysql_async::Conn, String>
+where
+    P: MySqlPoolAccess + ?Sized,
+{
     let start = Instant::now();
     let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token).await?;
     match ping_conn_with_timeout_and_cancel(&mut conn, timeout, cancel_token).await {
@@ -3963,36 +4000,47 @@ pub(crate) fn classify_mysql_checkout_stage(snapshot: MysqlCheckoutSnapshot) -> 
     }
 }
 
-fn mysql_checkout_snapshot(pool: &MySqlPool) -> MysqlCheckoutSnapshot {
-    let metrics = pool.metrics();
+fn mysql_checkout_snapshot<P>(pool: &P, max_connections: usize) -> MysqlCheckoutSnapshot
+where
+    P: MySqlPoolAccess + ?Sized,
+{
+    let metrics = pool.driver_pool().metrics();
     use std::sync::atomic::Ordering;
     MysqlCheckoutSnapshot {
         connection_count: metrics.connection_count.load(Ordering::Relaxed),
         connections_in_pool: metrics.connections_in_pool.load(Ordering::Relaxed),
-        max_connections: pool.max_connections(),
+        max_connections,
     }
 }
 
-pub(crate) async fn checkout_mysql_conn(
-    pool: &MySqlPool,
+pub(crate) async fn checkout_mysql_conn<P>(
+    pool: &P,
     timeout: Duration,
-) -> Result<mysql_async::Conn, super::PoolCheckoutError> {
+) -> Result<mysql_async::Conn, super::PoolCheckoutError>
+where
+    P: MySqlPoolAccess + ?Sized,
+{
     // Capture the phase before entering the driver future. The phase is tied
     // to this checkout's capacity decision, not to a later aggregate metric
     // snapshot that may already include another request.
-    let stage = classify_mysql_checkout_stage(mysql_checkout_snapshot(pool));
-    match tokio::time::timeout(timeout, pool.get_conn()).await {
+    let stage = pool.checkout_max_connections().map_or(MysqlCheckoutStage::Unknown, |max_connections| {
+        classify_mysql_checkout_stage(mysql_checkout_snapshot(pool, max_connections))
+    });
+    match tokio::time::timeout(timeout, pool.driver_pool().get_conn()).await {
         Ok(Ok(conn)) => Ok(conn),
         Ok(Err(error)) => Err(super::PoolCheckoutError::Failed { database: "MySQL", stage, detail: error.to_string() }),
         Err(_) => Err(super::PoolCheckoutError::Timeout { database: "MySQL", stage, timeout }),
     }
 }
 
-async fn get_conn_with_timeout_and_cancel(
-    pool: &MySqlPool,
+async fn get_conn_with_timeout_and_cancel<P>(
+    pool: &P,
     timeout: Duration,
     cancel_token: Option<&CancellationToken>,
-) -> Result<mysql_async::Conn, String> {
+) -> Result<mysql_async::Conn, String>
+where
+    P: MySqlPoolAccess + ?Sized,
+{
     let get_future = async { checkout_mysql_conn(pool, timeout).await.map_err(|error| error.to_string()) };
 
     match cancel_token {
@@ -4007,7 +4055,10 @@ async fn get_conn_with_timeout_and_cancel(
     }
 }
 
-pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<mysql_async::Conn, String> {
+pub async fn get_conn_with_timeout<P>(pool: &P, timeout: Duration) -> Result<mysql_async::Conn, String>
+where
+    P: MySqlPoolAccess + ?Sized,
+{
     checkout_mysql_conn(pool, timeout).await.map_err(|error| error.to_string())
 }
 
@@ -4643,13 +4694,16 @@ pub(crate) fn mysql_sql_statement_hard_limit(max_allowed_packet: u64) -> Option<
     packet_bytes.checked_sub(margin).filter(|limit| *limit > 0)
 }
 
-pub async fn execute_query_with_max_rows(
-    pool: &MySqlPool,
+pub async fn execute_query_with_max_rows<P>(
+    pool: &P,
     sql: &str,
     bare: bool,
     max_rows: Option<usize>,
     dialect: MySqlQueryDialect,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, String>
+where
+    P: MySqlPoolAccess + ?Sized,
+{
     let mut conn = get_conn_with_health_check(pool).await?;
     execute_query_on_conn_with_max_rows(&mut conn, sql, bare, max_rows, dialect).await
 }
@@ -5500,6 +5554,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mysql_checkout_raw_driver_pool_timeout_keeps_stage_unknown() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let options = mysql_async::OptsBuilder::default()
+            .ip_or_hostname(address.ip().to_string())
+            .tcp_port(address.port())
+            .user(Some("fault-injection"))
+            .pass(Some("fault-injection"));
+        let pool = mysql_async::Pool::new(options);
+
+        let error = checkout_mysql_conn(&pool, Duration::from_millis(50)).await.unwrap_err();
+
+        assert!(matches!(error, super::super::PoolCheckoutError::Timeout { stage: MysqlCheckoutStage::Unknown, .. }));
+        server.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), pool.disconnect()).await;
+    }
+
+    #[tokio::test]
     #[ignore = "requires DBX_REVIEW_MYSQL_* environment variables"]
     async fn mysql_checkout_fault_injection_preserves_wait_stage_when_real_pool_is_full() {
         let host = std::env::var("DBX_REVIEW_MYSQL_HOST").expect("DBX_REVIEW_MYSQL_HOST is required");
@@ -5527,6 +5603,15 @@ mod tests {
         assert!(matches!(error, super::super::PoolCheckoutError::Timeout { stage: MysqlCheckoutStage::Wait, .. }));
         drop(held_connection);
         let _ = tokio::time::timeout(Duration::from_secs(2), pool.disconnect()).await;
+    }
+
+    #[test]
+    fn mysql_public_metadata_and_query_helpers_accept_driver_pool_for_compatibility() {
+        let pool = mysql_async::Pool::new(mysql_async::OptsBuilder::default());
+        let columns = get_columns(&pool, "database", "table");
+        let query = execute_query_with_max_rows(&pool, "SELECT 1", false, Some(1), MySqlQueryDialect::default());
+
+        drop((columns, query));
     }
 
     #[tokio::test]
