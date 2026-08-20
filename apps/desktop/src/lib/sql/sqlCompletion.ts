@@ -3760,7 +3760,7 @@ function buildComparisonValueItems(context: SqlCompletionContext, columnsByTable
   // Find the column's data type
   let dataType: string | undefined;
   for (const [, cols] of columnsByTable) {
-    for (const col of cols) {
+    for (const col of completionColumnPrefixCandidates(cols, unqualified, 256)) {
       if (col.name.toLowerCase() === unqualified.toLowerCase()) {
         if (qualifier) {
           const qualLower = qualifier.toLowerCase();
@@ -4006,10 +4006,65 @@ function activeQueryBlockSql(sql: string): string {
   return activeSelectIndex == null ? sql : sql.slice(activeSelectIndex);
 }
 
-function collectCompletionColumns(columnsByTable: Map<string, SqlCompletionColumn[]>): Array<SqlCompletionColumn & { key: string }> {
+interface CompletionColumnSearchIndex {
+  entries: Array<{ normalizedName: string; index: number }>;
+}
+
+const completionColumnSearchIndexes = new WeakMap<readonly SqlCompletionColumn[], CompletionColumnSearchIndex>();
+
+function completionColumnSearchIndex(columns: readonly SqlCompletionColumn[]): CompletionColumnSearchIndex {
+  const cached = completionColumnSearchIndexes.get(columns);
+  if (cached) return cached;
+  const index: CompletionColumnSearchIndex = {
+    entries: columns
+      .map((column, index) => ({ normalizedName: column.name.trim().toLowerCase(), index }))
+      .sort((left, right) => left.normalizedName.localeCompare(right.normalizedName) || left.index - right.index),
+  };
+  completionColumnSearchIndexes.set(columns, index);
+  return index;
+}
+
+function completionColumnPrefixCandidates(columns: readonly SqlCompletionColumn[], prefix: string, limit = 256): SqlCompletionColumn[] {
+  if (!prefix) return [...columns];
+  const normalizedPrefix = prefix.trim().toLowerCase();
+  if (!normalizedPrefix) return [...columns];
+  const index = completionColumnSearchIndex(columns).entries;
+  let low = 0;
+  let high = index.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((index[middle]?.normalizedName ?? "") < normalizedPrefix) low = middle + 1;
+    else high = middle;
+  }
+  const candidates: SqlCompletionColumn[] = [];
+  const seen = new Set<number>();
+  for (let position = low; position < index.length && candidates.length < limit; position += 1) {
+    const entry = index[position];
+    if (!entry || !entry.normalizedName.startsWith(normalizedPrefix)) break;
+    const column = columns[entry.index];
+    if (column) {
+      candidates.push(column);
+      seen.add(entry.index);
+    }
+  }
+  // Preserve fuzzy/substring matching when the prefix index has not filled
+  // the bounded candidate pool, while avoiding a second scan for the common
+  // case where a prefix already has enough results.
+  if (candidates.length < limit) {
+    for (let indexPosition = 0; indexPosition < columns.length && candidates.length < limit; indexPosition += 1) {
+      if (seen.has(indexPosition)) continue;
+      const column = columns[indexPosition];
+      if (!column || !matchesIdentifierSearch(column.name, prefix)) continue;
+      candidates.push(column);
+    }
+  }
+  return candidates;
+}
+
+function collectCompletionColumns(columnsByTable: Map<string, SqlCompletionColumn[]>, prefix = ""): Array<SqlCompletionColumn & { key: string }> {
   const allColumns: Array<SqlCompletionColumn & { key: string }> = [];
   for (const [key, cols] of columnsByTable.entries()) {
-    for (const col of cols) {
+    for (const col of completionColumnPrefixCandidates(cols, prefix)) {
       allColumns.push({ ...col, key });
     }
   }
@@ -4022,7 +4077,7 @@ function columnsForInsertTarget(context: SqlCompletionContext, columnsByTable: M
   const schemaKey = context.insertSchema ? normalizeIdentifierPart(context.insertSchema) : undefined;
   const databaseKey = context.insertDatabase ? normalizeIdentifierPart(context.insertDatabase) : undefined;
   const qualifiedKey = schemaKey ? normalizeCompletionKey(`${context.insertDatabase ? `${context.insertDatabase}.` : ""}${context.insertSchema}.${context.insertTable}`) : undefined;
-  return collectCompletionColumns(columnsByTable).filter((column) => {
+  return collectCompletionColumns(columnsByTable, context.prefix).filter((column) => {
     if (normalizeIdentifierPart(column.table) !== tableKey) return false;
     if (!schemaKey) return true;
     if (!databaseKey && column.schema && normalizeIdentifierPart(column.schema) === schemaKey) return true;
@@ -4031,8 +4086,10 @@ function columnsForInsertTarget(context: SqlCompletionContext, columnsByTable: M
 }
 
 function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>, dialect?: SqlCompletionApplyDialect): SqlCompletionItem[] {
-  // Collect all columns from the map (all tables have been fetched)
-  const allColumns = collectCompletionColumns(columnsByTable);
+  // Build a bounded candidate pool before doing duplicate detection, ranking,
+  // and completion object materialization. Canonical column arrays remain the
+  // source of truth; the per-array prefix index is only a derived accelerator.
+  const allColumns = collectCompletionColumns(columnsByTable, context.prefix);
 
   // Handle INSERT column list: filter to only the target table
   let relevantCols = allColumns;
@@ -4084,11 +4141,18 @@ function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<str
   // keywords so they rank at the top instead of being interleaved.
   const relevanceBoost = context.referencedTables.length > 0 || !!context.qualifier || !!context.insertTable ? 2000 : 0;
 
-  return uniqueColumns
+  const rankedColumns = uniqueColumns
     .filter((column) => matchesIdentifierSearch(column.name, context.prefix) || matchesIdentifierSearch(column.displayLabel, context.prefix))
     .map((column) => {
       const keyBoost = isKeyColumn(column.name) ? 500 : 0;
       const matchScore = Math.max(identifierMatchScore(column.name, context.prefix), identifierMatchScore(column.displayLabel, context.prefix));
+      return { column, boost: matchScore + keyBoost + relevanceBoost };
+    })
+    .sort((left, right) => right.boost - left.boost || left.column.displayLabel.localeCompare(right.column.displayLabel))
+    .slice(0, 50);
+
+  return rankedColumns
+    .map(({ column, boost }) => {
       return {
         label: column.displayLabel,
         filterText: column.displayLabel === column.name ? undefined : column.name,
@@ -4096,10 +4160,9 @@ function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<str
         detail: buildColumnDetail(column),
         info: buildColumnInfo(column),
         apply: buildColumnApply(column, context, dialect),
-        boost: matchScore + keyBoost + relevanceBoost,
+        boost,
       };
-    })
-    .sort(compareCompletionItems);
+    });
 }
 
 function completionColumnsForReferencedTable<T extends SqlCompletionColumn & { key: string }>(table: SqlCompletionReferencedTable, columns: readonly T[]): T[] {
@@ -4119,7 +4182,7 @@ function applyReferencedColumnAliases<T extends SqlCompletionColumn>(table: SqlC
 
 function hasMatchingReferencedColumnPrefix(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>): boolean {
   if (!context.suggestColumns || !context.prefix || context.referencedTables.length === 0) return false;
-  return context.referencedTables.some((table) => columnsForReferencedTable(table, columnsByTable).some((column) => matchesIdentifierSearch(column.name, context.prefix)));
+  return context.referencedTables.some((table) => completionColumnPrefixCandidates(columnsForReferencedTable(table, columnsByTable), context.prefix, 1).length > 0);
 }
 
 function qualifiedTableTargetFromContext(context: SqlCompletionContext): { database?: string; schema: string; table: string } | null {
@@ -4180,10 +4243,6 @@ function buildColumnDetail(column: SqlCompletionColumn): string {
   let detail = column.dataType ? `${tableInfo}  [${column.dataType}]` : tableInfo;
   if (column.isNullable === false) {
     detail += "  NOT NULL";
-  }
-  const comment = column.comment?.trim();
-  if (comment) {
-    detail += `  -- ${comment}`;
   }
   return detail;
 }
@@ -4680,7 +4739,7 @@ function buildNonAggregatedColumnItems(context: SqlCompletionContext, columnsByT
 
   const items: SqlCompletionItem[] = [];
   for (const [, cols] of columnsByTable) {
-    for (const col of cols) {
+    for (const col of completionColumnPrefixCandidates(cols, context.prefix, 256)) {
       const key = col.name.toLowerCase();
       if (!nonAggSet.has(key) || seen.has(key)) continue;
       if (context.prefix && !matchesIdentifierSearch(col.name, context.prefix)) continue;

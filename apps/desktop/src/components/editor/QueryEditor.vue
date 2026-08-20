@@ -334,7 +334,6 @@ const completionTranslations = computed(() => ({
 const MAX_COMPLETION_TABLES = 200;
 const PRESTO_ON_DEMAND_TABLE_COMPLETION_MIN_PREFIX = 2;
 const PRESTO_ON_DEMAND_TABLE_COMPLETION_LIMIT = 20;
-const MAX_JOIN_FK_PREFETCH_TABLES = 24;
 const MAX_SEMANTIC_DIAGNOSTIC_COLUMN_TABLES = 4;
 const liveFontSize = ref(settingsStore.editorSettings.fontSize);
 const gestureStartFontSize = ref(settingsStore.editorSettings.fontSize);
@@ -3161,6 +3160,23 @@ function unregisterTableReferenceDropListener() {
 }
 
 let completionEpoch = 0;
+let tableCompletionRefreshActive = false;
+let latestTableCompletionRefresh: (() => Promise<void>) | null = null;
+
+function queueTableCompletionRefresh(task: () => Promise<void>): void {
+  latestTableCompletionRefresh = task;
+  if (tableCompletionRefreshActive) return;
+  tableCompletionRefreshActive = true;
+  void (async () => {
+    while (latestTableCompletionRefresh) {
+      const next = latestTableCompletionRefresh;
+      latestTableCompletionRefresh = null;
+      await next();
+    }
+  })().finally(() => {
+    tableCompletionRefreshActive = false;
+  });
+}
 let completionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let typedCompletionActivationUntil = 0;
 let suppressNextSqlCompletionAutoStartUntil = 0;
@@ -3934,16 +3950,21 @@ function scheduleCompletionMetadataRefresh(completionContext: ReturnType<typeof 
   });
   if (!localOnlyMetadata && !schemaLookupDatabase && (completionContext.suggestTables || (!!completionContext.qualifier && !isReferencedTableQualifier(completionContext)))) {
     const globalOracleTableSearch = props.databaseType === "oracle" && completionContext.suggestTables && !completionContext.qualifier;
-    void connectionStore
-      .refreshCompletionTables(connectionId, tableLookupTarget.database, tableLookupTarget.filter, MAX_COMPLETION_TABLES, tableLookupTarget.schema, globalOracleTableSearch, scope.schema, props.catalog)
-      .then((tables) => {
+    const refreshEpoch = completionEpoch;
+    queueTableCompletionRefresh(async () => {
+      if (refreshEpoch !== completionEpoch) return;
+      try {
+        const tables = await connectionStore.refreshCompletionTables(connectionId, tableLookupTarget.database, tableLookupTarget.filter, MAX_COMPLETION_TABLES, tableLookupTarget.schema, globalOracleTableSearch, scope.schema, props.catalog);
+        if (refreshEpoch !== completionEpoch) return;
         const scopedTables = tables.map((table) => ({ ...table, database: table.database ?? tableLookupTarget.database }));
         cachedTables = mergeCompletionTables(cachedTables, scopedTables);
-        if (completionContext.suggestTables && completionContext.referencedTables.length > 0) {
-          void ensureForeignKeysForTables([...completionContext.referencedTables, ...scopedTables.slice(0, MAX_JOIN_FK_PREFETCH_TABLES)]);
+        if (completionContext.suggestJoinConditions && completionContext.referencedTables.length > 0) {
+          void ensureForeignKeysForTables(completionContext.referencedTables);
         }
-      })
-      .catch(() => {});
+      } catch {
+        // Local candidates remain available when the remote refresh fails.
+      }
+    });
   }
   if (!localOnlyMetadata && shouldLoadCompletionObjects(completionContext)) {
     const completionObjectScope = routineCompletionScopeForContext(completionContext, scope);
@@ -4005,7 +4026,7 @@ function scheduleCompletionMetadataRefresh(completionContext: ReturnType<typeof 
         .catch(() => {});
     }
   }
-  if (!tableNameCompletion && (completionContext.suggestTables || completionContext.suggestJoinConditions) && completionContext.referencedTables.length > 0) {
+  if (!tableNameCompletion && completionContext.suggestJoinConditions && completionContext.referencedTables.length > 0) {
     void ensureForeignKeysForTables(completionContext.referencedTables);
   }
 }
@@ -4276,7 +4297,7 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
   const shouldFetchColumnsForCompletion = !tableNameCompletion && (!onDemandOnlyColumns || completionContext.suggestColumns || completionContext.exclusiveColumnSuggestions || !!completionContext.insertTable);
   if (shouldFetchColumnsForCompletion) {
     await Promise.all(
-      refs.map(async (refTable) => {
+      refs.slice(0, 4).map(async (refTable) => {
         if (isVirtualCompletionTableReference(refTable)) return;
         if (refTable.columns && refTable.columns.length > 0) return;
         const cacheKey = completionCacheKey(refTable, scope);
@@ -4296,9 +4317,8 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
   }
   if (epoch !== completionEpoch) return null;
 
-  if (!tableNameCompletion && (completionContext.suggestTables || completionContext.suggestJoinConditions) && refs.length > 0) {
-    const fkPrefetchTables = completionContext.suggestTables ? [...refs, ...tables.slice(0, MAX_JOIN_FK_PREFETCH_TABLES)] : refs;
-    await ensureForeignKeysForTables(fkPrefetchTables.filter((table) => !("columns" in table) || !table.columns || table.columns.length === 0));
+  if (!tableNameCompletion && completionContext.suggestJoinConditions && refs.length > 0) {
+    await ensureForeignKeysForTables(refs.filter((table) => !("columns" in table) || !table.columns || table.columns.length === 0));
     if (epoch !== completionEpoch) return null;
   }
 
