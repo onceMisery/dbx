@@ -6276,7 +6276,9 @@ export const useConnectionStore = defineStore("connection", () => {
       }
     }
     for (const key of completionColumnPrefixIndex.keys()) {
-      if (!matches(key)) continue;
+      const prefixMarker = key.toLowerCase().lastIndexOf(":prefix:");
+      const baseKey = prefixMarker >= 0 ? key.slice(0, prefixMarker) : key;
+      if (!matches(baseKey)) continue;
       completionColumnPrefixIndex.delete(key);
       removed++;
     }
@@ -6842,14 +6844,13 @@ export const useConnectionStore = defineStore("connection", () => {
     return completionForeignKeyIndex.get(completionForeignKeysKey(connectionId, database, table, schema))?.foreignKeys ?? [];
   }
 
-  async function listCompletionColumnsByPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): Promise<SqlCompletionColumn[]> {
+  async function listCompletionColumnsByPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string, _context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): Promise<SqlCompletionColumn[]> {
     const normalizedPrefix = prefix.trim();
     if (normalizedPrefix.length < 2) return [];
     const config = getConfig(connectionId);
     const databaseType = effectiveDatabaseTypeForConnection(config);
     if (databaseType !== "postgres" && databaseType !== "mysql") return [];
-    const uppercaseUnquotedIdentifier = databaseType === "postgres" && context?.tableQuoted === false;
-    const completionTable = uppercaseUnquotedIdentifier ? table.toUpperCase() : table;
+    const completionTable = table;
     const completionSchema = schema?.trim() || (databaseType === "mysql" ? database : undefined);
     const cached = completionColumnPrefixIndex.get(completionColumnPrefixKey(connectionId, database, completionTable, completionSchema, normalizedPrefix, catalog));
     if (cached) return cached.columns;

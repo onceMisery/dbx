@@ -4305,13 +4305,18 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
 
   const tableNameCompletion = isTableNameCompletionContext(completionContext);
   const shouldFetchColumnsForCompletion = !tableNameCompletion && (!onDemandOnlyColumns || completionContext.suggestColumns || completionContext.exclusiveColumnSuggestions || !!completionContext.insertTable);
+  const qualifiedColumnTarget = completionQualifiedTableTarget(completionContext);
+  const hasQualifiedColumnPrefix = (props.databaseType === "postgres" || props.databaseType === "mysql") && completionContext.qualifier && completionContext.prefix.length >= 2 && isReferencedTableQualifier(completionContext);
+  const columnRefs = hasQualifiedColumnPrefix
+    ? refs.filter((refTable) => refTable.alias?.toLowerCase() === completionContext.qualifier!.toLowerCase() || refTable.name.toLowerCase() === completionContext.qualifier!.toLowerCase() || (!!qualifiedColumnTarget && completionTablesMatch(refTable, qualifiedColumnTarget)))
+    : refs.slice(0, 4);
   if (shouldFetchColumnsForCompletion) {
     await Promise.all(
-      refs.slice(0, 4).map(async (refTable) => {
+      columnRefs.map(async (refTable) => {
         if (isVirtualCompletionTableReference(refTable)) return;
         if (refTable.columns && refTable.columns.length > 0) return;
         const cacheKey = completionCacheKey(refTable, scope);
-        const prefixCompletion = (props.databaseType === "postgres" || props.databaseType === "mysql") && completionContext.qualifier && completionContext.prefix.length >= 2 && isReferencedTableQualifier(completionContext) && (refTable.alias?.toLowerCase() === completionContext.qualifier.toLowerCase() || refTable.name.toLowerCase() === completionContext.qualifier.toLowerCase()) ? completionContext.prefix : undefined;
+        const prefixCompletion = hasQualifiedColumnPrefix ? completionContext.prefix : undefined;
         const prefixCacheKey = prefixCompletion ? `${cacheKey}:prefix:${prefixCompletion.toLowerCase()}` : undefined;
         if (prefixCompletion ? cachedPrefixColumnsByTable.has(prefixCacheKey!) : cachedColumnsByTable.has(cacheKey)) return;
         try {
@@ -4344,6 +4349,7 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
     }
   } else {
     for (const refTable of refs) {
+      if (hasQualifiedColumnPrefix && !columnRefs.includes(refTable)) continue;
       if (refTable.columns && refTable.columns.length > 0) {
         const key = refTable.name;
         columnsByTable.set(

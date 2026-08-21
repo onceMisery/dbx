@@ -4261,10 +4261,10 @@ function buildColumnInfo(column: SqlCompletionColumn): ((completion: Completion)
       column.isNullable === false ? "Nullable: no" : column.isNullable === true ? "Nullable: yes" : undefined,
       column.comment?.trim() ? `Comment: ${column.comment.trim()}` : undefined,
     ].filter((part): part is string => !!part);
-    if (details.length > 0) {
-      const body = document.createElement("div");
-      body.textContent = details.join("\n");
-      root.appendChild(body);
+    for (const detail of details) {
+      const line = document.createElement("div");
+      line.textContent = detail;
+      root.appendChild(line);
     }
     return root;
   };
