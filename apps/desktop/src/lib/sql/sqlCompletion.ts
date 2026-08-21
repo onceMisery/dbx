@@ -1,4 +1,5 @@
 import { Cassandra, MariaSQL, MSSQL, MySQL, PLSQL, PostgreSQL, SQLite, StandardSQL } from "@codemirror/lang-sql";
+import type { Completion, CompletionInfo } from "@codemirror/autocomplete";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
 import { buildMongoCompletionItemsFromContext, type MongoCompletionItem } from "@/lib/mongo/mongoCompletion";
 import { CLOUDFLARE_D1_COMMON_FUNCTION_NAMES } from "@/lib/sql/cloudflareD1";
@@ -1212,7 +1213,7 @@ export interface SqlCompletionItem {
   filterText?: string;
   type: "keyword" | "table" | "column" | "snippet" | "function" | "schema" | "variable" | "text";
   detail?: string;
-  info?: string;
+  info?: string | ((completion: Completion) => CompletionInfo | Promise<CompletionInfo>);
   apply?: string;
   replaceClosingQuote?: '"' | "'";
   boost: number;
@@ -4149,7 +4150,7 @@ function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<str
       return { column, boost: matchScore + keyBoost + relevanceBoost };
     })
     .sort((left, right) => right.boost - left.boost || left.column.displayLabel.localeCompare(right.column.displayLabel))
-    .slice(0, 50);
+    .slice(0, context.insertTable || !context.prefix ? 50 : context.qualifier ? 30 : 20);
 
   return rankedColumns
     .map(({ column, boost }) => {
@@ -4247,14 +4248,26 @@ function buildColumnDetail(column: SqlCompletionColumn): string {
   return detail;
 }
 
-function buildColumnInfo(column: SqlCompletionColumn): string | undefined {
-  const parts = [
-    column.schema ? `${column.schema}.${column.table}.${column.name}` : `${column.table}.${column.name}`,
-    column.dataType ? `Type: ${column.dataType}` : undefined,
-    column.isNullable === false ? "Nullable: no" : column.isNullable === true ? "Nullable: yes" : undefined,
-    column.comment?.trim() ? `Comment: ${column.comment.trim()}` : undefined,
-  ].filter((part): part is string => !!part);
-  return parts.length > 1 ? parts.join("\n") : undefined;
+function buildColumnInfo(column: SqlCompletionColumn): ((completion: Completion) => CompletionInfo) | undefined {
+  const hasDetails = !!column.dataType || column.isNullable !== undefined || !!column.comment?.trim();
+  if (!hasDetails) return undefined;
+  return () => {
+    const root = document.createElement("div");
+    const title = document.createElement("div");
+    title.textContent = column.schema ? `${column.schema}.${column.table}.${column.name}` : `${column.table}.${column.name}`;
+    root.appendChild(title);
+    const details = [
+      column.dataType ? `Type: ${column.dataType}` : undefined,
+      column.isNullable === false ? "Nullable: no" : column.isNullable === true ? "Nullable: yes" : undefined,
+      column.comment?.trim() ? `Comment: ${column.comment.trim()}` : undefined,
+    ].filter((part): part is string => !!part);
+    if (details.length > 0) {
+      const body = document.createElement("div");
+      body.textContent = details.join("\n");
+      root.appendChild(body);
+    }
+    return root;
+  };
 }
 
 function buildJoinConditionItems(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>, foreignKeysByTable?: Map<string, SqlCompletionForeignKey[]>, dialect?: SqlCompletionApplyDialect, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {

@@ -616,6 +616,7 @@ let cachedTables: SqlCompletionTable[] = [];
 const cachedCompletionObjectsByScope = new Map<string, SqlCompletionObject[]>();
 // Persistent column cache keyed by "schema.table" or "table"
 const cachedColumnsByTable = new Map<string, SqlCompletionColumn[]>();
+const cachedPrefixColumnsByTable = new Map<string, SqlCompletionColumn[]>();
 const cachedInsertValueHintColumnsByTable = new Map<string, string[]>();
 const cachedForeignKeysByTable = new Map<string, SqlCompletionForeignKey[]>();
 const loadedColumnsByTable = new Set<string>();
@@ -649,10 +650,19 @@ function completionColumnRequestContext(reference?: Pick<SqlCompletionReferenced
   };
 }
 
-async function listCompletionColumnsForEditor(connectionId: string, database: string, table: string, schema?: string, catalog = props.catalog, reference?: Pick<SqlCompletionReferencedTable, "nameQuoted" | "schemaQuoted">) {
+async function listCompletionColumnsForEditor(connectionId: string, database: string, table: string, schema?: string, catalog = props.catalog, reference?: Pick<SqlCompletionReferencedTable, "nameQuoted" | "schemaQuoted">, prefix?: string) {
   const requestedVersion = props.completionContextVersion;
   const sessionScoped = usesOracleSessionCompletionColumns(schema);
-  const columns = await connectionStore.listCompletionColumns(connectionId, database, table, schema, completionColumnRequestContext(reference), catalog);
+  let columns: SqlCompletionColumn[];
+  if (prefix && prefix.length >= 2 && (props.databaseType === "postgres" || props.databaseType === "mysql")) {
+    try {
+      columns = await connectionStore.listCompletionColumnsByPrefix(connectionId, database, table, schema, prefix, catalog, completionColumnRequestContext(reference));
+    } catch {
+      columns = await connectionStore.listCompletionColumns(connectionId, database, table, schema, completionColumnRequestContext(reference), catalog);
+    }
+  } else {
+    columns = await connectionStore.listCompletionColumns(connectionId, database, table, schema, completionColumnRequestContext(reference), catalog);
+  }
   if (sessionScoped && requestedVersion !== props.completionContextVersion) throw new Error("Stale Oracle completion context");
   return columns;
 }
@@ -4301,14 +4311,17 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
         if (isVirtualCompletionTableReference(refTable)) return;
         if (refTable.columns && refTable.columns.length > 0) return;
         const cacheKey = completionCacheKey(refTable, scope);
-        if (cachedColumnsByTable.has(cacheKey)) return;
+        const prefixCompletion = (props.databaseType === "postgres" || props.databaseType === "mysql") && completionContext.qualifier && completionContext.prefix.length >= 2 && isReferencedTableQualifier(completionContext) && (refTable.alias?.toLowerCase() === completionContext.qualifier.toLowerCase() || refTable.name.toLowerCase() === completionContext.qualifier.toLowerCase()) ? completionContext.prefix : undefined;
+        const prefixCacheKey = prefixCompletion ? `${cacheKey}:prefix:${prefixCompletion.toLowerCase()}` : undefined;
+        if (prefixCompletion ? cachedPrefixColumnsByTable.has(prefixCacheKey!) : cachedColumnsByTable.has(cacheKey)) return;
         try {
           const target = completionMetadataTarget(refTable, scope);
           if (!target) return;
-          const columns = await listCompletionColumnsForEditor(props.connectionId!, target.database, refTable.name, target.schema, target.catalog, refTable);
+          const columns = await listCompletionColumnsForEditor(props.connectionId!, target.database, refTable.name, target.schema, target.catalog, refTable, prefixCompletion);
           if (epoch !== completionEpoch) return;
           if (columns.length === 0) return;
-          cachedColumnsByTable.set(cacheKey, columns);
+          if (prefixCacheKey) cachedPrefixColumnsByTable.set(prefixCacheKey, columns);
+          else cachedColumnsByTable.set(cacheKey, columns);
         } catch (e) {
           console.error(`[DBX] Failed to load columns for ${cacheKey}:`, e);
         }
@@ -4344,7 +4357,10 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
         continue;
       }
       const cacheKey = completionCacheKey(refTable, scope);
-      const cached = cachedColumnsByTable.get(cacheKey);
+      const prefixCacheKey = (props.databaseType === "postgres" || props.databaseType === "mysql") && completionContext.qualifier && completionContext.prefix.length >= 2 && isReferencedTableQualifier(completionContext) && (refTable.alias?.toLowerCase() === completionContext.qualifier.toLowerCase() || refTable.name.toLowerCase() === completionContext.qualifier.toLowerCase())
+        ? `${cacheKey}:prefix:${completionContext.prefix.toLowerCase()}`
+        : undefined;
+      const cached = (prefixCacheKey ? cachedPrefixColumnsByTable.get(prefixCacheKey) : undefined) ?? cachedColumnsByTable.get(cacheKey);
       if (cached) {
         columnsByTable.set(cacheKey, cached);
       }
@@ -4462,6 +4478,7 @@ function refreshCompletionCache() {
   cachedTables = [];
   cachedCompletionObjectsByScope.clear();
   cachedColumnsByTable.clear();
+  cachedPrefixColumnsByTable.clear();
   cachedInsertValueHintColumnsByTable.clear();
   loadedColumnsByTable.clear();
   cachedForeignKeysByTable.clear();

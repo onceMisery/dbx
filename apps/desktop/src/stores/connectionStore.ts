@@ -116,6 +116,8 @@ import { inferMongoCompletionFields, type MongoCompletionField } from "@/lib/mon
 import { isMongoLegacyDriverProfile } from "@/lib/mongo/mongoCapabilities";
 import { mongoCollectionKindFromNode, toMongoCollectionKind } from "@/lib/sidebar/mongoCollectionMutation";
 import { completionSchemasFromTree, completionTablesFromTree } from "@/lib/metadata/completionTreeIndex";
+import { buildCompletionSearchIndex, queryCompletionSearchIndex, type CompletionSearchIndex } from "@/lib/metadata/completionSearchIndex";
+import { sqlCompletionPhase2Enabled } from "@/lib/metadata/completionFeatureFlags";
 import { kvRootNodeLabel } from "@/lib/kv/kvRootPresentation";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redis/redisKeyPattern";
 import { normalizeRedisDatabaseAliases, redisDatabaseAlias, redisDatabaseLabel } from "@/lib/redis/redisDatabaseAlias";
@@ -134,8 +136,9 @@ import type { MetadataScopeInput } from "@/lib/metadata/metadataLoadScope";
 import { MetadataResultCache, type MetadataCacheInvalidation } from "@/lib/metadata/metadataResultCache";
 import { invalidateTableMetadataCache } from "@/lib/metadata/tableMetadataCache";
 import { cancelObjectDdlLoadsForConnection, cancelObjectDdlLoadsForDatabase, invalidateObjectDdlCache } from "@/lib/metadata/objectDdlCache";
-import { cancelObjectMetadataLoadsForConnection, cancelObjectMetadataLoadsForDatabase } from "@/lib/metadata/objectMetadataCache";
-import { clearMetadataRuntimeCacheForConnection, clearMetadataRuntimeCacheForDatabase } from "@/lib/metadata/metadataRuntimeCache";
+import { cancelObjectMetadataLoadsForConnection, cancelObjectMetadataLoadsForDatabase, invalidateObjectMetadataCache, loadObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
+import { clearMetadataRuntimeCacheForConnection, clearMetadataRuntimeCacheForDatabase, invalidateMetadataDerivedCachePrefix, isMetadataDerivedCacheEntryCurrent, setMetadataDerivedCacheEntry } from "@/lib/metadata/metadataRuntimeCache";
+import { captureMetadataEpoch, isMetadataEpochCurrent, releaseMetadataEpoch } from "@/lib/metadata/metadataEpoch";
 import { invalidateObjectBrowserRowsCache } from "@/lib/table/objectBrowserRowsCache";
 import { MetadataTaskLimiter } from "@/lib/metadata/metadataTaskLimiter";
 import { buildCustomTypeTreeChildren } from "@/lib/sidebar/customTypeTree";
@@ -419,10 +422,13 @@ export const useConnectionStore = defineStore("connection", () => {
   let sidebarTableSearchIndexManifestWriteQueue: Promise<void> = Promise.resolve();
   const sidebarTableNameFilters = ref<Record<string, TableNameFilter>>(loadSidebarTableNameFilters());
   const sidebarTableNameFilterRevisions = new Map<string, number>();
-  const completionTableIndex = new Map<string, { touched: number; tables: SqlCompletionTable[] }>();
+  const completionTableIndex = new Map<string, { touched: number; tables: SqlCompletionTable[]; searchIndex: CompletionSearchIndex }>();
   const completionObjectIndex = new Map<string, { touched: number; objects: SqlCompletionObject[] }>();
   const completionColumnIndex = new Map<string, { touched: number; columns: SqlCompletionColumn[] }>();
+  const completionColumnPrefixIndex = new Map<string, { touched: number; columns: SqlCompletionColumn[]; complete: boolean }>();
   const completionForeignKeyIndex = new Map<string, { touched: number; foreignKeys: SqlCompletionForeignKey[] }>();
+  const activeCompletionTableSnapshots = new Map<number, { connectionId: string; database: string; schema?: string; catalog?: string; invalidatedTables: Set<string> }>();
+  let nextCompletionTableSnapshotId = 0;
   const completionInFlight = new Map<string, Promise<unknown>>();
   const completionMetadataLimiter = new MetadataTaskLimiter(COMPLETION_METADATA_CONCURRENCY, (event) => {
     console.debug("[DBX][completion-metadata:limit]", event);
@@ -2776,6 +2782,7 @@ export const useConnectionStore = defineStore("connection", () => {
     for (const key of completionTableIndex.keys()) {
       if (key.startsWith(cachePrefix)) completionTableIndex.delete(key);
     }
+    invalidateMetadataDerivedCachePrefix(database == null ? `completion-index:v1:${connectionId}:` : `completion-index:v1:${connectionId}:${database}:`);
     for (const key of completionObjectIndex.keys()) {
       if (key.startsWith(cachePrefix)) completionObjectIndex.delete(key);
     }
@@ -6183,6 +6190,30 @@ export const useConnectionStore = defineStore("connection", () => {
     return `${connectionId}:${database}:${catalog?.toLowerCase() ?? ""}:${schema?.toLowerCase() ?? ""}`;
   }
 
+  function completionSnapshotTableKey(tableName: string, schema?: string, catalog?: string): string {
+    return `${catalog?.toLowerCase() ?? ""}\u0000${schema?.toLowerCase() ?? ""}\u0000${tableName.toLowerCase()}`;
+  }
+
+  function registerCompletionTableSnapshot(connectionId: string, database: string, schema?: string, catalog?: string): number {
+    const id = ++nextCompletionTableSnapshotId;
+    activeCompletionTableSnapshots.set(id, { connectionId, database, schema, catalog, invalidatedTables: new Set() });
+    return id;
+  }
+
+  function completionTableSnapshotIsCurrent(id: number, tables: readonly SqlCompletionTable[]): boolean {
+    const snapshot = activeCompletionTableSnapshots.get(id);
+    if (!snapshot) return false;
+    return !tables.some((table) => snapshot.invalidatedTables.has(completionSnapshotTableKey(table.name, table.schema ?? snapshot.schema, table.catalog ?? snapshot.catalog)));
+  }
+
+  function unregisterCompletionTableSnapshot(id: number): void {
+    activeCompletionTableSnapshots.delete(id);
+  }
+
+  function completionIndexBudgetKey(connectionId: string, database: string, schema?: string, catalog?: string): string {
+    return `completion-index:v1:${connectionId}:${database}:${catalog ?? ""}:${schema ?? ""}`;
+  }
+
   function completionColumnsKey(connectionId: string, database: string, table: string, schema?: string, catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): string {
     if (getConfig(connectionId)?.db_type === "oracle") {
       const normalizedTable = context?.tableQuoted === false ? table.toUpperCase() : table;
@@ -6190,6 +6221,10 @@ export const useConnectionStore = defineStore("connection", () => {
       return `${connectionId}:${database}:${catalog ?? ""}:${normalizedSchema}:${normalizedTable}`;
     }
     return `${completionTableScopeKey(connectionId, database, schema, catalog)}:${table.toLowerCase()}`;
+  }
+
+  function completionColumnPrefixKey(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string): string {
+    return `${completionColumnsKey(connectionId, database, table, schema, catalog)}:prefix:${prefix.trim().toLowerCase()}`;
   }
 
   function completionForeignKeysKey(connectionId: string, database: string, table: string, schema?: string): string {
@@ -6219,6 +6254,13 @@ export const useConnectionStore = defineStore("connection", () => {
   function invalidateCompletionTableCache(connectionId: string, database: string, tableName: string, schema?: string, catalog?: string): number {
     const matches = (key: string) => completionTableCacheKeyMatches(key, connectionId, database, tableName, schema, catalog);
     let removed = 0;
+    const invalidatedSnapshotTable = completionSnapshotTableKey(tableName, schema, catalog);
+    for (const snapshot of activeCompletionTableSnapshots.values()) {
+      if (snapshot.connectionId !== connectionId || snapshot.database !== database) continue;
+      if (schema && snapshot.schema && snapshot.schema.toLowerCase() !== schema.toLowerCase()) continue;
+      if (catalog && snapshot.catalog && snapshot.catalog.toLowerCase() !== catalog.toLowerCase()) continue;
+      snapshot.invalidatedTables.add(invalidatedSnapshotTable);
+    }
     for (const cache of [completionColumnsCache.value, completionForeignKeysCache.value]) {
       for (const key of Object.keys(cache)) {
         if (!matches(key)) continue;
@@ -6233,6 +6275,33 @@ export const useConnectionStore = defineStore("connection", () => {
         removed++;
       }
     }
+    for (const key of completionColumnPrefixIndex.keys()) {
+      if (!matches(key)) continue;
+      completionColumnPrefixIndex.delete(key);
+      removed++;
+    }
+    for (const [scopeKey, entry] of completionTableIndex.entries()) {
+      const remaining = entry.tables.filter((table) => {
+        if (table.name.toLowerCase() !== tableName.toLowerCase()) return true;
+        if (schema && (table.schema ?? "").toLowerCase() !== schema.trim().toLowerCase()) return true;
+        if (catalog && (table.catalog ?? "").toLowerCase() !== catalog.trim().toLowerCase()) return true;
+        return false;
+      });
+      if (remaining.length === entry.tables.length) continue;
+      removed++;
+      const scopeParts = scopeKey.split(":");
+      const scopeCatalog = scopeParts[2] || undefined;
+      const scopeSchema = scopeParts[3] || undefined;
+      if (remaining.length === 0) {
+        completionTableIndex.delete(scopeKey);
+        invalidateMetadataDerivedCachePrefix(completionIndexBudgetKey(connectionId, database, scopeSchema, scopeCatalog));
+      } else {
+        const searchIndex = buildCompletionSearchIndex(remaining);
+        touchCompletionIndex(completionTableIndex, scopeKey, { tables: remaining, searchIndex });
+        setMetadataDerivedCacheEntry(completionIndexBudgetKey(connectionId, database, scopeSchema, scopeCatalog), connectionId, searchIndex.estimatedBytes);
+      }
+    }
+    void invalidateObjectMetadataCache({ connectionId, database, schema: metadataQuerySchema(connectionId, database, schema), tableName, catalog });
     return removed;
   }
 
@@ -6483,30 +6552,6 @@ export const useConnectionStore = defineStore("connection", () => {
     return 0;
   }
 
-  function completionAssistantIdentifierMatches(candidate: string, requested: string, quoted?: boolean): boolean {
-    return quoted ? candidate === requested : candidate.toLowerCase() === requested.toLowerCase();
-  }
-
-  function completionAssistantColumns(candidates: CompletionAssistantCandidate[], table: string, schema?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): SqlCompletionColumn[] {
-    const requestedSchema = schema?.trim();
-    return candidates
-      .filter((candidate) => {
-        if (candidate.kind !== "column") return false;
-        const parentName = candidate.parent_name?.trim();
-        if (parentName && !completionAssistantIdentifierMatches(parentName, table, context?.tableQuoted)) return false;
-        const parentSchema = candidate.parent_schema?.trim() || candidate.schema?.trim();
-        if (requestedSchema && parentSchema && !completionAssistantIdentifierMatches(parentSchema, requestedSchema, context?.schemaQuoted)) return false;
-        return true;
-      })
-      .map((candidate) => ({
-        name: candidate.name,
-        table: candidate.parent_name ?? table,
-        schema: candidate.parent_schema ?? candidate.schema ?? schema,
-        dataType: candidate.data_type ?? undefined,
-        comment: candidate.comment ?? null,
-      }));
-  }
-
   async function listCompletionAssistantTables(connectionId: string, database: string, filter: string, limit?: number, schema?: string, globalSearch = false, currentSchema?: string): Promise<SqlCompletionTable[]> {
     const oracleAssistant = getConfig(connectionId)?.db_type === "oracle";
     const preferredSchema = oracleAssistant ? completionPreferredSchema(connectionId, globalSearch ? currentSchema : (schema ?? currentSchema)) : schema?.trim() || undefined;
@@ -6563,23 +6608,6 @@ export const useConnectionStore = defineStore("connection", () => {
     }));
     indexCompletionObjects(connectionId, database, schema, objects);
     return objects;
-  }
-
-  async function listCompletionAssistantColumns(connectionId: string, database: string, table: string, schema?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): Promise<SqlCompletionColumn[]> {
-    const response = await completionAssistantSearch({
-      connection_id: connectionId,
-      database,
-      schema: schema ?? null,
-      object_kinds: ["column"],
-      mask: "",
-      max_results: 500,
-      parent_schema: schema ?? null,
-      parent_name: table,
-      match_mode: "prefix",
-    });
-    const columns = completionAssistantColumns(response.candidates, table, schema, context);
-    if (columns.length > 0) indexCompletionColumns(connectionId, database, table, schema, columns);
-    return columns;
   }
 
   function completionNameSegments(name: string): string[] {
@@ -6653,10 +6681,24 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     for (const [key, group] of groups) {
       const previous = completionTableIndex.get(key)?.tables ?? [];
+      const tables = dedupeCompletionTables([...previous, ...group]);
+      const searchIndex = buildCompletionSearchIndex(tables);
       touchCompletionIndex(completionTableIndex, key, {
-        tables: dedupeCompletionTables([...previous, ...group]),
+        tables,
+        searchIndex,
       });
+      const scopeParts = key.split(":");
+      setMetadataDerivedCacheEntry(completionIndexBudgetKey(connectionId, database, scopeParts[3] || undefined, scopeParts[2] || undefined), connectionId, searchIndex.estimatedBytes);
     }
+  }
+
+  function rebuildCompletionTableIndexIfNeeded(connectionId: string, database: string, key: string, entry: { tables: SqlCompletionTable[]; searchIndex: CompletionSearchIndex }): boolean {
+    const parts = key.split(":");
+    const indexKey = completionIndexBudgetKey(connectionId, database, parts[3] || undefined, parts[2] || undefined);
+    if (isMetadataDerivedCacheEntryCurrent(indexKey)) return true;
+    const searchIndex = buildCompletionSearchIndex(entry.tables);
+    entry.searchIndex = searchIndex;
+    return setMetadataDerivedCacheEntry(indexKey, connectionId, searchIndex.estimatedBytes);
   }
 
   function indexCompletionObjects(connectionId: string, database: string, schema: string | undefined, objects: SqlCompletionObject[]) {
@@ -6682,6 +6724,10 @@ export const useConnectionStore = defineStore("connection", () => {
     });
   }
 
+  function indexCompletionColumnPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, columns: SqlCompletionColumn[], complete: boolean, catalog?: string) {
+    touchCompletionIndex(completionColumnPrefixIndex, completionColumnPrefixKey(connectionId, database, table, schema, prefix, catalog), { columns, complete });
+  }
+
   function sqlCompletionForeignKeys(foreignKeys: ForeignKeyInfo[]): SqlCompletionForeignKey[] {
     return foreignKeys.map((foreignKey) => ({
       name: foreignKey.name,
@@ -6700,13 +6746,40 @@ export const useConnectionStore = defineStore("connection", () => {
 
   function lookupLocalCompletionTables(connectionId: string, database: string, filter = "", limit?: number, schema?: string, catalog?: string): SqlCompletionTable[] {
     const scopePrefix = `${connectionId}:${database}:${catalog?.toLowerCase() ?? ""}:`;
-    const allScopes = [...completionTableIndex.entries()].filter(([key]) => key.startsWith(scopePrefix)).map(([, entry]) => entry);
-    const preferred = schema ? completionTableIndex.get(completionTableScopeKey(connectionId, database, schema, catalog)) : undefined;
+    const snapshotScopes = [...completionTableIndex.entries()].filter(([key]) => key.startsWith(scopePrefix));
+    const allScopes = snapshotScopes
+      .filter(([key, entry]) => {
+        return rebuildCompletionTableIndexIfNeeded(connectionId, database, key, entry);
+      })
+      .map(([, entry]) => entry);
+    const preferredKey = schema ? completionTableScopeKey(connectionId, database, schema, catalog) : undefined;
+    const preferredEntry = schema && preferredKey ? completionTableIndex.get(preferredKey) : undefined;
+    const preferred = schema && preferredKey && preferredEntry && rebuildCompletionTableIndexIfNeeded(connectionId, database, preferredKey, preferredEntry) ? preferredEntry : undefined;
     const scopes = schema ? (preferred ? [preferred] : []) : allScopes;
+    if (sqlCompletionPhase2Enabled() && scopes.length > 0 && scopes.every((entry) => entry.searchIndex)) {
+      const indexed = scopes.flatMap((entry) => queryCompletionSearchIndex(entry.searchIndex!, filter, limit ?? 200, schema).map((result) => ({ table: result.table, score: result.score })));
+      return dedupeCompletionTables(indexed.sort((a, b) => b.score - a.score || a.table.name.localeCompare(b.table.name)).map((entry) => entry.table)).slice(0, limit ?? 200);
+    }
+
+    // An evicted index can be rebuilt from this snapshot. If the shared budget
+    // is still full, use the snapshot directly instead of falling back to a
+    // tree walk for every keystroke.
+    const snapshotTables = (schema ? (preferredEntry ? [preferredEntry] : []) : snapshotScopes.map(([, entry]) => entry)).flatMap((entry) => entry.tables);
+    if (snapshotTables.length > 0) {
+      const ranked = snapshotTables
+        .map((table) => ({ table, score: tableMatchScore(table, filter, schema) }))
+        .filter((entry) => entry.score >= 0)
+        .sort((a, b) => b.score - a.score || a.table.name.localeCompare(b.table.name));
+      return dedupeCompletionTables(ranked.map((entry) => entry.table)).slice(0, limit ?? 200);
+    }
+
+    // Cold or failed index fallback: extract tree data once, then seed the same
+    // bounded index so subsequent keystrokes do not repeat a full DFS.
     const treeTables = completionTablesFromTree(treeNodes.value, connectionId, database, schema, catalog);
-    const ranked = scopes
-      .flatMap((entry) => entry?.tables ?? [])
-      .concat(treeTables)
+    if (treeTables.length > 0) indexCompletionTables(connectionId, database, schema, treeTables, catalog);
+    const seeded = schema ? completionTableIndex.get(completionTableScopeKey(connectionId, database, schema, catalog)) : undefined;
+    if (seeded?.searchIndex) return queryCompletionSearchIndex(seeded.searchIndex, filter, limit ?? 200, schema).map((result) => result.table);
+    const ranked = treeTables
       .map((table) => ({ table, score: tableMatchScore(table, filter, schema) }))
       .filter((entry) => entry.score >= 0)
       .sort((a, b) => b.score - a.score || a.table.name.localeCompare(b.table.name));
@@ -6761,8 +6834,53 @@ export const useConnectionStore = defineStore("connection", () => {
     return completionColumnIndex.get(completionColumnsKey(connectionId, database, table, schema, catalog, context))?.columns ?? [];
   }
 
+  function lookupLocalCompletionColumnsByPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string): SqlCompletionColumn[] {
+    return completionColumnPrefixIndex.get(completionColumnPrefixKey(connectionId, database, table, schema, prefix, catalog))?.columns ?? [];
+  }
+
   function lookupLocalCompletionForeignKeys(connectionId: string, database: string, table: string, schema?: string): SqlCompletionForeignKey[] {
     return completionForeignKeyIndex.get(completionForeignKeysKey(connectionId, database, table, schema))?.foreignKeys ?? [];
+  }
+
+  async function listCompletionColumnsByPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): Promise<SqlCompletionColumn[]> {
+    const normalizedPrefix = prefix.trim();
+    if (normalizedPrefix.length < 2) return [];
+    const config = getConfig(connectionId);
+    const databaseType = effectiveDatabaseTypeForConnection(config);
+    if (databaseType !== "postgres" && databaseType !== "mysql") return [];
+    const uppercaseUnquotedIdentifier = databaseType === "postgres" && context?.tableQuoted === false;
+    const completionTable = uppercaseUnquotedIdentifier ? table.toUpperCase() : table;
+    const completionSchema = schema?.trim() || (databaseType === "mysql" ? database : undefined);
+    const cached = completionColumnPrefixIndex.get(completionColumnPrefixKey(connectionId, database, completionTable, completionSchema, normalizedPrefix, catalog));
+    if (cached) return cached.columns;
+    const requestKey = `column-prefix:${completionColumnPrefixKey(connectionId, database, completionTable, completionSchema, normalizedPrefix, catalog)}`;
+    return withCompletionInFlight(requestKey, async () => {
+      const existing = completionColumnPrefixIndex.get(completionColumnPrefixKey(connectionId, database, completionTable, completionSchema, normalizedPrefix, catalog));
+      if (existing) return existing.columns;
+      await ensureConnected(connectionId);
+      const response = await completionAssistantSearch({
+        connection_id: connectionId,
+        database,
+        schema: completionSchema ?? null,
+        object_kinds: ["column"],
+        mask: normalizedPrefix,
+        max_results: 128,
+        parent_schema: completionSchema ?? null,
+        parent_name: completionTable,
+        match_mode: "prefix",
+      });
+      const columns = response.candidates
+        .filter((candidate) => candidate.kind === "column")
+        .map((candidate) => ({
+          name: candidate.name,
+          table: completionTable,
+          schema: candidate.schema ?? completionSchema,
+          dataType: candidate.data_type ?? undefined,
+          comment: candidate.comment ?? null,
+        }));
+      indexCompletionColumnPrefix(connectionId, database, completionTable, completionSchema, normalizedPrefix, columns, !response.incomplete, catalog);
+      return columns;
+    }, { scope: completionLimiterScope(connectionId, database), kind: "column-prefix" });
   }
 
   function databaseNamesFromTree(connectionId: string): string[] {
@@ -6951,37 +7069,18 @@ export const useConnectionStore = defineStore("connection", () => {
     return withCompletionInFlight(
       `${cacheKey}:tables`,
       async () => {
-        await ensureConnected(connectionId, { activate: options.activateConnection !== false });
+        const snapshotId = registerCompletionTableSnapshot(connectionId, database, schema, catalog);
+        try {
+          await ensureConnected(connectionId, { activate: options.activateConnection !== false });
 
-        if (isSchemaAwareDatabase(connectionId)) {
-          if (normalizedFilter || limit) {
-            let results: SqlCompletionTable[] = [];
-            try {
-              results = await listCompletionAssistantTables(connectionId, database, trimmedFilter, limit, schema, globalSearch, currentSchema);
-            } catch {
-              if (schema) {
-                const tables = await listCompletionTableMetadata(connectionId, database, schema, trimmedFilter, limit, catalog);
-                results = tables.map((table) => ({
-                  name: table.name,
-                  catalog,
-                  schema,
-                  type: sqlObjectNavigationTypeFromTableType(table.table_type),
-                  ...completionStableTableType(table.table_type),
-                }));
-              } else {
-                results = lookupLocalCompletionTables(connectionId, database, normalizedFilter, limit, undefined, catalog);
-              }
-            }
-            if (results.length === 0 && relaxedFilter) {
-              if (globalSearch) {
-                try {
-                  results = await listCompletionAssistantTables(connectionId, database, relaxedFilter, expandedCompletionLimit(limit), schema, true, currentSchema);
-                } catch {
-                  results = [];
-                }
-              } else if (schema) {
-                try {
-                  const tables = await listCompletionTableMetadata(connectionId, database, schema, relaxedFilter, expandedCompletionLimit(limit), catalog);
+          if (isSchemaAwareDatabase(connectionId)) {
+            if (normalizedFilter || limit) {
+              let results: SqlCompletionTable[] = [];
+              try {
+                results = await listCompletionAssistantTables(connectionId, database, trimmedFilter, limit, schema, globalSearch, currentSchema);
+              } catch {
+                if (schema) {
+                  const tables = await listCompletionTableMetadata(connectionId, database, schema, trimmedFilter, limit, catalog);
                   results = tables.map((table) => ({
                     name: table.name,
                     catalog,
@@ -6989,52 +7088,86 @@ export const useConnectionStore = defineStore("connection", () => {
                     type: sqlObjectNavigationTypeFromTableType(table.table_type),
                     ...completionStableTableType(table.table_type),
                   }));
-                } catch {
-                  results = [];
+                } else {
+                  results = lookupLocalCompletionTables(connectionId, database, normalizedFilter, limit, undefined, catalog);
                 }
-              } else {
-                results = lookupLocalCompletionTables(connectionId, database, relaxedFilter, expandedCompletionLimit(limit), undefined, catalog);
               }
+              if (results.length === 0 && relaxedFilter) {
+                if (globalSearch) {
+                  try {
+                    results = await listCompletionAssistantTables(connectionId, database, relaxedFilter, expandedCompletionLimit(limit), schema, true, currentSchema);
+                  } catch {
+                    results = [];
+                  }
+                } else if (schema) {
+                  try {
+                    const tables = await listCompletionTableMetadata(connectionId, database, schema, relaxedFilter, expandedCompletionLimit(limit), catalog);
+                    results = tables.map((table) => ({
+                      name: table.name,
+                      catalog,
+                      schema,
+                      type: sqlObjectNavigationTypeFromTableType(table.table_type),
+                      ...completionStableTableType(table.table_type),
+                    }));
+                  } catch {
+                    results = [];
+                  }
+                } else {
+                  results = lookupLocalCompletionTables(connectionId, database, relaxedFilter, expandedCompletionLimit(limit), undefined, catalog);
+                }
+              }
+              const limitedTables = limit ? dedupeCompletionTables(results).slice(0, limit) : results;
+              if (completionTableSnapshotIsCurrent(snapshotId, limitedTables)) {
+                completionTablesCache.value[cacheKey] = limitedTables;
+                indexCompletionTables(connectionId, database, undefined, limitedTables, catalog);
+                evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
+              }
+              return limitedTables;
             }
-            const limitedTables = limit ? dedupeCompletionTables(results).slice(0, limit) : results;
-            completionTablesCache.value[cacheKey] = limitedTables;
-            indexCompletionTables(connectionId, database, undefined, limitedTables, catalog);
+
+            if (schema) {
+              const tables = await listCompletionTableMetadata(connectionId, database, schema, undefined, undefined, catalog);
+              const snapshotTables = tables.map((table) => ({
+                name: table.name,
+                catalog,
+                schema,
+                type: sqlObjectNavigationTypeFromTableType(table.table_type),
+                ...completionStableTableType(table.table_type),
+              }));
+              if (completionTableSnapshotIsCurrent(snapshotId, snapshotTables)) {
+                completionTablesCache.value[cacheKey] = snapshotTables;
+                indexCompletionTables(connectionId, database, undefined, snapshotTables, catalog);
+                evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
+              }
+              return snapshotTables;
+            } else {
+              const snapshotTables = lookupLocalCompletionTables(connectionId, database, normalizedFilter, limit, undefined, catalog);
+              completionTablesCache.value[cacheKey] = snapshotTables;
+              return snapshotTables;
+            }
+          }
+
+          const querySchema = catalog ? "" : database;
+          let tables = await listCompletionTableMetadata(connectionId, database, querySchema, trimmedFilter, limit, catalog);
+          if (tables.length === 0 && relaxedFilter) {
+            tables = await listCompletionTableMetadata(connectionId, database, querySchema, relaxedFilter, expandedCompletionLimit(limit), catalog);
+          }
+          let snapshotTables = tables.map((table) => ({
+            name: table.name,
+            catalog,
+            type: sqlObjectNavigationTypeFromTableType(table.table_type),
+            ...completionStableTableType(table.table_type),
+          }));
+          snapshotTables = limit ? snapshotTables.slice(0, limit) : snapshotTables;
+          if (completionTableSnapshotIsCurrent(snapshotId, snapshotTables)) {
+            completionTablesCache.value[cacheKey] = snapshotTables;
+            indexCompletionTables(connectionId, database, schema, snapshotTables, catalog);
             evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
-            return completionTablesCache.value[cacheKey];
           }
-
-          if (schema) {
-            const tables = await listCompletionTableMetadata(connectionId, database, schema, undefined, undefined, catalog);
-            completionTablesCache.value[cacheKey] = tables.map((table) => ({
-              name: table.name,
-              catalog,
-              schema,
-              type: sqlObjectNavigationTypeFromTableType(table.table_type),
-              ...completionStableTableType(table.table_type),
-            }));
-          } else {
-            completionTablesCache.value[cacheKey] = lookupLocalCompletionTables(connectionId, database, normalizedFilter, limit, undefined, catalog);
-          }
-          indexCompletionTables(connectionId, database, undefined, completionTablesCache.value[cacheKey], catalog);
-          evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
-          return completionTablesCache.value[cacheKey];
+          return snapshotTables;
+        } finally {
+          unregisterCompletionTableSnapshot(snapshotId);
         }
-
-        const querySchema = catalog ? "" : database;
-        let tables = await listCompletionTableMetadata(connectionId, database, querySchema, trimmedFilter, limit, catalog);
-        if (tables.length === 0 && relaxedFilter) {
-          tables = await listCompletionTableMetadata(connectionId, database, querySchema, relaxedFilter, expandedCompletionLimit(limit), catalog);
-        }
-        completionTablesCache.value[cacheKey] = tables.map((table) => ({
-          name: table.name,
-          catalog,
-          type: sqlObjectNavigationTypeFromTableType(table.table_type),
-          ...completionStableTableType(table.table_type),
-        }));
-        completionTablesCache.value[cacheKey] = limit ? completionTablesCache.value[cacheKey].slice(0, limit) : completionTablesCache.value[cacheKey];
-        indexCompletionTables(connectionId, database, schema, completionTablesCache.value[cacheKey], catalog);
-        evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
-        return completionTablesCache.value[cacheKey];
       },
       { scope: completionLimiterScope(connectionId, database), kind: "tables" },
     );
@@ -7201,52 +7334,47 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     const sessionCacheScope = usesOracleCurrentSchema && context?.clientSessionId ? `:${context.clientSessionId}:${context.version ?? 0}` : "";
     const cacheKey = `${connectionId}:${database}:${catalog ?? ""}:${completionSchema || ""}:${completionTable}${sessionCacheScope}`;
-    if (!completionColumnsCache.value[cacheKey]) {
-      await withCompletionInFlight(
-        `${cacheKey}:columns`,
-        async () => {
+    const sharedEpoch = captureMetadataEpoch({ connectionId, database, schema: completionSchema, tableName: completionTable, catalog });
+    try {
+      if (!usesOracleCurrentSchema) {
+        let canonicalColumns: ColumnInfo[] = [];
+        await completionMetadataLimiter.run(completionLimiterScope(connectionId, database), "columns", async () => {
           await ensureConnected(connectionId);
-          if (!usesOracleCurrentSchema && !catalog) {
-            try {
-              const assistantColumns = await listCompletionAssistantColumns(connectionId, database, completionTable, completionSchema, context);
-              if (assistantColumns.length > 0) {
-                completionColumnsCache.value[cacheKey] = assistantColumns.map((column) => ({
-                  name: column.name,
-                  data_type: column.dataType ?? "",
-                  is_nullable: column.isNullable ?? true,
-                  column_default: null,
-                  is_primary_key: false,
-                  extra: null,
-                  comment: column.comment ?? null,
-                  numeric_precision: null,
-                  numeric_scale: null,
-                  character_maximum_length: null,
-                }));
-                evictOldestCacheEntries(completionColumnsCache.value, COMPLETION_CACHE_MAX);
-                return;
-              }
-            } catch {
-              // Fall back to the existing metadata path below.
+          const querySchema = metadataQuerySchema(connectionId, database, completionSchema);
+          const result = await loadObjectMetadataFacet({ connectionId, database, schema: querySchema, tableName: completionTable, catalog }, "columns", async () => (await Promise.resolve(api.getColumns(connectionId, database, querySchema, completionTable, catalog, undefined))) ?? []);
+          if (isMetadataEpochCurrent(sharedEpoch)) canonicalColumns = result.value;
+        });
+        if (!isMetadataEpochCurrent(sharedEpoch)) return listCompletionColumns(connectionId, database, table, schema, context, catalog);
+        const columns = canonicalColumns.map((column) => ({ name: column.name, table: completionTable, schema: completionSchema, dataType: column.data_type, isNullable: column.is_nullable, comment: column.comment }));
+        indexCompletionColumns(connectionId, database, completionTable, completionSchema, columns, catalog);
+        return columns;
+      }
+      if (!completionColumnsCache.value[cacheKey]) {
+        await withCompletionInFlight(
+          `${cacheKey}:columns`,
+          async () => {
+            await ensureConnected(connectionId);
+            const querySchema = usesOracleCurrentSchema ? "" : metadataQuerySchema(connectionId, database, completionSchema);
+            if (usesOracleCurrentSchema) {
+              completionColumnsCache.value[cacheKey] = (await Promise.resolve(api.getColumns(connectionId, database, querySchema, completionTable, catalog, context?.clientSessionId))) ?? [];
             }
-          }
-          const querySchema = usesOracleCurrentSchema ? "" : metadataQuerySchema(connectionId, database, completionSchema);
-          completionColumnsCache.value[cacheKey] = await api.getColumns(connectionId, database, querySchema, completionTable, catalog, usesOracleCurrentSchema ? context?.clientSessionId : undefined);
-          evictOldestCacheEntries(completionColumnsCache.value, COMPLETION_CACHE_MAX);
-        },
-        { scope: completionLimiterScope(connectionId, database), kind: "columns" },
-      );
+            evictOldestCacheEntries(completionColumnsCache.value, COMPLETION_CACHE_MAX);
+          },
+          { scope: completionLimiterScope(connectionId, database), kind: "columns" },
+        );
+      }
+      const columns = completionColumnsCache.value[cacheKey].map((column) => ({
+        name: column.name,
+        table: completionTable,
+        schema: completionSchema,
+        dataType: column.data_type,
+        isNullable: column.is_nullable,
+        comment: column.comment,
+      }));
+      return columns;
+    } finally {
+      releaseMetadataEpoch(sharedEpoch);
     }
-
-    const columns = completionColumnsCache.value[cacheKey].map((column) => ({
-      name: column.name,
-      table: completionTable,
-      schema: completionSchema,
-      dataType: column.data_type,
-      isNullable: column.is_nullable,
-      comment: column.comment,
-    }));
-    if (!usesOracleCurrentSchema) indexCompletionColumns(connectionId, database, completionTable, completionSchema, columns, catalog);
-    return columns;
   }
 
   async function listCompletionForeignKeys(connectionId: string, database: string, table: string, schema?: string): Promise<SqlCompletionForeignKey[]> {
@@ -8211,6 +8339,7 @@ export const useConnectionStore = defineStore("connection", () => {
     listCompletionTables,
     listCompletionObjects,
     listCompletionColumns,
+    listCompletionColumnsByPrefix,
     listCompletionForeignKeys,
     listCompletionSchemas,
     listCompletionDatabases,
@@ -8218,6 +8347,7 @@ export const useConnectionStore = defineStore("connection", () => {
     lookupLocalCompletionTables,
     lookupLocalCompletionObjects,
     lookupLocalCompletionColumns,
+    lookupLocalCompletionColumnsByPrefix,
     lookupLocalCompletionForeignKeys,
     lookupLocalCompletionSchemas,
     lookupLocalCompletionDatabases,
