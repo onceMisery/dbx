@@ -54,10 +54,12 @@ import LightTooltip from "@/components/ui/LightTooltip.vue";
 import type { ColumnInfo, ConnectionConfig, CustomTypeTreeMemberMeta, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
 import { alignedCommentLeadingWidth, canTreeNodePin, canTreeNodeShowExpander, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
+import { AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR } from "@/lib/ai/aiTableReferenceDrop";
 import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
+import { encodeSpannerResourcePath } from "@/lib/connection/spannerResourcePath";
 import { hexToRgba } from "@/lib/common/color";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebar/sidebarLabelTooltip";
@@ -205,6 +207,10 @@ const showProductionBadge = computed(() => {
 
 function currentDatabaseType(): DatabaseType | undefined {
   return activeNode.value.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(activeNode.value.connectionId)) : undefined;
+}
+
+function currentDriverProfile(): string | undefined {
+  return activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId)?.driver_profile : undefined;
 }
 
 function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
@@ -458,7 +464,8 @@ function connectionTooltipUrl(config: ConnectionConfig): string {
   const user = cleanTooltipValue(config.username);
   const userInfo = user ? `${encodeURIComponent(user)}@` : "";
   const database = cleanTooltipValue(config.database);
-  const path = database ? `/${encodeURIComponent(database)}` : "";
+  const encodedDatabase = config.db_type === "spanner" ? encodeSpannerResourcePath(database) : encodeURIComponent(database);
+  const path = database ? `/${encodedDatabase}` : "";
   const params = cleanTooltipValue(config.url_params);
   const query = params ? (params.startsWith("?") ? params : `?${params}`) : "";
   return redactedConnectionString(`${scheme}://${userInfo}${hostForDisplay(host)}${port}${path}${query}`);
@@ -1114,6 +1121,7 @@ function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
       database: activeNode.value.database,
       referenceType: "database",
       databaseType: currentDatabaseType(),
+      driverProfile: currentDriverProfile(),
     });
   }
   if (activeNode.value.type === "column") {
@@ -1126,6 +1134,7 @@ function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
       tableName: activeNode.value.tableName,
       columnName,
       databaseType: currentDatabaseType(),
+      driverProfile: currentDriverProfile(),
     });
   }
   const payload = createTableReferencePayload({
@@ -1134,6 +1143,7 @@ function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
     schema: activeNode.value.schema,
     tableName: activeNode.value.label,
     databaseType: currentDatabaseType(),
+    driverProfile: currentDriverProfile(),
   });
   return payload;
 }
@@ -1180,7 +1190,7 @@ function onTableReferenceMouseUp(event: MouseEvent) {
   if (payload) {
     suppressNextTableReferenceClick = true;
     const target = document.elementFromPoint(event.clientX, event.clientY);
-    if (target instanceof Element && target.closest("[data-query-editor-root]")) {
+    if (target instanceof Element && target.closest(`[data-query-editor-root], ${AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR}`)) {
       window.dispatchEvent(
         createTableReferenceDropEvent({
           payload,

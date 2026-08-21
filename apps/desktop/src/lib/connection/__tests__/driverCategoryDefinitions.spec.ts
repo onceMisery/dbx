@@ -81,6 +81,7 @@ describe("AGENT_DRIVER_CATEGORY_MAP integrity", () => {
       "informix",
       "iris",
       "oracle",
+      "spanner",
       "sqlserver-legacy",
       // analytics
       "bigquery",
@@ -89,6 +90,7 @@ describe("AGENT_DRIVER_CATEGORY_MAP integrity", () => {
       "exasol",
       "hive",
       "ignite",
+      "ignite3",
       "kylin",
       "phoenix",
       "prestosql",
@@ -116,7 +118,6 @@ describe("AGENT_DRIVER_CATEGORY_MAP integrity", () => {
       "access",
       "duckdb",
       "h2",
-      "h2-legacy",
       // document
       "cassandra",
       "mongodb",

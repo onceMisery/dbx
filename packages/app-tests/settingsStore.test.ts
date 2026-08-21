@@ -7,6 +7,7 @@ import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS } from "../../apps/desktop/src/lib
 import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, SYSTEM_UI_FONT_FAMILY } from "../../apps/desktop/src/lib/app/appFonts.ts";
 import { tableOpenPageLimit } from "../../apps/desktop/src/lib/table/tableOpenPageLimit.ts";
 import { AI_PROVIDER_PRESETS, DEFAULT_EDITOR_SETTINGS, EXECUTE_MODE_CURRENT_DEFAULT_VERSION, normalizeAiConfig, normalizeEditorSettings, useSettingsStore } from "../../apps/desktop/src/stores/settingsStore.ts";
+import { DEFAULT_SHORTCUT_SETTINGS, tabNavigationHistoryDefaultShortcut, type ShortcutSettings } from "../../apps/desktop/src/lib/editor/shortcutRegistry.ts";
 
 const saveEditorSettingsMock = vi.hoisted(() => vi.fn());
 vi.mock("../../apps/desktop/src/lib/backend/api", async (importOriginal) => {
@@ -27,6 +28,16 @@ const OLD_FONT_SIZE_KEY = "dbx-query-editor-font-size";
 beforeEach(() => {
   saveEditorSettingsMock.mockClear();
 });
+
+function createDeferred() {
+  let resolve!: () => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 async function withMockLocalStorage(initial: Record<string, string>, run: () => void | Promise<void>) {
   const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
@@ -384,6 +395,8 @@ test("defaults shortcut settings", () => {
   assert.equal(settings.shortcuts.newQuery, "Mod+T");
   assert.equal(settings.shortcuts.openSettings, "Mod+,");
   assert.equal(settings.shortcuts.focusSearch, "Mod+F");
+  assert.equal(settings.shortcuts.navigateTabHistoryBack, tabNavigationHistoryDefaultShortcut("back"));
+  assert.equal(settings.shortcuts.navigateTabHistoryForward, tabNavigationHistoryDefaultShortcut("forward"));
   assert.equal(settings.shortcuts.zoomInUi, "Mod+=");
   assert.equal(settings.shortcuts.zoomOutUi, "Mod+-");
   assert.equal(settings.shortcuts.resetUiZoom, "Mod+0");
@@ -415,6 +428,47 @@ test("keeps saved shortcut overrides", () => {
   assert.equal(settings.shortcuts.zoomInUi, "Alt+Mod+=");
   assert.equal(settings.shortcuts.editSidebarConnection, "Alt+E");
   assert.equal(settings.shortcuts.saveSql, "Mod+S");
+});
+
+test("preserves adjacent tab shortcuts and persists unbound history actions when upgrading legacy settings", async () => {
+  const legacyShortcuts: Partial<ShortcutSettings> = { ...DEFAULT_SHORTCUT_SETTINGS };
+  delete legacyShortcuts.navigateTabHistoryBack;
+  delete legacyShortcuts.navigateTabHistoryForward;
+  legacyShortcuts.switchToPreviousTab = tabNavigationHistoryDefaultShortcut("back");
+  legacyShortcuts.switchToNextTab = tabNavigationHistoryDefaultShortcut("forward");
+
+  await withMockLocalStorage(
+    {
+      "dbx-app-state:editor_settings": JSON.stringify({
+        executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+        shortcuts: legacyShortcuts,
+      }),
+    },
+    async () => {
+      setActivePinia(createPinia());
+      const migratedStore = useSettingsStore();
+      await migratedStore.initEditorSettings();
+
+      assert.equal(migratedStore.editorSettings.shortcuts.switchToPreviousTab, tabNavigationHistoryDefaultShortcut("back"));
+      assert.equal(migratedStore.editorSettings.shortcuts.switchToNextTab, tabNavigationHistoryDefaultShortcut("forward"));
+      assert.equal(migratedStore.editorSettings.shortcuts.navigateTabHistoryBack, "");
+      assert.equal(migratedStore.editorSettings.shortcuts.navigateTabHistoryForward, "");
+
+      await vi.waitFor(() => {
+        const saved = saveEditorSettingsMock.mock.calls.at(-1)?.[0] as { shortcuts?: ShortcutSettings } | undefined;
+        assert.equal(saved?.shortcuts?.navigateTabHistoryBack, "");
+        assert.equal(saved?.shortcuts?.navigateTabHistoryForward, "");
+      });
+
+      setActivePinia(createPinia());
+      const reloadedStore = useSettingsStore();
+      await reloadedStore.initEditorSettings();
+      assert.equal(reloadedStore.editorSettings.shortcuts.switchToPreviousTab, tabNavigationHistoryDefaultShortcut("back"));
+      assert.equal(reloadedStore.editorSettings.shortcuts.switchToNextTab, tabNavigationHistoryDefaultShortcut("forward"));
+      assert.equal(reloadedStore.editorSettings.shortcuts.navigateTabHistoryBack, "");
+      assert.equal(reloadedStore.editorSettings.shortcuts.navigateTabHistoryForward, "");
+    },
+  );
 });
 
 test("defaults sidebar activation to single click", () => {
@@ -580,6 +634,168 @@ test("keeps only valid saved column formatter configs", () => {
   });
   assert.deepEqual(settings.customColumnFormatters, {
     fmt_1: { id: "fmt_1", name: "Status label", template: "status:${value}" },
+  });
+});
+
+test("deleting a saved custom formatter clears every reference to it", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_remove: { id: "fmt_remove", name: "Remove me", template: "remove:${value}" },
+        fmt_keep: { id: "fmt_keep", name: "Keep me", template: "keep:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_remove" },
+        second: { kind: "custom-ref", formatterId: "fmt_remove" },
+        keep: { kind: "custom-ref", formatterId: "fmt_keep" },
+        mask: { kind: "mask", prefix: 1, suffix: 1 },
+      },
+    });
+
+    await store.deleteCustomColumnFormatter("fmt_remove");
+
+    assert.deepEqual(store.editorSettings.customColumnFormatters, {
+      fmt_keep: { id: "fmt_keep", name: "Keep me", template: "keep:${value}" },
+    });
+    assert.deepEqual(store.editorSettings.columnFormatters, {
+      keep: { kind: "custom-ref", formatterId: "fmt_keep" },
+      mask: { kind: "mask", prefix: 1, suffix: 1 },
+    });
+  });
+});
+
+test("serializes concurrent custom formatter deletes", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+        fmt_b: { id: "fmt_b", name: "B", template: "b:${value}" },
+        fmt_keep: { id: "fmt_keep", name: "Keep", template: "keep:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_a" },
+        second: { kind: "custom-ref", formatterId: "fmt_b" },
+        keep: { kind: "custom-ref", formatterId: "fmt_keep" },
+      },
+    });
+    await store.persistEditorSettings();
+
+    await Promise.all([store.deleteCustomColumnFormatter("fmt_a"), store.deleteCustomColumnFormatter("fmt_b")]);
+
+    assert.deepEqual(store.editorSettings.customColumnFormatters, {
+      fmt_keep: { id: "fmt_keep", name: "Keep", template: "keep:${value}" },
+    });
+    assert.deepEqual(store.editorSettings.columnFormatters, {
+      keep: { kind: "custom-ref", formatterId: "fmt_keep" },
+    });
+    const saved = saveEditorSettingsMock.mock.calls.at(-1)?.[0] as { customColumnFormatters?: Record<string, unknown> } | undefined;
+    assert.deepEqual(saved?.customColumnFormatters, {
+      fmt_keep: { id: "fmt_keep", name: "Keep", template: "keep:${value}" },
+    });
+  });
+});
+
+test("queues formatter upserts behind a deferred delete save", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+        fmt_b: { id: "fmt_b", name: "B", template: "b:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_a" },
+      },
+    });
+    await store.persistEditorSettings();
+    const deleteSave = createDeferred();
+    saveEditorSettingsMock.mockImplementationOnce(() => deleteSave.promise);
+
+    const deletePromise = store.deleteCustomColumnFormatter("fmt_a");
+    await vi.waitFor(() => assert.equal(store.editorSettings.customColumnFormatters.fmt_a, undefined));
+    const upsertPromise = store.upsertCustomColumnFormatter({ id: "fmt_b", name: "B updated", template: "updated:${value}" });
+    await Promise.resolve();
+    assert.equal(store.editorSettings.customColumnFormatters.fmt_b.name, "B");
+
+    deleteSave.resolve();
+    await deletePromise;
+    await upsertPromise;
+
+    assert.deepEqual(store.editorSettings.customColumnFormatters, {
+      fmt_b: { id: "fmt_b", name: "B updated", template: "updated:${value}" },
+    });
+    assert.deepEqual(store.editorSettings.columnFormatters, {});
+  });
+});
+
+test("rolls back a failed delete before running a queued formatter upsert", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_a" },
+      },
+    });
+    await store.persistEditorSettings();
+    const deleteSave = createDeferred();
+    saveEditorSettingsMock.mockImplementationOnce(() => deleteSave.promise);
+
+    const deletePromise = store.deleteCustomColumnFormatter("fmt_a");
+    const deleteRejected = assert.rejects(deletePromise, /disk full/);
+    await vi.waitFor(() => assert.equal(store.editorSettings.customColumnFormatters.fmt_a, undefined));
+    const upsertPromise = store.upsertCustomColumnFormatter({ id: "fmt_b", name: "B", template: "b:${value}" });
+    await Promise.resolve();
+    assert.equal(store.editorSettings.customColumnFormatters.fmt_b, undefined);
+
+    deleteSave.reject(new Error("disk full"));
+    await deleteRejected;
+    await upsertPromise;
+
+    assert.deepEqual(store.editorSettings.customColumnFormatters, {
+      fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+      fmt_b: { id: "fmt_b", name: "B", template: "b:${value}" },
+    });
+    assert.deepEqual(store.editorSettings.columnFormatters, {
+      first: { kind: "custom-ref", formatterId: "fmt_a" },
+    });
+  });
+});
+
+test("rejects stale formatter drafts but allows deliberate same-id recreation", async () => {
+  await withMockLocalStorage({}, async () => {
+    setActivePinia(createPinia());
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    store.updateEditorSettings({
+      customColumnFormatters: {
+        fmt_rebuild: { id: "fmt_rebuild", name: "Original", template: "original:${value}" },
+      },
+    });
+    await store.persistEditorSettings();
+    const capturedDeleteVersion = store.customColumnFormatterDeleteVersion("fmt_rebuild");
+    const staleFormatter = store.editorSettings.customColumnFormatters.fmt_rebuild;
+
+    await store.deleteCustomColumnFormatter("fmt_rebuild");
+
+    assert.equal(await store.upsertCustomColumnFormatter(staleFormatter, capturedDeleteVersion), undefined);
+    assert.equal(store.editorSettings.customColumnFormatters.fmt_rebuild, undefined);
+    const rebuilt = { id: "fmt_rebuild", name: "Rebuilt", template: "rebuilt:${value}" };
+    assert.deepEqual(await store.upsertCustomColumnFormatter(rebuilt), rebuilt);
+    assert.deepEqual(store.editorSettings.customColumnFormatters.fmt_rebuild, rebuilt);
+    assert.notEqual(store.customColumnFormatterDeleteVersion("fmt_rebuild"), capturedDeleteVersion);
   });
 });
 

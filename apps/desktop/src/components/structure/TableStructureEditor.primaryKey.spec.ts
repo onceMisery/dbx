@@ -545,9 +545,9 @@ describe("TableStructureEditor metadata loading", () => {
   });
 
   it.each([
-    ["columns", ["columns", "comment"]],
+    ["columns", ["columns", "indexes", "comment"]],
     ["indexes", ["columns", "indexes", "comment"]],
-    ["foreignKeys", ["columns", "foreign-keys", "comment"]],
+    ["foreignKeys", ["columns", "indexes", "foreign-keys", "comment"]],
     ["triggers", ["triggers", "comment"]],
   ] as const)("loads only the required facets for the initial %s tab", async (initialTab, expectedFacets) => {
     await mountLoadingEditor(initialTab);
@@ -555,6 +555,106 @@ describe("TableStructureEditor metadata loading", () => {
     await vi.waitFor(() => expect(mocks.loadObjectMetadataFacet).toHaveBeenCalledTimes(expectedFacets.length));
     expect(mocks.loadObjectMetadataFacet.mock.calls.map((call) => call[1])).toEqual(expectedFacets);
     expect(mocks.loadObjectDdl).not.toHaveBeenCalled();
+  });
+
+  it("loads the PostgreSQL primary index name before showing a missing-name warning", async () => {
+    mocks.connection.db_type = "postgres";
+    mocks.connection.name = "postgres";
+    mocks.connection.driver_label = "postgres";
+    mocks.ensureConnected.mockResolvedValue(undefined);
+    mocks.listDataTypes.mockResolvedValue([]);
+    const warning = "Could not determine the existing PostgreSQL primary key constraint name. Refresh the table structure and try again.";
+    mocks.buildTableStructureChangeSql.mockResolvedValue({ statements: [], warnings: [warning] });
+    mocks.loadObjectMetadataFacet.mockImplementation(async (_request, facet: string) => ({
+      value:
+        facet === "columns"
+          ? [
+              { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true },
+              { name: "asdas", data_type: "integer", is_nullable: true, column_default: null, is_primary_key: false },
+            ]
+          : facet === "comment"
+            ? ""
+            : [],
+      cacheStatus: "remote",
+    }));
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const app = createApp(TableStructureEditor, {
+      connectionId: mocks.connection.id,
+      database: "test",
+      schema: "public",
+      tableName: "test",
+      initialTab: "columns",
+    });
+    mountedApps.push(app);
+    app.mount(root);
+
+    await vi.waitFor(() => expect(root.querySelector('[data-column-row-index="0"]')).not.toBeNull());
+    expect(mocks.loadObjectMetadataFacet.mock.calls.map((call) => call[1])).toEqual(["columns", "indexes", "comment"]);
+
+    const primaryKey = columnCheckbox(root, "structureEditor.primaryKey");
+    primaryKey.checked = false;
+    primaryKey.dispatchEvent(new Event("change", { bubbles: true }));
+
+    await vi.waitFor(() => expect(root.textContent).toContain(warning));
+    expect(buttonWithText(root, "structureEditor.apply").disabled).toBe(true);
+    expect(mocks.buildTableStructureChangeSql).toHaveBeenLastCalledWith(expect.objectContaining({ indexes: [] }));
+  });
+
+  it("backfills the PostgreSQL primary index name for a restored columns-only draft", async () => {
+    mocks.connection.db_type = "postgres";
+    mocks.connection.name = "postgres";
+    mocks.connection.driver_label = "postgres";
+    mocks.ensureConnected.mockResolvedValue(undefined);
+    mocks.listDataTypes.mockResolvedValue([]);
+    mocks.buildTableStructureChangeSql.mockResolvedValue({ statements: [], warnings: [] });
+    mocks.loadObjectMetadataFacet.mockImplementation(async (_request, facet: string) => ({
+      value:
+        facet === "indexes"
+          ? [
+              {
+                name: "test_pk",
+                columns: ["id"],
+                is_unique: true,
+                is_primary: true,
+              },
+            ]
+          : facet === "comment"
+            ? ""
+            : [],
+      cacheStatus: "remote",
+    }));
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const app = createApp(TableStructureEditor, {
+      connectionId: mocks.connection.id,
+      database: "test",
+      schema: "public",
+      tableName: "test",
+      draft: {
+        ...draft(true),
+        loadedMetadataFacets: ["columns", "comment"],
+      },
+    });
+    mountedApps.push(app);
+    app.mount(root);
+
+    await vi.waitFor(() => expect(mocks.loadObjectMetadataFacet).toHaveBeenCalledTimes(1));
+    expect(mocks.loadObjectMetadataFacet.mock.calls.map((call) => call[1])).toEqual(["indexes"]);
+
+    const primaryKey = columnCheckbox(root, "structureEditor.primaryKey");
+    primaryKey.checked = false;
+    primaryKey.dispatchEvent(new Event("change", { bubbles: true }));
+
+    await vi.waitFor(() =>
+      expect(mocks.buildTableStructureChangeSql).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          indexes: [expect.objectContaining({ name: "test_pk", isPrimary: true, original: expect.objectContaining({ name: "test_pk", is_primary: true }) })],
+        }),
+      ),
+    );
   });
 
   it("loads index metadata when an initialized column draft opens the indexes tab", async () => {

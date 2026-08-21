@@ -56,6 +56,7 @@ import {
   createForeignKeyDrafts,
   createIndexDrafts,
   createTriggerDrafts,
+  dataTypeBaseInputValue,
   dataTypeLengthInputValue,
   dataTypeLengthUnitValue,
   defaultNewColumnDataType,
@@ -79,7 +80,6 @@ import {
   resolveInsertColumnIndex,
   restoreCharacterLengthUnitsAfterSave,
   sameStructureIndexType,
-  splitDataType,
   tableStructureIdentifierComparisonKey,
   toColumnNames,
 } from "@/lib/table/tableStructureEditorState";
@@ -680,8 +680,15 @@ const indexTypesByDb: Record<string, string[]> = {
   sqlserver: ["CLUSTERED", "NONCLUSTERED", "COLUMNSTORE", "NONCLUSTERED COLUMNSTORE", "XML", "SPATIAL"],
   oracle: ["NORMAL", "BITMAP", "FUNCTION-BASED NORMAL", "FUNCTION-BASED DOMAIN", "DOMAIN", "CLUSTER"],
   sqlite: ["BTREE"],
+  "gaussdb-m": ["UBTREE"],
 };
-const indexTypeOptions = computed(() => (structureCapabilities.value.indexType ? (indexTypesByDb[structureDialect.value] ?? []) : []));
+const indexTypeOptions = computed(() => {
+  if (!structureCapabilities.value.indexType) return [];
+  if (connection.value?.driver_profile?.toLowerCase() === "gaussdb-m") {
+    return indexTypesByDb["gaussdb-m"];
+  }
+  return indexTypesByDb[structureDialect.value] ?? [];
+});
 
 interface DefaultValuePreset {
   label: string;
@@ -891,13 +898,13 @@ const targetLabel = computed(() => buildStructureTargetLabel(connection.value?.n
 
 function isManticoreTextColumn(column: EditableStructureColumn): boolean {
   if (databaseType.value !== "manticoresearch") return false;
-  const baseType = splitDataType(column.dataType).baseType.trim().toLowerCase();
+  const baseType = dataTypeBaseInputValue(databaseType.value, column.dataType).trim().toLowerCase();
   return baseType === "text" || baseType === "string";
 }
 
 function isManticoreJsonColumn(column: EditableStructureColumn): boolean {
   if (databaseType.value !== "manticoresearch") return false;
-  return splitDataType(column.dataType).baseType.trim().toLowerCase() === "json";
+  return dataTypeBaseInputValue(databaseType.value, column.dataType).trim().toLowerCase() === "json";
 }
 
 let sqlPreviewRequestId = 0;
@@ -1342,6 +1349,7 @@ function structureChangeOptions(): BuildTableStructureChangeSqlOptions {
     tableComment: tableComment.value,
     originalTableComment: isCreateMode.value ? undefined : originalTableComment.value,
     partitioned: isPartitionedParent.value,
+    isGaussdbMMode: connection.value?.driver_profile?.toLowerCase() === "gaussdb-m",
   };
 }
 
@@ -1491,6 +1499,12 @@ function setSecondaryMetadataLoading(scope: TableStructureRefreshScope, value: b
   if (scope.triggers && tableMetadataCapabilities.value.triggers) triggersLoading.value = value;
 }
 
+function withRequiredPostgresPrimaryKeyMetadata(scope: TableStructureRefreshScope): TableStructureRefreshScope {
+  if (isCreateMode.value || databaseType.value !== "postgres") return scope;
+  const needsPrimaryKeyMetadata = scope.columns || (activeTab.value === "columns" && !loadedMetadataFacets.has("indexes"));
+  return needsPrimaryKeyMetadata && !scope.indexes ? { ...scope, indexes: true } : scope;
+}
+
 async function fetchTableCommentValue(connectionId: string, database: string, schema: string, tableName: string, catalog?: string): Promise<string | undefined> {
   try {
     return (await api.getTableComment(connectionId, database, schema, tableName, catalog)) || "";
@@ -1521,9 +1535,10 @@ async function loadStructure(
   const schema = metadataSchema.value;
   const tableName = props.tableName;
   if (!connectionId || !database || !tableName) return;
+  const effectiveScope = withRequiredPostgresPrimaryKeyMetadata(scope);
   const requestId = ++structureLoadRequestId;
   if (!silent) loading.value = true;
-  setSecondaryMetadataLoading(scope, true);
+  setSecondaryMetadataLoading(effectiveScope, true);
   errorMessage.value = "";
   let secondaryMetadataScheduled = false;
   let loadedSuccessfully = false;
@@ -1544,28 +1559,28 @@ async function loadStructure(
             .then((status) => ({ known: true, status }))
             .catch(() => ({ known: false, status: { isPartitionedParent: false, isPartition: false } }))
         : Promise.resolve({ known: true, status: { isPartitionedParent: false, isPartition: false } });
-    const columnsPromise = scope.columns ? loadObjectMetadataFacet(metadataRequest, "columns", () => api.getColumns(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value) : Promise.resolve(undefined);
-    const indexesPromise = scope.indexes
+    const columnsPromise = effectiveScope.columns ? loadObjectMetadataFacet(metadataRequest, "columns", () => api.getColumns(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value) : Promise.resolve(undefined);
+    const indexesPromise = effectiveScope.indexes
       ? tableMetadataCapabilities.value.indexes
         ? loadObjectMetadataFacet(metadataRequest, "indexes", () => api.listIndexes(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value)
         : Promise.resolve([])
       : Promise.resolve(undefined);
-    const foreignKeysPromise = scope.foreignKeys
+    const foreignKeysPromise = effectiveScope.foreignKeys
       ? tableMetadataCapabilities.value.foreignKeys
         ? loadObjectMetadataFacet(metadataRequest, "foreign-keys", () => api.listForeignKeys(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value)
         : Promise.resolve([])
       : Promise.resolve(undefined);
-    const constraintsPromise = scope.constraints
+    const constraintsPromise = effectiveScope.constraints
       ? tableMetadataCapabilities.value.constraints
         ? loadObjectMetadataFacet(metadataRequest, "constraints", () => api.listConstraints(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value)
         : Promise.resolve([])
       : Promise.resolve(undefined);
-    const triggersPromise = scope.triggers
+    const triggersPromise = effectiveScope.triggers
       ? tableMetadataCapabilities.value.triggers
         ? loadObjectMetadataFacet(metadataRequest, "triggers", () => api.listTriggers(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value)
         : Promise.resolve([])
       : Promise.resolve(undefined);
-    const tableCommentPromise = scope.tableComment && structureCapabilities.value.comment ? loadCachedTableComment(metadataRequest, forceMetadata).then((result) => result.value) : Promise.resolve(undefined);
+    const tableCommentPromise = effectiveScope.tableComment && structureCapabilities.value.comment ? loadCachedTableComment(metadataRequest, forceMetadata).then((result) => result.value) : Promise.resolve(undefined);
 
     let nextColumns = await columnsPromise;
     if (nextColumns) {
@@ -1639,7 +1654,7 @@ async function loadStructure(
         if (showErrors && requestId === structureLoadRequestId) errorMessage.value = error?.message || String(error);
       })
       .finally(() => {
-        if (requestId === structureLoadRequestId) setSecondaryMetadataLoading(scope, false);
+        if (requestId === structureLoadRequestId) setSecondaryMetadataLoading(effectiveScope, false);
       });
     if (options.blockSecondaryMetadata) {
       await secondaryMetadataPromise;
@@ -1653,7 +1668,7 @@ async function loadStructure(
     }
   } finally {
     if (!secondaryMetadataScheduled && requestId === structureLoadRequestId) {
-      setSecondaryMetadataLoading(scope, false);
+      setSecondaryMetadataLoading(effectiveScope, false);
     }
     if (!silent) loading.value = false;
     if (!options.preserveDraft && loadedSuccessfully && requestId === structureLoadRequestId) {
@@ -2061,14 +2076,14 @@ function removeMysqlEnumValue(column: EditableStructureColumn, index: number) {
 }
 
 function updateColumnDataTypeLength(column: EditableStructureColumn, value: string | number) {
-  const baseType = splitDataType(column.dataType).baseType;
+  const baseType = dataTypeBaseInputValue(databaseType.value, column.dataType);
   column.dataType = combineDataTypeForDatabaseWithLengthUnit(databaseType.value, baseType, String(value), dataTypeLengthUnitValue(databaseType.value, column.dataType));
   syncSqlServerIdentityForDataType(column);
   syncDamengIdentityForDataType(column);
 }
 
 function updateColumnDataTypeLengthUnit(column: EditableStructureColumn, value: unknown) {
-  const baseType = splitDataType(column.dataType).baseType;
+  const baseType = dataTypeBaseInputValue(databaseType.value, column.dataType);
   const unit = value === "__default" ? "" : String(value ?? "");
   column.dataType = combineDataTypeForDatabaseWithLengthUnit(databaseType.value, baseType, dataTypeLengthInputValue(databaseType.value, column.dataType), unit);
   syncSqlServerIdentityForDataType(column);
@@ -2377,7 +2392,7 @@ function isColumnLengthDisabled(column: EditableStructureColumn): boolean {
   if (isColumnTypeDisabled(column)) {
     return true;
   }
-  const baseType = splitDataType(column.dataType).baseType.trim().toLowerCase();
+  const baseType = dataTypeBaseInputValue(databaseType.value, column.dataType).trim().toLowerCase();
   return isDataTypeLengthDisabled(databaseType.value, baseType);
 }
 
@@ -2457,15 +2472,24 @@ function existingIndexNamesForDraft(index: EditableStructureIndex): string[] {
 }
 
 function generatedIndexNameForDraft(index: EditableStructureIndex, columnsForName = index.columns): string {
-  return generateUniqueIndexName(structureIndexTableName(), columnsForName, existingIndexNamesForDraft(index));
+  const name = generateUniqueIndexName(structureIndexTableName(), columnsForName, existingIndexNamesForDraft(index));
+  // GaussDB M-mode expects lowercase index names (MySQL-compatible).
+  return connection.value?.driver_profile?.toLowerCase() === "gaussdb-m" ? name.toLowerCase() : name;
 }
 
 function refreshAutoIndexName(index: EditableStructureIndex, previousColumns = index.columns) {
   if (index.original || index.nameEdited) return;
+  const isGaussdbM = connection.value?.driver_profile?.toLowerCase() === "gaussdb-m";
   const previousName = generateIndexName(structureIndexTableName(), previousColumns);
   const previousUniqueName = generateUniqueIndexName(structureIndexTableName(), previousColumns, existingIndexNamesForDraft(index));
   const currentName = index.name.trim();
-  if (currentName && currentName !== previousName && currentName !== previousUniqueName) return;
+  if (currentName) {
+    if (isGaussdbM) {
+      if (currentName.toLowerCase() !== previousName.toLowerCase() && currentName.toLowerCase() !== previousUniqueName.toLowerCase()) return;
+    } else if (currentName !== previousName && currentName !== previousUniqueName) {
+      return;
+    }
+  }
   index.name = generatedIndexNameForDraft(index);
 }
 
@@ -3114,7 +3138,7 @@ async function loadActiveTableStructureMetadataIfNeeded() {
     return;
   }
   if (loading.value || secondaryMetadataLoading.value) return;
-  const scope = unloadedTableStructureRefreshScope(activeTab.value, loadedMetadataFacets);
+  const scope = withRequiredPostgresPrimaryKeyMetadata(unloadedTableStructureRefreshScope(activeTab.value, loadedMetadataFacets));
   if (!hasTableStructureRefreshWork(scope)) return;
   await loadStructure(true, scope, true, { blockSecondaryMetadata: true, preserveDraft: true });
   applyInitialStructureTarget();
@@ -3320,7 +3344,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                   <td :class="structureCellClass">
                     <SearchableSelect
                       v-if="!isColumnTypeDisabled(column)"
-                      :model-value="splitDataType(column.dataType).baseType"
+                      :model-value="dataTypeBaseInputValue(databaseType, column.dataType)"
                       :options="dataTypeOptions"
                       :placeholder="t('structureEditor.typePlaceholder')"
                       :search-placeholder="t('structureEditor.typePlaceholder')"
@@ -3332,7 +3356,7 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
                       :trigger-class="[structureMonoControlClass, 'w-full']"
                       @update:model-value="(v: string) => updateColumnDataType(column, v)"
                     />
-                    <Input v-else :model-value="gaussdbMDataTypeDisplayName(splitDataType(column.dataType).baseType)" :class="[structureMonoControlClass, 'w-full']" disabled />
+                    <Input v-else :model-value="gaussdbMDataTypeDisplayName(dataTypeBaseInputValue(databaseType, column.dataType))" :class="[structureMonoControlClass, 'w-full']" disabled />
                   </td>
                   <td v-if="columnEditorControls.length" :class="structureCellClass">
                     <Popover v-if="isMysqlEnumDataType(databaseType, column.dataType)">

@@ -46,16 +46,6 @@ pub async fn mongo_list_collections(
 }
 
 #[tauri::command]
-pub async fn vector_collection_detail(
-    state: State<'_, Arc<AppState>>,
-    connection_id: String,
-    database: String,
-    collection: String,
-) -> Result<dbx_core::db::vector_driver::CollectionInfo, String> {
-    dbx_core::schema::get_vector_collection_detail_core(&state, &connection_id, &database, &collection).await
-}
-
-#[tauri::command]
 pub async fn mongo_create_database(
     state: State<'_, Arc<AppState>>,
     connection_id: String,

@@ -301,6 +301,10 @@ impl MessageQueueAdmin for KafkaAdmin {
         Ok(subs)
     }
 
+    async fn get_kafka_consumer_group_snapshot(&self) -> Result<KafkaConsumerGroupSnapshot, String> {
+        self.call("mq_get_consumer_group_snapshot", consumer_group_snapshot_params(&self.config)).await
+    }
+
     async fn create_subscription(&self, _topic: &TopicRef, _sub: &str, _pos: ResetPosition) -> Result<(), String> {
         Err("Kafka consumer groups are created automatically when consumers join".to_string())
     }
@@ -657,6 +661,12 @@ fn build_connection_params(cfg: &MqAdminConfig) -> serde_json::Value {
     })
 }
 
+fn consumer_group_snapshot_params(cfg: &MqAdminConfig) -> serde_json::Value {
+    serde_json::json!({
+        "timeout_ms": cfg.request_timeout_ms(),
+    })
+}
+
 fn peek_messages_params(
     cfg: &MqAdminConfig,
     topic: &TopicRef,
@@ -862,6 +872,28 @@ mod tests {
         assert_eq!(params.get("startPosition").and_then(|value| value.as_str()), Some("offset"));
         assert_eq!(params.get("partition").and_then(|value| value.as_i64()), Some(2));
         assert_eq!(params.get("offset").and_then(|value| value.as_i64()), Some(17));
+    }
+
+    #[test]
+    fn consumer_group_snapshot_params_forward_the_configured_query_timeout() {
+        let mut cfg = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        cfg.query_timeout_secs = 17;
+
+        let params = consumer_group_snapshot_params(&cfg);
+
+        assert_eq!(params.get("timeout_ms").and_then(serde_json::Value::as_u64), Some(17_000));
+        assert_eq!(cfg.rpc_timeout(), Some(std::time::Duration::from_secs(17)));
+    }
+
+    #[test]
+    fn consumer_group_snapshot_params_keep_a_finite_agent_budget_for_unlimited_rpc_timeout() {
+        let mut cfg = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        cfg.query_timeout_secs = 0;
+
+        let params = consumer_group_snapshot_params(&cfg);
+
+        assert_eq!(params.get("timeout_ms").and_then(serde_json::Value::as_u64), Some(3_600_000));
+        assert_eq!(cfg.rpc_timeout(), None);
     }
 
     #[test]

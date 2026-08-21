@@ -34,6 +34,37 @@ fn quotes_identifiers_by_database_type() {
     assert_eq!(quote_table_identifier(Some(DatabaseType::Jdbc), "users_1"), "users_1");
     assert_eq!(quote_table_identifier(Some(DatabaseType::Jdbc), "user name"), "user name");
     assert_eq!(quote_table_identifier(Some(DatabaseType::Iotdb), "root.test.device2"), "root.test.device2");
+    assert_eq!(quote_table_identifier(Some(DatabaseType::Spanner), "user`name"), "`user``name`");
+}
+
+/// Spanner databases are created in one of two immutable dialects. The connected
+/// agent reports the correct identifier quote; when it is missing the static mapping
+/// must fall back to GoogleSQL (backticks), because GoogleSQL treats double quotes as
+/// string literals and would reject `SELECT * FROM "users"`.
+#[test]
+fn quotes_spanner_identifiers_by_connection_dialect() {
+    // GoogleSQL dialect: agent reports a backtick.
+    assert_eq!(quote_table_data_identifier(Some(DatabaseType::Spanner), "order", Some("`")), "`order`");
+    assert_eq!(quote_table_data_identifier(Some(DatabaseType::Spanner), "user`name", Some("`")), "`user``name`");
+
+    // PostgreSQL dialect: agent reports a double quote.
+    assert_eq!(quote_table_data_identifier(Some(DatabaseType::Spanner), "order", Some("\"")), "\"order\"");
+    assert_eq!(quote_table_data_identifier(Some(DatabaseType::Spanner), "user\"name", Some("\"")), "\"user\"\"name\"");
+
+    // No quote reported (metadata probe failed / caller outside the desktop store):
+    // fall back to the GoogleSQL default rather than the ANSI double quote.
+    assert_eq!(quote_table_data_identifier(Some(DatabaseType::Spanner), "order", None), "`order`");
+
+    // GoogleSQL's default schema is the empty string and must not produce `` ``.`t` ``,
+    // which Spanner rejects with `Invalid empty identifier`.
+    assert_eq!(
+        table_data_qualified_table_name(Some(DatabaseType::Spanner), Some(""), "singers", Some("`")),
+        "`singers`"
+    );
+    assert_eq!(
+        table_data_qualified_table_name(Some(DatabaseType::Spanner), Some("public"), "singers", Some("\"")),
+        "\"public\".\"singers\""
+    );
 }
 
 #[test]
@@ -82,6 +113,11 @@ fn qualifies_schema_only_for_schema_aware_databases() {
     assert_eq!(qualified_table_name(Some(DatabaseType::Informix), Some("xtdpcky"), "users"), "xtdpcky.users");
     assert_eq!(qualified_table_name(Some(DatabaseType::Sqlite), Some("analytics"), "users"), "\"analytics\".\"users\"");
     assert_eq!(qualified_table_name(Some(DatabaseType::Jdbc), Some("cbsdw_dwd"), "dwd_test_df"), "dwd_test_df");
+    // GoogleSQL's default schema is the empty string: the qualifier (and its dot) must be
+    // dropped entirely, otherwise Spanner reports `Invalid empty identifier`.
+    assert_eq!(qualified_table_name(Some(DatabaseType::Spanner), Some(""), "users"), "`users`");
+    assert_eq!(qualified_table_name(Some(DatabaseType::Spanner), None, "users"), "`users`");
+    assert_eq!(qualified_table_name(Some(DatabaseType::Spanner), Some("public"), "users"), "`public`.`users`");
     assert_eq!(qualified_table_name(Some(DatabaseType::Iotdb), Some("root.test"), "device2"), "root.test.device2");
     assert_eq!(
         qualified_table_name(Some(DatabaseType::Iotdb), Some("root.test"), "root.test.device2"),
@@ -127,6 +163,8 @@ fn maps_table_pagination_strategy_by_database_type() {
         TablePaginationStrategy::Unbounded
     );
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Jdbc)), TablePaginationStrategy::AgentMaxRows);
+    // Both Spanner dialects support `LIMIT n OFFSET m`; pin the fallback.
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Spanner)), TablePaginationStrategy::LimitOffset);
     assert_eq!(table_pagination_strategy(None), TablePaginationStrategy::LimitOffset);
 }
 
@@ -338,6 +376,44 @@ fn jdbc_non_tdengine_and_unscoped_tdengine_previews_remain_unqualified() {
             "SELECT * FROM readings;"
         );
     }
+}
+
+#[test]
+fn jdbc_table_data_qualifies_schema_without_forcing_identifier_quotes() {
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Jdbc),
+            driver_profile: Some("phoenix".to_string()),
+            schema: Some("DEMO".to_string()),
+            table_name: "STUDENT".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "SELECT * FROM DEMO.STUDENT;"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Jdbc),
+            driver_profile: Some("phoenix".to_string()),
+            identifier_quote: Some("\"".to_string()),
+            schema: Some("MY_SCHEMA".to_string()),
+            table_name: "ORDER".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "SELECT * FROM \"MY_SCHEMA\".\"ORDER\";"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Jdbc),
+            driver_profile: Some("phoenix".to_string()),
+            schema: None,
+            table_name: "STUDENT".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "SELECT * FROM STUDENT;"
+    );
 }
 
 #[test]

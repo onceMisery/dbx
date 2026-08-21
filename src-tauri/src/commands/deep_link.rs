@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 const CONNECTION_DEEP_LINK_PREFIX: &str = "dbx://connection/new";
+const APP_OPEN_DEEP_LINK_PREFIX: &str = "dbx://open";
 
 #[tauri::command]
 pub fn pending_open_connection_links(state: tauri::State<'_, DeepLinkOpenState>) -> Vec<String> {
@@ -38,17 +39,23 @@ where
 
 pub fn connection_deep_link_from_arg(arg: &str) -> Option<String> {
     let trimmed = arg.trim();
-    let suffix = trimmed.strip_prefix(CONNECTION_DEEP_LINK_PREFIX)?;
-    if !(suffix.is_empty()
+    matches_deep_link_target(trimmed, CONNECTION_DEEP_LINK_PREFIX).then(|| trimmed.to_string())
+}
+
+pub fn is_app_open_deep_link(arg: &str) -> bool {
+    matches_deep_link_target(arg.trim(), APP_OPEN_DEEP_LINK_PREFIX)
+}
+
+fn matches_deep_link_target(value: &str, target: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(target) else {
+        return false;
+    };
+    suffix.is_empty()
         || suffix.starts_with('?')
         || suffix.starts_with('#')
         || suffix == "/"
         || suffix.starts_with("/?")
-        || suffix.starts_with("/#"))
-    {
-        return None;
-    }
-    Some(trimmed.to_string())
+        || suffix.starts_with("/#")
 }
 
 fn dedupe_links(links: Vec<String>) -> Vec<String> {
@@ -77,6 +84,16 @@ mod tests {
         ]);
 
         assert_eq!(links, vec!["dbx://connection/new?type=mysql&host=127.0.0.1".to_string()]);
+    }
+
+    #[test]
+    fn recognizes_app_open_deep_links() {
+        assert!(is_app_open_deep_link("dbx://open"));
+        assert!(is_app_open_deep_link(" dbx://open?source=sponsor "));
+        assert!(is_app_open_deep_link("dbx://open/#landing"));
+        assert!(!is_app_open_deep_link("dbx://opened"));
+        assert!(!is_app_open_deep_link("dbx://open/window"));
+        assert!(!is_app_open_deep_link("dbx://connection/new"));
     }
 
     #[test]

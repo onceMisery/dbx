@@ -62,8 +62,10 @@ export type DatabaseType =
   | "neo4j"
   | "cassandra"
   | "bigquery"
+  | "spanner"
   | "kylin"
   | "ignite"
+  | "ignite3"
   | "sundb"
   | "oscar"
   | "tdengine"
@@ -1186,6 +1188,7 @@ export interface QueryTab {
     | "redis"
     | "redis-dashboard"
     | "mongo"
+    | "meilisearch"
     | "mongo-gridfs"
     | "mongo-bucket"
     | "vector"
@@ -1251,6 +1254,9 @@ export interface QueryTab {
     primaryKeys: string[];
   };
   tableMetaUpdatedAt?: number;
+  /** 该 tab 的 tableMeta 是哪个连接元数据代次下写入的：disconnect / 关闭数据库 /
+   * 死池重连等生命周期边界会让该代次递增，代次失配视同冷缓存（issue #6623 / PR #6640）。 */
+  tableMetaGeneration?: number;
   pendingDataChangeCount?: number;
   /** Ephemeral editor draft that has not yet been applied to the data grid. */
   hasPendingDataEditorDraft?: boolean;

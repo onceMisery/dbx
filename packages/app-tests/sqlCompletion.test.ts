@@ -268,6 +268,123 @@ test("suggests MySQL VERSION and REVERSE without broadening other dialects", () 
   assert.equal(buildFunctionItems("reve").find((item) => item.label === "REVERSE")?.apply, "REVERSE(${string})");
 });
 
+test("suggests the reported MySQL 5.7 built-in functions with dialect-specific signatures", () => {
+  const reportedFunctions = [
+    "VERSION",
+    "POSITION",
+    "REPEAT",
+    "STRCMP",
+    "POW",
+    "EXP",
+    "LN",
+    "LOG",
+    "LOG10",
+    "LOG2",
+    "SIN",
+    "PI",
+    "COS",
+    "TAN",
+    "ASIN",
+    "ACOS",
+    "ATAN",
+    "ATAN2",
+    "DEGREES",
+    "RADIANS",
+    "MONTHNAME",
+    "DAYOFMONTH",
+    "WEEKDAY",
+    "WEEK",
+    "QUARTER",
+    "ADDDATE",
+    "SUBDATE",
+    "ADDTIME",
+    "SUBTIME",
+    "TIMEDIFF",
+    "FROM_DAYS",
+    "TO_DAYS",
+    "MAKEDATE",
+    "MAKETIME",
+    "BIN",
+    "HEX",
+    "UNHEX",
+    "OCT",
+    "CONV",
+    "JSON_OBJECT",
+    "JSON_ARRAY",
+    "JSON_SET",
+    "JSON_INSERT",
+    "JSON_REPLACE",
+    "JSON_REMOVE",
+    "JSON_CONTAINS",
+    "JSON_LENGTH",
+    "PASSWORD",
+    "DATABASE",
+    "SCHEMA",
+    "USER",
+    "CURRENT_USER",
+    "COLLATION",
+    "FOUND_ROWS",
+    "LAST_INSERT_ID",
+    "BENCHMARK",
+    "SLEEP",
+    "UUID_SHORT",
+    "ELT",
+    "FIELD",
+    "MAKE_SET",
+    "TRUNCATE",
+    "MD5",
+    "SHA1",
+    "SHA2",
+  ] as const;
+  const mysqlItems = buildSqlCompletionItems("select ", "select ".length, {
+    tables: [],
+    columnsByTable: new Map(),
+    databaseType: "mysql",
+  });
+  const mysqlFunctions = mysqlItems.filter((item) => item.type === "function");
+  const mysqlFunctionLabels = new Set(mysqlFunctions.map((item) => item.label));
+
+  assert.deepEqual(
+    reportedFunctions.filter((name) => !mysqlFunctionLabels.has(name)),
+    [],
+  );
+  assert.equal(mysqlFunctions.find((item) => item.label === "POSITION")?.apply, "POSITION(${substring} IN ${string})");
+  assert.deepEqual(getSqlFunctionSignatureHelp("select position(", "select position(".length, "mysql")?.parameters, ["substring", "string"]);
+  assert.deepEqual(getSqlFunctionSignatureHelp("select log(10,", "select log(10,".length, "mysql")?.parameters, ["base", "number"]);
+  assert.deepEqual(getSqlFunctionSignatureHelp("select json_contains(", "select json_contains(".length, "mysql")?.parameters, ["target", "candidate"]);
+  assert.deepEqual(getSqlFunctionSignatureHelp("select json_length(", "select json_length(".length, "mysql")?.parameters, ["json"]);
+  assert.deepEqual(getSqlFunctionSignatureHelp("select benchmark(", "select benchmark(".length, "mysql")?.parameters, ["count", "expression"]);
+
+  for (const databaseType of ["postgres", "sqlserver"] as const) {
+    const items = buildSqlCompletionItems("select strc", "select strc".length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType,
+    });
+    assert.equal(
+      items.some((item) => item.type === "function" && item.label === "STRCMP"),
+      false,
+    );
+    assert.equal(getSqlFunctionSignatureHelp("select strcmp(", "select strcmp(".length, databaseType), null);
+  }
+
+  for (const name of ["TRUNCATE", "REPEAT", "DATABASE", "SCHEMA", "USER", "CURRENT_USER"]) {
+    const items = buildSqlCompletionItems(name.toLowerCase(), name.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "mysql",
+    });
+    assert.ok(
+      items.some((item) => item.type === "function" && item.label === name),
+      `${name} function suggestion missing`,
+    );
+    assert.ok(
+      items.some((item) => item.type === "keyword" && item.label === name),
+      `${name} keyword suggestion missing`,
+    );
+  }
+});
+
 test("suggests Oracle SQL, PL/SQL, and data type keywords", () => {
   const keywordCases = [
     ["tru", "TRUNCATE"],

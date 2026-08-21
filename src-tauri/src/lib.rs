@@ -9,6 +9,8 @@ mod startup_recovery;
 #[cfg(all(not(target_os = "windows"), not(test)))]
 #[path = "startup_recovery_noop.rs"]
 mod startup_recovery;
+#[cfg(any(target_os = "windows", test))]
+mod webview2_recovery;
 mod window_state_guard;
 
 use commands::connection::AppState;
@@ -33,6 +35,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 #[cfg(any(windows, target_os = "linux"))]
 use tauri_plugin_deep_link::DeepLinkExt;
+use tauri_plugin_opener::OpenerExt;
 
 const DESKTOP_TRAY_ID: &str = "main-tray";
 const APP_CLOSE_REQUESTED_EVENT: &str = "dbx-app-close-requested";
@@ -1287,6 +1290,7 @@ pub fn run() {
 
     let builder = if should_enable_single_instance(cfg!(debug_assertions)) {
         builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            let app_open_requested = args.iter().any(|arg| commands::deep_link::is_app_open_deep_link(arg));
             let links = commands::deep_link::connection_deep_links_from_args(args.clone());
             open_connection_deep_links(app, links);
 
@@ -1311,7 +1315,7 @@ pub fn run() {
             // simply vanished - so make the reason recoverable from the logs.
             if !show_main_window(app) {
                 eprintln!(
-                    "[WINDOW] single-instance handoff could not reveal the main window; {}",
+                    "[WINDOW] single-instance handoff could not reveal the main window; app_open_requested={app_open_requested}; {}",
                     main_window_probe_state(app)
                 );
             }
@@ -1321,6 +1325,7 @@ pub fn run() {
     };
 
     let builder = builder
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -1463,6 +1468,13 @@ pub fn run() {
             };
             state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
             state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
+            let oidc_app_handle = app.handle().clone();
+            state.set_mongo_oidc_browser_opener(Arc::new(move |url| {
+                oidc_app_handle
+                    .opener()
+                    .open_url(url, None::<&str>)
+                    .map_err(|err| format!("Failed to open the system browser: {err}"))
+            }));
             let state = Arc::new(state);
             app.manage(state.clone());
             app.manage(commands::redis_pubsub_server::start_pubsub_server(state.clone()));
@@ -1476,6 +1488,8 @@ pub fn run() {
             commands::ssh_prompt::install_ssh_notice_bridge(app.handle());
             #[cfg(target_os = "macos")]
             macos_app_delegate::install_dock_quit_handler(app.handle());
+            #[cfg(target_os = "windows")]
+            webview2_recovery::install(app.handle());
             let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
             open_connection_deep_links(app.handle(), startup_links);
 
@@ -1609,6 +1623,7 @@ pub fn run() {
             commands::connection::close_database_connection,
             commands::connection::session_credential_status,
             commands::connection::forget_session_credential,
+            commands::connection::replace_nacos_session_credential,
             commands::connection::clear_all_session_credentials,
             commands::connection::refresh_connections,
             commands::connection::check_connection_health,
@@ -1685,8 +1700,10 @@ pub fn run() {
             commands::tab_runtime_cache::delete_tab_runtime_cache_owner,
             commands::tab_runtime_cache::delete_tab_runtime_cache,
             commands::query::execute_query,
+            commands::query::execute_conditional_update,
             commands::query::execute_multi,
             commands::query::cancel_query,
+            commands::query::cancel_conditional_update,
             commands::query::close_query_session,
             commands::query::close_client_connection_session,
             commands::query::execute_batch,
@@ -1718,6 +1735,7 @@ pub fn run() {
             commands::query::build_drop_table_child_object_sql,
             commands::query::build_empty_table_sql,
             commands::query::build_truncate_table_sql,
+            commands::query::build_vacuum_table_sql,
             commands::query::build_mysql_auto_increment_sql,
             commands::query::build_drop_database_sql,
             commands::query::build_create_schema_sql,
@@ -1745,6 +1763,7 @@ pub fn run() {
             commands::query::build_data_grid_column_values_filter_condition,
             commands::query::build_data_grid_column_distinct_values_sql,
             commands::query::build_data_grid_count_sql,
+            commands::query::build_data_grid_conditional_update_sql,
             commands::query::build_hive_table_properties_sql,
             commands::query::build_export_insert_statements,
             commands::query::build_export_sql_insert,
@@ -1937,6 +1956,7 @@ pub fn run() {
             commands::nacos_cmd::nacos_sidebar_snapshot,
             commands::nacos_cmd::nacos_create_namespace,
             commands::nacos_cmd::nacos_update_namespace,
+            commands::nacos_cmd::nacos_delete_namespace,
             commands::nacos_cmd::nacos_list_configs,
             commands::nacos_cmd::nacos_get_config,
             commands::nacos_cmd::nacos_publish_config,
@@ -1992,10 +2012,13 @@ pub fn run() {
             commands::sqlite_backup::backup_sqlite_database,
             commands::mongo_cmd::mongo_list_databases,
             commands::mongo_cmd::mongo_list_collections,
-            commands::mongo_cmd::vector_collection_detail,
+            commands::vector_cmd::vector_collection_detail,
             commands::mongo_cmd::mongo_create_database,
             commands::mongo_cmd::mongo_drop_database,
             commands::mongo_cmd::mongo_drop_collection,
+            commands::vector_cmd::vector_drop_database,
+            commands::vector_cmd::vector_drop_collection,
+            commands::vector_cmd::vector_rename_collection,
             commands::mongo_cmd::mongo_rename_collection,
             commands::mongo_cmd::mongo_clone_collection,
             commands::docs::docs_collect_snapshot,
@@ -2037,6 +2060,15 @@ pub fn run() {
             commands::mongo_cmd::mongo_update_documents,
             commands::document_cmd::document_delete_document,
             commands::document_cmd::document_save_meilisearch_batch,
+            commands::document_cmd::meilisearch_search_documents,
+            commands::document_cmd::meilisearch_fetch_documents,
+            commands::document_cmd::meilisearch_get_document,
+            commands::document_cmd::meilisearch_get_index_settings,
+            commands::document_cmd::meilisearch_update_index_settings,
+            commands::document_cmd::meilisearch_get_index_stats,
+            commands::document_cmd::meilisearch_get_index_overview,
+            commands::document_cmd::meilisearch_delete_index,
+            commands::document_cmd::meilisearch_delete_all_documents,
             commands::hbase_cmd::hbase_get_table_schema,
             commands::hbase_cmd::hbase_scan_rows,
             commands::hbase_cmd::hbase_get_row,
@@ -2097,6 +2129,8 @@ pub fn run() {
             commands::mq_cmd::mq_list_subscriptions,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_enrich_subscriptions,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_kafka_consumer_group_snapshot,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_create_subscription,
             #[cfg(feature = "mq-admin")]
@@ -2316,6 +2350,10 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             if let RunEvent::Opened { urls } = &event {
+                if urls.iter().any(|url| commands::deep_link::is_app_open_deep_link(url.as_str())) {
+                    show_main_window(app_handle);
+                }
+
                 let links: Vec<String> = urls
                     .iter()
                     .map(|url| url.to_string())

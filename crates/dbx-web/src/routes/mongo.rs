@@ -344,29 +344,6 @@ pub async fn list_collections(
     Ok(Json(result))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VectorCollectionDetailRequest {
-    pub connection_id: String,
-    pub database: String,
-    pub collection: String,
-}
-
-pub async fn vector_collection_detail(
-    State(state): State<Arc<WebState>>,
-    Json(req): Json<VectorCollectionDetailRequest>,
-) -> Result<Json<dbx_core::db::vector_driver::CollectionInfo>, AppError> {
-    let result = dbx_core::schema::get_vector_collection_detail_core(
-        &state.app,
-        &req.connection_id,
-        &req.database,
-        &req.collection,
-    )
-    .await
-    .map_err(AppError::from)?;
-    Ok(Json(result))
-}
-
 pub async fn create_database(
     State(state): State<Arc<WebState>>,
     Json(req): Json<MongoCollectionRequest>,

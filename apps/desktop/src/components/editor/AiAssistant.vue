@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, toRaw, watch, type Component } from "vue";
 import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
@@ -131,8 +131,10 @@ import ExplainPlanViewer from "@/components/explain/ExplainPlanViewer.vue";
 import { parseExplainResult, parseOracleExplainText, type ParsedExplainPlan } from "@/lib/diagram/explainPlan";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { AI_TABLE_MENTION_CANDIDATE_LIMIT, AI_TABLE_MENTION_SCHEMA_LIMIT, filterAiTableMentionCandidates, formatAiTableMention, parseAiTableMentions, type AiTableMention } from "@/lib/ai/aiTableMentions";
+import { handleAiTableReferenceDropEvent } from "@/lib/ai/aiTableReferenceDrop";
+import { DBX_TABLE_REFERENCE_DROP_EVENT, clearActiveTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
 import { isAiPromptImeCompositionEvent, shouldSubmitAiPromptOnKeydown } from "@/lib/ai/aiPromptKeyboard";
-import { looksLikeActionProposal, containsChinese, looksLikeWriteSqlProposal, shouldGrantWriteSqlOnShortAffirmative } from "@/lib/ai/aiProposalDetect";
+import { isActionableWriteProposalMessage, isActionableWriteSqlProposal, looksLikeActionProposal, looksLikeWriteSqlProposal, shouldGrantWriteSqlOnShortAffirmative } from "@/lib/ai/aiProposalDetect";
 import { visibleToActualIndex } from "@/lib/ai/aiMessageEdit";
 import { shouldShowReasoningCharCount, reasoningCharCountClass } from "@/lib/ai/aiReasoningPresentation";
 import { saveTextFile } from "@/lib/export/saveTextFile";
@@ -199,8 +201,11 @@ interface ChatMessage {
   reasoning?: string;
   isThinking?: boolean;
   agentSteps?: AiAgentStepItem[];
-  /** Hidden system-generated context summary; not rendered in chat UI but included in LLM history. */
-  kind?: "contextSummary";
+  /** Hidden system-generated context summary; not rendered in chat UI but included in LLM history.
+   *  `writeSqlConfirmation` / `productionWriteBlocked` mark backend-generated,
+   *  localized confirmation/block messages so the UI does not re-detect them
+   *  from text phrasing. */
+  kind?: "contextSummary" | "writeSqlConfirmation" | "productionWriteBlocked";
   /** Per-message token stats from the last agent run; ephemeral, not persisted. */
   tokens?: { input: number; output: number };
 }
@@ -906,7 +911,15 @@ const proposalConfirmMessage = computed<ChatMessage | null>(() => {
     if (msg.kind === "contextSummary") continue;
     if (msg.role !== "assistant") return null;
     if (!msg.content) return null;
-    return looksLikeActionProposal(msg.content) ? msg : null;
+    // Backend-generated write confirmations are localized, so the English/Chinese
+    // phrase detectors cannot recognize them; the `kind` marker plus one exact
+    // SQL block is the structural proof of actionability.
+    if (msg.kind === "writeSqlConfirmation") return extractSingleSqlCodeBlock(msg.content) ? msg : null;
+    if (!looksLikeActionProposal(msg.content)) return null;
+    // A generic write question cannot authorize a later, unseen tool call.
+    // Hide its action bar until the assistant displays one exact SQL block.
+    if (looksLikeWriteSqlProposal(msg.content) && !isActionableWriteSqlProposal(msg.content)) return null;
+    return msg;
   }
   return null;
 });
@@ -940,17 +953,17 @@ function sendProposalReply(positive: boolean) {
   if (isGenerating.value) return;
   const target = proposalConfirmMessage.value;
   if (!target) return;
-  if (positive && productionContext.value.active && looksLikeWriteSqlProposal(target.content)) {
+  const isWriteConfirmation = isActionableWriteProposalMessage(target);
+  if (positive && productionContext.value.active && (target.kind === "writeSqlConfirmation" || looksLikeWriteSqlProposal(target.content))) {
     const sql = extractFirstSqlCodeBlock(target.content);
     if (sql) emit("replaceSql", sql);
     toast(t("production.aiReviewRequired"), 5000);
     return;
   }
-  const isZh = containsChinese(target.content || "");
-  const replyZh = positive ? "请执行上面你刚提议的操作，不要再反问确认。" : "不用执行上面提到的操作，继续当前对话。";
-  const replyEn = positive ? "Execute the action you just proposed above; do not ask for confirmation again." : "Do not execute the action mentioned above; continue the current conversation.";
-  prompt.value = isZh ? replyZh : replyEn;
-  if (positive && assistantMode.value === "agent" && looksLikeWriteSqlProposal(target.content)) {
+  // Write confirmations carry the exact-SQL reply; other action proposals keep
+  // the generic wording so the model does not receive SQL-specific instructions.
+  prompt.value = positive ? (isWriteConfirmation ? t("ai.writeSqlConfirmationReplyYes") : t("ai.proposalConfirmReplyYes")) : isWriteConfirmation ? t("ai.writeSqlConfirmationReplyNo") : t("ai.proposalConfirmReplyNo");
+  if (positive && assistantMode.value === "agent" && isWriteConfirmation) {
     confirmedWriteSqlText = extractSingleSqlCodeBlock(target.content);
     if (confirmedWriteSqlText) {
       allowWriteSqlForNextRun = true;
@@ -1063,6 +1076,8 @@ async function loadDatabases(connection = props.connection): Promise<string[]> {
 async function changeConnection(connectionId: string) {
   const conn = connectionStore.getConfig(connectionId);
   if (!conn) return;
+  if (props.connection?.id === connectionId) return;
+  clearContextReferences();
   connectionStore.activeConnectionId = connectionId;
   const tab = props.tab;
   const tabId = tab ? tab.id : queryStore.createTab(connectionId, resolveDefaultDatabase(conn, []));
@@ -1087,6 +1102,8 @@ function changeNamespace(value: string) {
   const connection = props.connection;
   if (!tab || !connection) return;
   const namespace = decodeSelectableDatabaseValue(connection.db_type, value);
+  if (resolveAiNamespaceSelection(tab, connection).value === namespace) return;
+  clearContextReferences();
   if (resolveAiNamespaceSelection(tab, connection).kind === "schema") {
     queryStore.updateSchema(tab.id, namespace || undefined);
   } else {
@@ -1135,6 +1152,31 @@ function appendAssistantDelta(assistantIdx: number, delta: string) {
   if (msg.isThinking) msg.isThinking = false;
   pendingAssistantDelta += delta;
   scheduleAssistantDeltaFlush(assistantIdx);
+}
+
+function replaceAssistantText(assistantIdx: number, content: string) {
+  // A model can stream prose or a code block before returning a write tool call.
+  // Discard that partial output so the confirmation detector sees exactly one SQL block.
+  if (assistantDeltaFrame !== null) {
+    cancelAnimationFrame(assistantDeltaFrame);
+    assistantDeltaFrame = null;
+  }
+  pendingAssistantDelta = "";
+  pendingAssistantReasoning = "";
+  pendingAssistantIndex = -1;
+  const msg = messages.value[assistantIdx];
+  if (!msg) return;
+  msg.content = content;
+  msg.reasoning = undefined;
+  msg.isThinking = false;
+}
+
+function writeSqlConfirmationText(sql: string): string {
+  return `${t("ai.writeSqlConfirmationRequired")}\n\n\`\`\`sql\n${sql.trim()}\n\`\`\`\n\n${t("ai.writeSqlConfirmationQuestion")}`;
+}
+
+function productionWriteBlockedText(sql: string): string {
+  return `${t("ai.productionWriteBlocked")}\n\n\`\`\`sql\n${sql.trim()}\n\`\`\``;
 }
 
 function appendAssistantReasoning(assistantIdx: number, delta: string) {
@@ -2246,6 +2288,22 @@ function onTauriFileDrop(event: Event) {
   void addDroppedAttachmentPaths(payload.paths);
 }
 
+function onTableReferenceDropEvent(event: Event) {
+  handleAiTableReferenceDropEvent(event, {
+    context: {
+      connectionId: props.tab?.connectionId || props.connection?.id,
+      database: props.tab?.database || props.connection?.database || "",
+    },
+    assistantRoot: assistantRootRef.value,
+    elementFromPoint: (x, y) => document.elementFromPoint(x, y),
+    onMention: (mention, payload) => {
+      addSelectedMention({ kind: "table", schema: mention.schema, name: mention.table, tableType: "table" });
+      clearActiveTableReferencePayload(payload);
+      nextTick(() => promptTextareaRef.value?.focus());
+    },
+  });
+}
+
 async function send() {
   const text = prompt.value.trim();
   if ((!text && !selectedMentions.value.length && !selectedSqlFileMentions.value.length && !selectedCsvAttachments.value.length && !selectedImageAttachments.value.length) || isGenerating.value) return;
@@ -2444,6 +2502,16 @@ async function send() {
         agentEvents.push(event);
         if (event.type === "text_delta" && event.delta) {
           appendAssistantDelta(assistantIdx, event.delta);
+        }
+        if (event.type === "write_sql_confirmation_required") {
+          replaceAssistantText(assistantIdx, writeSqlConfirmationText(event.sql));
+          const msg = messages.value[assistantIdx];
+          if (msg) msg.kind = "writeSqlConfirmation";
+        }
+        if (event.type === "production_write_blocked") {
+          replaceAssistantText(assistantIdx, productionWriteBlockedText(event.sql));
+          const msg = messages.value[assistantIdx];
+          if (msg) msg.kind = "productionWriteBlocked";
         }
         if (event.type === "reasoning_delta" && event.delta) {
           appendAssistantReasoning(assistantIdx, event.delta);
@@ -2841,6 +2909,7 @@ onMounted(async () => {
 
   window.addEventListener("resize", handlePanelResize);
   document.addEventListener("dbx:tauri-file-drop", onTauriFileDrop as EventListener);
+  window.addEventListener(DBX_TABLE_REFERENCE_DROP_EVENT, onTableReferenceDropEvent);
   if (typeof ResizeObserver !== "undefined" && assistantRootRef.value) {
     promptPanelResizeObserver = new ResizeObserver(handlePanelResize);
     promptPanelResizeObserver.observe(assistantRootRef.value);
@@ -2919,6 +2988,7 @@ onUnmounted(() => {
   document.body.style.cursor = "";
   window.removeEventListener("resize", handlePanelResize);
   document.removeEventListener("dbx:tauri-file-drop", onTauriFileDrop as EventListener);
+  window.removeEventListener(DBX_TABLE_REFERENCE_DROP_EVENT, onTableReferenceDropEvent);
   promptPanelResizeObserver?.disconnect();
 });
 
@@ -2942,7 +3012,23 @@ function setPrompt(text: string) {
   nextTick(() => promptTextareaRef.value?.focus());
 }
 
-defineExpose({ triggerAction, setPrompt });
+function addTableMention(target: { schema?: string; table: string }) {
+  const table = target.table.trim();
+  if (!table) return;
+  addSelectedMention({ kind: "table", schema: target.schema, name: table, tableType: "TABLE" });
+  nextTick(() => promptTextareaRef.value?.focus());
+}
+
+function clearContextReferences() {
+  selectedMentions.value = [];
+  selectedSqlFileMentions.value = [];
+  mentionCache.value = {};
+  mentionCandidates.value = [];
+  mentionOpen.value = false;
+  mentionError.value = "";
+}
+
+defineExpose({ triggerAction, setPrompt, addTableMention, clearContextReferences });
 
 const messageRenderer = computed(() => {
   const appearance = aiCodeAppearance.value;
@@ -2976,7 +3062,7 @@ async function openExternalUrl(url: string) {
 </script>
 
 <template>
-  <div ref="assistantRootRef" class="flex h-full min-h-0 flex-col overflow-hidden" @dragenter="onAttachmentDragEnter" @dragover="onAttachmentDragOver" @dragleave="onAttachmentDragLeave" @drop="onAttachmentDrop">
+  <div ref="assistantRootRef" data-ai-assistant-root class="flex h-full min-h-0 flex-col overflow-hidden" @dragenter="onAttachmentDragEnter" @dragover="onAttachmentDragOver" @dragleave="onAttachmentDragLeave" @drop="onAttachmentDrop">
     <div class="flex items-center gap-2 border-b px-3 shrink-0" :class="settings.editorSettings.appLayout === 'classic' ? 'h-9' : 'h-10'">
       <span class="flex flex-1 self-stretch items-center truncate text-xs font-medium" data-tauri-drag-region>
         {{ chatTitle }}
@@ -3273,11 +3359,11 @@ async function openExternalUrl(url: string) {
                 <div v-if="msg === proposalConfirmMessage" class="mt-2 flex gap-2" :title="t('ai.proposalConfirmTitle')">
                   <Button size="sm" variant="default" class="h-7 gap-1 text-[11px]" @click="sendProposalReply(true)">
                     <Check class="h-3 w-3" />
-                    {{ t("ai.proposalConfirmYes") }}
+                    {{ t(isActionableWriteProposalMessage(msg) ? "ai.writeSqlConfirmYes" : "ai.proposalConfirmYes") }}
                   </Button>
                   <Button size="sm" variant="outline" class="h-7 gap-1 text-[11px]" @click="sendProposalReply(false)">
                     <X class="h-3 w-3" />
-                    {{ t("ai.proposalConfirmNo") }}
+                    {{ t(isActionableWriteProposalMessage(msg) ? "ai.writeSqlConfirmNo" : "ai.proposalConfirmNo") }}
                   </Button>
                 </div>
               </div>

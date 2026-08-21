@@ -1862,6 +1862,10 @@ const contextMenuItems = computed<ContextMenuItem[]>(() => {
   ];
 });
 
+function currentContextMenuItems(): ContextMenuItem[] {
+  return contextMenuItems.value;
+}
+
 function handleSqlIntentionActions(currentView: EditorViewType): boolean {
   if (props.readOnly) return false;
   try {
@@ -5561,6 +5565,16 @@ watch(
   },
 );
 
+watch(
+  () => connectionStore.completionCacheRevision(props.connectionId, props.database),
+  () => {
+    completionEpoch++;
+    refreshCompletionCache();
+    setSemanticDiagnostics([]);
+    scheduleSemanticDiagnostics();
+  },
+);
+
 watch([() => props.clientSessionId, () => props.completionContextVersion], () => {
   completionEpoch++;
   refreshCompletionCache();
@@ -5881,7 +5895,7 @@ defineExpose({
 
 <template>
   <div class="h-full w-full overflow-hidden relative" @gesturestart="onEditorGestureStart" @gesturechange="onEditorGestureChange" @gestureend="onEditorGestureEnd">
-    <CustomContextMenu :items="contextMenuItems" @close="contextMenuOpen = false" v-slot="{ onContextMenu }">
+    <CustomContextMenu :items="currentContextMenuItems" @close="contextMenuOpen = false" v-slot="{ onContextMenu }">
       <div
         ref="editorRef"
         data-query-editor-root

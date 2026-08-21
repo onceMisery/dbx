@@ -1,5 +1,5 @@
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
-import { isSchemaAware, usesDatabaseObjectTreeMode, usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
+import { isSchemaAware, spannerObjectTreeSchema, usesDatabaseObjectTreeMode, usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
 import type { CodeMirrorSqlDialectName } from "@/lib/editor/codemirrorSqlDialect";
 
 type JdbcDialectConnection = Partial<Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "connection_string" | "url_params" | "jdbc_driver_class" | "jdbc_driver_paths" | "database_info" | "external_config">>;
@@ -21,6 +21,9 @@ const CONNECTION_ROOT_SCHEMA_TYPES = new Set<DatabaseType>(["oracle", "dameng", 
 const JDBC_DIALECT_MATCHERS: Array<{ type: DatabaseType; patterns: RegExp[] }> = [
   { type: "databend", patterns: [/jdbc:databend:/i, /com\.databend\.jdbc\.DatabendDriver/i, /databend-jdbc/i] },
   { type: "starrocks", patterns: [/starrocks/i] },
+  // Phoenix remains a generic JDBC connection, but exposes queryable schemas.
+  // Returning `jdbc` keeps its generic SQL behavior while enabling the schema tree.
+  { type: "jdbc", patterns: [/phoenix/i] },
   { type: "doris", patterns: [/doris/i] },
   { type: "goldendb", patterns: [/jdbc:goldendb:/i, /goldendb/i] },
   { type: "mysql", patterns: [/kyuubi/i] },
@@ -54,6 +57,10 @@ export function inferJdbcDialect(connection?: JdbcDialectConnection): DatabaseTy
   return JDBC_DIALECT_MATCHERS.find((matcher) => matcher.patterns.some((pattern) => pattern.test(haystack)))?.type;
 }
 
+export function jdbcDriverProfileUsesSchemaQualification(driverProfile?: string): boolean {
+  return inferJdbcDialect({ db_type: "jdbc", driver_profile: driverProfile }) === "jdbc";
+}
+
 export function effectiveDatabaseTypeForConnection(connection?: JdbcDialectConnection): DatabaseType | undefined {
   if (!connection) return undefined;
   if (connection.db_type === "gbase" && isGbase8sProfile(connection.driver_profile)) return "informix";
@@ -81,10 +88,17 @@ export function connectionShouldLoadIdentifierQuote(connection: JdbcDialectConne
   if (!connection) return false;
   if (connection.db_type === "gbase" && isGbase8sProfile(connection.driver_profile)) return true;
   if (connection.db_type === "kingbase") return true;
+  // Cloud Spanner is dual-dialect: the agent reports a backtick for GoogleSQL and
+  // a double quote for PostgreSQL-dialect databases. The backend counts Spanner
+  // unconditionally in `uses_connection_identifier_quote`, so the UI must fetch
+  // the reported quote or every locally built statement would use the GoogleSQL
+  // default against a PostgreSQL-dialect database.
+  if (connection.db_type === "spanner") return true;
   if (gaussdbIdentifierQuoteStyle(connection) !== "auto") return false;
   if (connection.db_type === "gaussdb") return true;
   if (connection.db_type !== "jdbc") return false;
-  return ["gaussdb", "opengauss", "postgres"].includes(inferJdbcDialect(connection) ?? "");
+  const dialect = inferJdbcDialect(connection);
+  return dialect === "jdbc" || ["gaussdb", "opengauss", "postgres"].includes(dialect ?? "");
 }
 
 export function supportsGaussdbIdentifierQuoteStyle(connection: JdbcDialectConnection | undefined): boolean {
@@ -207,8 +221,22 @@ export function connectionQueryExecutionSchema(connection: JdbcDialectConnection
 export function connectionObjectTreeQuerySchema(connection: JdbcDialectConnection | undefined, database: string, schema?: string): string {
   if (connection?.db_type === "jdbc" && inferJdbcDialect(connection) === "databend") return schema || database;
   if (connectionUsesDatabaseObjectTreeMode(connection)) return "";
-  if (effectiveDatabaseTypeForConnection(connection) === "informix") return schema || "";
+  const type = effectiveDatabaseTypeForConnection(connection);
+  if (type === "informix") return schema || "";
+  if (type === "spanner") return spannerObjectTreeSchema(schema);
   return schema || database;
+}
+
+/**
+ * Metadata schema for query paths that treat the database name as the schema when a
+ * connection exposes no schema level (MySQL, HBase, and the other flat engines).
+ * Cloud Spanner is the exception: its database is a resource path, so the blank
+ * GoogleSQL schema has to be sent instead of the path. Behavior for every other
+ * database type is exactly `schema || database`.
+ */
+export function connectionDatabaseMetadataSchema(connection: JdbcDialectConnection | undefined, database: string, schema?: string): string {
+  if (schema) return schema;
+  return effectiveDatabaseTypeForConnection(connection) === "spanner" ? "" : database;
 }
 
 export function metadataSchemaForConnection(connection: JdbcDialectConnection | undefined, database: string, schema?: string): string {
@@ -223,6 +251,7 @@ export function connectionObjectTreeNodeSchema(connection: JdbcDialectConnection
   const type = effectiveDatabaseTypeForConnection(connection);
   if (type === "informix") return schema || undefined;
   if (type === "sqlite") return schema || database;
+  if (type === "spanner") return spannerObjectTreeSchema(schema);
   if (!type) return schema;
   return isSchemaAware(type) ? schema || database : undefined;
 }

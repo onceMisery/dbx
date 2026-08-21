@@ -385,6 +385,15 @@ pub(crate) fn uses_connection_identifier_quote(
     identifier_quote: Option<&str>,
 ) -> bool {
     database_type == Some(DatabaseType::Kingbase)
+        // JDBC table-data requests carry the schema returned by DatabaseMetaData.
+        // Keep the JDBC identifier unquoted when no driver quote was reported, but
+        // still qualify the table with that schema.
+        || database_type == Some(DatabaseType::Jdbc)
+        // Spanner is dual-dialect: GoogleSQL uses backticks, the PostgreSQL dialect uses
+        // double quotes, and only the connected agent knows which. Unconditional like
+        // Kingbase — when no quote was reported the callers fall back to
+        // `quote_table_identifier`, whose static mapping is GoogleSQL-correct.
+        || database_type == Some(DatabaseType::Spanner)
         || (database_type == Some(DatabaseType::Informix) && identifier_quote.is_some())
         || (matches!(database_type, Some(DatabaseType::Gaussdb | DatabaseType::OpenGauss | DatabaseType::Postgres))
             && identifier_quote.is_some())

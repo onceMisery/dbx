@@ -1089,6 +1089,53 @@ pub async fn get_vector_collection_detail_core(
     db::vector_driver::get_collection_detail(&client, database, collection).await
 }
 
+pub async fn drop_vector_database_core(state: &AppState, connection_id: &str, database: &str) -> Result<(), String> {
+    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let client = {
+        let connections = state.connections.read().await;
+        match connections.get(&pool_key) {
+            Some(PoolKind::VectorDb(client)) => client.clone(),
+            _ => return Err("Not a vector database connection".to_string()),
+        }
+    };
+    db::vector_driver::drop_database(&client, database).await
+}
+
+pub async fn drop_vector_collection_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    collection: &str,
+) -> Result<(), String> {
+    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let client = {
+        let connections = state.connections.read().await;
+        match connections.get(&pool_key) {
+            Some(PoolKind::VectorDb(client)) => client.clone(),
+            _ => return Err("Not a vector database connection".to_string()),
+        }
+    };
+    db::vector_driver::drop_collection(&client, database, collection).await
+}
+
+pub async fn rename_vector_collection_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    collection: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let client = {
+        let connections = state.connections.read().await;
+        match connections.get(&pool_key) {
+            Some(PoolKind::VectorDb(client)) => client.clone(),
+            _ => return Err("Not a vector database connection".to_string()),
+        }
+    };
+    db::vector_driver::rename_collection(&client, database, collection, new_name).await
+}
+
 pub async fn get_table_comment_core(
     state: &AppState,
     connection_id: &str,
@@ -1288,9 +1335,42 @@ fn table_comments_from_query_result(result: db::QueryResult) -> HashMap<String, 
         .collect()
 }
 
-fn oracle_columns_sql(schema: &str, table: &str) -> String {
-    let owner = oracle_columns_owner_filter(schema);
-    format!(
+// Oracle 11g can spend about a minute evaluating SYS_CONTEXT inside the ALL_SYNONYMS START WITH clause.
+const ORACLE_CURRENT_SCHEMA_SQL: &str = "SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS CURRENT_SCHEMA FROM DUAL";
+
+fn oracle_current_schema_from_query_result(result: db::QueryResult) -> Result<String, String> {
+    let schema_index = result
+        .columns
+        .iter()
+        .position(|column| column.trim().eq_ignore_ascii_case("CURRENT_SCHEMA"))
+        .ok_or_else(|| "Oracle current schema query did not return CURRENT_SCHEMA".to_string())?;
+    let schema = result
+        .rows
+        .first()
+        .and_then(|row| row.get(schema_index))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Oracle current schema query returned an empty schema".to_string())?;
+    let schema = schema.trim();
+    if schema.is_empty() {
+        return Err("Oracle current schema query returned an empty schema".to_string());
+    }
+    Ok(schema.to_string())
+}
+
+fn oracle_columns_sql(schema: &str, table: &str) -> Result<String, String> {
+    let schema = schema.trim();
+    if schema.is_empty() {
+        return Err("Oracle columns query requires a resolved schema".to_string());
+    }
+    oracle_columns_sql_for_resolved_owner(&schema.to_uppercase(), table)
+}
+
+fn oracle_columns_sql_for_resolved_owner(owner: &str, table: &str) -> Result<String, String> {
+    if owner.trim().is_empty() {
+        return Err("Oracle columns query requires a resolved schema".to_string());
+    }
+    let owner = sql_string(owner);
+    Ok(format!(
         "WITH synonym_chain AS ( \
            SELECT CONNECT_BY_ROOT s.OWNER AS root_owner, \
                   s.TABLE_OWNER AS resolved_owner, \
@@ -1355,16 +1435,7 @@ fn oracle_columns_sql(schema: &str, table: &str) -> String {
            ON ro.resolved_owner = c.OWNER AND ro.resolved_table = c.TABLE_NAME \
          ORDER BY c.COLUMN_ID",
         table = sql_string(table),
-    )
-}
-
-fn oracle_columns_owner_filter(schema: &str) -> String {
-    let schema = schema.trim();
-    if schema.is_empty() {
-        "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')".to_string()
-    } else {
-        sql_string(&schema.to_uppercase())
-    }
+    ))
 }
 
 fn oracle_column_type(data_type: &str, precision: Option<i32>, scale: Option<i32>, length: Option<i32>) -> String {
@@ -1423,13 +1494,30 @@ async fn oracle_columns_via_sql(
     client: &mut db::agent_driver::AgentDriverClient,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ColumnInfo>, String> {
-    let sql = oracle_columns_sql(schema, table);
+    let request_schema = (!schema.trim().is_empty()).then_some(schema);
+    let sql = if let Some(schema) = request_schema {
+        oracle_columns_sql(schema, table)?
+    } else {
+        let result = client
+            .execute_query_with_timeout::<db::QueryResult>(
+                agent_execute_query_params(
+                    ORACLE_CURRENT_SCHEMA_SQL,
+                    if database.is_empty() { None } else { Some(database) },
+                    None,
+                    QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                ),
+                timeout_duration,
+            )
+            .await?;
+        let current_schema = oracle_current_schema_from_query_result(result)?;
+        oracle_columns_sql_for_resolved_owner(&current_schema, table)?
+    };
     let result = client
         .execute_query_with_timeout::<db::QueryResult>(
             agent_execute_query_params(
                 &sql,
                 if database.is_empty() { None } else { Some(database) },
-                if schema.is_empty() { None } else { Some(schema) },
+                request_schema,
                 QueryExecutionOptions { max_rows: Some(10_000), ..Default::default() },
             ),
             timeout_duration,
@@ -1445,14 +1533,34 @@ async fn external_driver_oracle_columns_via_sql(
     schema: &str,
     table: &str,
 ) -> Result<Vec<db::ColumnInfo>, String> {
+    let request_schema = if schema.trim().is_empty() { "" } else { schema };
+    let sql = if request_schema.is_empty() {
+        let result: db::QueryResult = session
+            .invoke_with_timeout(
+                "executeQuery",
+                serde_json::json!({
+                    "connection": config,
+                    "database": database,
+                    "schema": request_schema,
+                    "sql": ORACLE_CURRENT_SCHEMA_SQL,
+                    "maxRows": 1
+                }),
+                agent_metadata_timeout(Some(config)),
+            )
+            .await?;
+        let current_schema = oracle_current_schema_from_query_result(result)?;
+        oracle_columns_sql_for_resolved_owner(&current_schema, table)?
+    } else {
+        oracle_columns_sql(schema, table)?
+    };
     let result: db::QueryResult = session
         .invoke_with_timeout(
             "executeQuery",
             serde_json::json!({
                 "connection": config,
                 "database": database,
-                "schema": schema,
-                "sql": oracle_columns_sql(schema, table),
+                "schema": request_schema,
+                "sql": sql,
                 "maxRows": 10_000
             }),
             agent_metadata_timeout(Some(config)),
@@ -2777,7 +2885,8 @@ mod tests {
         mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
         mysql_object_source_ddl_column_index, mysql_object_source_sql, mysql_table_list_source_for_config,
         mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_columns_from_query_result,
-        oracle_columns_sql, oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
+        oracle_columns_sql, oracle_columns_sql_for_resolved_owner, oracle_current_schema_from_query_result,
+        oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
         oracle_object_statistics_rows_only_sql, oracle_object_statistics_sql,
         oracle_object_statistics_user_segments_sql, oracle_table_comment_from_query_result, oracle_table_comment_sql,
         oracle_table_comments_sql, presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
@@ -2785,7 +2894,7 @@ mod tests {
         should_query_oracle_columns_via_sql_first, table_comments_from_query_result, table_name_filter_matches,
         tdengine_table_comment_like_pattern, tdengine_table_comment_sql, tdengine_table_comments_sql,
         uses_mongodb_agent_collection_listing, visible_schema_filter, MetadataErrorAction, MysqlTableListSource,
-        TableNameFilter, TDENGINE_COMMENT_SEARCH_TIMEOUT, TDENGINE_LIKE_PATTERN_MAX_BYTES,
+        TableNameFilter, ORACLE_CURRENT_SCHEMA_SQL, TDENGINE_COMMENT_SEARCH_TIMEOUT, TDENGINE_LIKE_PATTERN_MAX_BYTES,
     };
     use super::{list_databases_core, list_tables_core};
     use super::{
@@ -2797,6 +2906,24 @@ mod tests {
     use crate::storage::Storage;
     use std::collections::HashMap;
     use std::time::Duration;
+
+    fn oracle_current_schema_result(columns: &[&str], rows: Vec<Vec<serde_json::Value>>) -> db::QueryResult {
+        db::QueryResult {
+            columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            column_types: Vec::new(),
+            column_sortables: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows,
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
+        }
+    }
 
     async fn spawn_turso_table_server() -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3864,6 +3991,7 @@ for line in sys.stdin:
     #[test]
     fn shardingsphere_proxy_marker_is_ascii_case_insensitive_and_exact() {
         assert!(super::is_shardingsphere_proxy_version("5.7.22-ShardingSphere-Proxy 5.5.2"));
+        assert!(super::is_shardingsphere_proxy_version("8.0.27-ShardingSphere-Proxy 5.5.2"));
         assert!(super::is_shardingsphere_proxy_version("8.0.36-SHARDINGSPHERE-PROXY 5.5.2"));
         assert!(!super::is_shardingsphere_proxy_version("8.0.36-ShardingSphere Proxy 5.5.2"));
         assert!(!super::is_shardingsphere_proxy_version("8.0.36-MySQL Community Server"));
@@ -4476,10 +4604,11 @@ for line in sys.stdin:
 
     #[test]
     fn oracle_columns_sql_uses_exact_table_name_for_quoted_lowercase_tables() {
-        let sql = oracle_columns_sql("DBX_TEST", "test");
+        let sql = oracle_columns_sql("DBX_TEST", "test").unwrap();
 
         assert!(sql.contains("ALL_TAB_COLUMNS"));
         assert!(sql.contains("ALL_COL_COMMENTS"));
+        assert!(!sql.contains("SYS_CONTEXT"));
         assert!(sql.contains("o.OWNER = 'DBX_TEST'"));
         assert!(sql.contains("o.OBJECT_NAME = 'test'"));
         assert!(sql.contains("cols.OWNER = c.OWNER"));
@@ -4489,20 +4618,62 @@ for line in sys.stdin:
 
     #[test]
     fn oracle_columns_sql_resolves_private_and_public_synonyms_in_oracle_precedence_order() {
-        let sql = oracle_columns_sql("", "ORDERS_ALIAS");
+        let sql = oracle_columns_sql_for_resolved_owner("Dbx'Owner", "ORDERS_ALIAS").unwrap();
 
-        assert!(sql.contains("SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"));
+        assert!(!sql.contains("SYS_CONTEXT"));
         assert!(sql.contains("FROM ALL_SYNONYMS s"));
-        assert!(sql.contains("s.OWNER IN (SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'), 'PUBLIC')"));
-        assert!(sql.contains("CASE WHEN sc.root_owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') THEN 1 ELSE 2 END"));
+        assert!(sql.contains("s.OWNER IN ('Dbx''Owner', 'PUBLIC')"));
+        assert!(sql.contains("CASE WHEN sc.root_owner = 'Dbx''Owner' THEN 1 ELSE 2 END"));
         assert!(sql.contains("s.DB_LINK IS NULL"));
         assert!(sql.contains("ORDER BY resolution_priority, synonym_depth"));
         assert!(sql.contains("WHERE ROWNUM = 1"));
     }
 
     #[test]
+    fn oracle_blank_schema_requires_a_resolved_current_schema_literal() {
+        assert_eq!(
+            ORACLE_CURRENT_SCHEMA_SQL,
+            "SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS CURRENT_SCHEMA FROM DUAL"
+        );
+        assert!(oracle_columns_sql("", "ORDERS_ALIAS").is_err());
+
+        let current_schema = oracle_current_schema_from_query_result(oracle_current_schema_result(
+            &["current_schema"],
+            vec![vec![serde_json::json!("  Mixed'Case  ")]],
+        ))
+        .unwrap();
+        assert_eq!(current_schema, "Mixed'Case");
+        let sql = oracle_columns_sql_for_resolved_owner(&current_schema, "ORDERS_ALIAS").unwrap();
+
+        assert!(sql.contains("s.OWNER IN ('Mixed''Case', 'PUBLIC')"));
+        assert!(sql.contains("o.OWNER = 'Mixed''Case'"));
+        assert!(!sql.contains("SYS_CONTEXT"));
+    }
+
+    #[test]
+    fn oracle_current_schema_result_rejects_missing_empty_and_non_string_values() {
+        assert!(oracle_current_schema_from_query_result(oracle_current_schema_result(
+            &["OTHER"],
+            vec![vec![serde_json::json!("DBX_TEST")]],
+        ))
+        .is_err());
+        let missing_rows = oracle_current_schema_result(&["CURRENT_SCHEMA"], Vec::new());
+        assert!(oracle_current_schema_from_query_result(missing_rows).is_err());
+        assert!(oracle_current_schema_from_query_result(oracle_current_schema_result(
+            &["CURRENT_SCHEMA"],
+            vec![vec![serde_json::json!("   ")]],
+        ))
+        .is_err());
+        assert!(oracle_current_schema_from_query_result(oracle_current_schema_result(
+            &["CURRENT_SCHEMA"],
+            vec![vec![serde_json::json!(11)]],
+        ))
+        .is_err());
+    }
+
+    #[test]
     fn oracle_columns_sql_follows_two_level_synonyms_without_cycles() {
-        let sql = oracle_columns_sql("DBX_TEST", "ORDERS_ALIAS");
+        let sql = oracle_columns_sql("DBX_TEST", "ORDERS_ALIAS").unwrap();
 
         assert!(sql.contains("SELECT CONNECT_BY_ROOT s.OWNER AS root_owner"));
         assert!(sql.contains("LEVEL AS synonym_depth"));
@@ -4516,7 +4687,7 @@ for line in sys.stdin:
 
     #[test]
     fn oracle_columns_sql_preserves_quoted_case_synonym_names_and_excludes_database_links() {
-        let sql = oracle_columns_sql("DBX_TEST", "Order Alias");
+        let sql = oracle_columns_sql("DBX_TEST", "Order Alias").unwrap();
 
         assert!(sql.contains("s.SYNONYM_NAME = 'Order Alias'"));
         assert!(sql.contains("o.OBJECT_NAME = 'Order Alias'"));
@@ -5271,6 +5442,18 @@ struct ObjectListOutcome {
     paging_applied: bool,
 }
 
+async fn list_native_postgres_objects(
+    pool: &deadpool_postgres::Pool,
+    config: &ConnectionConfig,
+    schema: &str,
+) -> Result<Vec<db::ObjectInfo>, String> {
+    if config.db_type == DatabaseType::Redshift {
+        db::postgres::list_redshift_objects(pool, schema, true, true).await
+    } else {
+        db::postgres::list_objects(pool, schema, true, true, false).await
+    }
+}
+
 fn unpaged_object_list(objects: Vec<db::ObjectInfo>) -> ObjectListOutcome {
     ObjectListOutcome { objects, paging_applied: false }
 }
@@ -5397,7 +5580,7 @@ async fn list_objects_once(
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
                             Ok(Some(pool)) => {
-                                return db::postgres::list_objects(&pool, schema, true, true, false)
+                                return list_native_postgres_objects(&pool, config, schema)
                                     .await
                                     .map(unpaged_object_list)
                             }
@@ -5426,7 +5609,7 @@ async fn list_objects_once(
                         if let Some(pool) =
                             native_postgres_metadata_pool(state, connection_id, database, config).await?
                         {
-                            return db::postgres::list_objects(&pool, schema, true, true, false)
+                            return list_native_postgres_objects(&pool, config, schema)
                                 .await
                                 .map(unpaged_object_list)
                                 .map_err(|fallback_error| {
@@ -5471,6 +5654,13 @@ async fn list_objects_once(
         }
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_cloudberry_config) => {
             db::cloudberry::list_objects(p, schema).await.map(unpaged_object_list)
+        }
+        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Redshift) => {
+            let include_relations = object_types_include_relations(object_types);
+            let include_routines = object_types_include_routines(object_types);
+            db::postgres::list_redshift_objects(p, schema, include_relations, include_routines)
+                .await
+                .map(unpaged_object_list)
         }
         PoolKind::Postgres(p) => {
             let include_relations = object_types_include_relations(object_types);
@@ -5548,7 +5738,7 @@ async fn list_completion_objects_once(
                     if let Some(config) = fallback_config.as_ref() {
                         match native_postgres_metadata_pool(state, connection_id, database, config).await {
                             Ok(Some(pool)) => {
-                                return db::postgres::list_objects(&pool, schema, true, true, false)
+                                return list_native_postgres_objects(&pool, config, schema)
                                     .await
                                     .map(filter_completion_objects)
                             }
@@ -5573,7 +5763,7 @@ async fn list_completion_objects_once(
                         if let Some(pool) =
                             native_postgres_metadata_pool(state, connection_id, database, config).await?
                         {
-                            return db::postgres::list_objects(&pool, schema, true, true, false)
+                            return list_native_postgres_objects(&pool, config, schema)
                                 .await
                                 .map(filter_completion_objects)
                                 .map_err(|fallback_error| {
@@ -5605,6 +5795,9 @@ async fn list_completion_objects_once(
         }
         PoolKind::Postgres(p) if db_config.as_ref().is_some_and(is_cloudberry_config) => {
             db::cloudberry::list_objects(p, schema).await.map(filter_completion_objects)
+        }
+        PoolKind::Postgres(p) if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Redshift) => {
+            db::postgres::list_redshift_objects(p, schema, false, true).await.map(filter_completion_objects)
         }
         PoolKind::Postgres(p) => {
             db::postgres::list_objects(p, schema, true, true, false).await.map(filter_completion_objects)
@@ -6320,6 +6513,14 @@ async fn list_indexes_core_for_session(
         {
             let connections = state.connections.read().await;
             try_sqlserver!(connections, &pool_key, list_indexes, schema, table);
+            if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+                if external_driver_uses_mysql_ddl(config.as_ref()) {
+                    let config = config.clone();
+                    let session = session.clone();
+                    drop(connections);
+                    return external_driver_gaussdb_m_indexes(session, config.as_ref(), database, schema, table).await;
+                }
+            }
             if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
                 drop(connections);
                 let mut client = client.lock().await;
@@ -7218,6 +7419,165 @@ fn is_mysql_external_driver_config(config: &ConnectionConfig) -> bool {
 
 fn external_driver_uses_mysql_ddl(config: &ConnectionConfig) -> bool {
     is_mysql_external_driver_config(config) || gaussdb_uses_m_jdbc_driver(config)
+}
+
+async fn external_driver_gaussdb_m_indexes(
+    session: std::sync::Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<db::IndexInfo>, String> {
+    // Query information_schema.STATISTICS row by row (one row per index column,
+    // ordered by SEQ_IN_INDEX).
+    // Docs: https://support.huaweicloud.com/intl/en-us/centralized-m-comp-devg-v8-gaussdb/gaussdb-81-0134.html
+    // The STATISTICS view has no EXPRESSION column in GaussDB M-mode. Expression
+    // indexes are not supported via this path.
+    let sql = format!(
+        "SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX, NON_UNIQUE, \
+                INDEX_TYPE, INDEX_COMMENT, SUB_PART \
+         FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+        sql_string(schema),
+        sql_string(table),
+    );
+    log::debug!("[gaussdb-m][list_indexes] sql={sql}");
+
+    let timeout = agent_metadata_timeout(Some(config));
+
+    let result: db::QueryResult = session
+        .invoke_with_timeout(
+            "executeQuery",
+            serde_json::json!({
+                "connection": config,
+                "database": database,
+                "schema": schema,
+                "sql": sql,
+                "maxRows": 1000,
+                "fetchSize": 1000,
+                "timeoutSecs": 60,
+            }),
+            timeout,
+        )
+        .await?;
+
+    log::debug!("[gaussdb-m][list_indexes] row_count={}", result.rows.len());
+
+    let col_index: std::collections::HashMap<String, usize> =
+        result.columns.iter().enumerate().map(|(i, name)| (name.to_uppercase(), i)).collect();
+    let get_str = |row: &[serde_json::Value], key: &str| -> String {
+        let upper = key.to_uppercase();
+        col_index.get(&upper).and_then(|&i| row.get(i)).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    };
+    let get_i64 = |row: &[serde_json::Value], key: &str| -> Option<i64> {
+        let upper = key.to_uppercase();
+        col_index.get(&upper).and_then(|&i| row.get(i)).and_then(|v| v.as_i64())
+    };
+
+    let mut indexes: Vec<db::IndexInfo> = Vec::new();
+    let mut current_name = String::new();
+    let mut current_columns: Vec<String> = Vec::new();
+    let mut current_is_expression: Vec<bool> = Vec::new();
+    let mut current_non_unique: i64 = 1;
+    let mut current_index_type: Option<String> = None;
+    let mut current_comment: Option<String> = None;
+
+    for row in &result.rows {
+        let name = get_str(row, "INDEX_NAME");
+        if name.is_empty() {
+            log::debug!("[gaussdb-m][list_indexes] skipping row with empty INDEX_NAME: {:?}", row);
+            continue;
+        }
+
+        if name != current_name {
+            // Finalize previous index
+            if !current_name.is_empty() {
+                let is_primary =
+                    current_name.to_lowercase().ends_with("_pkey") || current_name.eq_ignore_ascii_case("primary");
+                indexes.push(db::IndexInfo {
+                    name: current_name.clone(),
+                    columns: current_columns.clone(),
+                    is_unique: current_non_unique == 0,
+                    is_primary,
+                    filter: None,
+                    index_type: current_index_type.clone(),
+                    included_columns: None,
+                    comment: current_comment.clone(),
+                    key_is_expression: current_is_expression.clone(),
+                });
+            }
+            // Start new index
+            current_name = name;
+            current_columns = Vec::new();
+            current_is_expression = Vec::new();
+            current_non_unique = get_i64(row, "NON_UNIQUE").unwrap_or(1);
+            current_index_type = {
+                let t = get_str(row, "INDEX_TYPE");
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            };
+            current_comment = {
+                let c = get_str(row, "INDEX_COMMENT");
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
+            };
+        }
+
+        // Build column name with prefix/sub_part suffix
+        let column_name = get_str(row, "COLUMN_NAME");
+        if column_name.is_empty() {
+            continue;
+        }
+
+        // SUB_PART is bigint in STATISTICS; JDBC plugin sends it as JSON number,
+        // but may also be null or string.
+        let sub_part: String = col_index
+            .get("SUB_PART")
+            .and_then(|&i| row.get(i))
+            .and_then(|v| {
+                if v.is_null() {
+                    None
+                } else if let Some(n) = v.as_i64() {
+                    Some(n.to_string())
+                } else {
+                    v.as_str().map(|s| s.to_string())
+                }
+            })
+            .unwrap_or_default();
+
+        if !sub_part.is_empty() && sub_part != "0" && sub_part != "NULL" {
+            // Prefix index: COLUMN_NAME(SUB_PART) like "name(10)"
+            current_columns.push(format!("{}({})", column_name, sub_part));
+        } else {
+            current_columns.push(column_name);
+        }
+        current_is_expression.push(false);
+    }
+
+    // Finalize last index
+    if !current_name.is_empty() {
+        let is_primary = current_name.to_lowercase().ends_with("_pkey") || current_name.eq_ignore_ascii_case("primary");
+        indexes.push(db::IndexInfo {
+            name: current_name,
+            columns: current_columns,
+            is_unique: current_non_unique == 0,
+            is_primary,
+            filter: None,
+            index_type: current_index_type,
+            included_columns: None,
+            comment: current_comment,
+            key_is_expression: current_is_expression,
+        });
+    }
+
+    Ok(indexes)
 }
 
 fn gaussdb_m_view_object_source_sql(
