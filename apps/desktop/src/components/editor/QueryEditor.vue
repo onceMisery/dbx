@@ -4309,7 +4309,6 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
 
   const tableNameCompletion = isTableNameCompletionContext(completionContext);
   const shouldFetchColumnsForCompletion = !tableNameCompletion && (!onDemandOnlyColumns || completionContext.suggestColumns || completionContext.exclusiveColumnSuggestions || !!completionContext.insertTable);
-  const qualifiedColumnTarget = completionQualifiedTableTarget(completionContext);
   const hasQualifiedColumnPrefix = (props.databaseType === "postgres" || props.databaseType === "mysql") && completionContext.qualifier && completionContext.prefix.length >= 2 && isReferencedTableQualifier(completionContext);
   const columnRefs = hasQualifiedColumnPrefix
     ? refs.filter((refTable) => refTable.alias?.toLowerCase() === completionContext.qualifier!.toLowerCase() || refTable.name.toLowerCase() === completionContext.qualifier!.toLowerCase() || (!!qualifiedColumnTarget && completionTablesMatch(refTable, qualifiedColumnTarget)))
