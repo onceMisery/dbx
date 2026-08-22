@@ -323,6 +323,17 @@ pub async fn get_object_source(
 }
 
 #[tauri::command]
+pub async fn get_event_info(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    name: String,
+) -> Result<db::MysqlEventInfo, String> {
+    dbx_core::schema::get_event_info_core(&state, &connection_id, &database, &schema, &name).await
+}
+
+#[tauri::command]
 pub async fn get_custom_type_details(
     state: State<'_, Arc<AppState>>,
     connection_id: String,

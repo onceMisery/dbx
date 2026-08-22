@@ -8347,12 +8347,65 @@ pub async fn get_object_source_core(
     Ok(finalize_object_source(source))
 }
 
+pub async fn get_event_info_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    _schema: &str,
+    name: &str,
+) -> Result<db::MysqlEventInfo, String> {
+    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
+    match pool {
+        PoolKind::Mysql(pool, _) => db::mysql::get_event_info(&pool, database, name).await,
+        PoolKind::ExternalDriver { config, session, .. } => {
+            let quote = |value: &str| format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
+            let sql = format!("SELECT EVENT_SCHEMA, EVENT_NAME, DEFINER, TIME_ZONE, EVENT_TYPE, EXECUTE_AT, INTERVAL_VALUE, INTERVAL_FIELD, STARTS, ENDS, STATUS, ON_COMPLETION, EVENT_COMMENT, EVENT_DEFINITION, CREATED, LAST_ALTERED, LAST_EXECUTED FROM information_schema.EVENTS WHERE EVENT_SCHEMA = {} AND EVENT_NAME = {} LIMIT 1", quote(database), quote(name));
+            let result: db::QueryResult = session.invoke_with_timeout("executeQuery", serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": _schema, "sql": sql, "maxRows": 1 }), agent_metadata_timeout(Some(&config))).await?;
+            let row = result.rows.first().ok_or_else(|| format!("MySQL event not found: {database}.{name}"))?;
+            let text = |column: &str| {
+                result.columns.iter().position(|c| c.eq_ignore_ascii_case(column)).and_then(|i| row.get(i)).and_then(
+                    |v| {
+                        if v.is_null() {
+                            None
+                        } else {
+                            Some(v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                        }
+                    },
+                )
+            };
+            Ok(db::MysqlEventInfo {
+                name: text("EVENT_NAME").unwrap_or_else(|| name.to_string()),
+                schema: text("EVENT_SCHEMA").unwrap_or_else(|| database.to_string()),
+                definer: text("DEFINER"),
+                time_zone: text("TIME_ZONE"),
+                event_type: text("EVENT_TYPE"),
+                execute_at: text("EXECUTE_AT"),
+                interval_value: text("INTERVAL_VALUE"),
+                interval_field: text("INTERVAL_FIELD"),
+                starts: text("STARTS"),
+                ends: text("ENDS"),
+                status: text("STATUS"),
+                on_completion: text("ON_COMPLETION"),
+                comment: text("EVENT_COMMENT"),
+                event_body: text("EVENT_DEFINITION"),
+                event_definition: text("EVENT_DEFINITION"),
+                created_at: text("CREATED"),
+                updated_at: text("LAST_ALTERED"),
+                last_executed: text("LAST_EXECUTED"),
+                source: None,
+            })
+        }
+        _ => Err("MySQL event details are only supported for MySQL connections".into()),
+    }
+}
+
 fn finalize_object_source(mut source: db::ObjectSource) -> db::ObjectSource {
     if matches!(source.object_type, db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function) {
         source.source = normalize_routine_object_source(source.source);
     }
     if matches!(source.object_type, db::ObjectSourceKind::Event) {
-        source.editable = Some(false);
+        source.editable = Some(true);
     }
     source
 }

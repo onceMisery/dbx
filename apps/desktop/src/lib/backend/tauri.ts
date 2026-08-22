@@ -33,6 +33,7 @@ import type {
   CustomTypeDetails,
   ObjectSource,
   ObjectSourceKind,
+  MysqlEventInfo,
   ColumnInfo,
   SqlServerColumnMetadata,
   IndexInfo,
@@ -1130,6 +1131,10 @@ export async function getObjectSource(connectionId: string, database: string, sc
     signature,
     relationName,
   });
+}
+
+export async function getEventInfo(connectionId: string, database: string, schema: string, name: string): Promise<MysqlEventInfo> {
+  return invoke("get_event_info", { connectionId, database, schema, name });
 }
 
 export async function listSchemas(connectionId: string, database: string, applyVisibleFilter = false): Promise<string[]> {

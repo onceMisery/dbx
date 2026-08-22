@@ -418,6 +418,7 @@ async fn main() {
         .route("/schema/completion-objects", get(routes::schema::list_completion_objects))
         .route("/schema/completion-assistant", post(routes::schema::completion_assistant_search))
         .route("/schema/object-source", get(routes::schema::get_object_source))
+        .route("/schema/event-info", get(routes::schema::get_event_info))
         .route("/schema/custom-type-details", get(routes::schema::get_custom_type_details))
         .route("/schema/columns", get(routes::schema::list_columns))
         .route("/schema/all-columns", get(routes::schema::get_all_columns))

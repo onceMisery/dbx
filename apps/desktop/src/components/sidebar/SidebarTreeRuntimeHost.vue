@@ -966,6 +966,10 @@ function runRowClickAction(clickDetail: number, requestId: number) {
     openMongoTreeData(node);
     return;
   }
+  if (node.type === "event") {
+    void openObjectBrowser();
+    return;
+  }
   const action = treeNodeRowAction(node.type, canExpand.value, settingsStore.editorSettings.sidebarActivation, currentDatabaseType(), settingsStore.editorSettings.sidebarOpenDatabaseOnSingleClick, canOpenObjectBrowser.value);
   // WebKit can keep incrementing click.detail while the pointer moves quickly
   // between adjacent rows. Nacos entries are idempotent navigation targets, so
@@ -1323,6 +1327,10 @@ function requestDeleteSelectedNode(): boolean {
 
 function onDoubleClick(event: MouseEvent) {
   if (dataTabOpenModeFromTreeClick(activeNode.value.type, event, settingsStore.editorSettings.shortcuts.openDataInNewTab) === "new-tab") return;
+  if (activeNode.value.type === "event") {
+    void openObjectBrowser();
+    return;
+  }
   const action = treeNodeRowDoubleClickAction(activeNode.value.type, canOpenObjectBrowser.value, settingsStore.editorSettings.sidebarActivation, canExpand.value, currentDatabaseType(), canOpenConnectionDatabaseBrowser.value, settingsStore.editorSettings.sidebarOpenDatabaseOnSingleClick);
   if (action === "open-database-browser") {
     void openDatabaseBrowser();
@@ -1479,7 +1487,7 @@ async function openObjectBrowser() {
     connectionStore.activeConnectionId = node.connectionId;
 
     if (hasTreeNodeDatabaseContext(node)) {
-      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog);
+      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, node.type === "event" ? node.objectName || node.label : undefined);
       return;
     }
 
@@ -2018,10 +2026,10 @@ function dropObjectSqlOptions(): DropObjectSqlOptions | null {
 }
 
 function dropObjectSqlOptionsForNode(node: TreeNode): DropObjectSqlOptions | null {
-  if (node.type !== "view" && node.type !== "materialized_view" && node.type !== "procedure" && node.type !== "function") return null;
+  if (node.type !== "view" && node.type !== "materialized_view" && node.type !== "procedure" && node.type !== "function" && node.type !== "event") return null;
   return {
     databaseType: tableStructureDatabaseTypeForNode(node),
-    objectType: node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : node.type === "procedure" ? "PROCEDURE" : "FUNCTION",
+    objectType: node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : node.type === "procedure" ? "PROCEDURE" : node.type === "function" ? "FUNCTION" : "EVENT",
     schema: node.schema,
     name: node.objectName || node.label,
     signature: node.signature,
@@ -2082,6 +2090,7 @@ function dropObjectMenuLabel(): string {
   if (activeNode.value.type === "materialized_view") return t("contextMenu.dropView");
   if (activeNode.value.type === "procedure") return t("contextMenu.dropProcedure");
   if (activeNode.value.type === "function") return t("contextMenu.dropFunction");
+  if (activeNode.value.type === "event") return t("contextMenu.dropObject");
   return t("contextMenu.dropObject");
 }
 
@@ -2243,7 +2252,7 @@ function requestDropTableChildObject() {
 function canDropTreeNode(node: TreeNode): boolean {
   if (isSqlServerLinkedNode(node)) return false;
   if (node.type === "table") return !!node.connectionId && !!node.database;
-  if (node.type === "view" || node.type === "materialized_view" || node.type === "procedure" || node.type === "function") {
+  if (node.type === "view" || node.type === "materialized_view" || node.type === "procedure" || node.type === "function" || node.type === "event") {
     return !!node.connectionId && !!node.database && !!dropObjectSqlOptionsForNode(node);
   }
   if (canDropMongoIndexNode(node)) return true;
@@ -2756,7 +2765,8 @@ async function confirmDropObject() {
     await connectionStore.ensureConnected(node.connectionId);
     const sql = dropObjectPreviewSql.value || (await buildDropObjectSql(options));
     await executeTreeNodeSqlWithProductionGuard(node, sql, { database: node.database, schema: node.schema });
-    const msgKey = node.type === "view" ? "contextMenu.dropViewSuccess" : node.type === "materialized_view" ? "contextMenu.dropViewSuccess" : node.type === "procedure" ? "contextMenu.dropProcedureSuccess" : "contextMenu.dropFunctionSuccess";
+    const msgKey =
+      node.type === "view" ? "contextMenu.dropViewSuccess" : node.type === "materialized_view" ? "contextMenu.dropViewSuccess" : node.type === "procedure" ? "contextMenu.dropProcedureSuccess" : node.type === "function" ? "contextMenu.dropFunctionSuccess" : "contextMenu.dropEventSuccess";
     toast(t(msgKey, { name: node.label }), 3000);
     closeDroppedTableObjectTabsForNode(node);
     // Refresh the parent object list so group badges and children stay in sync.
@@ -5549,7 +5559,18 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     return true;
   }
 
-  if (node.type === "sequence" || node.type === "event") {
+  if (node.type === "event") {
+    // Event definitions use the dedicated editor hosted by ObjectBrowser.
+    // Open that surface from the tree instead of routing through the generic source dialog.
+    items.push({ label: t("contextMenu.editObject"), action: openObjectBrowser, icon: Pencil });
+    items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    items.push({ label: t("contextMenu.dropObject"), action: deleteMenuAction(requestDropObject), icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
+    items.push({ label: t("contextMenu.refreshChildren"), action: refresh, icon: RefreshCw, shortcut: shortcutRefresh });
+    return true;
+  }
+
+  if (node.type === "sequence") {
     items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     items.push({ label: t("contextMenu.changeOpenMode"), action: () => emit("open-settings", "navigation"), icon: Settings2 });
@@ -5631,6 +5652,9 @@ function buildObjectGroupSidebarMenu(context: SidebarMenuFactoryContext): boolea
     }
     if (node.type === "group-views" && node.connectionId && node.database) {
       items.push({ label: t("contextMenu.createView"), action: createView, icon: Plus });
+    }
+    if (node.type === "group-events" && node.connectionId && node.database) {
+      items.push({ label: t("contextMenu.createEvent"), action: openObjectBrowser, icon: Plus });
     }
     if (mysqlObjectTemplate) {
       items.push({ label: t(mysqlObjectTemplate.titleKey), action: createMysqlObjectTemplate, icon: Plus });

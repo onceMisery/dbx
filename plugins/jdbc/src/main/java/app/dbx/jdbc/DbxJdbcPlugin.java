@@ -1921,7 +1921,39 @@ public final class DbxJdbcPlugin {
             }
         }
 
+        if ((allowedObjectTypes.isEmpty() || allowedObjectTypes.contains("EVENT")) && isMysqlFamilyConnection(connection)) {
+            appendMysqlEvents(result, conn, database, schema);
+        }
+
         return filterMetadataNodes(result, filter, limit, offset, objectTypes, "object_type", false);
+    }
+
+    private static boolean isMysqlFamilyConnection(JsonNode connection) {
+        String url = jdbcUrl(connection);
+        return urlMatchesPrefix(url, "jdbc:mysql:") || urlMatchesPrefix(url, "jdbc:mariadb:") || urlMatchesPrefix(url, "jdbc:tidb:");
+    }
+
+    private static void appendMysqlEvents(ArrayNode result, Connection conn, String database, String schema) {
+        String eventSchema = emptyToNull(schema) != null ? schema : database;
+        if (eventSchema == null || eventSchema.isBlank()) return;
+        String sql = "SELECT EVENT_NAME, EVENT_SCHEMA, EVENT_COMMENT, CREATED, LAST_ALTERED FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?";
+        try (PreparedStatement statement = conn.prepareStatement(sql)) {
+            statement.setString(1, eventSchema);
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", rs.getString("EVENT_NAME"));
+                    item.put("object_type", "EVENT");
+                    putNullable(item, "schema", rs.getString("EVENT_SCHEMA"));
+                    putNullable(item, "comment", rs.getString("EVENT_COMMENT"));
+                    putNullable(item, "created_at", rs.getString("CREATED"));
+                    putNullable(item, "updated_at", rs.getString("LAST_ALTERED"));
+                    result.add(item);
+                }
+            }
+        } catch (SQLException ignored) {
+            // Lack of EVENT privilege must not hide tables and routines.
+        }
     }
 
     private static JsonNode listDataTypes(JsonNode connection, String database) throws SQLException {

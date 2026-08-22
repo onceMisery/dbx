@@ -2309,6 +2309,7 @@ defineExpose({
           :database="activeTab.database"
           :catalog="activeTab.objectBrowser?.catalog"
           :schema="activeTab.objectBrowser?.schema"
+          :initial-event-name="activeTab.objectBrowser?.eventName"
           :viewport="activeTab.objectBrowser?.viewport"
           @open-table="emit('openObjectTable', $event)"
           @schema-change="emit('objectSchemaChange', $event)"
