@@ -2165,11 +2165,35 @@ function identifierRangeAt(sql: string, pos: number): { from: number; to: number
 
 type CompletionMetadataScope = Pick<SqlCompletionScope, "database" | "schema">;
 
-function completionCacheKey(table: { name: string; catalog?: string | null; database?: string | null; schema?: string | null }, scope?: CompletionMetadataScope) {
+function completionCacheKey(table: { name: string; catalog?: string | null; database?: string | null; schema?: string | null; nameQuoted?: boolean; schemaQuoted?: boolean }, scope?: CompletionMetadataScope) {
   const schema = table.schema ?? scope?.schema ?? props.schema;
   const scopedDatabase = scope && scope.database !== props.database ? scope.database : undefined;
   const database = supportsDatabaseSchemaQualifierCompletion() ? (table.database ?? scopedDatabase) : undefined;
-  return schema ? `${database ? `${database}.` : ""}${schema}.${table.name}` : table.name;
+  const baseKey = schema ? `${database ? `${database}.` : ""}${schema}.${table.name}` : table.name;
+  if (props.databaseType !== "postgres" || (!table.nameQuoted && !table.schemaQuoted)) return baseKey;
+  return `${baseKey}:quoted:s=${table.schemaQuoted ? "1" : "0"}:t=${table.nameQuoted ? "1" : "0"}`;
+}
+
+function completionPrefixCacheKey(table: { name: string; catalog?: string | null; database?: string | null; schema?: string | null; nameQuoted?: boolean; schemaQuoted?: boolean }, scope: CompletionMetadataScope | undefined, prefix: string) {
+  return `${completionCacheKey(table, scope)}:prefix:${prefix.trim().toLowerCase()}`;
+}
+
+function lookupCachedPrefixColumns(table: { name: string; catalog?: string | null; database?: string | null; schema?: string | null; nameQuoted?: boolean; schemaQuoted?: boolean }, scope: CompletionMetadataScope | undefined, prefix: string): SqlCompletionColumn[] | undefined {
+  const normalizedPrefix = prefix.trim().toLowerCase();
+  const exactKey = completionPrefixCacheKey(table, scope, normalizedPrefix);
+  const exact = cachedPrefixColumnsByTable.get(exactKey);
+  if (exact) return exact;
+
+  const marker = `${completionCacheKey(table, scope)}:prefix:`;
+  let best: { prefix: string; columns: SqlCompletionColumn[] } | undefined;
+  for (const [key, columns] of cachedPrefixColumnsByTable) {
+    if (!key.startsWith(marker)) continue;
+    const cachedPrefix = key.slice(marker.length);
+    if (!normalizedPrefix.startsWith(cachedPrefix) || (best && cachedPrefix.length <= best.prefix.length)) continue;
+    best = { prefix: cachedPrefix, columns };
+  }
+  if (!best) return undefined;
+  return best.columns.filter((column) => column.name.toLowerCase().startsWith(normalizedPrefix));
 }
 
 const pendingInsertValueHintColumnLoads = new Set<string>();
@@ -3863,13 +3887,15 @@ function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getS
 
   const qualifiedColumnTarget = completionQualifiedTableTarget(completionContext);
   if (qualifiedColumnTarget) {
-    const cacheKey = completionCacheKey(qualifiedColumnTarget, scope);
-    const cached = cachedColumnsByTable.get(cacheKey);
+    const reference = completionContext.referencedTables.find((table) => completionTablesMatch(table, qualifiedColumnTarget));
+    const qualifiedCacheTable = { ...qualifiedColumnTarget, nameQuoted: reference?.nameQuoted, schemaQuoted: reference?.schemaQuoted };
+    const cacheKey = completionCacheKey(qualifiedCacheTable, scope);
+    const cachedPrefix = completionContext.prefix.length >= 2 && (props.databaseType === "postgres" || props.databaseType === "mysql") ? lookupCachedPrefixColumns(qualifiedCacheTable, scope, completionContext.prefix) : undefined;
+    const cached = cachedPrefix ?? cachedColumnsByTable.get(cacheKey);
     if (cached) {
       columnsByTable.set(cacheKey, cached);
     } else {
       const target = completionMetadataTarget(qualifiedColumnTarget, scope);
-      const reference = completionContext.referencedTables.find((table) => completionTablesMatch(table, qualifiedColumnTarget));
       const prefixColumns =
         target && completionContext.prefix.length >= 2 && (props.databaseType === "postgres" || props.databaseType === "mysql")
           ? connectionStore.lookupLocalCompletionColumnsByPrefix(props.connectionId, target.database, qualifiedColumnTarget.name, target.schema, completionContext.prefix, target.catalog, completionColumnRequestContext(reference))
@@ -3902,12 +3928,6 @@ function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getS
       continue;
     }
     const cacheKey = completionCacheKey(refTable, scope);
-    const cached = cachedColumnsByTable.get(cacheKey);
-    if (cached) {
-      columnsByTable.set(cacheKey, cached);
-      continue;
-    }
-    const target = completionMetadataTarget(refTable, scope);
     const prefixCompletion =
       (props.databaseType === "postgres" || props.databaseType === "mysql") &&
       completionContext.qualifier &&
@@ -3916,6 +3936,12 @@ function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getS
       (refTable.alias?.toLowerCase() === completionContext.qualifier.toLowerCase() || refTable.name.toLowerCase() === completionContext.qualifier.toLowerCase())
         ? completionContext.prefix
         : undefined;
+    const cached = (prefixCompletion ? lookupCachedPrefixColumns(refTable, scope, prefixCompletion) : undefined) ?? cachedColumnsByTable.get(cacheKey);
+    if (cached) {
+      columnsByTable.set(cacheKey, cached);
+      continue;
+    }
+    const target = completionMetadataTarget(refTable, scope);
     const prefixColumns = target && prefixCompletion ? connectionStore.lookupLocalCompletionColumnsByPrefix(props.connectionId, target.database, refTable.name, target.schema, prefixCompletion, target.catalog, refTable) : [];
     const localColumns = prefixColumns.length > 0 ? prefixColumns : target && !usesOracleSessionCompletionColumns(target.schema) ? connectionStore.lookupLocalCompletionColumns(props.connectionId, target.database, refTable.name, target.schema, target.catalog, refTable) : [];
     if (localColumns.length > 0) {
@@ -4339,8 +4365,8 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
         if (refTable.columns && refTable.columns.length > 0) return;
         const cacheKey = completionCacheKey(refTable, scope);
         const prefixCompletion = hasQualifiedColumnPrefix ? completionContext.prefix : undefined;
-        const prefixCacheKey = prefixCompletion ? `${cacheKey}:prefix:${prefixCompletion.toLowerCase()}` : undefined;
-        if (prefixCompletion ? cachedPrefixColumnsByTable.has(prefixCacheKey!) : cachedColumnsByTable.has(cacheKey)) return;
+        const prefixCacheKey = prefixCompletion ? completionPrefixCacheKey(refTable, scope, prefixCompletion) : undefined;
+        if (prefixCompletion ? lookupCachedPrefixColumns(refTable, scope, prefixCompletion) : cachedColumnsByTable.has(cacheKey)) return;
         try {
           const target = completionMetadataTarget(refTable, scope);
           if (!target) return;
@@ -4385,15 +4411,15 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
         continue;
       }
       const cacheKey = completionCacheKey(refTable, scope);
-      const prefixCacheKey =
+      const prefixCompletion =
         (props.databaseType === "postgres" || props.databaseType === "mysql") &&
         completionContext.qualifier &&
         completionContext.prefix.length >= 2 &&
         isReferencedTableQualifier(completionContext) &&
         (refTable.alias?.toLowerCase() === completionContext.qualifier.toLowerCase() || refTable.name.toLowerCase() === completionContext.qualifier.toLowerCase())
-          ? `${cacheKey}:prefix:${completionContext.prefix.toLowerCase()}`
+          ? completionContext.prefix
           : undefined;
-      const cached = (prefixCacheKey ? cachedPrefixColumnsByTable.get(prefixCacheKey) : undefined) ?? cachedColumnsByTable.get(cacheKey);
+      const cached = (prefixCompletion ? lookupCachedPrefixColumns(refTable, scope, prefixCompletion) : undefined) ?? cachedColumnsByTable.get(cacheKey);
       if (cached) {
         columnsByTable.set(cacheKey, cached);
       }
