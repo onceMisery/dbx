@@ -7481,7 +7481,6 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function listCompletionColumns(connectionId: string, database: string, table: string, schema?: string, context?: { clientSessionId?: string; version?: number; tableQuoted?: boolean; schemaQuoted?: boolean }, catalog?: string): Promise<SqlCompletionColumn[]> {
     const config = getConfig(connectionId);
-    const databaseType = effectiveDatabaseTypeForConnection(config);
     const oracleIdentifier = config?.db_type === "oracle";
     const uppercaseUnquotedIdentifier = oracleIdentifier || config?.db_type === "saphana";
     const completionTable = uppercaseUnquotedIdentifier && context?.tableQuoted === false ? table.toUpperCase() : table;
@@ -7499,11 +7498,8 @@ export const useConnectionStore = defineStore("connection", () => {
         `${cacheKey}:columns`,
         async () => {
           await ensureConnected(connectionId);
-          // The assistant's unbounded column search is currently authoritative
-          // only for PostgreSQL. Other dialects keep their canonical metadata
-          // path for full-table loads; MySQL/PostgreSQL prefix lookups remain
-          // available through listCompletionColumnsByPrefix.
-          if (databaseType === "postgres" && !usesOracleCurrentSchema && !catalog) {
+          // Use assistant metadata opportunistically, then fall back to canonical metadata.
+          if (!usesOracleCurrentSchema && !catalog) {
             try {
               const assistantColumns = await listCompletionAssistantColumns(connectionId, database, completionTable, completionSchema, context, requestRevision);
               if (assistantColumns.length > 0) {
