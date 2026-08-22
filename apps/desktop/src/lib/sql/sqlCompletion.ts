@@ -3740,6 +3740,8 @@ function buildSelectAllColumnItems(context: SqlCompletionContext, columnsByTable
 
 function buildInsertAllColumnItems(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>, t?: SqlCompletionTranslations, dialect?: SqlCompletionApplyDialect, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
   if (!context.insertTable) return [];
+  // The INSERT column prefix controls the replacement/filter range, but the
+  // all-column snippet must always expand the complete target table.
   const columns = uniqueColumnsByName(columnsForInsertTarget(context, columnsByTable));
   if (columns.length === 0) return [];
 
@@ -4084,9 +4086,7 @@ function completionColumnSearchIndex(columns: readonly SqlCompletionColumn[]): C
   const cached = completionColumnSearchIndexes.get(columns);
   if (cached) return cached;
   const index: CompletionColumnSearchIndex = {
-    entries: columns
-      .map((column, index) => ({ normalizedName: column.name.trim().toLowerCase(), index }))
-      .sort((left, right) => left.normalizedName.localeCompare(right.normalizedName) || left.index - right.index),
+    entries: columns.map((column, index) => ({ normalizedName: column.name.trim().toLowerCase(), index })).sort((left, right) => left.normalizedName.localeCompare(right.normalizedName) || left.index - right.index),
   };
   completionColumnSearchIndexes.set(columns, index);
   return index;
@@ -4145,7 +4145,7 @@ function columnsForInsertTarget(context: SqlCompletionContext, columnsByTable: M
   const schemaKey = context.insertSchema ? normalizeIdentifierPart(context.insertSchema) : undefined;
   const databaseKey = context.insertDatabase ? normalizeIdentifierPart(context.insertDatabase) : undefined;
   const qualifiedKey = schemaKey ? normalizeCompletionKey(`${context.insertDatabase ? `${context.insertDatabase}.` : ""}${context.insertSchema}.${context.insertTable}`) : undefined;
-  return collectCompletionColumns(columnsByTable, context.prefix).filter((column) => {
+  return collectCompletionColumns(columnsByTable).filter((column) => {
     if (normalizeIdentifierPart(column.table) !== tableKey) return false;
     if (!schemaKey) return true;
     if (!databaseKey && column.schema && normalizeIdentifierPart(column.schema) === schemaKey) return true;
@@ -4210,27 +4210,27 @@ function buildColumnItems(context: SqlCompletionContext, columnsByTable: Map<str
   const relevanceBoost = context.referencedTables.length > 0 || !!context.qualifier || !!context.insertTable ? 2000 : 0;
 
   const rankedColumns = uniqueColumns
-    .filter((column) => matchesIdentifierSearch(column.name, context.prefix) || matchesIdentifierSearch(column.displayLabel, context.prefix))
-    .map((column) => {
+    .map((column, index) => ({ column, index }))
+    .filter(({ column }) => matchesIdentifierSearch(column.name, context.prefix) || matchesIdentifierSearch(column.displayLabel, context.prefix))
+    .map(({ column, index }) => {
       const keyBoost = isKeyColumn(column.name) ? 500 : 0;
       const matchScore = Math.max(identifierMatchScore(column.name, context.prefix), identifierMatchScore(column.displayLabel, context.prefix));
-      return { column, boost: matchScore + keyBoost + relevanceBoost };
+      return { column, index, boost: matchScore + keyBoost + relevanceBoost };
     })
-    .sort((left, right) => right.boost - left.boost || left.column.displayLabel.localeCompare(right.column.displayLabel))
+    .sort((left, right) => right.boost - left.boost || left.index - right.index)
     .slice(0, context.insertTable || !context.prefix ? 50 : context.qualifier ? 30 : 20);
 
-  return rankedColumns
-    .map(({ column, boost }) => {
-      return {
-        label: column.displayLabel,
-        filterText: column.displayLabel === column.name ? undefined : column.name,
-        type: "column" as const,
-        detail: buildColumnDetail(column),
-        info: buildColumnInfo(column),
-        apply: buildColumnApply(column, context, dialect),
-        boost,
-      };
-    });
+  return rankedColumns.map(({ column, boost }) => {
+    return {
+      label: column.displayLabel,
+      filterText: column.displayLabel === column.name ? undefined : column.name,
+      type: "column" as const,
+      detail: buildColumnDetail(column),
+      info: buildColumnInfo(column),
+      apply: buildColumnApply(column, context, dialect),
+      boost,
+    };
+  });
 }
 
 function completionColumnsForReferencedTable<T extends SqlCompletionColumn & { key: string }>(table: SqlCompletionReferencedTable, columns: readonly T[]): T[] {
@@ -4315,26 +4315,12 @@ function buildColumnDetail(column: SqlCompletionColumn): string {
   return detail;
 }
 
-function buildColumnInfo(column: SqlCompletionColumn): ((completion: Completion) => CompletionInfo) | undefined {
+function buildColumnInfo(column: SqlCompletionColumn): string | undefined {
   const hasDetails = !!column.dataType || column.isNullable !== undefined || !!column.comment?.trim();
   if (!hasDetails) return undefined;
-  return () => {
-    const root = document.createElement("div");
-    const title = document.createElement("div");
-    title.textContent = column.schema ? `${column.schema}.${column.table}.${column.name}` : `${column.table}.${column.name}`;
-    root.appendChild(title);
-    const details = [
-      column.dataType ? `Type: ${column.dataType}` : undefined,
-      column.isNullable === false ? "Nullable: no" : column.isNullable === true ? "Nullable: yes" : undefined,
-      column.comment?.trim() ? `Comment: ${column.comment.trim()}` : undefined,
-    ].filter((part): part is string => !!part);
-    for (const detail of details) {
-      const line = document.createElement("div");
-      line.textContent = detail;
-      root.appendChild(line);
-    }
-    return root;
-  };
+  const title = column.schema ? `${column.schema}.${column.table}.${column.name}` : `${column.table}.${column.name}`;
+  const details = [column.dataType ? `Type: ${column.dataType}` : undefined, column.isNullable === false ? "Nullable: no" : column.isNullable === true ? "Nullable: yes" : undefined, column.comment?.trim() ? `Comment: ${column.comment.trim()}` : undefined].filter((part): part is string => !!part);
+  return [title, ...details].join("\n");
 }
 
 function buildJoinConditionItems(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>, foreignKeysByTable?: Map<string, SqlCompletionForeignKey[]>, dialect?: SqlCompletionApplyDialect, keywordCase?: SqlKeywordCase): SqlCompletionItem[] {
