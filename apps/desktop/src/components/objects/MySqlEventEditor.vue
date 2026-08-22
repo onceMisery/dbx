@@ -12,7 +12,7 @@ import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutio
 import { buildMysqlEventSql } from "@/lib/table/mysqlEventSql";
 import type { ConnectionConfig, MysqlEventInfo } from "@/types/database";
 
-const props = defineProps<{ connection: ConnectionConfig; database: string; schema: string; name?: string }>();
+const props = defineProps<{ connection: ConnectionConfig; database: string; schema: string; name?: string; readOnly?: boolean }>();
 const emit = defineEmits<{ saved: [name: string]; close: [] }>();
 const { t, locale } = useI18n();
 const loading = ref(false),
@@ -89,6 +89,7 @@ async function load() {
   }
 }
 async function save() {
+  if (props.readOnly) return;
   refreshPreview();
   if (!preview.value) return;
   saving.value = true;
@@ -124,46 +125,48 @@ onMounted(load);
         <button v-for="tab in tabs" :key="tab.id" type="button" class="border-b-2 px-3 py-1.5 text-xs" :class="activeTab === tab.id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground'" @click="activeTab = tab.id">{{ tab.label }}</button>
       </div>
       <div v-if="activeTab === 'definition'" class="flex flex-col gap-3">
-        <label class="text-xs">{{ t("contextMenu.eventName") }}<Input v-model="draft.name" :disabled="existing" class="mt-1 h-8" @input="refreshPreview" /></label
-        ><textarea v-model="draft.body" class="min-h-40 rounded border bg-background p-2 font-mono text-xs" :placeholder="t('contextMenu.eventBodyPlaceholder')" @input="refreshPreview" />
+        <label class="text-xs">{{ t("contextMenu.eventName") }}<Input v-model="draft.name" :disabled="props.readOnly || existing" class="mt-1 h-8" @input="refreshPreview" /></label
+        ><textarea v-model="draft.body" :disabled="props.readOnly" class="min-h-40 rounded border bg-background p-2 font-mono text-xs" :placeholder="t('contextMenu.eventBodyPlaceholder')" @input="refreshPreview" />
       </div>
       <div v-else-if="activeTab === 'schedule'" class="flex flex-col gap-3">
         <div class="grid grid-cols-2 gap-2">
           <label class="text-xs"
             >{{ t("contextMenu.eventSchedule")
-            }}<select v-model="draft.schedule.mode" class="mt-1 h-8 w-full rounded border bg-background px-2 text-xs" @change="refreshPreview">
+            }}<select v-model="draft.schedule.mode" :disabled="props.readOnly" class="mt-1 h-8 w-full rounded border bg-background px-2 text-xs" @change="refreshPreview">
               <option value="every">EVERY</option>
               <option value="at">AT</option>
             </select></label
           ><label v-if="draft.schedule.mode === 'every'" class="text-xs"
             >{{ t("contextMenu.eventIntervalUnit")
-            }}<select v-model="draft.schedule.intervalUnit" class="mt-1 h-8 w-full rounded border bg-background px-2 text-xs" @change="refreshPreview">
+            }}<select v-model="draft.schedule.intervalUnit" :disabled="props.readOnly" class="mt-1 h-8 w-full rounded border bg-background px-2 text-xs" @change="refreshPreview">
               <option v-for="unit in units" :key="unit" :value="unit">{{ unit }}</option>
             </select></label
           >
         </div>
         <label class="text-xs"
-          >{{ draft.schedule.mode === "at" ? t("contextMenu.eventExecuteAt") : t("contextMenu.eventIntervalValue") }}<DateTimePicker v-if="draft.schedule.mode === 'at'" v-model="executeAtDate" class="mt-1" :locale="locale" :placeholder="t('dateTimePicker.inputPlaceholder')" full-width /><Input
+          >{{ draft.schedule.mode === "at" ? t("contextMenu.eventExecuteAt") : t("contextMenu.eventIntervalValue")
+          }}<DateTimePicker v-if="draft.schedule.mode === 'at'" v-model="executeAtDate" class="mt-1" :locale="locale" :placeholder="t('dateTimePicker.inputPlaceholder')" :disabled="props.readOnly" full-width /><Input
             v-else
             v-model="draft.schedule.intervalValue"
+            :disabled="props.readOnly"
             class="mt-1 h-8"
             placeholder="1"
             @input="refreshPreview"
         /></label>
         <div class="grid grid-cols-2 gap-2">
-          <label class="text-xs">{{ t("contextMenu.eventStarts") }}<DateTimePicker v-model="startsDate" class="mt-1" :locale="locale" :placeholder="t('dateTimePicker.inputPlaceholder')" full-width /></label
-          ><label class="text-xs">{{ t("contextMenu.eventEnds") }}<DateTimePicker v-model="endsDate" class="mt-1" :locale="locale" :placeholder="t('dateTimePicker.inputPlaceholder')" full-width /></label>
+          <label class="text-xs">{{ t("contextMenu.eventStarts") }}<DateTimePicker v-model="startsDate" class="mt-1" :locale="locale" :placeholder="t('dateTimePicker.inputPlaceholder')" :disabled="props.readOnly" full-width /></label
+          ><label class="text-xs">{{ t("contextMenu.eventEnds") }}<DateTimePicker v-model="endsDate" class="mt-1" :locale="locale" :placeholder="t('dateTimePicker.inputPlaceholder')" :disabled="props.readOnly" full-width /></label>
         </div>
         <div class="grid grid-cols-2 gap-2">
           <label class="text-xs"
             >{{ t("contextMenu.eventCompletion")
-            }}<select v-model="draft.preserve" class="mt-1 h-8 w-full rounded border bg-background px-2 text-xs" @change="refreshPreview">
+            }}<select v-model="draft.preserve" :disabled="props.readOnly" class="mt-1 h-8 w-full rounded border bg-background px-2 text-xs" @change="refreshPreview">
               <option :value="true">PRESERVE</option>
               <option :value="false">NOT PRESERVE</option>
             </select></label
           ><label class="text-xs"
             >{{ t("contextMenu.eventStatus")
-            }}<select v-model="draft.enabled" class="mt-1 h-8 w-full rounded border bg-background px-2 text-xs" @change="refreshPreview">
+            }}<select v-model="draft.enabled" :disabled="props.readOnly" class="mt-1 h-8 w-full rounded border bg-background px-2 text-xs" @change="refreshPreview">
               <option :value="true">ENABLE</option>
               <option :value="false">DISABLE</option>
             </select></label
@@ -171,7 +174,7 @@ onMounted(load);
         </div>
       </div>
       <div v-else-if="activeTab === 'comment'">
-        <label class="text-xs">{{ t("contextMenu.eventComment") }}<Input v-model="draft.comment" class="mt-1 h-8" :placeholder="t('contextMenu.eventCommentPlaceholder')" @input="refreshPreview" /></label>
+        <label class="text-xs">{{ t("contextMenu.eventComment") }}<Input v-model="draft.comment" :disabled="props.readOnly" class="mt-1 h-8" :placeholder="t('contextMenu.eventCommentPlaceholder')" @input="refreshPreview" /></label>
       </div>
       <div v-else class="flex min-h-0 flex-1 flex-col gap-2">
         <div class="flex items-center gap-2 text-xs font-medium"><Eye class="h-3.5 w-3.5" /> {{ t("contextMenu.eventSqlPreview") }}</div>
@@ -180,7 +183,7 @@ onMounted(load);
       <div v-if="error" class="whitespace-pre-wrap text-xs text-destructive">{{ error }}</div>
       <div class="flex justify-end gap-2">
         <Button variant="outline" size="sm" @click="emit('close')">{{ t("contextMenu.eventCancel") }}</Button
-        ><Button size="sm" :disabled="saving || !preview" @click="save"><Loader2 v-if="saving" class="mr-1 h-3.5 w-3.5 animate-spin" /><Check v-else class="mr-1 h-3.5 w-3.5" />{{ t("contextMenu.eventSave") }}</Button>
+        ><Button v-if="!props.readOnly" size="sm" :disabled="saving || !preview" @click="save"><Loader2 v-if="saving" class="mr-1 h-3.5 w-3.5 animate-spin" /><Check v-else class="mr-1 h-3.5 w-3.5" />{{ t("contextMenu.eventSave") }}</Button>
       </div>
     </template>
   </div>

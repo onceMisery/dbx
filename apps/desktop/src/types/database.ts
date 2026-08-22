@@ -1261,6 +1261,7 @@ export interface QueryTab {
     schema?: string;
     objectType?: "tables";
     eventName?: string;
+    eventReadOnly?: boolean;
     viewport?: ObjectBrowserViewport;
   };
   objectSource?: {
