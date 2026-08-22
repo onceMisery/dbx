@@ -13,7 +13,7 @@ import { buildMysqlEventSql } from "@/lib/table/mysqlEventSql";
 import type { ConnectionConfig, MysqlEventInfo } from "@/types/database";
 
 const props = defineProps<{ connection: ConnectionConfig; database: string; schema: string; name?: string }>();
-const emit = defineEmits<{ saved: []; close: [] }>();
+const emit = defineEmits<{ saved: [name: string]; close: [] }>();
 const { t, locale } = useI18n();
 const loading = ref(false),
   saving = ref(false),
@@ -103,7 +103,7 @@ async function save() {
         return true;
       },
     });
-    emit("saved");
+    emit("saved", draft.value.name.trim());
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
   } finally {

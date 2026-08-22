@@ -1330,16 +1330,19 @@ function openNewEventEditor() {
   sidePanelMode.value = "event-editor";
 }
 
-async function onEventSaved() {
+async function onEventSaved(savedName: string) {
   const row = sidePanelRow.value;
-  if (row?.name) {
-    const cacheSchema = row.schema || selectedSchema.value || props.database;
-    const cacheScope = { connectionId: props.connection.id, database: props.database, schema: cacheSchema, tableName: row.name };
+  const name = savedName.trim() || row?.name || "";
+  if (name) {
+    const cacheSchema = row?.schema || selectedSchema.value || props.database;
+    const cacheScope = { connectionId: props.connection.id, database: props.database, schema: cacheSchema, tableName: name };
     await Promise.all([invalidateObjectMetadataCache(cacheScope), invalidateObjectDdl(cacheScope)]);
     invalidateObjectBrowserRowsCache({ connectionId: props.connection.id, database: props.database, schema: cacheSchema });
+    if (row && row.name !== name) {
+      sidePanelRow.value = { ...row, id: `event:${cacheSchema}:${name}`, name, displayName: name };
+    }
   }
   await loadObjects({ allowCached: false });
-  closeSidePanel();
   toast(t("objects.sourceSaved"));
 }
 
