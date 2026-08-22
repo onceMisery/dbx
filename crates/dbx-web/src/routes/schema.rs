@@ -346,6 +346,22 @@ pub async fn get_object_source(
     Ok(Json(result))
 }
 
+pub async fn get_event_info(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<dbx_core::db::MysqlEventInfo>, AppError> {
+    let result = dbx_core::schema::get_event_info_core(
+        &state.app,
+        &q.connection_id,
+        q.database.as_deref().unwrap_or(""),
+        q.schema.as_deref().unwrap_or(""),
+        q.table.as_deref().unwrap_or(""),
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
 pub async fn get_custom_type_details(
     State(state): State<Arc<WebState>>,
     Query(q): Query<SchemaQuery>,

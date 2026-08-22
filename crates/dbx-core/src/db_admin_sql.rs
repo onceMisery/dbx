@@ -14,6 +14,7 @@ pub enum DatabaseObjectType {
     MaterializedView,
     Procedure,
     Function,
+    Event,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1047,6 +1048,7 @@ fn object_type_keyword(object_type: DatabaseObjectType) -> &'static str {
         DatabaseObjectType::MaterializedView => "MATERIALIZED VIEW",
         DatabaseObjectType::Procedure => "PROCEDURE",
         DatabaseObjectType::Function => "FUNCTION",
+        DatabaseObjectType::Event => "EVENT",
     }
 }
 

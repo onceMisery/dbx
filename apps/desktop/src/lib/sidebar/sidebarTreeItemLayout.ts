@@ -5,6 +5,7 @@ const leafTypes: Set<TreeNodeType> = new Set([
   "index",
   "fkey",
   "trigger",
+  "event",
   "procedure",
   "function",
   "synonym",
