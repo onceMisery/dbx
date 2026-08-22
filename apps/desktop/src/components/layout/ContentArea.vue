@@ -2311,6 +2311,7 @@ defineExpose({
           :schema="activeTab.objectBrowser?.schema"
           :initial-event-name="activeTab.objectBrowser?.eventName"
           :initial-event-read-only="activeTab.objectBrowser?.eventReadOnly"
+          :initial-event-open-request-id="activeTab.objectBrowser?.eventOpenRequestId"
           :viewport="activeTab.objectBrowser?.viewport"
           @open-table="emit('openObjectTable', $event)"
           @schema-change="emit('objectSchemaChange', $event)"

@@ -150,6 +150,7 @@ const props = defineProps<{
   schema?: string;
   initialEventName?: string;
   initialEventReadOnly?: boolean;
+  initialEventOpenRequestId?: number;
   viewport?: ObjectBrowserViewport;
 }>();
 
@@ -469,7 +470,7 @@ watch(objectFilter, () => {
   }
   scrollObjectsToTop();
 });
-watch([() => props.initialEventName, rows, loadingObjects], openInitialEventIfNeeded, { flush: "post" });
+watch([() => props.initialEventName, () => props.initialEventOpenRequestId, rows, loadingObjects], openInitialEventIfNeeded, { flush: "post" });
 watch(
   () => props.connection.show_system_schemas,
   (value, oldValue) => {
@@ -2637,10 +2638,11 @@ function applyObjectBrowserRows(nextRows: ObjectBrowserRow[]) {
 
 function openInitialEventIfNeeded() {
   const name = props.initialEventName?.trim();
-  if (!name || openedInitialEvent.value === name || loadingObjects.value) return;
+  const requestKey = `${props.initialEventOpenRequestId ?? 0}:${name}`;
+  if (!name || openedInitialEvent.value === requestKey || loadingObjects.value) return;
   const row = rows.value.find((candidate) => candidate.type === "EVENT" && candidate.name === name);
   if (!row) return;
-  openedInitialEvent.value = name;
+  openedInitialEvent.value = requestKey;
   openEventEditor(row);
 }
 
@@ -2656,13 +2658,10 @@ function finishObjectBrowserRowsLoad() {
   restoreObjectBrowserViewport();
 }
 
-watch(
-  () => props.initialEventName,
-  (name, previous) => {
-    if (name !== previous) openedInitialEvent.value = "";
-    openInitialEventIfNeeded();
-  },
-);
+watch([() => props.initialEventName, () => props.initialEventOpenRequestId], ([name, requestId], [previousName, previousRequestId]) => {
+  if (name !== previousName || requestId !== previousRequestId) openedInitialEvent.value = "";
+  openInitialEventIfNeeded();
+});
 
 async function loadObjects(options?: { allowCached?: boolean }) {
   error.value = "";
