@@ -6364,16 +6364,21 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   function completionColumnsKey(connectionId: string, database: string, table: string, schema?: string, catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): string {
-    if (getConfig(connectionId)?.db_type === "oracle") {
+    const databaseType = getConfig(connectionId)?.db_type;
+    if (databaseType === "oracle") {
       const normalizedTable = context?.tableQuoted === false ? table.toUpperCase() : table;
       const normalizedSchema = schema && context?.schemaQuoted === false ? schema.toUpperCase() : (schema ?? "");
       return `${connectionId}:${database}:${catalog ?? ""}:${normalizedSchema}:${normalizedTable}`;
     }
-    return `${completionTableScopeKey(connectionId, database, schema, catalog)}:${table.toLowerCase()}`;
+    const baseKey = `${completionTableScopeKey(connectionId, database, schema, catalog)}:${table.toLowerCase()}`;
+    if (databaseType !== "postgres" || (!context?.tableQuoted && !context?.schemaQuoted)) return baseKey;
+    const quotedSchema = context.schemaQuoted ? encodeURIComponent(schema ?? "") : "";
+    const quotedTable = context.tableQuoted ? encodeURIComponent(table) : "";
+    return `${baseKey}:quoted:s=${quotedSchema}:t=${quotedTable}`;
   }
 
-  function completionColumnPrefixKey(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string): string {
-    return `${completionColumnsKey(connectionId, database, table, schema, catalog)}:prefix:${prefix.trim().toLowerCase()}`;
+  function completionColumnPrefixKey(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): string {
+    return `${completionColumnsKey(connectionId, database, table, schema, catalog, context)}:prefix:${prefix.trim().toLowerCase()}`;
   }
 
   function completionForeignKeysKey(connectionId: string, database: string, table: string, schema?: string): string {
@@ -6789,7 +6794,7 @@ export const useConnectionStore = defineStore("connection", () => {
       requestRevision,
     );
     const columns = completionAssistantColumns(response.candidates, table, schema, context);
-    if (columns.length > 0 && requestRevision === completionCacheRevision(connectionId, database)) indexCompletionColumns(connectionId, database, table, schema, columns);
+    if (columns.length > 0 && requestRevision === completionCacheRevision(connectionId, database)) indexCompletionColumns(connectionId, database, table, schema, columns, undefined, context);
     return columns;
   }
 
@@ -6887,14 +6892,14 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
-  function indexCompletionColumns(connectionId: string, database: string, table: string, schema: string | undefined, columns: SqlCompletionColumn[], catalog?: string) {
-    touchCompletionIndex(completionColumnIndex, completionColumnsKey(connectionId, database, table, schema, catalog), {
+  function indexCompletionColumns(connectionId: string, database: string, table: string, schema: string | undefined, columns: SqlCompletionColumn[], catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }) {
+    touchCompletionIndex(completionColumnIndex, completionColumnsKey(connectionId, database, table, schema, catalog, context), {
       columns,
     });
   }
 
-  function indexCompletionColumnPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, columns: SqlCompletionColumn[], complete: boolean, catalog?: string) {
-    touchCompletionIndex(completionColumnPrefixIndex, completionColumnPrefixKey(connectionId, database, table, schema, prefix, catalog), { columns, complete });
+  function indexCompletionColumnPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, columns: SqlCompletionColumn[], complete: boolean, catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }) {
+    touchCompletionIndex(completionColumnPrefixIndex, completionColumnPrefixKey(connectionId, database, table, schema, prefix, catalog, context), { columns, complete });
   }
 
   function sqlCompletionForeignKeys(foreignKeys: ForeignKeyInfo[]): SqlCompletionForeignKey[] {
@@ -6976,46 +6981,73 @@ export const useConnectionStore = defineStore("connection", () => {
     return completionColumnIndex.get(completionColumnsKey(connectionId, database, table, schema, catalog, context))?.columns ?? [];
   }
 
-  function lookupLocalCompletionColumnsByPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string): SqlCompletionColumn[] {
-    return completionColumnPrefixIndex.get(completionColumnPrefixKey(connectionId, database, table, schema, prefix, catalog))?.columns ?? [];
+  function completionColumnPrefixEntry(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): { columns: SqlCompletionColumn[]; complete: boolean } | undefined {
+    const normalizedPrefix = prefix.trim().toLowerCase();
+    const exact = completionColumnPrefixIndex.get(completionColumnPrefixKey(connectionId, database, table, schema, normalizedPrefix, catalog, context));
+    if (exact) return exact;
+
+    const marker = `${completionColumnsKey(connectionId, database, table, schema, catalog, context)}:prefix:`;
+    let reusable: { prefix: string; columns: SqlCompletionColumn[] } | undefined;
+    for (const [key, entry] of completionColumnPrefixIndex) {
+      if (!entry.complete || !key.startsWith(marker)) continue;
+      const cachedPrefix = key.slice(marker.length);
+      if (!normalizedPrefix.startsWith(cachedPrefix) || (reusable && cachedPrefix.length <= reusable.prefix.length)) continue;
+      reusable = { prefix: cachedPrefix, columns: entry.columns };
+    }
+    if (!reusable) return undefined;
+    return {
+      columns: reusable.columns.filter((column) => column.name.toLowerCase().startsWith(normalizedPrefix)),
+      complete: true,
+    };
+  }
+
+  function lookupLocalCompletionColumnsByPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): SqlCompletionColumn[] {
+    return completionColumnPrefixEntry(connectionId, database, table, schema, prefix, catalog, context)?.columns ?? [];
   }
 
   function lookupLocalCompletionForeignKeys(connectionId: string, database: string, table: string, schema?: string): SqlCompletionForeignKey[] {
     return completionForeignKeyIndex.get(completionForeignKeysKey(connectionId, database, table, schema))?.foreignKeys ?? [];
   }
 
-  async function listCompletionColumnsByPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string, _context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): Promise<SqlCompletionColumn[]> {
+  async function listCompletionColumnsByPrefix(connectionId: string, database: string, table: string, schema: string | undefined, prefix: string, catalog?: string, context?: { tableQuoted?: boolean; schemaQuoted?: boolean }): Promise<SqlCompletionColumn[]> {
     const normalizedPrefix = prefix.trim();
     if (normalizedPrefix.length < 2) return [];
     const databaseType = effectiveDatabaseTypeForConnection(getConfig(connectionId));
     if (databaseType !== "postgres" && databaseType !== "mysql") return [];
     const completionTable = table;
     const completionSchema = schema?.trim() || (databaseType === "mysql" ? database : undefined);
-    const cacheKey = completionColumnPrefixKey(connectionId, database, completionTable, completionSchema, normalizedPrefix, catalog);
-    const cached = completionColumnPrefixIndex.get(cacheKey);
+    const cacheKey = completionColumnPrefixKey(connectionId, database, completionTable, completionSchema, normalizedPrefix, catalog, context);
+    const cached = completionColumnPrefixEntry(connectionId, database, completionTable, completionSchema, normalizedPrefix, catalog, context);
     if (cached) return cached.columns;
     const requestRevision = completionCacheRevision(connectionId, database);
-    return withCompletionInFlight(`column-prefix:${requestRevision}:${cacheKey}`, async () => {
-      const existing = completionColumnPrefixIndex.get(cacheKey);
-      if (existing) return existing.columns;
-      await ensureConnected(connectionId);
-      const response = await completionAssistantSearch({
-        connection_id: connectionId,
-        database,
-        schema: completionSchema ?? null,
-        object_kinds: ["column"],
-        mask: normalizedPrefix,
-        max_results: 128,
-        parent_schema: completionSchema ?? null,
-        parent_name: completionTable,
-        match_mode: "prefix",
-      }, requestRevision);
-      const columns = completionAssistantColumns(response.candidates, completionTable, completionSchema, _context);
-      if (requestRevision === completionCacheRevision(connectionId, database)) {
-        indexCompletionColumnPrefix(connectionId, database, completionTable, completionSchema, normalizedPrefix, columns, !response.incomplete, catalog);
-      }
-      return columns;
-    }, { scope: completionLimiterScope(connectionId, database), kind: "column-prefix" });
+    return withCompletionInFlight(
+      `column-prefix:${requestRevision}:${cacheKey}`,
+      async () => {
+        const existing = completionColumnPrefixIndex.get(cacheKey);
+        if (existing) return existing.columns;
+        await ensureConnected(connectionId);
+        const response = await completionAssistantSearch(
+          {
+            connection_id: connectionId,
+            database,
+            schema: completionSchema ?? null,
+            object_kinds: ["column"],
+            mask: normalizedPrefix,
+            max_results: 128,
+            parent_schema: completionSchema ?? null,
+            parent_name: completionTable,
+            match_mode: "prefix",
+          },
+          requestRevision,
+        );
+        const columns = completionAssistantColumns(response.candidates, completionTable, completionSchema, context);
+        if (requestRevision === completionCacheRevision(connectionId, database)) {
+          indexCompletionColumnPrefix(connectionId, database, completionTable, completionSchema, normalizedPrefix, columns, !response.incomplete, catalog, context);
+        }
+        return columns;
+      },
+      { scope: completionLimiterScope(connectionId, database), kind: "column-prefix" },
+    );
   }
 
   function databaseNamesFromTree(connectionId: string): string[] {
@@ -7459,7 +7491,7 @@ export const useConnectionStore = defineStore("connection", () => {
       return [];
     }
     const sessionCacheScope = usesOracleCurrentSchema && context?.clientSessionId ? `:${context.clientSessionId}:${context.version ?? 0}` : "";
-    const cacheKey = `${connectionId}:${database}:${catalog ?? ""}:${completionSchema || ""}:${completionTable}${sessionCacheScope}`;
+    const cacheKey = `${completionColumnsKey(connectionId, database, completionTable, completionSchema, catalog, context)}${sessionCacheScope}`;
     if (!completionColumnsCache.value[cacheKey]) {
       const requestRevision = completionCacheRevision(connectionId, database);
       await withCompletionInFlight(
@@ -7513,7 +7545,7 @@ export const useConnectionStore = defineStore("connection", () => {
       isNullable: column.is_nullable,
       comment: column.comment,
     }));
-    if (!usesOracleCurrentSchema) indexCompletionColumns(connectionId, database, completionTable, completionSchema, columns, catalog);
+    if (!usesOracleCurrentSchema) indexCompletionColumns(connectionId, database, completionTable, completionSchema, columns, catalog, context);
     return columns;
   }
 
