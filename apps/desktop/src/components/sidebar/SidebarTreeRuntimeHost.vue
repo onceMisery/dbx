@@ -28,6 +28,7 @@ import {
   Pin,
   ArrowRightLeft,
   Download,
+  Eye,
   Upload,
   FileCode,
   Network,
@@ -1479,7 +1480,7 @@ async function confirmDeleteSavedSqlFile() {
   releaseActiveNodeReference([node.id]);
 }
 
-async function openObjectBrowser() {
+async function openObjectBrowser(eventReadOnly = false) {
   const node = activeNode.value;
   if (!node.connectionId) return;
   try {
@@ -1487,7 +1488,7 @@ async function openObjectBrowser() {
     connectionStore.activeConnectionId = node.connectionId;
 
     if (hasTreeNodeDatabaseContext(node)) {
-      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, node.type === "event" ? node.objectName || node.label : undefined);
+      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly);
       return;
     }
 
@@ -1496,7 +1497,7 @@ async function openObjectBrowser() {
     const options = await getDatabaseOptions(node.connectionId);
     const database = resolveDefaultDatabase(connection, options);
     if (database) {
-      queryStore.openObjectBrowser(node.connectionId, database);
+      queryStore.openObjectBrowser(node.connectionId, database, undefined, undefined, node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly);
     } else {
       await toggle();
     }
@@ -5563,7 +5564,7 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     // Event definitions use the dedicated editor hosted by ObjectBrowser.
     // Open that surface from the tree instead of routing through the generic source dialog.
     items.push({ label: t("contextMenu.editObject"), action: openObjectBrowser, icon: Pencil });
-    items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    items.push({ label: t("contextMenu.viewObject"), action: () => openObjectBrowser(true), icon: Eye });
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     items.push({ label: t("contextMenu.dropObject"), action: deleteMenuAction(requestDropObject), icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
     items.push({ label: t("contextMenu.refreshChildren"), action: refresh, icon: RefreshCw, shortcut: shortcutRefresh });

@@ -1879,11 +1879,11 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
-  function openObjectBrowser(connectionId: string, database: string, schema?: string, catalog?: string, eventName?: string) {
+  function openObjectBrowser(connectionId: string, database: string, schema?: string, catalog?: string, eventName?: string, eventReadOnly = false) {
     const title = catalog ? `${catalog}.${database} objects` : schema ? `${schema} objects` : `${database} objects`;
     const existing = tabs.value.find((tab) => tab.mode === "objects" && tab.connectionId === connectionId && tab.database === database && (tab.objectBrowser?.catalog || "") === (catalog || "") && (tab.objectBrowser?.schema || "") === (schema || ""));
     if (existing) {
-      if (eventName) existing.objectBrowser = { ...existing.objectBrowser, eventName };
+      if (eventName) existing.objectBrowser = { ...existing.objectBrowser, eventName, eventReadOnly };
       switchTab(existing.id);
       return existing.id;
     }
@@ -1905,6 +1905,7 @@ export const useQueryStore = defineStore("query", () => {
         schema,
         objectType: "tables",
         eventName,
+        eventReadOnly,
       },
     };
     tabs.value.push(tab);

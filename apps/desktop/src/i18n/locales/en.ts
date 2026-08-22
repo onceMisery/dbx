@@ -2924,6 +2924,7 @@ export default {
     dropTableSuccess: 'Table "{name}" dropped',
     editView: "Edit View",
     viewSource: "View Source",
+    viewObject: "View",
     changeOpenMode: "Change open mode",
     viewDetails: "View Details",
     viewDdl: "View DDL",
