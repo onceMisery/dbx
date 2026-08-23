@@ -3064,6 +3064,9 @@ export default withEnglishFallback({
     eventSave: "Save",
     compileObject: "Compilar",
     compileObjectSuccess: '"{name}" compilado con éxito',
+    dropEventSuccess: "Evento eliminado {name}",
+    editObject: "Editar objeto",
+    createEvent: "Crear evento",
   },
   visibleDatabases: {
     title: "Bases de datos visibles",

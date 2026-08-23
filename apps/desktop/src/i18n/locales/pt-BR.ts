@@ -3064,6 +3064,9 @@ export default withEnglishFallback({
     renameDatabaseTitle: "Renomear banco de dados",
     renameDatabaseNotOwner: "Somente o proprietário do banco de dados pode renomear «{name}».",
     renameDatabasePreparedTransactions: "Há {count} transações preparadas pendentes no banco de dados «{name}». Execute COMMIT ou ROLLBACK antes de renomear.",
+    dropEventSuccess: "Evento excluído {name}",
+    editObject: "Editar objeto",
+    createEvent: "Criar evento"
   },
   visibleDatabases: {
     title: "Bancos de dados visíveis",

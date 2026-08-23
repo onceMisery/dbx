@@ -3062,6 +3062,9 @@ export default withEnglishFallback({
     eventSave: "Save",
     compileObject: "編譯",
     compileObjectSuccess: '"{name}" 編譯成功',
+    dropEventSuccess: "事件已刪除 {name}",
+    editObject: "編輯物件",
+    createEvent: "新建事件",
   },
   visibleDatabases: {
     title: "顯示資料庫",

@@ -3088,6 +3088,9 @@ export default withEnglishFallback({
     eventSave: "Save",
     compileObject: "コンパイル",
     compileObjectSuccess: '"{name}" のコンパイルに成功しました',
+    dropEventSuccess: "イベントが削除されました {name}",
+    editObject: "オブジェクトを編集",
+    createEvent: "イベントを作成",
   },
   visibleDatabases: {
     title: "表示するデータベース",
