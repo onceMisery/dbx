@@ -114,7 +114,7 @@ pub fn drop_event_sql(schema: Option<&str>, name: &str, if_exists: bool) -> Resu
         Some(schema) => format!("{}.{}", ident(schema)?, ident(name)?),
         None => ident(name)?,
     };
-    Ok(format!("DROP EVENT {}{}", if_exists.then_some("IF EXISTS ").unwrap_or(""), qualified))
+    Ok(format!("DROP EVENT {}{}", if if_exists { "IF EXISTS " } else { "" }, qualified))
 }
 
 #[cfg(test)]

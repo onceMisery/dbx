@@ -1484,7 +1484,7 @@ async function confirmDeleteSavedSqlFile() {
   releaseActiveNodeReference([node.id]);
 }
 
-async function openObjectBrowser(eventReadOnly = false) {
+async function openObjectBrowser(eventReadOnly = false, openEventEditor = false) {
   const node = activeNode.value;
   if (!node.connectionId) return;
   try {
@@ -1492,7 +1492,7 @@ async function openObjectBrowser(eventReadOnly = false) {
     connectionStore.activeConnectionId = node.connectionId;
 
     if (hasTreeNodeDatabaseContext(node)) {
-      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly, node.type === "group-events" ? "events" : undefined);
+      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, openEventEditor && node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly, node.type === "event" || node.type === "group-events" ? "events" : undefined);
       return;
     }
 
@@ -1501,7 +1501,7 @@ async function openObjectBrowser(eventReadOnly = false) {
     const options = await getDatabaseOptions(node.connectionId);
     const database = resolveDefaultDatabase(connection, options);
     if (database) {
-      queryStore.openObjectBrowser(node.connectionId, database, undefined, undefined, node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly, node.type === "group-events" ? "events" : undefined);
+      queryStore.openObjectBrowser(node.connectionId, database, undefined, undefined, openEventEditor && node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly, node.type === "event" || node.type === "group-events" ? "events" : undefined);
     } else {
       await toggle();
     }
@@ -5567,8 +5567,8 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   if (node.type === "event") {
     // Event definitions use the dedicated editor hosted by ObjectBrowser.
     // Open that surface from the tree instead of routing through the generic source dialog.
-    items.push({ label: t("contextMenu.editObject"), action: openObjectBrowser, icon: Pencil });
-    items.push({ label: t("contextMenu.viewObject"), action: () => openObjectBrowser(true), icon: Eye });
+    items.push({ label: t("contextMenu.editObject"), action: () => openObjectBrowser(false, true), icon: Pencil });
+    items.push({ label: t("contextMenu.viewObject"), action: () => openObjectBrowser(true, true), icon: Eye });
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     items.push({ label: t("contextMenu.dropObject"), action: deleteMenuAction(requestDropObject), icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
     items.push({ label: t("contextMenu.refreshChildren"), action: refresh, icon: RefreshCw, shortcut: shortcutRefresh });

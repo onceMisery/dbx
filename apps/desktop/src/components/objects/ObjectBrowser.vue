@@ -193,7 +193,7 @@ const sourceCanEdit = ref(true);
 // Unified panel: either "table-info" (for tables) or "source" (for views/procedures/etc.)
 const sidePanelRow = ref<ObjectBrowserRow | null>(null);
 const openedInitialEvent = ref("");
-const isInitialEventEditor = computed(() => !!props.initialEventName && sidePanelMode.value === "event-editor");
+const isEventEditor = computed(() => sidePanelMode.value === "event-editor");
 const sidePanelMode = ref<"table-info" | "source" | "type-info" | "event-editor">("source");
 // Table info panel state
 const tableInfoTab = ref<TableInfoTab>("ddl");
@@ -1322,13 +1322,6 @@ async function openSource(row: ObjectBrowserRow) {
 function openEventEditor(row: ObjectBrowserRow) {
   sidePanelGuard.start();
   sidePanelRow.value = row;
-  sourceRow.value = null;
-  sidePanelMode.value = "event-editor";
-}
-
-function openNewEventEditor() {
-  sidePanelGuard.start();
-  sidePanelRow.value = { id: "new-event", name: "", displayName: "", schema: selectedSchema.value || props.database, type: "EVENT" };
   sourceRow.value = null;
   sidePanelMode.value = "event-editor";
 }
@@ -3056,7 +3049,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 
 <template>
   <div ref="rootRef" data-object-browser-root class="flex h-full min-h-0 min-w-0 flex-col bg-background outline-none" tabindex="0" @keydown="onObjectBrowserKeydown">
-    <div v-if="!isInitialEventEditor" class="flex h-10 shrink-0 items-center gap-2 border-b px-3">
+    <div v-if="!isEventEditor" class="flex h-10 shrink-0 items-center gap-2 border-b px-3">
       <div class="flex min-w-0 items-center gap-2">
         <span class="inline-flex max-w-[14rem] min-w-0 items-center rounded border border-border bg-muted/50 px-2 py-0.5 text-xs font-medium truncate" :title="selectedSchema || props.database">
           {{ selectedSchema || props.database }}
@@ -3088,7 +3081,6 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             {{ filterLabel(filter) }}
           </button>
         </div>
-        <Button v-if="effectiveDatabaseType === 'mysql'" variant="ghost" size="icon" class="h-7 w-7 shrink-0" :title="t('contextMenu.createEvent')" @click="openNewEventEditor"><Activity class="h-3.5 w-3.5" /></Button>
       </div>
       <SearchableSelect
         v-if="needsSchema"
@@ -3182,7 +3174,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     <div v-else-if="filteredRows.length === 0" class="flex flex-1 items-center justify-center text-sm text-muted-foreground">
       {{ t("objects.empty") }}
     </div>
-    <div v-else class="flex min-h-0 min-w-0 flex-1" :class="{ 'event-editor-layout': isInitialEventEditor }">
+    <div v-else class="flex min-h-0 min-w-0 flex-1" :class="{ 'event-editor-layout': isEventEditor }">
       <div class="flex min-h-0 min-w-0 flex-1 flex-col">
         <div v-if="isListView" class="object-browser-table flex min-h-0 min-w-0 flex-1 flex-col overflow-x-auto overflow-y-hidden">
           <div class="grid h-7 shrink-0 items-center gap-3 border-b bg-muted/40 px-3 text-xs font-medium text-muted-foreground" :style="{ gridTemplateColumns, minWidth: `${objectGridMinWidth}px` }">
