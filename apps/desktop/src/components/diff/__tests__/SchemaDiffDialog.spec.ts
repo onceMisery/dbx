@@ -54,4 +54,21 @@ describe("SchemaDiffDialog fullscreen layout", () => {
     expect(configStepSource).toContain('v-if="restrictTables && canConfigureTableSelection"');
     expect(configStepSource).toContain("restrictTables && localSelectedTables.length && canConfigureTableSelection && isTableIdentityReady('target')");
   });
+
+  it("keeps explicit table selection in a shared scope below both sides", () => {
+    const comparisonScope = configStepSource.indexOf("<!-- Comparison Scope -->");
+    const targetInfo = configStepSource.indexOf("<!-- Target Info -->");
+    const options = configStepSource.indexOf("<!-- Options -->");
+    const tableSelectors = configStepSource.match(/<TableMultiSelect\b/g) ?? [];
+    const tableSelector = configStepSource.indexOf("<TableMultiSelect", comparisonScope);
+    const targetMatch = configStepSource.indexOf("<!-- Target Same-Name Match -->", comparisonScope);
+
+    expect(comparisonScope).toBeGreaterThan(targetInfo);
+    expect(comparisonScope).toBeLessThan(options);
+    expect(tableSelectors).toHaveLength(1);
+    expect(tableSelector).toBeGreaterThan(comparisonScope);
+    expect(tableSelector).toBeLessThan(options);
+    expect(targetMatch).toBeGreaterThan(comparisonScope);
+    expect(targetMatch).toBeLessThan(options);
+  });
 });

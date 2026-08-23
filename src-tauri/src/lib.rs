@@ -280,7 +280,23 @@ struct LinuxDrmRenderDevice {
     device_file: std::path::PathBuf,
     driver: Option<String>,
     boot_vga: bool,
+    pci_id: Option<(u16, u16)>,
 }
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinuxDmabufRendererPciQuirk {
+    vendor_id: u16,
+    device_id: u16,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_DMABUF_RENDERER_PCI_QUIRKS: &[LinuxDmabufRendererPciQuirk] = &[LinuxDmabufRendererPciQuirk {
+    // Strix Halo can stop presenting new WebKitGTK DMABuf frames while the
+    // WebView remains interactive on native Wayland.
+    vendor_id: 0x1002,
+    device_id: 0x1586,
+}];
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_nvidia_driver_from_state(
@@ -312,6 +328,13 @@ fn linux_selected_drm_render_device<'a>(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_pci_id_from_sysfs_value(value: &str) -> Option<u16> {
+    let value = value.trim();
+    let value = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
+    (!value.is_empty()).then(|| u16::from_str_radix(value, 16).ok()).flatten()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_drm_render_devices_from_paths(
     sys_class_drm: &std::path::Path,
     dev_dri: &std::path::Path,
@@ -337,7 +360,13 @@ fn linux_drm_render_devices_from_paths(
                 .ok()
                 .and_then(|path| path.file_name().and_then(std::ffi::OsStr::to_str).map(str::to_ascii_lowercase));
             let boot_vga = std::fs::read_to_string(device_path.join("boot_vga")).is_ok_and(|value| value.trim() == "1");
-            Some(LinuxDrmRenderDevice { device_file, driver, boot_vga })
+            let vendor_id = std::fs::read_to_string(device_path.join("vendor"))
+                .ok()
+                .and_then(|value| linux_pci_id_from_sysfs_value(&value));
+            let device_id = std::fs::read_to_string(device_path.join("device"))
+                .ok()
+                .and_then(|value| linux_pci_id_from_sysfs_value(&value));
+            Some(LinuxDrmRenderDevice { device_file, driver, boot_vga, pci_id: vendor_id.zip(device_id) })
         })
         .collect::<Vec<_>>();
     devices.sort_by(|left, right| left.device_file.cmp(&right.device_file));
@@ -373,27 +402,28 @@ fn linux_drm_driver_is_software_only(driver: Option<&str>) -> bool {
     driver.is_none_or(|driver| LINUX_SOFTWARE_ONLY_DRM_DRIVERS.contains(&driver))
 }
 
-#[cfg(target_os = "linux")]
-fn linux_nvidia_driver() -> LinuxNvidiaDriver {
-    let devices = linux_drm_render_devices();
-    let explicit_device_file = std::env::var_os("WEBKIT_WEB_RENDER_DEVICE_FILE")
-        .filter(|path| !path.is_empty())
-        .map(std::path::PathBuf::from)
-        // Resolve stable /dev/dri/by-path links to the renderD* node used by sysfs.
-        .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
-    let render_driver = linux_selected_drm_render_device(explicit_device_file.as_deref(), &devices)
-        .and_then(|device| device.driver.as_deref());
-    linux_nvidia_driver_from_state(
-        std::path::Path::new("/dev/nvidiactl").exists(),
-        std::path::Path::new("/proc/driver/nvidia/version").exists(),
-        render_driver,
-    )
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_selected_device_has_dmabuf_quirk(
+    selected_device: Option<&LinuxDrmRenderDevice>,
+    uses_native_wayland: bool,
+) -> bool {
+    uses_native_wayland
+        && selected_device.is_some_and(|device| {
+            let Some((vendor_id, device_id)) = device.pci_id else {
+                return false;
+            };
+            LINUX_DMABUF_RENDERER_PCI_QUIRKS
+                .iter()
+                .any(|quirk| vendor_id == quirk.vendor_id && device_id == quirk.device_id)
+        })
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_webkit_rendering_workarounds(
     driver: LinuxNvidiaDriver,
     has_hardware_render_device: bool,
+    selected_device: Option<&LinuxDrmRenderDevice>,
+    uses_native_wayland: bool,
 ) -> &'static [(&'static str, &'static str)] {
     match driver {
         LinuxNvidiaDriver::Proprietary => {
@@ -414,12 +444,23 @@ fn linux_webkit_rendering_workarounds(
             // disable the DMABuf renderer there as well.
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
         }
+        LinuxNvidiaDriver::None if linux_selected_device_has_dmabuf_quirk(selected_device, uses_native_wayland) => {
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        }
         LinuxNvidiaDriver::None => {
             // AMD / Intel and other Mesa drivers keep DMABuf enabled to avoid
             // unnecessary CPU usage and UI lag on Wayland.
             &[]
         }
     }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_webkit_environment_override<'a>(
+    existing_value: Option<&std::ffi::OsStr>,
+    workaround_value: &'a str,
+) -> Option<&'a str> {
+    existing_value.is_none().then_some(workaround_value)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -452,6 +493,30 @@ fn linux_appimage_wayland_backend_override(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_uses_native_wayland(
+    appimage: Option<&std::ffi::OsStr>,
+    wayland_display: Option<&std::ffi::OsStr>,
+    session_type: Option<&std::ffi::OsStr>,
+    gdk_backend: Option<&std::ffi::OsStr>,
+) -> bool {
+    let has_wayland_display = wayland_display.is_some_and(|value| !value.is_empty());
+    let is_wayland_session =
+        session_type.and_then(std::ffi::OsStr::to_str).is_some_and(|value| value.eq_ignore_ascii_case("wayland"));
+    if !has_wayland_display || !is_wayland_session {
+        return false;
+    }
+
+    let automatic_backend = linux_appimage_wayland_backend_override(appimage, wayland_display, gdk_backend);
+    gdk_backend.or_else(|| automatic_backend.map(std::ffi::OsStr::new)).is_none_or(|backends| {
+        backends
+            .to_string_lossy()
+            .split(',')
+            .next()
+            .is_some_and(|backend| backend.trim().eq_ignore_ascii_case("wayland"))
+    })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_appimage_system_gtk_immodules_cache(
     appimage: Option<&std::ffi::OsStr>,
     appdir: Option<&std::ffi::OsStr>,
@@ -479,10 +544,32 @@ fn linux_appimage_system_gtk_immodules_cache(
 #[cfg(target_os = "linux")]
 fn apply_linux_webkit_rendering_workarounds() {
     let render_devices = linux_drm_render_devices();
+    let explicit_device_file = std::env::var_os("WEBKIT_WEB_RENDER_DEVICE_FILE")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        // Resolve stable /dev/dri/by-path links to the renderD* node used by sysfs.
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+    let selected_device = linux_selected_drm_render_device(explicit_device_file.as_deref(), &render_devices);
+    let nvidia_driver = linux_nvidia_driver_from_state(
+        std::path::Path::new("/dev/nvidiactl").exists(),
+        std::path::Path::new("/proc/driver/nvidia/version").exists(),
+        selected_device.and_then(|device| device.driver.as_deref()),
+    );
     let has_hardware_render_device =
         render_devices.iter().any(|device| !linux_drm_driver_is_software_only(device.driver.as_deref()));
-    for (key, value) in linux_webkit_rendering_workarounds(linux_nvidia_driver(), has_hardware_render_device) {
-        if std::env::var_os(key).is_none() {
+    let uses_native_wayland = linux_uses_native_wayland(
+        std::env::var_os("APPIMAGE").as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("XDG_SESSION_TYPE").as_deref(),
+        std::env::var_os("GDK_BACKEND").as_deref(),
+    );
+    for (key, value) in linux_webkit_rendering_workarounds(
+        nvidia_driver,
+        has_hardware_render_device,
+        selected_device,
+        uses_native_wayland,
+    ) {
+        if let Some(value) = linux_webkit_environment_override(std::env::var_os(key).as_deref(), value) {
             std::env::set_var(key, value);
         }
     }
@@ -907,7 +994,8 @@ mod tests {
     use super::{
         app_menu_copy_support_info_label, app_menu_quit_label, linux_appimage_system_gtk_immodules_cache,
         linux_appimage_wayland_backend_override, linux_drm_driver_is_software_only,
-        linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state, linux_selected_drm_render_device,
+        linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state, linux_pci_id_from_sysfs_value,
+        linux_selected_drm_render_device, linux_uses_native_wayland, linux_webkit_environment_override,
         linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
         should_enable_single_instance, should_fallback_to_native_quit, should_hide_window_on_close,
         should_setup_desktop_tray, should_show_main_window_after_setup, should_show_main_window_before_setup_tasks,
@@ -1075,7 +1163,27 @@ mod tests {
     }
 
     fn drm_render_device(path: &str, driver: &str, boot_vga: bool) -> LinuxDrmRenderDevice {
-        LinuxDrmRenderDevice { device_file: PathBuf::from(path), driver: Some(driver.to_string()), boot_vga }
+        LinuxDrmRenderDevice {
+            device_file: PathBuf::from(path),
+            driver: Some(driver.to_string()),
+            boot_vga,
+            pci_id: None,
+        }
+    }
+
+    fn drm_pci_render_device(
+        path: &str,
+        driver: &str,
+        boot_vga: bool,
+        vendor_id: u16,
+        device_id: u16,
+    ) -> LinuxDrmRenderDevice {
+        LinuxDrmRenderDevice {
+            device_file: PathBuf::from(path),
+            driver: Some(driver.to_string()),
+            boot_vga,
+            pci_id: Some((vendor_id, device_id)),
+        }
     }
 
     #[test]
@@ -1090,9 +1198,42 @@ mod tests {
         assert!(linux_drm_render_devices_from_paths(&sys_class_drm, &dev_dri).is_empty());
 
         std::fs::write(dev_dri.join("renderD129"), []).unwrap();
+        std::fs::write(sys_class_drm.join("renderD129/device/vendor"), "0x1002\n").unwrap();
+        std::fs::write(sys_class_drm.join("renderD129/device/device"), "0x1586\n").unwrap();
         let devices = linux_drm_render_devices_from_paths(&sys_class_drm, &dev_dri);
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device_file, dev_dri.join("renderD129"));
+        assert_eq!(devices[0].pci_id, Some((0x1002, 0x1586)));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_linux_drm_pci_ids_without_accepting_malformed_values() {
+        assert_eq!(linux_pci_id_from_sysfs_value("0x1002\n"), Some(0x1002));
+        assert_eq!(linux_pci_id_from_sysfs_value("0X1586"), Some(0x1586));
+        assert_eq!(linux_pci_id_from_sysfs_value("8086"), Some(0x8086));
+        assert_eq!(linux_pci_id_from_sysfs_value(""), None);
+        assert_eq!(linux_pci_id_from_sysfs_value("0x"), None);
+        assert_eq!(linux_pci_id_from_sysfs_value("0x10000"), None);
+        assert_eq!(linux_pci_id_from_sysfs_value("not-a-device"), None);
+
+        let root = std::env::temp_dir().join(format!("dbx-drm-pci-ids-{}", uuid::Uuid::new_v4()));
+        let sys_class_drm = root.join("sys/class/drm");
+        let dev_dri = root.join("dev/dri");
+        for node in ["renderD128", "renderD129"] {
+            std::fs::create_dir_all(sys_class_drm.join(node).join("device")).unwrap();
+            std::fs::create_dir_all(&dev_dri).unwrap();
+            std::fs::write(dev_dri.join(node), []).unwrap();
+        }
+        std::fs::write(sys_class_drm.join("renderD128/device/vendor"), "malformed").unwrap();
+        std::fs::write(sys_class_drm.join("renderD128/device/device"), "0x1586").unwrap();
+        std::fs::write(sys_class_drm.join("renderD129/device/vendor"), "0x1002").unwrap();
+
+        let devices = linux_drm_render_devices_from_paths(&sys_class_drm, &dev_dri);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].pci_id, None);
+        assert_eq!(devices[1].pci_id, None);
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1150,21 +1291,106 @@ mod tests {
     #[test]
     fn applies_driver_specific_linux_webkit_rendering_workarounds() {
         assert_eq!(
-            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Proprietary, true),
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Proprietary, true, None, false),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1"), ("__NV_DISABLE_EXPLICIT_SYNC", "1")]
         );
         assert_eq!(
-            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Nouveau, true),
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::Nouveau, true, None, false),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
         );
-        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true), &[]);
+        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, None, false), &[]);
         // Without any hardware render device (GPU-less VM / server) Mesa falls
         // back to llvmpipe, whose DMABuf compositing path can crash the WebKit
         // process.
         assert_eq!(
-            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, false),
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, false, None, false),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
         );
+    }
+
+    #[test]
+    fn disables_linux_webkit_dmabuf_only_for_strix_halo_on_native_wayland() {
+        let strix_halo = drm_pci_render_device("/dev/dri/renderD128", "amdgpu", true, 0x1002, 0x1586);
+        let mut strix_halo_without_driver = strix_halo.clone();
+        strix_halo_without_driver.driver = None;
+        let adjacent_amd = drm_pci_render_device("/dev/dri/renderD128", "amdgpu", true, 0x1002, 0x1587);
+        let native_wayland =
+            linux_uses_native_wayland(None, Some(OsStr::new("wayland-0")), Some(OsStr::new("wayland")), None);
+        assert!(native_wayland);
+        assert_eq!(
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, Some(&strix_halo), native_wayland),
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+        assert_eq!(
+            linux_webkit_rendering_workarounds(
+                LinuxNvidiaDriver::None,
+                true,
+                Some(&strix_halo_without_driver),
+                native_wayland,
+            ),
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+        assert_eq!(
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, Some(&adjacent_amd), native_wayland),
+            &[]
+        );
+
+        for native_wayland in [
+            linux_uses_native_wayland(
+                None,
+                Some(OsStr::new("wayland-0")),
+                Some(OsStr::new("wayland")),
+                Some(OsStr::new("x11")),
+            ),
+            linux_uses_native_wayland(None, None, Some(OsStr::new("wayland")), None),
+            linux_uses_native_wayland(None, Some(OsStr::new("wayland-0")), None, None),
+            linux_uses_native_wayland(None, Some(OsStr::new("wayland-0")), Some(OsStr::new("x11")), None),
+        ] {
+            assert!(!native_wayland);
+            assert_eq!(
+                linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, Some(&strix_halo), native_wayland),
+                &[]
+            );
+        }
+    }
+
+    #[test]
+    fn linux_webkit_strix_quirk_follows_the_selected_hybrid_render_node() {
+        let devices = [
+            drm_pci_render_device("/dev/dri/renderD128", "i915", true, 0x8086, 0x46a6),
+            drm_pci_render_device("/dev/dri/renderD129", "amdgpu", false, 0x1002, 0x1586),
+        ];
+        let default_device = linux_selected_drm_render_device(None, &devices).unwrap();
+        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, Some(default_device), true), &[]);
+
+        let explicit_device = linux_selected_drm_render_device(Some(Path::new("/dev/dri/renderD129")), &devices);
+        assert_eq!(
+            linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, explicit_device, true),
+            &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+
+        let unmatched_device = linux_selected_drm_render_device(Some(Path::new("/dev/dri/renderD130")), &devices);
+        assert!(unmatched_device.is_none());
+        assert_eq!(linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, true, unmatched_device, true), &[]);
+    }
+
+    #[test]
+    fn appimage_linux_webkit_quirk_respects_x11_first_and_explicit_wayland() {
+        let appimage = Some(OsStr::new("/opt/DBX.AppImage"));
+        let display = Some(OsStr::new("wayland-0"));
+        let session = Some(OsStr::new("wayland"));
+
+        assert!(!linux_uses_native_wayland(appimage, display, session, None));
+        assert!(linux_uses_native_wayland(appimage, display, session, Some(OsStr::new("wayland"))));
+        assert!(!linux_uses_native_wayland(appimage, display, session, Some(OsStr::new("x11,wayland,*"))));
+    }
+
+    #[test]
+    fn linux_webkit_workarounds_preserve_user_environment_values() {
+        assert_eq!(linux_webkit_environment_override(None, "1"), Some("1"));
+        for value in [OsStr::new(""), OsStr::new("0"), OsStr::new("1")] {
+            assert_eq!(linux_webkit_environment_override(Some(value), "1"), None);
+        }
     }
 
     #[test]
