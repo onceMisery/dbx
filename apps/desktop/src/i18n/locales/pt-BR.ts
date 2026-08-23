@@ -3066,7 +3066,7 @@ export default withEnglishFallback({
     renameDatabasePreparedTransactions: "Há {count} transações preparadas pendentes no banco de dados «{name}». Execute COMMIT ou ROLLBACK antes de renomear.",
     dropEventSuccess: "Evento excluído {name}",
     editObject: "Editar objeto",
-    createEvent: "Criar evento"
+    createEvent: "Criar evento",
   },
   visibleDatabases: {
     title: "Bancos de dados visíveis",
