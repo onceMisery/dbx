@@ -8405,7 +8405,7 @@ fn finalize_object_source(mut source: db::ObjectSource) -> db::ObjectSource {
         source.source = normalize_routine_object_source(source.source);
     }
     if matches!(source.object_type, db::ObjectSourceKind::Event) {
-        source.editable = Some(true);
+        source.editable = Some(false);
     }
     source
 }

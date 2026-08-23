@@ -1269,6 +1269,7 @@ export interface QueryTab {
     eventName?: string;
     eventReadOnly?: boolean;
     eventOpenRequestId?: number;
+    initialObjectFilter?: "tables" | "events";
     viewport?: ObjectBrowserViewport;
   };
   objectSource?: {

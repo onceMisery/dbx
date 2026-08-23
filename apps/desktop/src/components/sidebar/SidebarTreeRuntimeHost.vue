@@ -1332,6 +1332,10 @@ function onDoubleClick(event: MouseEvent) {
     void openObjectBrowser();
     return;
   }
+  if (activeNode.value.type === "group-events") {
+    void openObjectBrowser();
+    return;
+  }
   const action = treeNodeRowDoubleClickAction(activeNode.value.type, canOpenObjectBrowser.value, settingsStore.editorSettings.sidebarActivation, canExpand.value, currentDatabaseType(), canOpenConnectionDatabaseBrowser.value, settingsStore.editorSettings.sidebarOpenDatabaseOnSingleClick);
   if (action === "open-database-browser") {
     void openDatabaseBrowser();
@@ -1488,7 +1492,7 @@ async function openObjectBrowser(eventReadOnly = false) {
     connectionStore.activeConnectionId = node.connectionId;
 
     if (hasTreeNodeDatabaseContext(node)) {
-      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly);
+      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly, node.type === "group-events" ? "events" : undefined);
       return;
     }
 
@@ -1497,7 +1501,7 @@ async function openObjectBrowser(eventReadOnly = false) {
     const options = await getDatabaseOptions(node.connectionId);
     const database = resolveDefaultDatabase(connection, options);
     if (database) {
-      queryStore.openObjectBrowser(node.connectionId, database, undefined, undefined, node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly);
+      queryStore.openObjectBrowser(node.connectionId, database, undefined, undefined, node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly, node.type === "group-events" ? "events" : undefined);
     } else {
       await toggle();
     }

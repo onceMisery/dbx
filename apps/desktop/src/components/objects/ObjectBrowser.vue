@@ -151,6 +151,7 @@ const props = defineProps<{
   initialEventName?: string;
   initialEventReadOnly?: boolean;
   initialEventOpenRequestId?: number;
+  initialObjectFilter?: "tables" | "events";
   viewport?: ObjectBrowserViewport;
 }>();
 
@@ -2648,11 +2649,12 @@ function openInitialEventIfNeeded() {
 
 function finishObjectBrowserRowsLoad() {
   loadingObjects.value = false;
-  if (!userHasSelectedFilter.value && objectCounts.value.tables > 0) {
+  const preferredFilter = props.initialObjectFilter ?? (props.initialEventName ? "events" : "tables");
+  if (!userHasSelectedFilter.value && objectCounts.value[preferredFilter] > 0) {
     // The default table filter is a presentation choice, not a user query
     // change, so preserve the tab's saved scroll offset across remounts.
     preserveObjectFilterScrollOnce = objectFilter.value !== "tables";
-    objectFilter.value = "tables";
+    objectFilter.value = preferredFilter;
   }
   openInitialEventIfNeeded();
   restoreObjectBrowserViewport();
