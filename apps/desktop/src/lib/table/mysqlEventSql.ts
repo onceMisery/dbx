@@ -31,9 +31,12 @@ export function buildMysqlEventSql(draft: MysqlEventDraft, operation: "CREATE" |
     schedule = `AT ${literal(draft.schedule.executeAt)}`;
   } else {
     const unit = draft.schedule.intervalUnit.trim().toUpperCase();
-    if (!draft.schedule.intervalValue.trim()) throw new Error("EVERY schedule requires an interval value");
+    const intervalValue = draft.schedule.intervalValue.trim();
+    if (!/^\d+$/.test(intervalValue) || /^0+$/.test(intervalValue)) {
+      throw new Error("EVERY schedule requires a positive integer interval value");
+    }
     if (!units.has(unit)) throw new Error(`Invalid interval unit: ${draft.schedule.intervalUnit}`);
-    schedule = `EVERY ${draft.schedule.intervalValue.trim()} ${unit}`;
+    schedule = `EVERY ${intervalValue} ${unit}`;
   }
   let sql = `${operation} EVENT ${name} ON SCHEDULE ${schedule}`;
   if (draft.starts?.trim()) sql += ` STARTS ${literal(draft.starts)}`;

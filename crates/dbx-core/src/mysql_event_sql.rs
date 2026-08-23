@@ -83,10 +83,11 @@ fn build_event_sql(prefix: &str, definition: &MysqlEventDefinition) -> Result<St
         }
         MysqlEventSchedule::At { execute_at } => format!("AT {}", literal(execute_at)),
         MysqlEventSchedule::Every { interval_value, interval_unit } => {
-            if interval_value.trim().is_empty() {
-                return Err("event EVERY schedule must include interval_value".into());
+            let interval_value = interval_value.trim();
+            if !interval_value.bytes().all(|byte| byte.is_ascii_digit()) || interval_value.bytes().all(|byte| byte == b'0') {
+                return Err("event EVERY schedule requires a positive integer interval_value".into());
             }
-            format!("EVERY {} {}", interval_value.trim(), unit(interval_unit)?)
+            format!("EVERY {} {}", interval_value, unit(interval_unit)?)
         }
     };
     let mut sql = format!("{prefix} {name} ON SCHEDULE {schedule}");
@@ -145,6 +146,14 @@ mod tests {
         def.body = "SELECT 1".into();
         def.schedule = MysqlEventSchedule::Every { interval_value: "1".into(), interval_unit: "fortnight".into() };
         assert!(create_event_sql(&def).is_err());
+    }
+    #[test]
+    fn rejects_non_positive_or_non_numeric_interval_values() {
+        let mut def = definition();
+        for interval_value in ["", "0", " 000 ", "1 DAY", "1; DROP EVENT other"] {
+            def.schedule = MysqlEventSchedule::Every { interval_value: interval_value.into(), interval_unit: "DAY".into() };
+            assert!(create_event_sql(&def).is_err(), "unexpectedly accepted {interval_value:?}");
+        }
     }
     #[test]
     fn builds_at_and_drop_sql() {

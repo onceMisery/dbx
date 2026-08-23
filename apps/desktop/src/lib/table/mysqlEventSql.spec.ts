@@ -11,4 +11,9 @@ describe("buildMysqlEventSql", () => {
     expect(() => buildMysqlEventSql({ name: "e", schedule: { mode: "every", intervalValue: "1", intervalUnit: "FORTNIGHT" }, body: "SELECT 1" })).toThrow("Invalid interval unit");
     expect(() => buildMysqlEventSql({ name: "e", schedule: { mode: "at", executeAt: "" }, body: " " })).toThrow("Event body");
   });
+  it("rejects non-positive or non-numeric interval values", () => {
+    for (const intervalValue of ["", "0", " 000 ", "1 DAY", "1; DROP EVENT other"]) {
+      expect(() => buildMysqlEventSql({ name: "e", schedule: { mode: "every", intervalValue, intervalUnit: "DAY" }, body: "SELECT 1" })).toThrow("positive integer interval value");
+    }
+  });
 });
