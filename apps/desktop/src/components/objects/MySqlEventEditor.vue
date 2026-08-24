@@ -122,7 +122,7 @@ onMounted(load);
 <template>
   <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4" data-mysql-event-editor>
     <div class="flex items-center justify-between border-b pb-2">
-      <div class="flex items-center gap-2 text-sm font-semibold"><Clock class="h-4 w-4 text-orange-300" /> {{ t("contextMenu.eventEditorTitle") }}</div>
+      <div class="flex items-center gap-2 text-sm font-semibold"><Clock class="h-4 w-4 text-orange-400" /> {{ t("contextMenu.eventEditorTitle") }}</div>
       <Button variant="ghost" size="icon" class="h-6 w-6" :aria-label="t('contextMenu.eventCancel')" @click="emit('close')"><X class="h-4 w-4" /></Button>
     </div>
     <div v-if="loading" class="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 class="h-4 w-4 animate-spin" /> {{ t("contextMenu.eventLoading") }}</div>
