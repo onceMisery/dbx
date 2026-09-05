@@ -1095,6 +1095,7 @@ export default withEnglishFallback({
     sqliteTransportSshOnly: "遠端 SQLite 僅支援 SSH 跳板，無法使用代理或 HTTP 通道。",
     sqliteRemotePathPlaceholder: "/var/lib/app/data.db",
     sqliteRemotePathHint: "請填寫最後一跳 SSH 主機上的絕對路徑。",
+    sqliteSshCipherUnsupportedHint: "暫不支援透過 SSH 開啟加密（SQLCipher）的 SQLite 資料庫。",
     sqliteWorkerPlacement: "SQLite worker",
     sqliteWorkerPlacementSession: "工作階段",
     sqliteWorkerPlacementPersist: "持續",

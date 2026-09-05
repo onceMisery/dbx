@@ -279,6 +279,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   "update:open": [value: boolean];
   "check-updates": [];
+  "ai-config-deep-link-handled": [];
 }>();
 
 const isSettingsPage = computed(() => props.variant === "page");
@@ -3972,6 +3973,7 @@ async function applyPendingAiConfigDeepLinkDraft() {
   if (!settingsVisible.value || !requestId || requestId === handledAiConfigRequestId || !draft) return;
 
   handledAiConfigRequestId = requestId;
+  emit("ai-config-deep-link-handled");
   activeSettingsTab.value = "ai";
   aiEnterEditMode();
   aiEditConfigName.value = draft.name;

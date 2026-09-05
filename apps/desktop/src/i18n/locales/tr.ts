@@ -1112,6 +1112,7 @@ export default withEnglishFallback({
     sqliteTransportSshOnly: "Uzak SQLite yalnızca SSH atlamalarını destekler. Proxy ve HTTP tünel katmanları kullanılamaz.",
     sqliteRemotePathPlaceholder: "/var/lib/app/data.db",
     sqliteRemotePathHint: "Son SSH atlamasındaki mutlak bir yol girin.",
+    sqliteSshCipherUnsupportedHint: "Şifrelenmiş (SQLCipher) SQLite veritabanları henüz SSH üzerinden desteklenmiyor.",
     sqliteWorkerPlacement: "SQLite worker'ı",
     sqliteWorkerPlacementSession: "Oturum",
     sqliteWorkerPlacementPersist: "Kalıcı",

@@ -4076,6 +4076,13 @@ export const useQueryStore = defineStore("query", () => {
     tab.objectBrowser = { ...tab.objectBrowser, viewport };
   }
 
+  function updateObjectBrowserSearch(id: string, query: string) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab || tab.mode !== "objects") return;
+    if (tab.objectBrowser?.searchQuery === query) return;
+    tab.objectBrowser = { ...tab.objectBrowser, searchQuery: query };
+  }
+
   function updateNacosConfigEditorViewport(connectionId: string, namespace: string, viewport: NacosConfigEditorViewport) {
     if (!Number.isFinite(viewport.scrollTop) || !Number.isFinite(viewport.scrollLeft)) return;
     const tab = tabs.value.find((candidate) => candidate.mode === "nacos" && candidate.connectionId === connectionId && (candidate.nacosNamespace || "") === namespace);
@@ -7704,6 +7711,7 @@ export const useQueryStore = defineStore("query", () => {
     updateEditorViewport,
     updateEditorSelection,
     updateObjectBrowserViewport,
+    updateObjectBrowserSearch,
     updateNacosConfigEditorViewport,
     setAutoCommit,
     markManualTransactionDirty,

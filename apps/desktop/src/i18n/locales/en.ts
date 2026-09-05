@@ -1111,6 +1111,7 @@ export default {
     sqliteTransportSshOnly: "Remote SQLite only supports SSH hops. Proxy and HTTP tunnel layers cannot be used.",
     sqliteRemotePathPlaceholder: "/var/lib/app/data.db",
     sqliteRemotePathHint: "Enter an absolute path on the final SSH hop.",
+    sqliteSshCipherUnsupportedHint: "Encrypted (SQLCipher) SQLite databases are not supported over SSH yet.",
     sqliteWorkerPlacement: "SQLite worker",
     sqliteWorkerPlacementSession: "Session",
     sqliteWorkerPlacementPersist: "Persist",

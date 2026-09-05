@@ -36,7 +36,15 @@ vi.mock("@/stores/productionSafetyStore", () => ({
   useProductionSafetyStore: () => ({}),
 }));
 
-function createEditor(sourceColumns?: Array<string | undefined>, confirmDangerousRowDeletion = true, cacheKey?: string, readonlyColumnIndexes?: number[], existingRows: CellValue[][] = [], onCellValueChanged?: (rowId: number, columnIndex: number) => void) {
+function createEditor(
+  sourceColumns?: Array<string | undefined>,
+  confirmDangerousRowDeletion = true,
+  cacheKey?: string,
+  readonlyColumnIndexes?: number[],
+  existingRows: CellValue[][] = [],
+  onCellValueChanged?: (rowId: number, columnIndex: number) => void,
+  tableColumns?: Array<{ name: string; data_type: string; extra?: string; column_default?: string }>,
+) {
   let editor: ReturnType<typeof useDataGridEditor>;
   const result = ref<{ columns: string[]; rows: CellValue[][] }>({
     columns: ["first", "hidden", "last"],
@@ -51,7 +59,7 @@ function createEditor(sourceColumns?: Array<string | undefined>, confirmDangerou
     database: computed(() => "app"),
     tableMeta: computed(() => ({
       tableName: "people",
-      columns: [
+      columns: tableColumns ?? [
         { name: "first", data_type: "varchar" },
         { name: "hidden", data_type: "varchar" },
         { name: "last", data_type: "varchar" },
@@ -386,6 +394,29 @@ describe("useDataGridEditor appendPastedRowsToNewRow", () => {
       ["Grace", null, "Hopper"],
     ]);
     expect(editor.hasPendingChanges.value).toBe(true);
+  });
+
+  it("clears generated key columns instead of pasting the copied value", () => {
+    const editor = createEditor(undefined, true, undefined, undefined, [], undefined, [
+      { name: "first", data_type: "integer", extra: "autoincrement" },
+      { name: "hidden", data_type: "varchar" },
+      { name: "last", data_type: "varchar" },
+    ]);
+
+    const result = editor.appendPastedRowsToNewRow(
+      -1,
+      [
+        ["1", "Lovelace"],
+        ["2", "Hopper"],
+      ],
+      [0, 2],
+    );
+
+    expect(result).toEqual({ ok: true, rowCount: 2 });
+    expect(editor.newRows.value).toEqual([
+      [null, null, "Lovelace"],
+      [null, null, "Hopper"],
+    ]);
   });
 
   it("keeps explicitly read-only mapped columns out of editing and paste", () => {

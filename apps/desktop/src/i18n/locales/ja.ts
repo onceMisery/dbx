@@ -1093,6 +1093,7 @@ export default withEnglishFallback({
     sqliteTransportSshOnly: "リモート SQLite は SSH ホップのみ対応です。プロキシ層や HTTP トンネルは使用できません。",
     sqliteRemotePathPlaceholder: "/var/lib/app/data.db",
     sqliteRemotePathHint: "最終 SSH ホップ上の絶対パスを入力してください。",
+    sqliteSshCipherUnsupportedHint: "SSH 経由での暗号化（SQLCipher）SQLite データベースの接続にはまだ対応していません。",
     sqliteWorkerPlacement: "SQLite ワーカー",
     sqliteWorkerPlacementSession: "セッション",
     sqliteWorkerPlacementPersist: "永続化",

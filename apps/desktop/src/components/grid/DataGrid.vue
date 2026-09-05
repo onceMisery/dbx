@@ -11230,9 +11230,11 @@ const mongoJsonPreviewStyle = computed(() => ({
 
 const contentGridStyle = computed(() => {
   const hasRightCellDetail = !cellDetailPanelIsBottom.value && showCellDetail.value && activeCellDetail.value;
-  const tableInfoAvailableWidth = hasRightCellDetail ? `max(0px, calc(100% - ${detailPanelHeight.value}px))` : "100%";
+  const rightPanelWidth = hasRightCellDetail ? detailPanelHeight.value : mongoJsonPreviewOpen.value ? mongoJsonPreviewWidth.value : 0;
+  const hasRightPanel = hasRightCellDetail || mongoJsonPreviewOpen.value;
+  const tableInfoAvailableWidth = hasRightPanel ? `max(0px, calc(100% - ${rightPanelWidth}px))` : "100%";
   const tableInfoTrack = showTableInfo.value ? `minmax(0, min(${ddlWidth.value}px, ${tableInfoAvailableWidth}))` : "0px";
-  const detailTrack = hasRightCellDetail ? `minmax(0, min(${detailPanelHeight.value}px, 100%))` : "0px";
+  const detailTrack = hasRightPanel ? `minmax(0, min(${rightPanelWidth}px, 100%))` : "0px";
 
   if (cellDetailPanelIsBottom.value && showCellDetail.value && activeCellDetail.value) {
     return {

@@ -1003,6 +1003,7 @@ export default withEnglishFallback({
     sqliteTransportSshOnly: "원격 SQLite는 SSH 홉만 지원합니다. 프록시 및 HTTP 터널 계층은 사용할 수 없습니다.",
     sqliteRemotePathPlaceholder: "/var/lib/app/data.db",
     sqliteRemotePathHint: "마지막 SSH 홉의 절대 경로를 입력하세요.",
+    sqliteSshCipherUnsupportedHint: "SSH를 통한 암호화(SQLCipher)된 SQLite 데이터베이스 연결은 아직 지원되지 않습니다.",
     sqliteWorkerPlacement: "SQLite 워커",
     sqliteWorkerPlacementSession: "세션",
     sqliteWorkerPlacementPersist: "영속",

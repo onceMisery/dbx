@@ -176,6 +176,7 @@ const props = defineProps<{
   /** 显式"新建事件"请求号：每次菜单点击递增，用于打开/重新进入 CREATE 编辑器 */
   initialEventCreateRequestId?: number;
   initialObjectFilter?: "tables" | "events";
+  initialSearchQuery?: string;
   viewport?: ObjectBrowserViewport;
 }>();
 
@@ -183,6 +184,7 @@ const emit = defineEmits<{
   openTable: [target: { tableName: string; schema?: string; tableType?: string; catalog?: string }];
   schemaChange: [schema: string | undefined];
   viewportChange: [viewport: ObjectBrowserViewport];
+  searchChange: [query: string];
 }>();
 
 const { t } = useI18n();
@@ -200,7 +202,7 @@ const schemas = ref<string[]>([]);
 const selectedSchema = ref<string | undefined>(props.schema);
 const rows = ref<ObjectBrowserRow[]>([]);
 const rootRef = ref<HTMLElement>();
-const search = ref("");
+const search = ref(props.initialSearchQuery ?? "");
 const objectFilter = ref<ObjectFilter>("all");
 const userHasSelectedFilter = ref(false);
 const sortKey = ref<ObjectBrowserSortKey>("name");
@@ -534,7 +536,10 @@ watch([sortKey, sortDirection], () => scrollObjectsToTop());
 
 // Also jump to the top when the search query or object-type filter changes —
 // filtered results bear no relation to the previous scroll position.
-watch(search, () => scrollObjectsToTop());
+watch(search, (value) => {
+  scrollObjectsToTop();
+  emit("searchChange", value);
+});
 watch(objectFilter, () => {
   if (preserveObjectFilterScrollOnce) {
     preserveObjectFilterScrollOnce = false;

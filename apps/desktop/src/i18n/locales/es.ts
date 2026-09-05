@@ -1095,6 +1095,7 @@ export default withEnglishFallback({
     sqliteTransportSshOnly: "SQLite remoto solo admite saltos SSH. No se pueden usar capas de proxy ni túnel HTTP.",
     sqliteRemotePathPlaceholder: "/var/lib/app/data.db",
     sqliteRemotePathHint: "Introduce una ruta absoluta en el último salto SSH.",
+    sqliteSshCipherUnsupportedHint: "Las bases de datos SQLite cifradas (SQLCipher) aún no son compatibles a través de SSH.",
     sqliteWorkerPlacement: "Worker de SQLite",
     sqliteWorkerPlacementSession: "Sesión",
     sqliteWorkerPlacementPersist: "Persistente",

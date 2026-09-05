@@ -972,7 +972,11 @@ fn decode_pg_text_wkb(value: &str) -> Option<super::wkb::DecodedGeometry> {
         .or_else(|| trimmed.strip_prefix("\\x"))
         .or_else(|| trimmed.strip_prefix("\\X"))
         .unwrap_or(trimmed);
-    if hex.len() < 10 || !hex.len().is_multiple_of(2) || !matches!(&hex[..2], "00" | "01") || !hex.is_ascii() {
+    // `is_ascii()` must be checked before slicing `hex[..2]`: multibyte UTF-8
+    // text (e.g. Redshift simple-query values probed with an unknown column
+    // type) would otherwise panic on a non-char byte boundary and abort the
+    // process under `panic = "abort"`.
+    if hex.len() < 10 || !hex.len().is_multiple_of(2) || !hex.is_ascii() || !matches!(&hex[..2], "00" | "01") {
         return None;
     }
     let bytes = hex
@@ -9468,6 +9472,17 @@ mod tests {
             assert_eq!(pg_text_fallback_value(value, None), (serde_json::json!(value), None));
         }
         assert_eq!(pg_text_fallback_value("SRID=4326;point(1 2)", None), (serde_json::json!("point(1 2)"), Some(4326)));
+    }
+
+    #[test]
+    fn postgres_text_fallback_does_not_panic_on_multibyte_text() {
+        // Redshift reads decode every simple-query value through the hex-WKB
+        // probe with an unknown column type, so ordinary multibyte text must
+        // pass through instead of slicing at a non-char byte boundary.
+        for value in ["中文字符测试数据", "🚚运输状态标签", "0101中文不是几何数据"] {
+            assert_eq!(pg_text_fallback_value(value, None), (serde_json::json!(value), None));
+            assert_eq!(pg_text_fallback_value(value, Some(PgColType::Geometry)), (serde_json::json!(value), None));
+        }
     }
 
     struct DockerPostgres {

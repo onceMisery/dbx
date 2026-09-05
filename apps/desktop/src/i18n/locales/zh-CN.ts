@@ -1038,6 +1038,7 @@ export default withEnglishFallback({
     sqliteTransportSshOnly: "远程 SQLite 只支持 SSH 跳板，不能使用代理或 HTTP 隧道。",
     sqliteRemotePathPlaceholder: "/var/lib/app/data.db",
     sqliteRemotePathHint: "请填写最后一跳 SSH 主机上的绝对路径。",
+    sqliteSshCipherUnsupportedHint: "暂不支持通过 SSH 打开加密（SQLCipher）的 SQLite 数据库。",
     sqliteWorkerPlacement: "SQLite worker",
     sqliteWorkerPlacementSession: "会话",
     sqliteWorkerPlacementPersist: "持久",
