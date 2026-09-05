@@ -7137,6 +7137,7 @@ export default withEnglishFallback({
     mcpCodeBuddyConfigPath: "CodeBuddy Code, genel olarak ~/.codebuddy/.mcp.json ya da projede .mcp.json kullanabilir.",
     mcpZCodeConfigPath: "ZCode: Ayarlar > MCP Sunucuları > Yeni MCP Sunucusu > Tam yapılandırma; Kullanıcı ya da Çalışma Alanı kapsamını seçip JSON yapılandırmasını yapıştırın.",
     mcpTraeConfigPath: "TRAE: Ayarlar > MCP > Ekle > Elle Ekle, ardından JSON yapılandırmasını yapıştırın.",
+    mcpQoderConfigPath: "Qoder: Ayarlar > MCP > Elle Ekle, ardından JSON yapılandırmasını yapıştırın.",
     mcpCherryStudioConfigPath: "Cherry Studio: Ayarlar > MCP Sunucuları > Sunucu Ekle > JSON İçe Aktar, ardından yapılandırmayı yapıştırın.",
     mcpVsCodeConfigPath: "VS Code/Copilot, çalışma alanında .vscode/mcp.json ya da kullanıcı profilinde mcp.json kullanabilir.",
     mcpWindsurfConfigPath: "Windsurf, ~/.codeium/windsurf/mcp_config.json kullanabilir.",

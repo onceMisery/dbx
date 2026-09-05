@@ -174,7 +174,7 @@ import { currentExecutableStatementRange, type SqlTextRange } from "@/lib/sql/sq
 import { executableStatementRangeCacheForDoc, executableStatementRangeStartingAt, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
 import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES, tableColumnTemplateRowsToSettings } from "@/lib/table/tableColumnTemplates";
 import { DEFAULT_SQL_VARIABLE_SYNTAX_TOGGLES, normalizeSqlVariableSyntaxOverrides, SQL_VARIABLE_SYNTAX_DATABASE_TYPES, SQL_VARIABLE_SYNTAX_KEYS, SQL_VARIABLE_SYNTAX_TOKENS, type SqlVariableSyntaxOverrides, type SqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
-import { buildMcpCherryStudioConfig, buildMcpCodexConfig, buildMcpDeepSeekHarnessConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpPiConfig, buildMcpTraeConfig, buildMcpVsCodeConfig, mcpWebBackendUrl, type McpLaunchConfig } from "@/lib/mcp/mcpConfigTemplates";
+import { buildMcpCherryStudioConfig, buildMcpCodexConfig, buildMcpDeepSeekHarnessConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpPiConfig, buildMcpQoderConfig, buildMcpTraeConfig, buildMcpVsCodeConfig, mcpWebBackendUrl, type McpLaunchConfig } from "@/lib/mcp/mcpConfigTemplates";
 import { beginMcpStatusRequest, mcpUpdateAvailability } from "@/lib/mcp/mcpUpdateStatus";
 import { isMcpPolicyMutationBlocked, MCP_CAPABILITY_ROWS, MCP_EXECUTION_MODE_COLUMNS, mcpExecutionModeFromPolicy, mcpPolicyFieldsForExecutionMode, type McpExecutionMode } from "@/lib/mcp/mcpPolicySelection";
 import { isMacOS, isWindows } from "@/lib/backend/platform";
@@ -2117,7 +2117,7 @@ async function exportDebugLogs() {
 }
 
 // ---------- MCP Server ----------
-type McpConfigTab = "claude" | "cursor" | "codebuddy" | "zcode" | "trae" | "vscode" | "windsurf" | "codex" | "deepseek-harness" | "opencode" | "pi" | "cherry-studio";
+type McpConfigTab = "claude" | "cursor" | "codebuddy" | "zcode" | "trae" | "vscode" | "windsurf" | "codex" | "deepseek-harness" | "opencode" | "pi" | "cherry-studio" | "qoder";
 type McpCopyKind = "install" | "uninstall" | "http-endpoint" | "http-token" | "http-config" | `${McpConfigTab}-config`;
 type McpTransportTab = "stdio" | "http";
 
@@ -2568,6 +2568,12 @@ const mcpTraeRecommendedConfig = computed(() => {
   // TRAE currently splits Windows executable paths containing spaces, so bypass Node and launch the native MCP binary directly.
   const nativeBinPath = !isWeb && isWindows() ? mcpStatus.value?.native_bin_path : undefined;
   return buildMcpTraeConfig(mcpLaunchConfig.value, nativeBinPath ?? undefined);
+});
+
+const mcpQoderRecommendedConfig = computed(() => {
+  // Qoder follows TRAE's mcpServers JSON format and has the same Windows path parsing limitation.
+  const nativeBinPath = !isWeb && isWindows() ? mcpStatus.value?.native_bin_path : undefined;
+  return buildMcpQoderConfig(mcpLaunchConfig.value, nativeBinPath ?? undefined);
 });
 
 const mcpVsCodeRecommendedConfig = computed(() => buildMcpVsCodeConfig(mcpLaunchConfig.value));
@@ -8339,6 +8345,7 @@ LIMIT 100;</pre
                       <TabsTrigger value="opencode" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">OpenCode</TabsTrigger>
                       <TabsTrigger value="pi" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Pi</TabsTrigger>
                       <TabsTrigger value="cherry-studio" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Cherry Studio</TabsTrigger>
+                      <TabsTrigger value="qoder" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Qoder</TabsTrigger>
                     </TabsList>
 
                     <TabsContent value="claude" class="m-0">
@@ -8510,6 +8517,21 @@ LIMIT 100;</pre
                           <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpCherryStudioRecommendedConfig }}</code></pre>
                           <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('cherry-studio-config', mcpCherryStudioRecommendedConfig)">
                             <CheckCircle2 v-if="mcpCopied === 'cherry-studio-config'" class="h-3.5 w-3.5 text-green-500" />
+                            <Copy v-else class="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </div>
+                    </TabsContent>
+
+                    <TabsContent value="qoder" class="m-0">
+                      <div class="space-y-2">
+                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                          {{ t("settings.mcpQoderConfigPath") }}
+                        </div>
+                        <div class="relative rounded-md border bg-background p-3">
+                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpQoderRecommendedConfig }}</code></pre>
+                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('qoder-config', mcpQoderRecommendedConfig)">
+                            <CheckCircle2 v-if="mcpCopied === 'qoder-config'" class="h-3.5 w-3.5 text-green-500" />
                             <Copy v-else class="h-3.5 w-3.5" />
                           </Button>
                         </div>

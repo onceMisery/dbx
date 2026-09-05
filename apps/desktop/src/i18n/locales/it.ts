@@ -6763,6 +6763,7 @@ export default withEnglishFallback({
     mcpCodeBuddyConfigPath: "CodeBuddy Code può usare ~/.codebuddy/.mcp.json globalmente oppure .mcp.json a livello di progetto.",
     mcpZCodeConfigPath: "ZCode: Impostazioni > Server MCP > Nuovo server MCP > Configurazione completa; scegli l'ambito Utente o Area di lavoro, quindi incolla la configurazione JSON.",
     mcpTraeConfigPath: "TRAE: Impostazioni > MCP > Aggiungi > Aggiungi manualmente, poi incolla la configurazione JSON.",
+    mcpQoderConfigPath: "Qoder: Impostazioni > MCP > Aggiungi manualmente, poi incolla la configurazione JSON.",
     mcpCherryStudioConfigPath: "Cherry Studio: Impostazioni > Server MCP > Aggiungi server > Importa JSON, quindi incolla la configurazione.",
     mcpVsCodeConfigPath: "VS Code/Copilot può usare .vscode/mcp.json nell'area di lavoro o mcp.json nel profilo utente.",
     mcpWindsurfConfigPath: "Windsurf può usare ~/.codeium/windsurf/mcp_config.json.",

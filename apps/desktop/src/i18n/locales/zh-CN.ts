@@ -7134,6 +7134,7 @@ export default withEnglishFallback({
     mcpCodeBuddyConfigPath: "CodeBuddy Code 可使用全局 ~/.codebuddy/.mcp.json 或项目级 .mcp.json。",
     mcpZCodeConfigPath: "ZCode：设置 > MCP 服务器 > 新建 MCP 服务器 > 完整配置，选择用户或工作区作用域后粘贴 JSON 配置。",
     mcpTraeConfigPath: "TRAE：设置 > MCP > 添加 > 手动添加，然后粘贴 JSON 配置。",
+    mcpQoderConfigPath: "Qoder：设置 > MCP > 手动添加，然后粘贴 JSON 配置。",
     mcpCherryStudioConfigPath: "Cherry Studio：设置 > MCP 服务器 > 添加服务器 > 导入 JSON，然后粘贴配置。",
     mcpVsCodeConfigPath: "VS Code/Copilot 可放在工作区 .vscode/mcp.json 或用户配置文件 mcp.json。",
     mcpWindsurfConfigPath: "Windsurf 可放在 ~/.codeium/windsurf/mcp_config.json。",
