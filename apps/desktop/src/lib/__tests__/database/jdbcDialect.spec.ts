@@ -56,6 +56,20 @@ describe("jdbc dialect inference", () => {
         jdbc_driver_paths: ["/drivers/intersystems-jdbc-3.10.5.jar"],
       }),
     ).toBe("iris");
+    // Legacy Caché connections pick the CacheDB.jar from the driver store; the
+    // jar file name and driver label are the only Intersystems markers there.
+    expect(
+      inferJdbcDialect({
+        db_type: "jdbc",
+        jdbc_driver_paths: ["/drivers/CacheDB.jar"],
+      }),
+    ).toBe("iris");
+    expect(
+      inferJdbcDialect({
+        db_type: "jdbc",
+        driver_label: "CacheDB",
+      }),
+    ).toBe("iris");
   });
 
   it("uses IRIS table preview dialect for generic JDBC IRIS connections", () => {
@@ -284,6 +298,7 @@ describe("jdbc dialect inference", () => {
     expect(inferJdbcDialect({ db_type: "jdbc", driver_label: "Kyuubi JDBC", connection_string: "jdbc:hive2://kyuubi.example.com/default" })).toBe("mysql");
     expect(inferJdbcDialect({ db_type: "jdbc", connection_string: "jdbc:hive2://hiveserver.example.com/default" })).toBe("mysql");
     expect(inferJdbcDialect({ db_type: "jdbc", connection_string: "jdbc:mysql://mysql.example.com/app" })).toBe("mysql");
+    expect(inferJdbcDialect({ db_type: "jdbc", jdbc_driver_paths: ["/drivers/mysql-connector-j-8.0.33.jar"] })).toBe("mysql");
   });
 
   it("prefers explicit Kyuubi identity over Apache Hive product metadata", () => {

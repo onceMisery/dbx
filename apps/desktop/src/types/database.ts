@@ -1304,6 +1304,7 @@ export interface QueryTab {
     objectType: ObjectSourceKind;
     signature?: string;
   };
+  tableComment?: string | null;
   tableMeta?: {
     schema?: string;
     tableName: string;

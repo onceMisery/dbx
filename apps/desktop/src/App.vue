@@ -118,6 +118,7 @@ import { shouldBlockAppNativeSelectAll } from "@/lib/common/clipboard";
 import { APP_FONT_SANS_CSS_VAR, DATA_GRID_FONT_FAMILY_CSS_VAR, DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { DATA_GRID_TYPE_COLOR_KEYS, dataGridTypeColorCssVar, resolveActiveDataGridTypeColors } from "@/lib/dataGrid/dataGridTypeColorScheme";
 import { rankSavedSqlHistory } from "@/lib/savedSql/savedSqlHistory";
+import { useUiFontFamilyPreview } from "@/composables/useUiFontFamilyPreview";
 import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { savedSqlDefaultTargetForWrite } from "@/lib/savedSql/savedSqlExecutionTarget";
 import { countActiveUpdateBlockingTasks } from "@/lib/app/appUpdateTaskGuard";
@@ -173,6 +174,7 @@ const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const { active: appBackgroundActive, backgroundObjectUrl: appBackgroundObjectUrl, backgroundImageStyle: appBackgroundImageStyle } = useBackgroundImage(settingsStore);
+const { uiFontFamilyPreview } = useUiFontFamilyPreview();
 const savedSqlStore = useSavedSqlStore();
 const promptTemplateStore = usePromptTemplateStore();
 const recentConnectionIds = ref<readonly string[]>(parseRecentConnectionIds(safeLocalStorageGet(RECENT_CONNECTION_IDS_STORAGE_KEY)));
@@ -1130,7 +1132,7 @@ function applyDataGridTypeColors() {
 }
 
 const appUiFontFamilyStyle = computed<Record<string, string>>(() => {
-  const fontFamily = settingsStore.editorSettings.uiFontFamily || DEFAULT_UI_FONT_FAMILY;
+  const fontFamily = uiFontFamilyPreview.value || settingsStore.editorSettings.uiFontFamily || DEFAULT_UI_FONT_FAMILY;
   return {
     [APP_FONT_SANS_CSS_VAR]: fontFamily,
     fontFamily: `var(${APP_FONT_SANS_CSS_VAR}, ${DEFAULT_UI_FONT_FAMILY})`,
@@ -1191,8 +1193,12 @@ watch(
 );
 
 watch(
-  () => settingsStore.editorSettings.uiFontFamily,
-  (fontFamily) => {
+  [() => settingsStore.editorSettings.uiFontFamily, uiFontFamilyPreview],
+  ([fontFamily, preview]) => {
+    if (preview) {
+      applyUiFontFamily(preview);
+      return;
+    }
     applyUiFontFamily(fontFamily);
   },
   { immediate: true },
@@ -3584,7 +3590,7 @@ onUnmounted(() => {
                     @view-table-ddl="(_tabId: string, target: SqlObjectNavigationTarget) => onViewTableDdl(target)"
                     @open-object-source="(_tabId: string, target: SqlObjectNavigationTarget, initialEditing: boolean) => onOpenObjectSource(target, initialEditing)"
                     @open-object-table="
-                      (tabId: string, target: { tableName: string; schema?: string; tableType?: string; catalog?: string }) => {
+                      (tabId: string, target: { tableName: string; schema?: string; tableType?: string; catalog?: string; comment?: string | null }) => {
                         const tab = queryStore.tabs.find((candidate) => candidate.id === tabId) ?? activeTab;
                         if (!tab) return;
                         openObjectBrowserTableTarget({
@@ -3594,6 +3600,7 @@ onUnmounted(() => {
                           catalog: target.catalog,
                           tableName: target.tableName,
                           tableType: target.tableType,
+                          comment: target.comment,
                         });
                       }
                     "
@@ -3749,6 +3756,10 @@ onUnmounted(() => {
           @open-tunnel-profile-settings="
             setConnectionDialogOpen(false);
             openSettings('tunnels');
+          "
+          @open-connection-settings="
+            setConnectionDialogOpen(false);
+            openConnectionSettings($event, 'advanced');
           "
           @open-lineage-target="openLineageTarget"
           @open-database-search-target="openDatabaseSearchTarget"

@@ -1300,7 +1300,7 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                   </TooltipTrigger>
                   <TooltipContent :side="tabTooltipSide" class="text-xs grid grid-cols-[auto_1fr] gap-x-2">
                     <template v-for="line in tabTooltipLines(entry.tab, t)" :key="line.label">
-                      <span class="text-muted-foreground">{{ line.label }}</span>
+                      <span class="font-medium opacity-70">{{ line.label }}</span>
                       <span>{{ line.value }}</span>
                     </template>
                   </TooltipContent>

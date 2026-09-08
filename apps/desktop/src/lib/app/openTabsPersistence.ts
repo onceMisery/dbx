@@ -53,6 +53,7 @@ export interface SavedOpenTab {
   objectBrowser?: QueryTab["objectBrowser"];
   objectSource?: QueryTab["objectSource"];
   sourceView?: boolean;
+  tableComment?: QueryTab["tableComment"];
   tableMeta?: QueryTab["tableMeta"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   resultEvicted?: boolean;
@@ -148,6 +149,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     objectBrowser: tab.objectBrowser,
     objectSource: tab.objectSource,
     ...(tab.sourceView ? { sourceView: true } : {}),
+    ...(tab.tableComment !== undefined ? { tableComment: tab.tableComment } : {}),
     tableMeta: tab.tableMeta,
     ...(tab.mongoEditTarget !== undefined ? { mongoEditTarget: tab.mongoEditTarget } : {}),
     ...(tab.mode !== "data" && tab.resultEvicted ? { resultEvicted: true } : {}),

@@ -1861,11 +1861,23 @@ export async function analyzeEditableQueryEditability(sql: string): Promise<Quer
   return invoke("analyze_editable_query_editability", { sql });
 }
 
+/// A server-side check that must pass before `statements` may run. Without a
+/// primary key a row is addressed by matching every column value, so the same
+/// predicate can match rows outside the loaded page; `sql` counts the matches
+/// of a predicate the save actually sends, and the save must be refused with
+/// `message` unless the returned count is at most `maxMatchedRows`.
+export interface DataGridSaveGuard {
+  sql: string;
+  maxMatchedRows: number;
+  message: string;
+}
+
 export interface DataGridSavePreparation {
   validationError?: string;
   statements: string[];
   rollbackStatements: string[];
   executionSchema?: string;
+  keylessGuards?: DataGridSaveGuard[];
 }
 
 export async function prepareDataGridSave(options: DataGridSaveStatementOptions, driverProfile?: string): Promise<DataGridSavePreparation> {
@@ -5062,6 +5074,10 @@ export async function cancelDatabaseExport(exportId: string): Promise<void> {
 
 export async function clearDatabaseExportCancellation(exportId: string): Promise<void> {
   await invoke("clear_database_export_cancellation", { exportId });
+}
+
+export async function databaseExportDestinationNeedsConfirmation(directory: string): Promise<boolean> {
+  return invoke("database_export_destination_needs_confirmation", { directory });
 }
 
 export async function recordDatabaseExportDestination(directory: string): Promise<void> {

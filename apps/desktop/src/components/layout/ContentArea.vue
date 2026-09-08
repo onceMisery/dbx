@@ -1275,6 +1275,7 @@ defineExpose({
               class="relative z-0 flex-1"
               :auto-focus="autoFocus !== false"
               :model-value="activeTab.sql"
+              :tab-id="activeTab.id"
               :connection-id="activeTab.connectionId"
               :catalog="activeTab.catalog"
               :database="activeTab.database"

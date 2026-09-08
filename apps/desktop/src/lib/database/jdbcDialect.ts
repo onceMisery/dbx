@@ -42,7 +42,9 @@ const JDBC_DIALECT_MATCHERS: Array<{ type: DatabaseType; patterns: RegExp[] }> =
   { type: "sqlite", patterns: [/jdbc:sqlite:/i, /sqlite/i] },
   { type: "db2", patterns: [/jdbc:db2:/i, /\bdb2\b/i] },
   { type: "informix", patterns: [/jdbc:informix/i, /informix/i] },
-  { type: "iris", patterns: [/jdbc:(?:iris|cache):/i, /com\.intersystems\.jdbc\.(?:IRIS|Cache)Driver/i, /intersystems-jdbc/i] },
+  // CacheDB.jar (legacy Caché driver) carries none of the intersystems URL or
+  // class-name markers, so match the jar file name / driver label directly.
+  { type: "iris", patterns: [/jdbc:(?:iris|cache):/i, /com\.intersystems\.jdbc\.(?:IRIS|Cache)Driver/i, /intersystems-jdbc/i, /cachedb/i] },
 ];
 
 // ASE uses Transact-SQL, but treating it as SQL Server globally would also

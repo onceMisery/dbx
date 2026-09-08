@@ -13,6 +13,7 @@ pub mod csv_export;
 pub mod data_compare;
 pub mod database_export;
 pub mod deep_link;
+pub mod diagnostics;
 pub mod dialect_cmd;
 pub mod docs;
 pub mod document_cmd;
