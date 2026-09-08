@@ -1,5 +1,6 @@
 import { computed, ref, watch, watchPostEffect, type ComputedRef, type Ref } from "vue";
 import { BACKGROUND_IMAGE_SURFACE_VARS, backgroundImageStyle, backgroundImageSurfaceAlpha, surfaceColorWithAlpha, type BackgroundImageSettings } from "@/lib/app/appBackgroundImage";
+import { APP_CUSTOM_UI_COLOR_DEFS, appCustomUiColorValue, deriveCustomUiColors } from "@/lib/app/appTheme";
 import { readBackgroundImage } from "@/lib/backend/api";
 import { useTheme } from "@/composables/useTheme";
 import type { EditorSettings } from "@/stores/settingsStore";
@@ -7,6 +8,8 @@ import type { EditorSettings } from "@/stores/settingsStore";
 type SettingsStoreLike = { editorSettings: EditorSettings };
 
 export const BACKGROUND_IMAGE_ACTIVE_CLASS = "dbx-bg-active";
+
+const SURFACE_VAR_NAMES = new Set<string>(BACKGROUND_IMAGE_SURFACE_VARS);
 
 const backgroundObjectUrl = ref<string | null>(null);
 let loadedFilePath: string | null = null;
@@ -62,7 +65,7 @@ export interface BackgroundImageComposable {
 
 export function useBackgroundImage(settingsStore: SettingsStoreLike): BackgroundImageComposable {
   const backgroundSettings = computed(() => settingsStore.editorSettings.backgroundImage);
-  const { isDark, themePalette, customUiColors, customUiColorsDark, cornerStyle } = useTheme();
+  const { isDark, themePalette, activeCustomUiColors, cornerStyle } = useTheme();
 
   void loadBackgroundObjectUrl(settingsStore);
   watch(
@@ -80,25 +83,50 @@ export function useBackgroundImage(settingsStore: SettingsStoreLike): Background
   // the freshly applied palette classes, then re-emit them with alpha. The
   // theme refs read below are the reactive deps: any palette / mode / custom
   // color change re-runs this effect right after applyTheme rewrote the
-  // class-based (and custom-palette inline) variables.
+  // class-based (and custom-palette inline) variables. Custom palettes own
+  // every surface variable as an inline style, so clearing them would fall
+  // back to the palette class colors; their base values are resolved from the
+  // custom color settings instead of the computed style.
+  const customSurfaceBaseColors = (): Map<string, string> => {
+    const base = new Map<string, string>();
+    if (themePalette.value !== "custom") return base;
+    const colors = activeCustomUiColors.value;
+    for (const def of APP_CUSTOM_UI_COLOR_DEFS) {
+      if (SURFACE_VAR_NAMES.has(def.varName)) {
+        base.set(def.varName, appCustomUiColorValue(colors[def.key]).color);
+      }
+    }
+    for (const [name, value] of Object.entries(deriveCustomUiColors(colors))) {
+      if (SURFACE_VAR_NAMES.has(name)) base.set(name, value);
+    }
+    return base;
+  };
+
   watchPostEffect(() => {
     if (typeof document === "undefined") return;
     void isDark.value;
     void themePalette.value;
-    void customUiColors.value;
-    void customUiColorsDark.value;
+    void activeCustomUiColors.value;
     void cornerStyle.value;
     const doc = document.documentElement;
     const alpha = backgroundImageSurfaceAlpha(backgroundSettings.value);
     const isActive = active.value;
+    const customBase = customSurfaceBaseColors();
     for (const varName of BACKGROUND_IMAGE_SURFACE_VARS) {
       doc.style.removeProperty(varName);
     }
     doc.classList.toggle(BACKGROUND_IMAGE_ACTIVE_CLASS, isActive);
-    if (!isActive) return;
+    if (!isActive) {
+      // Re-emit the custom palette values the clear above removed.
+      for (const [varName, color] of customBase) {
+        doc.style.setProperty(varName, color);
+      }
+      return;
+    }
     const computedStyle = getComputedStyle(doc);
     for (const varName of BACKGROUND_IMAGE_SURFACE_VARS) {
-      const tinted = surfaceColorWithAlpha(computedStyle.getPropertyValue(varName), alpha);
+      const base = customBase.get(varName) ?? computedStyle.getPropertyValue(varName);
+      const tinted = surfaceColorWithAlpha(base, alpha);
       if (tinted) doc.style.setProperty(varName, tinted);
     }
   });

@@ -2,6 +2,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { reactive } from "vue";
 import { BACKGROUND_IMAGE_ACTIVE_CLASS, useBackgroundImage } from "@/composables/useBackgroundImage";
+import { useTheme } from "@/composables/useTheme";
 import { defaultBackgroundImageSettings, type BackgroundImageSettings } from "@/lib/app/appBackgroundImage";
 
 const readBackgroundImageMock = vi.hoisted(() => vi.fn());
@@ -9,6 +10,8 @@ const readBackgroundImageMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/backend/api", () => ({
   readBackgroundImage: readBackgroundImageMock,
 }));
+
+vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
 
 function settingsWith(overrides: Partial<BackgroundImageSettings>) {
   const base = defaultBackgroundImageSettings();
@@ -21,6 +24,7 @@ describe("useBackgroundImage", () => {
     readBackgroundImageMock.mockReset();
     (globalThis as Record<string, unknown>).__TAURI_INTERNALS__ = {};
     document.documentElement.className = "";
+    document.documentElement.removeAttribute("style");
   });
 
   it("reports no active background without a configured file", () => {
@@ -55,5 +59,56 @@ describe("useBackgroundImage", () => {
     expect(document.documentElement.classList.contains(BACKGROUND_IMAGE_ACTIVE_CLASS)).toBe(false);
     expect(warnSpy).toHaveBeenCalledTimes(1);
     warnSpy.mockRestore();
+  });
+
+  it("tints custom palette surface colors from the custom color settings while active", async () => {
+    const theme = useTheme();
+    const originalMode = theme.themeMode.value;
+    const originalPalette = theme.themePalette.value;
+    const originalColors = { ...theme.customUiColors.value };
+    theme.setThemeMode("light");
+    theme.setCustomUiColors({ ...originalColors, background: "#123456", sidebar: "#654321" });
+    theme.setThemePalette("custom");
+    const createObjectURL = vi.fn(() => "blob:bg-custom");
+    Object.defineProperty(URL, "createObjectURL", { value: createObjectURL, configurable: true, writable: true });
+    readBackgroundImageMock.mockResolvedValue("aGVsbG8=");
+    try {
+      const bg = useBackgroundImage(settingsWith({ filePath: "/data/background-image.png", opacity: 0.5 }));
+      await vi.waitFor(() => expect(bg.active.value).toBe(true));
+      await vi.waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue("--background")).toBe("rgb(18 52 86 / 0.5)");
+        expect(document.documentElement.style.getPropertyValue("--sidebar")).toBe("rgb(101 67 33 / 0.5)");
+      });
+    } finally {
+      theme.setCustomUiColors(originalColors);
+      theme.setThemeMode(originalMode);
+      theme.setThemePalette(originalPalette);
+    }
+  });
+
+  it("re-emits custom palette inline surface colors when the wallpaper is inactive", async () => {
+    const theme = useTheme();
+    const originalMode = theme.themeMode.value;
+    const originalPalette = theme.themePalette.value;
+    const originalColors = { ...theme.customUiColors.value };
+    theme.setThemeMode("light");
+    theme.setCustomUiColors({ ...originalColors, background: "#123456", sidebar: "#654321" });
+    theme.setThemePalette("custom");
+    try {
+      // applyCustomUiColors has just written these inline values for the custom palette.
+      document.documentElement.style.setProperty("--background", "rgb(18 52 86)");
+      document.documentElement.style.setProperty("--sidebar", "rgb(101 67 33)");
+
+      const bg = useBackgroundImage(settingsWith({}));
+      await vi.waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue("--background")).toBe("rgb(18 52 86)");
+        expect(document.documentElement.style.getPropertyValue("--sidebar")).toBe("rgb(101 67 33)");
+      });
+      expect(bg.active.value).toBe(false);
+    } finally {
+      theme.setCustomUiColors(originalColors);
+      theme.setThemeMode(originalMode);
+      theme.setThemePalette(originalPalette);
+    }
   });
 });

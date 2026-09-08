@@ -179,6 +179,18 @@ describe("settingsTransfer", () => {
     expect(transferCategoryForKey("notARealSetting")).toBeUndefined();
   });
 
+  it("round-trips the wallpaper settings under the appearance category", () => {
+    const settings: EditorSettings = {
+      ...DEFAULT_EDITOR_SETTINGS,
+      backgroundImage: { ...DEFAULT_EDITOR_SETTINGS.backgroundImage, filePath: "/data/background-image.png", fileName: "wall.png", opacity: 0.42 },
+    };
+    const result = parseSettingsTransferFile(serializeSettingsTransfer(settings));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.editorSettings.backgroundImage).toEqual(settings.backgroundImage);
+    expect(transferCategoryForKey("backgroundImage")).toBe("appearance");
+  });
+
   it("collects categories in display order without duplicates", () => {
     expect(collectTransferCategories(["snippets", "theme", "shortcuts", "fontFamily"])).toEqual(["appearance", "shortcuts", "snippets"]);
   });
