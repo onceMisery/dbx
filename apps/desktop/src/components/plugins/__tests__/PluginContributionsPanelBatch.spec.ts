@@ -61,6 +61,9 @@ vi.mock("@/components/plugins/PluginIcon.vue", async () => ({ default: (await im
 // Shortcut preferences have their own component/store tests. Keep this batch
 // harness scoped to plugin mutations and their exact backend call counts.
 vi.mock("@/components/plugins/PluginShortcutSettings.vue", async () => ({ default: (await import("@/components/grid/__tests__/vueHostHarness")).createPassthroughStub("PluginShortcutSettings") }));
+// The graphics-engine grant lives in the settings store; this batch harness has
+// no pinia, so the section is stubbed like the other store-backed child panels.
+vi.mock("@/components/plugins/PluginGraphicsEngineSection.vue", async () => ({ default: (await import("@/components/grid/__tests__/vueHostHarness")).createPassthroughStub("PluginGraphicsEngineSection") }));
 
 import PluginContributionsPanel from "@/components/plugins/PluginContributionsPanel.vue";
 
