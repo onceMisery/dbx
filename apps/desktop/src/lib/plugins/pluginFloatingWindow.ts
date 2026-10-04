@@ -23,12 +23,16 @@ export const FLOATING_DEFAULT_WIDTH_PX = 320;
 export const FLOATING_DEFAULT_HEIGHT_PX = 200;
 /** Gap kept between a snapped window and the work-area edge, in logical pixels. */
 export const FLOATING_EDGE_MARGIN_PX = 16;
-/** Distance from a work-area edge (logical pixels) that pulls the window onto it when a drag ends. */
+/** Distance from a work-area edge (logical pixels) that pulls the window onto it when a drag ends. A release past the edge always snaps, so this only widens the band on the inner side. */
 export const FLOATING_SNAP_THRESHOLD_PX = 28;
 /** Width of the strip an edge-docked widget leaves on screen, in logical pixels. */
 export const FLOATING_DOCK_SLIVER_PX = 14;
-/** How long the cursor may stay off a revealed docked widget before it tucks away. */
-const FLOATING_DOCK_IDLE_MS = 1_200;
+/**
+ * How long a docked widget stays a fully visible capsule before it tucks away:
+ * measured from the last moment the cursor was over it, so aiming the widget is
+ * never interrupted, and a reopened widget gets this much time to be read.
+ */
+const FLOATING_DOCK_IDLE_MS = 2_500;
 const FLOATING_DOCK_POLL_MS = 150;
 /** Extra hit area around the dock strip, in physical pixels. */
 const FLOATING_DOCK_HOVER_PAD_PX = 8;
@@ -100,10 +104,10 @@ export interface SnapFloatingResult {
 }
 
 /**
- * Pulls a physical rect onto the work-area edges it landed near, then clamps it
- * fully inside, so a released widget is never half off-screen. `margin` and
- * `threshold` are logical pixels and are scaled by the monitor DPI here. Pure:
- * no window access, so the geometry rules are unit-testable.
+ * Pulls a physical rect onto the work-area edges it landed near or past, then
+ * clamps it fully inside, so a released widget is never half off-screen.
+ * `margin` and `threshold` are logical pixels and are scaled by the monitor DPI
+ * here. Pure: no window access, so the geometry rules are unit-testable.
  */
 export function snapRectToWorkArea(rect: FloatingRect, monitor: FloatingMonitor, options?: { margin?: number; threshold?: number }): SnapFloatingResult {
   const scale = monitor.scaleFactor > 0 ? monitor.scaleFactor : 1;
@@ -120,10 +124,13 @@ function snapAxis(value: number, min: number, max: number, threshold: number, mi
   // reachable by clamping into the (inverted) range instead.
   if (max < min) return Math.min(Math.max(value, max), min);
   let next = value;
-  if (Math.abs(value - min) <= threshold) {
+  // At or past the edge always snaps: a drag tracks the cursor without a lower
+  // bound, so shoving the widget against a border lands it well outside any
+  // threshold band — and that overshoot is the intent to dock, not a miss.
+  if (value <= min + threshold) {
     next = min;
     edges.push(minEdge);
-  } else if (Math.abs(value - max) <= threshold) {
+  } else if (value >= max - threshold) {
     next = max;
     edges.push(maxEdge);
   }
@@ -223,7 +230,8 @@ export function parseFloatingPosition(raw: string | null): FloatingPosition | nu
  * default on `fallback` (the monitor the caller is on, so the widget opens where
  * the user is looking). `size` is logical. Docked windows store their revealed
  * (flush-to-edge, fully on-screen) point, so the same rules cover them; the
- * window tucks itself once it is up (resumeFloatingDock).
+ * window comes up as a readable capsule and tucks once the cursor has left it
+ * (resumeFloatingDock).
  */
 export function resolveFloatingPlacement(stored: FloatingPosition | null, monitors: readonly FloatingMonitor[], size: { width: number; height: number }, fallback?: FloatingMonitor): { x: number; y: number; restored: boolean } {
   if (stored) {
@@ -704,7 +712,11 @@ async function refreshFloatingDock(window: DockableWindow): Promise<void> {
 
 /**
  * Re-arms the dock for a freshly opened floating window whose stored position
- * carries an edge: it opens tucked, exactly where the user parked it.
+ * carries an edge — the user had left it parked on that edge. It opens as a full,
+ * readable capsule and only tucks once the cursor has been away for a moment: a
+ * widget the user just summoned should not greet them as a sliver. A window with
+ * no docked home (a fresh minimize) gets no dock at all and simply stays a capsule,
+ * even though the default placement sits against the edge.
  */
 export async function resumeFloatingDock(): Promise<void> {
   if (!isTauriRuntime() || !isFloatingPluginWindow()) return;
@@ -717,7 +729,7 @@ export async function resumeFloatingDock(): Promise<void> {
   const [rect, monitors] = await Promise.all([currentWindowRect(window), listMonitors()]);
   const monitor = pickMonitorForPoint(stored, monitors) ?? monitors[0];
   if (!rect || !monitor) return;
-  await dockFloatingWindow(window, stored.edge, monitor, rect, true);
+  await dockFloatingWindow(window, stored.edge, monitor, rect, false);
 }
 
 /** Resizes the calling floating window (logical pixels). */

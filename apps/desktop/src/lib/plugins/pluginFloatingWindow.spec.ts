@@ -46,10 +46,25 @@ describe("snapRectToWorkArea", () => {
     expect(result.edges).toEqual([]);
   });
 
-  it("clamps a window dragged past the edge back inside, so it can never be lost off-screen", () => {
+  it("snaps a window shoved past an edge onto that edge, so it is never lost off-screen", () => {
+    // A drag tracks the native cursor with no lower bound, so pushing the widget
+    // against a border lands the release well outside the threshold band. That
+    // overshoot is the intent to dock, and the result is still fully on screen.
     const result = snapRectToWorkArea({ x: 2400, y: -300, width: 260, height: 60 }, monitor, { margin: FLOATING_EDGE_MARGIN_PX, threshold: FLOATING_SNAP_THRESHOLD_PX });
-    expect(result.rect.x).toBe(1920 - FLOATING_EDGE_MARGIN_PX - 260);
-    expect(result.rect.y).toBe(FLOATING_EDGE_MARGIN_PX);
+    expect(result.edges).toEqual(["right", "top"]);
+    expect(result.rect).toEqual({ x: 1920 - FLOATING_EDGE_MARGIN_PX - 260, y: FLOATING_EDGE_MARGIN_PX, width: 260, height: 60 });
+  });
+
+  it("snaps anywhere along an edge, not only where the threshold band reaches", () => {
+    const shovedLeft = snapRectToWorkArea({ x: -140, y: 500, width: 260, height: 60 }, monitor, { margin: FLOATING_EDGE_MARGIN_PX, threshold: FLOATING_SNAP_THRESHOLD_PX });
+    expect(shovedLeft.edges).toEqual(["left"]);
+    expect(shovedLeft.rect.x).toBe(FLOATING_EDGE_MARGIN_PX);
+    expect(shovedLeft.rect.y).toBe(500);
+
+    const shovedBottom = snapRectToWorkArea({ x: 800, y: 1200, width: 260, height: 60 }, monitor, { margin: FLOATING_EDGE_MARGIN_PX, threshold: FLOATING_SNAP_THRESHOLD_PX });
+    expect(shovedBottom.edges).toEqual(["bottom"]);
+    expect(shovedBottom.rect.y).toBe(1040 - FLOATING_EDGE_MARGIN_PX - 60);
+    expect(shovedBottom.rect.x).toBe(800);
   });
 
   it("scales the margin and threshold by the monitor DPI, so a snap feels the same on every display", () => {
