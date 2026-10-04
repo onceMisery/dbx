@@ -170,7 +170,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="floating-plugin-window relative size-full overflow-hidden bg-transparent">
-    <PluginWorkbenchHost v-if="plugin && contribution" :plugin="plugin" :contribution="contribution" :context="hostContext" @ready="onHostReady()" @error="onHostError($event)" @close-tab="void closeWindow()" @open-workbench="onOpenWorkbench" @open-filesystem="onOpenFilesystem" />
+    <PluginWorkbenchHost v-if="plugin && contribution && !failure" :plugin="plugin" :contribution="contribution" :context="hostContext" @ready="onHostReady()" @error="onHostError($event)" @close-tab="void closeWindow()" @open-workbench="onOpenWorkbench" @open-filesystem="onOpenFilesystem" />
     <div v-else class="absolute inset-0 flex items-center justify-center p-3">
       <!-- Opaque card: an error inside a transparent window would be unreadable
            over whatever the user is working on. -->
