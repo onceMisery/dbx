@@ -1,8 +1,5 @@
-<<<<<<< ours
 import { normalizeModelTemplates, type ModelTemplate } from "@/lib/model/modelTemplates";
-=======
 import { normalizePluginGraphicsEngineIds } from "@/lib/plugins/pluginGraphicsEngine";
->>>>>>> theirs
 import { normalizePluginShortcutSettings, type PluginShortcutSettings } from "@/lib/plugins/pluginShortcuts";
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";

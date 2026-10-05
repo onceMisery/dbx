@@ -44,6 +44,7 @@ import { formatBytes } from "@/lib/database/serverMetrics";
 import type { PluginCenterFocus } from "@/lib/plugins/pluginCenterNavigation";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import type { InstalledPlugin, PluginInstallResult, PluginRepository, PluginRepositoryCatalogResult, PluginTrustedKey } from "@/types/database";
 import { useI18n } from "vue-i18n";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
@@ -85,6 +86,15 @@ const { t, locale: appLocale } = useI18n();
 const { toast } = useToast();
 const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
+const settingsStore = useSettingsStore();
+
+// A reinstall must start without consent: drop any graphics-engine (unsafe-eval) grant
+// when the plugin is uninstalled, mirroring the backend's forget_plugin_permissions.
+function forgetGraphicsEngineGrant(pluginId: string) {
+  const granted = settingsStore.editorSettings.pluginGraphicsEngineIds;
+  if (!granted.includes(pluginId)) return;
+  settingsStore.updateEditorSettings({ pluginGraphicsEngineIds: granted.filter((id) => id !== pluginId) });
+}
 const activeSection = ref<"marketplace" | "installed" | "settings">("marketplace");
 const installedPlugins = ref<InstalledPlugin[]>([]);
 const trustedKeys = ref<PluginTrustedKey[]>([]);
@@ -654,6 +664,7 @@ async function runBatchUninstall() {
       (definition) => definition.plugin.manifest.name,
       async (definition) => {
         await api.uninstallPlugin(definition.plugin.manifest.id);
+        forgetGraphicsEngineGrant(definition.plugin.manifest.id);
       },
       (definition) => definition.plugin.manifest.id,
     );
@@ -1035,6 +1046,7 @@ async function uninstallSelectedPlugin() {
   operating.value = true;
   try {
     applyInstalledPlugins(await api.uninstallPlugin(definition.plugin.manifest.id));
+    forgetGraphicsEngineGrant(definition.plugin.manifest.id);
     retireBatchFailure(definition.plugin.manifest.id);
     notifyComponentUpdatesChanged();
     window.dispatchEvent(new CustomEvent("dbx:plugins-changed"));
