@@ -3152,6 +3152,7 @@ export default withEnglishFallback({
     cut: "Вырезать",
     uncommittedBlankRow: "Незаполненная новая строка будет проигнорирована при сохранении",
     copyExtractorSqlDeletesInserts: "SQL-операторы DELETEs/INSERTs",
+    columnInfo: "Информация о столбце",
   },
   exportProgress: {
     streamingUnsupported: "Потоковый экспорт не поддерживается для этого запроса. Упростите его или используйте поддерживаемый драйвер.",
@@ -10452,6 +10453,10 @@ export default withEnglishFallback({
     shortcutSelectLineEnds: "Выделить концы строк",
     openQueryOnConnectionOpen: "Открывать страницу запроса при открытии подключения",
     openQueryOnConnectionOpenDescription: "При открытии подключения или базы данных открывается запрос default.sql. Изменения сохраняются автоматически.",
+    dataGridColumnCommentsInInfoArea: "Показывать комментарии к столбцам в информационной области",
+    dataGridColumnCommentsInInfoAreaDescription: "Переносить комментарии выбранных столбцов в нижнюю строку состояния и не отображать их в заголовке таблицы.",
+    dataGridTransposeMetadataInInfoColumn: "Отдельный информационный столбец в транспонированном представлении",
+    dataGridTransposeMetadataInInfoColumnDescription: "В транспонированном представлении данных таблицы и результатов запроса размещать тип, допустимость NULL и комментарии в отдельном информационном столбце справа от значений; имена полей остаются в одной строке.",
   },
   driverStore: {
     jreDirRemoveFailed: "Не удалось удалить старый каталог JRE: {path} (исходная ошибка: {error})",

@@ -3376,6 +3376,7 @@ export default withEnglishFallback({
     filterModeOrderReset: "คืนค่าลำดับเริ่มต้น",
     uncommittedBlankRow: "แถวใหม่ที่ยังไม่ได้กรอกจะถูกละเว้นเมื่อบันทึก",
     copyExtractorSqlDeletesInserts: "คำสั่ง SQL DELETEs/INSERTs",
+    columnInfo: "ข้อมูลคอลัมน์",
   },
   exportProgress: {
     streamingUnsupported: "ไม่รองรับการส่งออกแบบ Streaming สำหรับ Query นี้ ทำให้เรียบง่ายขึ้นหรือใช้ Driver ที่รองรับ",
@@ -10882,6 +10883,10 @@ export default withEnglishFallback({
     shortcutToggleCaseSelection: "สลับตัวพิมพ์ของการเลือก",
     shortcutConvertNamingStyle: "สลับรูปแบบการตั้งชื่อ",
     shortcutExPasteSqlInCondition: "ExPaste: วางเป็นเงื่อนไข IN",
+    dataGridColumnCommentsInInfoArea: "แสดงคำอธิบายคอลัมน์ในพื้นที่ข้อมูล",
+    dataGridColumnCommentsInInfoAreaDescription: "ย้ายคำอธิบายของคอลัมน์ที่เลือกไปยังแถบสถานะด้านล่าง และไม่แสดงในส่วนหัวอีกต่อไป",
+    dataGridTransposeMetadataInInfoColumn: "มุมมองทรานสโพสใช้คอลัมน์ข้อมูลแยกต่างหาก",
+    dataGridTransposeMetadataInInfoColumnDescription: "ในมุมมองทรานสโพสของข้อมูลตารางและผลลัพธ์คิวรี ให้วางประเภท การเป็นค่าว่างได้ และคำอธิบายไว้ในคอลัมน์ข้อมูลแยกทางด้านขวาของค่า โดยชื่อคอลัมน์คงอยู่ในบรรทัดเดียว",
   },
   driverStore: {
     jreDirRemoveFailed: "ลบไดเรกทอรี JRE เก่าไม่สำเร็จ: {path} (ข้อผิดพลาดเดิม: {error})",
