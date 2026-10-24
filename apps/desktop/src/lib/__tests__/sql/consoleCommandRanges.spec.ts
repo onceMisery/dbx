@@ -26,6 +26,21 @@ describe("SQL*Plus console command statement ranges", () => {
     }
   });
 
+  it("keeps SET CONSTRAINTS on the SQL path", () => {
+    const sql = "SET CONSTRAINTS ALL\nDEFERRED;\nSET TIMING ON\nSELECT 1;";
+    for (const databaseType of ["oracle", "yashandb"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(sql, databaseType))).toEqual(["SET CONSTRAINTS ALL\nDEFERRED", "SET TIMING ON", "SELECT 1"]);
+    }
+  });
+
+  it.each(["EXIT", "RUN", "PROMPT", "DESC", "SET"])("isolates argumentless %s before SQL", (command) => {
+    const sql = `${command}\nSELECT 1;\nSELECT 2;`;
+    for (const databaseType of ["oracle", "yashandb"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(sql, databaseType))).toEqual([command, "SELECT 1", "SELECT 2"]);
+      expect(statementRangeAtCursor(sql, sql.indexOf("SELECT 1"), databaseType)?.sql).toBe("SELECT 1");
+    }
+  });
+
   it("keeps unknown first words as SQL", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges("DESCRIPTION OF THINGS\nSELECT 1;", "oracle"))).toEqual(["DESCRIPTION OF THINGS\nSELECT 1"]);
   });

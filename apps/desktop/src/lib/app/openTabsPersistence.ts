@@ -48,6 +48,7 @@ export interface SavedOpenTab {
   externalSqlIgnoredFileVersion?: QueryTab["externalSqlIgnoredFileVersion"];
   externalSqlFileMissing?: boolean;
   lastExecutedSql?: string;
+  lastConsoleSql?: string;
   resultBaseSql?: string;
   resultSortedSql?: string;
   resultSortColumn?: string;
@@ -201,6 +202,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.externalSqlIgnoredFileVersion ? { externalSqlIgnoredFileVersion: tab.externalSqlIgnoredFileVersion } : {}),
     ...(tab.externalSqlFileMissing ? { externalSqlFileMissing: true } : {}),
     ...(tab.lastExecutedSql !== undefined ? { lastExecutedSql: tab.lastExecutedSql } : {}),
+    ...(tab.lastConsoleSql !== undefined ? { lastConsoleSql: tab.lastConsoleSql } : {}),
     ...(tab.resultBaseSql !== undefined ? { resultBaseSql: tab.resultBaseSql } : {}),
     ...(tab.resultSortedSql !== undefined ? { resultSortedSql: tab.resultSortedSql } : {}),
     ...(tab.resultSortColumn !== undefined ? { resultSortColumn: tab.resultSortColumn } : {}),
@@ -302,6 +304,7 @@ function restoreOpenTabsArray(parsed: unknown, rawActiveTabId: string | null, op
         ...tab,
         mode,
         sql: typeof tab.sql === "string" ? tab.sql : "",
+        lastConsoleSql: typeof tab.lastConsoleSql === "string" ? tab.lastConsoleSql : undefined,
         isExecuting: false,
         redisMonitorActive: false,
         isCancelling: false,

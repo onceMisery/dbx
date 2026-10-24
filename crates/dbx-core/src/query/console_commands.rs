@@ -133,9 +133,9 @@ fn resolve_console_command_locally(command: ConsoleCommand) -> ConsoleExecution 
 /// moves after `END;`: left in place it would comment out the injected `;`
 /// and break the block. `None` when nothing executable remains.
 fn exec_anonymous_block_sql(call: &str) -> Option<String> {
-    let trimmed = call.trim().trim_end_matches(';').trim_end();
-    let (body, comment) = split_trailing_line_comment(trimmed);
-    if body.trim().is_empty() {
+    let (body, comment) = split_trailing_line_comment(call.trim());
+    let body = body.trim_end_matches(';').trim_end();
+    if body.is_empty() {
         return None;
     }
     Some(match comment {
@@ -175,14 +175,16 @@ async fn describe_object(
     if object.is_empty() {
         return ConsoleExecution::Error("DESCRIBE requires an object name".to_string());
     }
-    let (owner, table) = split_owner_qualified_object(object);
-    let schema_arg = owner.or(schema).unwrap_or("");
+    let (owner, table) = split_qualified_object(object);
+    let owner = owner.map(unquote_identifier);
+    let table = unquote_identifier(table);
+    let schema_arg = owner.as_deref().or(schema).unwrap_or("");
     match crate::schema::get_columns_core_for_session_in_context(
         state,
         connection_id,
         database,
         schema_arg,
-        table,
+        &table,
         None,
         None,
     )
@@ -194,39 +196,34 @@ async fn describe_object(
     }
 }
 
-/// Split `OWNER.TABLE`; each part may be double-quoted. A dot inside a quoted
-/// name cannot be distinguished from the qualifier, matching SQL*Plus.
-fn split_owner_qualified_object(object: &str) -> (Option<&str>, &str) {
-    fn unquote(part: &str) -> &str {
-        part.trim().trim_matches('"')
-    }
-    match object.split_once('.') {
-        Some((owner, table)) => {
-            let (owner, table) = (unquote(owner), unquote(table));
-            if owner.is_empty() || table.is_empty() {
-                (None, unquote(object))
-            } else {
-                (Some(owner), table)
+/// Split at the first unquoted dot, preserving quotes for case folding.
+fn split_qualified_object(object: &str) -> (Option<&str>, &str) {
+    let mut quoted = false;
+    for (index, ch) in object.char_indices() {
+        match ch {
+            '"' => quoted = !quoted,
+            '.' if !quoted => {
+                let (owner, table) = (object[..index].trim(), object[index + 1..].trim());
+                if !owner.is_empty() && !table.is_empty() {
+                    return (Some(owner), table);
+                }
+                break;
             }
+            _ => {}
         }
-        None => (None, unquote(object)),
     }
+    (None, object.trim())
 }
 
-/// Split `SCHEMA.TABLE` keeping each part's quotes, so
-/// [`normalize_pg_identifier`] can still tell quoted identifiers (exact) from
-/// unquoted ones (lowercase-folded).
-fn split_pg_qualified_object(object: &str) -> (Option<&str>, &str) {
-    match object.split_once('.') {
-        Some((schema, table)) if !schema.trim().is_empty() && !table.trim().is_empty() => {
-            (Some(schema.trim()), table.trim())
-        }
-        _ => (None, object.trim()),
-    }
+fn unquote_identifier(identifier: &str) -> String {
+    identifier
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .map_or_else(|| identifier.to_string(), |inner| inner.replace("\"\"", "\""))
 }
 
 /// `\d [SCHEMA.]TABLE` rewrites to a pg_catalog query through the normal
-/// statement path, so search-path resolution (`current_schemas`) and type
+/// statement path, so search-path visibility and type
 /// rendering (`format_type`) behave exactly like psql. Unquoted identifiers
 /// fold to lowercase, as PostgreSQL does.
 fn psql_describe_sql(object: &str) -> Option<String> {
@@ -234,11 +231,11 @@ fn psql_describe_sql(object: &str) -> Option<String> {
     if object.is_empty() {
         return None;
     }
-    let (owner, table) = split_pg_qualified_object(object);
+    let (owner, table) = split_qualified_object(object);
     let table_literal = pg_string_literal(&normalize_pg_identifier(table));
     let schema_condition = match owner {
         Some(owner) => format!("n.nspname = {}", pg_string_literal(&normalize_pg_identifier(owner))),
-        None => "n.nspname = ANY (current_schemas(true))".to_string(),
+        None => "pg_table_is_visible(c.oid)".to_string(),
     };
     Some(format!(
         "SELECT a.attname AS \"Name\", \
@@ -262,10 +259,7 @@ fn psql_list_tables_sql(pattern: &str) -> String {
         "n.nspname NOT IN ('pg_catalog', 'information_schema')".to_string(),
         r"n.nspname NOT LIKE 'pg\_%' ESCAPE '\'".to_string(),
     ];
-    let (schema_pattern, table_pattern) = match pattern.split_once('.') {
-        Some((schema, table)) => (Some(schema.trim()), table.trim()),
-        None => (None, pattern),
-    };
+    let (schema_pattern, table_pattern) = split_qualified_object(pattern);
     match schema_pattern {
         Some(schema_pattern) => {
             conditions.push(pg_pattern_condition("n.nspname", schema_pattern));
@@ -274,8 +268,7 @@ fn psql_list_tables_sql(pattern: &str) -> String {
             }
         }
         None => {
-            // psql lists the search path unless the pattern names a schema.
-            conditions.push("n.nspname = ANY (current_schemas(false))".to_string());
+            conditions.push("pg_table_is_visible(c.oid)".to_string());
             if !table_pattern.is_empty() {
                 conditions.push(pg_pattern_condition("c.relname", table_pattern));
             }
@@ -296,11 +289,11 @@ ORDER BY n.nspname, c.relname",
 /// `column = 'value'` or `column LIKE 'va%' ESCAPE '\'` for one psql pattern.
 /// A pattern without wildcards is exact equality (with identifier folding).
 fn pg_pattern_condition(column: &str, pattern: &str) -> String {
-    if !pattern.contains('*') && !pattern.contains('?') {
+    if pattern.starts_with('"') && pattern.ends_with('"') || !pattern.contains('*') && !pattern.contains('?') {
         return format!("{column} = {}", pg_string_literal(&normalize_pg_identifier(pattern)));
     }
     let mut like = String::new();
-    for ch in pattern.chars() {
+    for ch in normalize_pg_identifier(pattern).chars() {
         match ch {
             '*' => like.push('%'),
             '?' => like.push('_'),
@@ -317,7 +310,7 @@ fn pg_pattern_condition(column: &str, pattern: &str) -> String {
 /// Unquoted PostgreSQL identifiers fold to lowercase; `"Quoted"` stay exact.
 fn normalize_pg_identifier(identifier: &str) -> String {
     if identifier.starts_with('"') && identifier.ends_with('"') && identifier.len() >= 2 {
-        identifier[1..identifier.len() - 1].to_string()
+        unquote_identifier(identifier)
     } else {
         identifier.to_lowercase()
     }
@@ -395,6 +388,8 @@ mod tests {
         );
         // A trailing line comment must not swallow the injected `;`.
         assert_eq!(exec_anonymous_block_sql("p(1) -- note"), Some("BEGIN\np(1);\nEND; -- note".to_string()));
+        assert_eq!(exec_anonymous_block_sql("p(1); -- note"), Some("BEGIN\np(1);\nEND; -- note".to_string()));
+        assert_eq!(exec_anonymous_block_sql("p('a;b');  -- note"), Some("BEGIN\np('a;b');\nEND; -- note".to_string()));
         // `--` inside a string literal is not a comment.
         assert_eq!(exec_anonymous_block_sql("f('-')"), Some("BEGIN\nf('-');\nEND;".to_string()));
         // Nothing executable left after stripping the comment.
@@ -453,12 +448,21 @@ mod tests {
 
     #[test]
     fn owner_qualified_objects_split_with_quotes() {
-        assert_eq!(split_owner_qualified_object("SCOTT.EMP"), (Some("SCOTT"), "EMP"));
-        assert_eq!(split_owner_qualified_object("emp"), (None, "emp"));
-        assert_eq!(split_owner_qualified_object("\"My Table\""), (None, "My Table"));
-        assert_eq!(split_owner_qualified_object("\"SCOTT\".\"EMP\""), (Some("SCOTT"), "EMP"));
-        assert_eq!(split_owner_qualified_object(".EMP"), (None, ".EMP"));
-        assert_eq!(split_owner_qualified_object("SCOTT."), (None, "SCOTT."));
+        for (input, owner, table) in [
+            ("SCOTT.EMP", Some("SCOTT"), "EMP"),
+            ("emp", None, "emp"),
+            ("\"My Table\"", None, "My Table"),
+            ("\"SCOTT\".\"EMP\"", Some("SCOTT"), "EMP"),
+            ("\"a.b\"", None, "a.b"),
+            ("\"a.b\".\"c.d\"", Some("a.b"), "c.d"),
+            ("\"a\"\".b\".\"c\"\".d\"", Some("a\".b"), "c\".d"),
+            (".EMP", None, ".EMP"),
+            ("SCOTT.", None, "SCOTT."),
+        ] {
+            let (actual_owner, actual_table) = split_qualified_object(input);
+            assert_eq!(actual_owner.map(unquote_identifier).as_deref(), owner, "{input}");
+            assert_eq!(unquote_identifier(actual_table), table, "{input}");
+        }
     }
 
     #[test]
@@ -490,13 +494,21 @@ mod tests {
     fn psql_describe_rewrites_to_pg_catalog_query() {
         let sql = psql_describe_sql("emp").unwrap();
         assert!(sql.contains("c.relname = 'emp'"));
-        assert!(sql.contains("current_schemas(true)"));
+        assert!(sql.contains("pg_table_is_visible(c.oid)"));
+        assert!(!sql.contains("current_schemas"));
         assert!(sql.contains("format_type(a.atttypid, a.atttypmod)"));
         let qualified = psql_describe_sql("public.EMP").unwrap();
         assert!(qualified.contains("n.nspname = 'public'"));
         assert!(qualified.contains("c.relname = 'emp'"), "unquoted names fold to lowercase");
+        assert!(!qualified.contains("pg_table_is_visible"));
         let quoted = psql_describe_sql("\"MyTable\"").unwrap();
         assert!(quoted.contains("c.relname = 'MyTable'"));
+        let quoted_dot = psql_describe_sql("\"a.b\"").unwrap();
+        assert!(quoted_dot.contains("c.relname = 'a.b'"));
+        assert!(quoted_dot.contains("pg_table_is_visible(c.oid)"));
+        let qualified_quotes = psql_describe_sql("\"a\"\".b\".\"c\"\".d\"").unwrap();
+        assert!(qualified_quotes.contains("n.nspname = 'a\".b'"));
+        assert!(qualified_quotes.contains("c.relname = 'c\".d'"));
         let escaped = psql_describe_sql("it's").unwrap();
         assert!(escaped.contains("c.relname = 'it''s'"));
         assert!(psql_describe_sql("").is_none());
@@ -505,10 +517,11 @@ mod tests {
     #[test]
     fn psql_list_tables_handles_patterns() {
         let plain = psql_list_tables_sql("");
-        assert!(plain.contains("current_schemas(false)"));
+        assert!(plain.contains("pg_table_is_visible(c.oid)"));
         assert!(plain.contains("c.relkind IN ('r', 'p', 'v', 'm', 'f')"));
         let pattern = psql_list_tables_sql("t*");
         assert!(pattern.contains(r"c.relname LIKE 't%' ESCAPE '\'"));
+        assert!(psql_list_tables_sql("EMP*").contains("c.relname LIKE 'emp%'"));
         let escaped_wildcards = psql_list_tables_sql("100%*");
         assert!(escaped_wildcards.contains(r"c.relname LIKE '100\%%' ESCAPE '\'"));
         // Patterns without psql wildcards match exactly, keeping % literal.
@@ -520,5 +533,10 @@ mod tests {
         assert!(qualified.contains("n.nspname = 'public'"));
         assert!(qualified.contains(r"c.relname LIKE 't_x' ESCAPE '\'"));
         assert!(!qualified.contains("current_schemas"));
+        assert!(!qualified.contains("pg_table_is_visible"));
+        let quoted = psql_list_tables_sql("\"a.b\".\"c\"\".d\"");
+        assert!(quoted.contains("n.nspname = 'a.b'"));
+        assert!(quoted.contains("c.relname = 'c\".d'"));
+        assert!(psql_list_tables_sql("\"a.*\"").contains("c.relname = 'a.*'"));
     }
 }

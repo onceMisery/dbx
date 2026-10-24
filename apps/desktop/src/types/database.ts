@@ -2519,6 +2519,8 @@ export interface QueryTab {
   externalSqlFileMissing?: boolean;
   originalSql?: string;
   lastExecutedSql?: string;
+  /** Last successful single statement for SQL*Plus `/`, not the submitted batch. */
+  lastConsoleSql?: string;
   resultBaseSql?: string;
   /** Fingerprint of the complete editor document when the displayed result started. */
   resultEditorFingerprint?: string;

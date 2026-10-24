@@ -13919,6 +13919,29 @@ for line in sys.stdin:
         }
 
         #[tokio::test]
+        async fn sqlplus_server_statements_keep_their_sql_semantics() {
+            let (state, commands, _directory) = console_state(DatabaseType::Oracle).await;
+            let results = execute_multi_core_with_options_for_client_and_progress_typed(
+                &state,
+                "conn-1",
+                "",
+                "SET CONSTRAINTS ALL DEFERRED;\nEXEC p(1); -- note\nSELECT 1;",
+                None,
+                None,
+                QueryExecutionOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(results.len(), 3);
+            assert!(results.iter().all(|result| !result.execution_error));
+            let recorded = commands.lock().unwrap();
+            assert!(recorded.iter().any(|sql| sql == "SET CONSTRAINTS ALL DEFERRED"), "{recorded:?}");
+            assert!(recorded.iter().any(|sql| sql == "BEGIN\np(1);\nEND; -- note"), "{recorded:?}");
+        }
+
+        #[tokio::test]
         async fn sqlplus_client_side_commands_resolve_without_touching_the_pool() {
             let (state, commands, _directory) = console_state(DatabaseType::Oracle).await;
             let results = execute_multi_core_with_options_for_client_and_progress_typed(

@@ -2853,6 +2853,7 @@ export const useQueryStore = defineStore("query", () => {
       externalSqlIgnoredFileVersion: t.externalSqlIgnoredFileVersion,
       externalSqlFileMissing: t.externalSqlFileMissing,
       lastExecutedSql: t.lastExecutedSql,
+      lastConsoleSql: t.lastConsoleSql,
       resultBaseSql: t.resultBaseSql,
       resultSortedSql: t.resultSortedSql,
       resultSortColumn: t.resultSortColumn,
@@ -5785,6 +5786,7 @@ export const useQueryStore = defineStore("query", () => {
       tab.detachedConnectionName = undefined;
       if (tab.connectionId === connectionId) continue;
       tab.connectionId = connectionId;
+      tab.lastConsoleSql = undefined;
       if (fallbackDatabase && !tab.database?.trim()) tab.database = fallbackDatabase;
       rebound += 1;
     }
@@ -6497,6 +6499,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.objectBrowser = undefined;
     clearResultPayload(tab);
     tab.lastExecutedSql = undefined;
+    tab.lastConsoleSql = undefined;
     tab.resultBaseSql = undefined;
     tab.resultSortedSql = undefined;
     clearExplain(tab);
@@ -6532,6 +6535,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.objectBrowser = undefined;
     clearResultPayload(tab);
     tab.lastExecutedSql = undefined;
+    tab.lastConsoleSql = undefined;
     tab.resultBaseSql = undefined;
     tab.resultSortedSql = undefined;
     clearExplain(tab);
@@ -6561,6 +6565,7 @@ export const useQueryStore = defineStore("query", () => {
       tab.resultSortedSql = undefined;
       clearExplain(tab);
     }
+    tab.lastConsoleSql = undefined;
     tab.schema = schema;
     // 只有显式选择才允许参与 SQL Server 的未限定表名改写；隐式来源（连接默认、
     // 恢复的页签、保存的 SQL、外部文件）只更新浏览/补全上下文。
@@ -6585,6 +6590,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.schemaQualifiesSql = undefined;
     clearResultPayload(tab);
     tab.lastExecutedSql = undefined;
+    tab.lastConsoleSql = undefined;
     tab.resultBaseSql = undefined;
     tab.resultSortedSql = undefined;
     clearExplain(tab);
@@ -7895,11 +7901,9 @@ export const useQueryStore = defineStore("query", () => {
     assertUpdateAllowsInteraction();
     const tab = findExecutionTab(id);
     if (!tab || !sqlInput.trim()) return;
-    // SQL*Plus rerun: a script that is only a `/` re-executes the tab's last
-    // statement. The backend splitter deliberately drops redundant `/` lines
-    // (re-running them would double-execute DML), so the substitution happens
-    // here before dispatch.
-    const sql = sqlInput.trim() === "/" && isConsoleCommandDatabaseType(effectiveDatabaseTypeForConnection(useConnectionStore().getConfig(tab.connectionId))) && tab.lastExecutedSql ? tab.lastExecutedSql : sqlInput;
+    // Keep the console buffer separate from lastExecutedSql, which may contain
+    // an entire batch or statements that failed or were skipped after EXIT.
+    const sql = sqlInput.trim() === "/" && isConsoleCommandDatabaseType(effectiveDatabaseTypeForConnection(useConnectionStore().getConfig(tab.connectionId))) && tab.lastConsoleSql ? tab.lastConsoleSql : sqlInput;
     if (tab.typeManagementDraft || isOracleFamilyTypeSource(effectiveDatabaseTypeForConnection(useConnectionStore().getConfig(tab.connectionId)), tab.objectSource?.objectType)) throw new Error(t("objects.typeManagementUseSave"));
     if (pendingResultRunPreparations.has(tab)) return false;
 
@@ -9238,6 +9242,13 @@ export const useQueryStore = defineStore("query", () => {
         };
       }
       reconcileBatchSqlResults(tab, executionId, results);
+      if (tab.mode === "query" && !usesExternalExecutionTarget && isConsoleCommandDatabaseType(effectiveDbType) && !options?.pagination?.sessionId) {
+        for (const result of results) {
+          if (!result.execution_error && result.sourceStatement && !/^(?:EXIT|QUIT|RUN)\b/i.test(result.sourceStatement)) {
+            tab.lastConsoleSql = result.sourceStatement;
+          }
+        }
+      }
       // Sticky proven-read-only aggregation (Oracle/OceanBase-Oracle/MySQL/PG).
       // Only the initial manual execution participates: a later cursor-page
       // fetch (pagination.sessionId present) must neither set nor clear the

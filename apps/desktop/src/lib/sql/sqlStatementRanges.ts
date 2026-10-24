@@ -389,8 +389,8 @@ const CONSOLE_COMMAND_VERBS = new Set([
   "WHENEVER",
   "XQUERY",
 ]);
-// `SET TRANSACTION|ROLE|CONSTRAINT` is server SQL, not a console command.
-const CONSOLE_SET_SERVER_SQL_FOLLOWERS = new Set(["TRANSACTION", "ROLE", "CONSTRAINT"]);
+// `SET TRANSACTION|ROLE|CONSTRAINT[S]` is server SQL, not a console command.
+const CONSOLE_SET_SERVER_SQL_FOLLOWERS = new Set(["TRANSACTION", "ROLE", "CONSTRAINT", "CONSTRAINTS"]);
 
 export function isConsoleCommandDatabaseType(databaseType?: DatabaseType): boolean {
   return !!databaseType && CONSOLE_COMMAND_DATABASES.has(databaseType);

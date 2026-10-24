@@ -1751,7 +1751,9 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
                 let word_start = i - line.len();
                 if !has_executable_sql_with_options(&sql[start..word_start.max(start)], options) {
                     console_capture = Some(word_start);
-                    i += ch.len_utf8();
+                    if ch != '\n' {
+                        i += ch.len_utf8();
+                    }
                     continue;
                 }
             }
@@ -6660,6 +6662,40 @@ SELECT 1;";
             split_sql_statements_for_database(sql, DatabaseType::Oracle),
             vec!["SET TRANSACTION READ ONLY", "SET TIMING ON", "SELECT 1"]
         );
+    }
+
+    #[test]
+    fn set_constraints_stays_server_sql_next_to_console_commands() {
+        let sql = "SET CONSTRAINTS ALL DEFERRED;\nSET TIMING ON\nSELECT 1;";
+        for database in [DatabaseType::Oracle, DatabaseType::Yashandb] {
+            assert_eq!(
+                split_sql_statements_for_database(sql, database),
+                vec!["SET CONSTRAINTS ALL DEFERRED", "SET TIMING ON", "SELECT 1"]
+            );
+            assert_eq!(find_statement_at_cursor_for_database(sql, 0, database), "SET CONSTRAINTS ALL DEFERRED");
+        }
+    }
+
+    #[test]
+    fn argumentless_console_lines_finish_before_the_next_statement_at_cursor() {
+        for database in [DatabaseType::Oracle, DatabaseType::Yashandb] {
+            for newline in ["\n", "\r\n"] {
+                for command in ["EXIT", "RUN", "PROMPT", "DESC", "SET"] {
+                    let sql = format!("{command}{newline}SELECT 1 FROM DUAL;{newline}SELECT 2 FROM DUAL;");
+                    assert_eq!(
+                        split_sql_statements_for_database(&sql, database),
+                        vec![command, "SELECT 1 FROM DUAL", "SELECT 2 FROM DUAL"]
+                    );
+                    assert_eq!(find_statement_at_cursor_for_database(&sql, 0, database), command);
+                    for statement in ["SELECT 1 FROM DUAL", "SELECT 2 FROM DUAL"] {
+                        assert_eq!(
+                            find_statement_at_cursor_for_database(&sql, sql.find(statement).unwrap(), database),
+                            statement
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

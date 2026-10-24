@@ -223,7 +223,7 @@ pub fn is_console_command_word(word: &str) -> bool {
 }
 
 /// `SET` alone or with an unknown option stays client-side (SQL*Plus reports
-/// SP2-0158); `SET TRANSACTION|ROLE|CONSTRAINT` is server SQL and returns
+/// SP2-0158); `SET TRANSACTION|ROLE|CONSTRAINT[S]` is server SQL and returns
 /// `None` so the normal executor handles it.
 fn parse_set_command(rest: &str) -> Option<ConsoleCommand> {
     if rest.is_empty() {
@@ -232,7 +232,7 @@ fn parse_set_command(rest: &str) -> Option<ConsoleCommand> {
     let (option, value) = split_first_word(rest);
     let upper = option.to_ascii_uppercase();
     match upper.as_str() {
-        "TRANSACTION" | "ROLE" | "CONSTRAINT" => None,
+        "TRANSACTION" | "ROLE" | "CONSTRAINT" | "CONSTRAINTS" => None,
         _ if SQLPLUS_SET_OPTIONS.contains(&upper.as_str()) => {
             Some(ConsoleCommand::SetOption { option: upper.to_string(), value: value.trim().to_string() })
         }
@@ -323,6 +323,7 @@ mod tests {
         assert_eq!(parse("SET TRANSACTION READ ONLY"), None);
         assert_eq!(parse("SET ROLE DBA"), None);
         assert_eq!(parse("SET CONSTRAINT ALL IMMEDIATE"), None);
+        assert_eq!(parse("SET CONSTRAINTS ALL DEFERRED;"), None);
         // Unknown SET option is a client-side skip, like SQL*Plus SP2-0158.
         assert_eq!(parse("SET BOGUS 1"), Some(ConsoleCommand::Unsupported { verb: "SET".into() }));
         assert_eq!(parse("SET"), Some(ConsoleCommand::Unsupported { verb: "SET".into() }));

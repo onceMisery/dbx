@@ -2375,6 +2375,10 @@ mod tests {
             classify_sql_risk_for_database("SET TRANSACTION READ ONLY", DatabaseType::Oracle).unwrap(),
             SqlRisk::ReadOnly
         );
+        assert_ne!(
+            classify_sql_risk_for_database("SET CONSTRAINTS ALL DEFERRED", DatabaseType::Oracle).unwrap(),
+            SqlRisk::ReadOnly
+        );
         // Databases without console syntax are unaffected.
         assert_eq!(classify_sql_risk_for_database("DESC emp", DatabaseType::Mysql).unwrap(), SqlRisk::ReadOnly);
     }
