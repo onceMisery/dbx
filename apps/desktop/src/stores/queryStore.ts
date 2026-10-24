@@ -119,7 +119,7 @@ import { appendLargeValueCells, canUseTableDataLargeValuePreview, remapLargeValu
 import { simpleDataGridOrderByReferencesMissingColumn, sortDataGridRowIndexes, type DataGridSortDirection } from "@/lib/dataGrid/dataGridSort";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { agentProtocolQueryResultMaxRows, capQueryResultTotal, effectiveQueryResultMaxRows, limitQueryPagination, queryResultLimitReached } from "@/lib/dataGrid/queryResultRowLimit";
-import { elasticsearchRestRequestRanges, executableStatementRanges, splitSqlStatementRanges, sqlStatementParameterOptionsForCompatibility, stripMysqlClientDisplayCommand } from "@/lib/sql/sqlStatementRanges";
+import { elasticsearchRestRequestRanges, executableStatementRanges, isConsoleCommandDatabaseType, splitSqlStatementRanges, sqlStatementParameterOptionsForCompatibility, stripMysqlClientDisplayCommand } from "@/lib/sql/sqlStatementRanges";
 import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
 import { replaceSqlServerLeadingUseQuery, sqlServerLeadingUseScript, switchesDatabaseWithUseStatement, useDatabaseFromStatement } from "@/lib/sql/sqlCompletionLookupTarget";
 import { classifySqlRisk } from "@/lib/sql/sqlRisk";
@@ -7854,7 +7854,7 @@ export const useQueryStore = defineStore("query", () => {
 
   async function executeTabSql(
     id: string,
-    sql: string,
+    sqlInput: string,
     options?: {
       resultBaseSql?: string;
       resultSortedSql?: string | undefined;
@@ -7894,7 +7894,12 @@ export const useQueryStore = defineStore("query", () => {
   ) {
     assertUpdateAllowsInteraction();
     const tab = findExecutionTab(id);
-    if (!tab || !sql.trim()) return;
+    if (!tab || !sqlInput.trim()) return;
+    // SQL*Plus rerun: a script that is only a `/` re-executes the tab's last
+    // statement. The backend splitter deliberately drops redundant `/` lines
+    // (re-running them would double-execute DML), so the substitution happens
+    // here before dispatch.
+    const sql = sqlInput.trim() === "/" && isConsoleCommandDatabaseType(effectiveDatabaseTypeForConnection(useConnectionStore().getConfig(tab.connectionId))) && tab.lastExecutedSql ? tab.lastExecutedSql : sqlInput;
     if (tab.typeManagementDraft || isOracleFamilyTypeSource(effectiveDatabaseTypeForConnection(useConnectionStore().getConfig(tab.connectionId)), tab.objectSource?.objectType)) throw new Error(t("objects.typeManagementUseSave"));
     if (pendingResultRunPreparations.has(tab)) return false;
 

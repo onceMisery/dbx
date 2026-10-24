@@ -830,6 +830,12 @@ const ORACLE_SQL_KEYWORDS = Array.from(
   ]),
 );
 
+// SQL*Plus console commands the backend executes client-side (dbx-sql-core
+// console_command.rs). Offered only for the clients whose syntax they are;
+// oceanbase-oracle and the rest of the Oracle family stay plain SQL there.
+const SQLPLUS_CONSOLE_COMPLETION_WORDS = ["DESC", "DESCRIBE", "EXEC", "EXECUTE", "PROMPT", "SHOW", "SHOW USER", "SPOOL", "EXIT", "QUIT", "RUN"];
+const ORACLE_WITH_CONSOLE_SQL_KEYWORDS = [...ORACLE_SQL_KEYWORDS, ...SQLPLUS_CONSOLE_COMPLETION_WORDS];
+
 const DATABASE_SQL_KEYWORDS: Partial<Record<DatabaseType, string[]>> = {
   mysql: MYSQL_SQL_KEYWORDS,
   postgres: POSTGRES_SQL_KEYWORDS,
@@ -847,7 +853,8 @@ const DATABASE_SQL_KEYWORDS: Partial<Record<DatabaseType, string[]>> = {
   "cloudflare-d1": SQLITE_SQL_KEYWORDS,
   sqlserver: SQLSERVER_SQL_KEYWORDS,
   spanner: SPANNER_SQL_KEYWORDS,
-  oracle: ORACLE_SQL_KEYWORDS,
+  oracle: ORACLE_WITH_CONSOLE_SQL_KEYWORDS,
+  yashandb: ORACLE_WITH_CONSOLE_SQL_KEYWORDS,
   "oceanbase-oracle": ORACLE_SQL_KEYWORDS,
   manticoresearch: MANTICORESEARCH_SQL_KEYWORDS,
   duckdb: ["COMMENT", ...DUCKDB_SQL_KEYWORDS],
