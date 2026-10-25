@@ -822,6 +822,13 @@ export default {
     logoutDescription: "End the current session and return to the login page",
     logoutConfirm: "Are you sure you want to log out?",
   },
+  console: {
+    title: "Command Console",
+    welcome: "Connected to {name}. Type SQL or client commands and press Enter; unfinished statements continue with ->; EXIT quits. Up/Down browses history, Ctrl+C cancels or clears.",
+    noPreviousStatement: "No previous statement to re-execute.",
+    running: "running…",
+    unsupportedType: "This connection type does not support the SQL command console",
+  },
   toolbar: {
     fileEncoding: "File encoding",
     encodingAuto: "Auto",

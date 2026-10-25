@@ -32,6 +32,11 @@ describe("openTabsPersistence originalSql round-trip", () => {
     expect(restored.lastConsoleSql).toBeUndefined();
   });
 
+  it("does not persist console tabs (terminal history is session-scoped)", () => {
+    const saved = serializeOpenTabs([queryTab({ id: "c1-tab", mode: "console", title: "10.0.0.9 - console" })]);
+    expect(saved).toEqual([]);
+  });
+
   it("preserves retained result source connections independently of the editor connection", () => {
     const base = { title: "Result", sequence: 1, sql: "SELECT 1", createdAt: 1 };
     const [restored] = roundTrip([

@@ -2622,6 +2622,7 @@ export interface QueryTab {
   mode:
     | "data"
     | "query"
+    | "console"
     | "redis"
     | "redis-dashboard"
     | "mongo"

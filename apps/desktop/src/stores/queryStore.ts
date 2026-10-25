@@ -120,6 +120,7 @@ import { simpleDataGridOrderByReferencesMissingColumn, sortDataGridRowIndexes, t
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { agentProtocolQueryResultMaxRows, capQueryResultTotal, effectiveQueryResultMaxRows, limitQueryPagination, queryResultLimitReached } from "@/lib/dataGrid/queryResultRowLimit";
 import { elasticsearchRestRequestRanges, executableStatementRanges, isConsoleCommandDatabaseType, splitSqlStatementRanges, sqlStatementParameterOptionsForCompatibility, stripMysqlClientDisplayCommand } from "@/lib/sql/sqlStatementRanges";
+import { consoleEntriesForResult, consoleStatementComplete, echoCommandText, supportsSqlConsole, type ConsoleEntry } from "@/lib/console/consoleFormat";
 import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
 import { replaceSqlServerLeadingUseQuery, sqlServerLeadingUseScript, switchesDatabaseWithUseStatement, useDatabaseFromStatement } from "@/lib/sql/sqlCompletionLookupTarget";
 import { classifySqlRisk } from "@/lib/sql/sqlRisk";
@@ -4985,6 +4986,7 @@ export const useQueryStore = defineStore("query", () => {
     if (idx < 0) return;
     persistSavedSqlEditorPosition(tabs.value[idx]);
     if (tab.mode === "sqlserver-trace") void disposeSqlServerActivityTrace(tab.id);
+    resetConsoleSession(id);
     clearDataGridPendingSnapshotsForTab(id);
     beginClosingDataGridViewSnapshotsForTab(id);
     beginClosingBrowserState(id);
@@ -5443,6 +5445,7 @@ export const useQueryStore = defineStore("query", () => {
     }
     closingTabs.forEach((tab) => {
       if (tab.mode === "sqlserver-trace") void disposeSqlServerActivityTrace(tab.id);
+      resetConsoleSession(tab.id);
       clearDataGridPendingSnapshotsForTab(tab.id);
       beginClosingDataGridViewSnapshotsForTab(tab.id);
       beginClosingBrowserState(tab.id);
@@ -5787,6 +5790,7 @@ export const useQueryStore = defineStore("query", () => {
       if (tab.connectionId === connectionId) continue;
       tab.connectionId = connectionId;
       tab.lastConsoleSql = undefined;
+      resetConsoleSession(tab.id);
       if (fallbackDatabase && !tab.database?.trim()) tab.database = fallbackDatabase;
       rebound += 1;
     }
@@ -6500,6 +6504,7 @@ export const useQueryStore = defineStore("query", () => {
     clearResultPayload(tab);
     tab.lastExecutedSql = undefined;
     tab.lastConsoleSql = undefined;
+    resetConsoleSession(tab.id);
     tab.resultBaseSql = undefined;
     tab.resultSortedSql = undefined;
     clearExplain(tab);
@@ -6536,6 +6541,7 @@ export const useQueryStore = defineStore("query", () => {
     clearResultPayload(tab);
     tab.lastExecutedSql = undefined;
     tab.lastConsoleSql = undefined;
+    resetConsoleSession(tab.id);
     tab.resultBaseSql = undefined;
     tab.resultSortedSql = undefined;
     clearExplain(tab);
@@ -6566,6 +6572,7 @@ export const useQueryStore = defineStore("query", () => {
       clearExplain(tab);
     }
     tab.lastConsoleSql = undefined;
+    resetConsoleSession(tab.id);
     tab.schema = schema;
     // 只有显式选择才允许参与 SQL Server 的未限定表名改写；隐式来源（连接默认、
     // 恢复的页签、保存的 SQL、外部文件）只更新浏览/补全上下文。
@@ -6591,6 +6598,7 @@ export const useQueryStore = defineStore("query", () => {
     clearResultPayload(tab);
     tab.lastExecutedSql = undefined;
     tab.lastConsoleSql = undefined;
+    resetConsoleSession(tab.id);
     tab.resultBaseSql = undefined;
     tab.resultSortedSql = undefined;
     clearExplain(tab);
@@ -7855,6 +7863,197 @@ export const useQueryStore = defineStore("query", () => {
       if (isolatedClientSessionId) {
         void closeClientSessionId(target.connectionId, target.database, isolatedClientSessionId, target.catalog, { tabId: tab.id });
       }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Navicat-style command console (命令列界面): one terminal tab per connection
+  // scope. Session state lives here (not persisted); execution reuses the same
+  // executeMulti path as the query editor, which includes the SQL*Plus/psql
+  // console-command dispatch in dbx-core.
+  // ---------------------------------------------------------------------------
+
+  interface ConsoleSession {
+    /** Terminal scrollback (echoed commands, output, errors, notices). */
+    entries: ConsoleEntry[];
+    /** Lines typed so far that have not run yet (statement incomplete). */
+    buffer: string;
+    /** Successfully submitted statements, oldest first. */
+    history: string[];
+    /** Position while browsing history; -1 = not browsing. */
+    historyIndex: number;
+    /** Input captured when history browsing started (restore on ↓ past end). */
+    pendingInput: string;
+    /** Last statement that produced a non-error result: `/` and RUN target. */
+    lastGoodSql?: string;
+    isExecuting: boolean;
+    executionId?: string;
+  }
+
+  const consoleSessions = reactive(new Map<string, ConsoleSession>());
+
+  function consoleSessionFor(tabId: string): ConsoleSession {
+    let session = consoleSessions.get(tabId);
+    if (!session) {
+      session = { entries: [], buffer: "", history: [], historyIndex: -1, lastGoodSql: undefined, isExecuting: false, executionId: undefined, pendingInput: "" };
+      consoleSessions.set(tabId, session);
+    }
+    return consoleSessions.get(tabId)!;
+  }
+
+  function resetConsoleSession(tabId: string) {
+    const session = consoleSessions.get(tabId);
+    if (!session) return;
+    if (session.executionId) void cancelConsoleStatement(tabId);
+    consoleSessions.delete(tabId);
+    const tab = tabs.value.find((candidate) => candidate.id === tabId);
+    if (tab?.mode === "console" && tab.executionId === session.executionId) {
+      tab.isExecuting = false;
+      tab.isCancelling = false;
+      tab.executionId = undefined;
+      tab.queryExecutionStartedAt = undefined;
+    }
+  }
+
+  function openConsoleTab(options: { connectionId: string; database: string; schema?: string; catalog?: string }) {
+    const conn = useConnectionStore().getConfig(options.connectionId);
+    if (!conn) return;
+    const hostLabel = conn.host || conn.name;
+    const id = createTab(options.connectionId, options.database, `${hostLabel} - ${t("console.title")}`, "console", options.schema, "", options.catalog);
+    const session = consoleSessionFor(id);
+    if (session.entries.length === 0) {
+      session.entries.push({ kind: "notice", text: t("console.welcome", { name: `${conn.name} (${hostLabel})` }) });
+    }
+    return id;
+  }
+
+  async function executeConsoleStatement(tabId: string, line: string) {
+    assertUpdateAllowsInteraction();
+    const tab = tabs.value.find((t) => t.id === tabId);
+    if (!tab || tab.mode !== "console") return;
+    const session = consoleSessionFor(tabId);
+    if (session.isExecuting) return;
+    const connStore = useConnectionStore();
+    const conn = connStore.getConfig(tab.connectionId);
+    const dbType = effectiveDatabaseTypeForConnection(conn);
+    if (!supportsSqlConsole(dbType)) return;
+    const parameterOptions = sqlStatementParameterOptionsForCompatibility(dbType, dbType === "opengauss" ? connStore.databaseCompatibilityMode(tab.connectionId, tab.database || conn?.database) : conn?.database_info?.compatibilityMode);
+    const trimmedLine = line.trim();
+    if (!trimmedLine && !session.buffer) return;
+    session.buffer = session.buffer ? `${session.buffer}\n${line}` : line;
+
+    // History: every submitted line joins once the statement completes; the
+    // buffer itself is what history navigates.
+    if (!consoleStatementComplete(session.buffer, dbType, parameterOptions)) return;
+
+    const statement = session.buffer;
+    session.buffer = "";
+    // Separate requests do not share a backend SQL buffer: rerun only the
+    // last successful statement retained by this console session.
+    let effectiveSql = statement;
+    const isRerun = /^(?:\/|RUN)\s*;?\s*$/i.test(statement);
+    if (isRerun) {
+      if (!session.lastGoodSql) {
+        session.entries.push({ kind: "error", text: t("console.noPreviousStatement") });
+        return;
+      }
+      effectiveSql = session.lastGoodSql;
+    }
+    session.entries.push({ kind: "command", text: isRerun ? `${echoCommandText(statement, dbType)} → ${effectiveSql}` : echoCommandText(statement, dbType) });
+    if (!isRerun) {
+      const historyTail = session.history[session.history.length - 1];
+      if (historyTail !== statement) session.history.push(statement);
+      session.historyIndex = -1;
+    }
+
+    session.isExecuting = true;
+    const executionId = uuid();
+    session.executionId = executionId;
+    tab.isExecuting = true;
+    tab.isCancelling = false;
+    tab.executionId = executionId;
+    tab.queryExecutionStartedAt = Date.now();
+    const targetEpoch = manualTransactionTargetEpoch(tab);
+    const cancelRequestCount = tab.cancelRequestCount ?? 0;
+    const isCurrent = () => tabs.value.includes(tab) && consoleSessions.get(tabId) === session && tab.executionId === executionId && manualTransactionTargetEpoch(tab) === targetEpoch;
+    let exitAcknowledged = false;
+    try {
+      const results = await api.executeMulti(tab.connectionId, tab.database, effectiveSql, tab.schema, executionId, {
+        maxRows: effectiveQueryResultMaxRows(settingsStore.editorSettings.queryResultMaxRowsEnabled, settingsStore.editorSettings.queryResultMaxRows),
+        // Pin every console statement to one physical connection (the same
+        // tab-scoped session the query editor uses): session state — `USE db`,
+        // SET variables, temp tables — must survive between submissions.
+        // The existing closeClientConnectionSession cleanup releases this
+        // exact id when the tab closes or its context changes.
+        clientSessionId: tab.id,
+        preserveExplicitTransaction: true,
+        timeoutSecs: queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs),
+        ...(tab.catalog ? { catalog: tab.catalog } : {}),
+      });
+      if (!isCurrent() || (tab.cancelRequestCount ?? 0) !== cancelRequestCount) return;
+      applyAutoCommitTransactionReport(tab, results);
+      const statements = splitSqlStatementRanges(effectiveSql, dbType, parameterOptions);
+      for (const [index, result] of results.entries()) {
+        for (const entry of consoleEntriesForResult(result)) session.entries.push(entry);
+        const statementIndex = result.statement_index ?? (statements.length === 1 ? 0 : results.length === statements.length ? index : undefined);
+        const source = statementIndex === undefined ? undefined : statements[statementIndex];
+        if (!result.execution_error && source && !/^(?:EXIT|QUIT|RUN)\b/i.test(source.sql)) {
+          session.lastGoodSql = statements.length === 1 ? effectiveSql : source.sql;
+        }
+        if (!result.execution_error && /^(?:EXIT|QUIT)\s*;?\s*$/i.test(effectiveSql.trim())) exitAcknowledged = true;
+      }
+    } catch (error) {
+      if (isCurrent()) session.entries.push({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      session.isExecuting = false;
+      session.executionId = undefined;
+      if (isCurrent()) {
+        tab.isExecuting = false;
+        tab.isCancelling = false;
+        tab.executionId = undefined;
+        tab.queryExecutionStartedAt = undefined;
+        if (exitAcknowledged) closeTab(tabId, { force: true });
+      }
+    }
+  }
+
+  function consoleHistoryNavigate(tabId: string, direction: -1 | 1, currentInput: string): { text: string; fromHistory: boolean } {
+    const session = consoleSessionFor(tabId);
+    if (session.history.length === 0) return { text: currentInput, fromHistory: false };
+    let index = session.historyIndex;
+    if (direction === -1) {
+      if (index === -1) {
+        session.pendingInput = currentInput;
+        index = session.history.length - 1;
+      } else if (index > 0) {
+        index -= 1;
+      }
+    } else {
+      if (index === -1) return { text: currentInput, fromHistory: false };
+      index += 1;
+      if (index >= session.history.length) {
+        session.historyIndex = -1;
+        return { text: session.pendingInput ?? "", fromHistory: false };
+      }
+    }
+    session.historyIndex = index;
+    return { text: session.history[index] ?? "", fromHistory: true };
+  }
+
+  async function cancelConsoleStatement(tabId: string): Promise<boolean> {
+    const session = consoleSessions.get(tabId);
+    const tab = tabs.value.find((candidate) => candidate.id === tabId);
+    if (!session?.executionId || !tab || tab.isCancelling) return false;
+    const executionId = session.executionId;
+    tab.isCancelling = true;
+    tab.cancelRequestCount = (tab.cancelRequestCount ?? 0) + 1;
+    session.entries.push({ kind: "notice", text: "^C" });
+    try {
+      return await api.cancelQuery(executionId);
+    } catch {
+      return false;
+    } finally {
+      if (tab.executionId === executionId) tab.isCancelling = false;
     }
   }
 
@@ -10093,6 +10292,7 @@ export const useQueryStore = defineStore("query", () => {
   async function cancelTabExecution(id: string) {
     const tab = findExecutionTab(id);
     if (!tab || !canCancelQueryExecution(tab)) return false;
+    if (tab.mode === "console") return cancelConsoleStatement(id);
 
     const executionId = tab.executionId;
     if (!executionId) return false;
@@ -11033,6 +11233,11 @@ export const useQueryStore = defineStore("query", () => {
     requiresAppCloseDraftPersist,
     isConfirmingAppClose,
     createTab,
+    openConsoleTab,
+    consoleSessionFor,
+    executeConsoleStatement,
+    consoleHistoryNavigate,
+    cancelConsoleStatement,
     openObjectSourceTab,
     openObjectSourceTabPending,
     retryObjectSourceTab,

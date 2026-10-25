@@ -446,6 +446,12 @@ function startsConsoleCommandLine(sql: string, index: number): boolean {
   return true;
 }
 
+export function isConsoleCommandLine(line: string, databaseType?: DatabaseType): boolean {
+  const text = line.trim();
+  if (!text || text.includes("\n")) return false;
+  return isConsoleCommandDatabaseType(databaseType) ? startsConsoleCommandLine(text, 0) : !!databaseType && PSQL_CONSOLE_DATABASES.has(databaseType) && startsPsqlConsoleCommandLine(text, 0);
+}
+
 const MYSQL_ROUTINE_BLOCK_DATABASES: ReadonlySet<DatabaseType> = new Set(["mysql", "doris", "starrocks", "manticoresearch", "goldendb"]);
 // PostgreSQL/openGauss are also the connection types users pick for GaussDB/openGauss instances
 // running in Oracle (A) compatibility mode, where a routine body is written in Oracle style
@@ -519,10 +525,19 @@ function isAsciiAlphanumeric(ch: string): boolean {
  * whitespace are excluded so editor highlights stay tight).
  */
 export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): RawStatement[] {
+  return scanSqlStatementRanges(sql, databaseType, parameterOptions).statements;
+}
+
+/** Interactive input must end outside quotes/comments/blocks at a client delimiter. */
+export function isSqlInputComplete(sql: string, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): boolean {
+  return scanSqlStatementRanges(sql, databaseType, parameterOptions).complete;
+}
+
+function scanSqlStatementRanges(sql: string, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): { statements: RawStatement[]; complete: boolean } {
   databaseType = statementParsingDatabaseType(databaseType, parameterOptions);
   if (isHttpJsonRestDatabaseType(databaseType)) {
     const requests = splitElasticsearchRestRequestRanges(sql);
-    if (requests) return requests;
+    if (requests) return { statements: requests, complete: requests.length > 0 };
   }
 
   const statements: RawStatement[] = [];
@@ -542,6 +557,8 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
   let dollarTag = "";
   let postgresDollarQuotedRoutine = false;
   let oraclePlSqlStatementEnd: number | null | undefined;
+  let unterminatedBlockComment = false;
+  let awaitingSlash = false;
   let i = 0;
 
   // Incremental cache for the MySQL routine-block check below: without it, every
@@ -749,6 +766,7 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
     if ((isOracleLikeDatabase(databaseType, parameterOptions) || isPostgresFamilyDatabase(databaseType)) && isAtLineStart(sql, i) && isSlashLine(sql, i)) {
       const lineEnd = findLineEnd(sql, i);
       flush(i);
+      awaitingSlash = false;
       i = nextLineStart(sql, lineEnd);
       statementHitStart = i;
       continue;
@@ -774,6 +792,7 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
       const hintMarker = sql[i + 2];
       if (statementStart === -1 && pendingHintStart === -1 && (hintMarker === "+" || hintMarker === "@" || hintMarker === "&")) pendingHintStart = i;
       const close = sql.indexOf("*/", i + 2);
+      unterminatedBlockComment = close === -1;
       if (statementStart === -1) {
         if (databaseType === "mysql") {
           if (pendingMysqlDirectiveStart === -1 || i > pendingMysqlDirectiveLineEnd) {
@@ -859,7 +878,7 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
       } else {
         if (oraclePlSqlStatementEnd === undefined && !postgresDollarQuotedRoutine && statementStart !== -1 && keepsOracleStyleBlockTogether(sql.slice(statementStart, i), databaseType, parameterOptions)) {
           const statementSoFar = sql.slice(statementStart, i);
-          oraclePlSqlStatementEnd = startsWithOraclePlSqlBlock(statementSoFar) ? statementStart + (oraclePlSqlBlockEnd(sql.slice(statementStart)) ?? sql.length - statementStart) : null;
+          oraclePlSqlStatementEnd = startsWithOraclePlSqlBlock(statementSoFar) ? statementStart + (oraclePlSqlBlockEnd(sql.slice(statementStart)) ?? Infinity) : null;
         }
         const resolvedOraclePlSqlStatementEnd = oraclePlSqlStatementEnd;
         const isOraclePlSql = typeof resolvedOraclePlSqlStatementEnd === "number";
@@ -879,6 +898,7 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
             i += 1;
             continue;
           }
+          awaitingSlash = isOraclePlSql;
           flush(i + 1);
         } else {
           flush();
@@ -895,11 +915,11 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
     i += 1;
   }
 
-  // Flush any trailing statement that lacks a terminating semicolon.
+  const complete = statements.length > 0 && statementStart === -1 && state === "none" && !unterminatedBlockComment && !awaitingSlash;
+  // Editors still expose unfinished statements; interactive execution does not.
   flush();
 
-  if (databaseType === "sqlserver") return mergeSqlServerControlFlowBatches(sql, statements, databaseType, parameterOptions);
-  return statements;
+  return { statements: databaseType === "sqlserver" ? mergeSqlServerControlFlowBatches(sql, statements, databaseType, parameterOptions) : statements, complete };
 }
 
 /**
