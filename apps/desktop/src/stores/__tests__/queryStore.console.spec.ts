@@ -301,4 +301,25 @@ describe("queryStore command console", () => {
     await run;
     expect(store.tabs.find((tab) => tab.id === tabId)).toBeUndefined();
   });
+
+  it("runs DM8 client commands on Enter and replays only the last statement", async () => {
+    mocks.getConfig.mockReturnValue({ id: "dm-1", name: "DM8", db_type: "dameng", database: "", query_timeout_secs: 30 });
+    const { store, tabId } = await setup("dm-1", "");
+    for (const command of ["DESC t", "EXEC p(1)", "SHOW USER", "PROMPT dm8", "SET TIMING ON"]) {
+      await store.executeConsoleStatement(tabId, command);
+      expect(mocks.executeMulti.mock.calls.at(-1)?.[2]).toBe(command);
+    }
+    await store.executeConsoleStatement(tabId, "EXEC p(2)");
+    await store.executeConsoleStatement(tabId, "RUN");
+    expect(mocks.executeMulti.mock.calls.at(-1)?.[2]).toBe("EXEC p(2)");
+    await store.executeConsoleStatement(tabId, "/");
+    expect(mocks.executeMulti.mock.calls.at(-1)?.[2]).toBe("EXEC p(2)");
+    mocks.executeMulti.mockClear();
+    await store.executeConsoleStatement(tabId, "SET SCHEMA DBX_TEST");
+    expect(mocks.executeMulti).not.toHaveBeenCalled();
+    await store.executeConsoleStatement(tabId, ";");
+    expect(mocks.executeMulti.mock.calls[0][2]).toBe("SET SCHEMA DBX_TEST\n;");
+    await store.executeConsoleStatement(tabId, "EXIT");
+    expect(store.tabs.find((tab) => tab.id === tabId)).toBeUndefined();
+  });
 });

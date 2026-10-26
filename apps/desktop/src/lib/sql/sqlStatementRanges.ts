@@ -336,10 +336,10 @@ const SET_OPERATION_MODIFIER_KEYWORDS = new Set(["ALL", "DISTINCT"]);
 // language (`CREATE [OR REPLACE] PROCEDURE ... IS BEGIN ... END;`), so its statement
 // ranges must stay whole instead of splitting at every body semicolon.
 const ORACLE_LIKE_PL_SQL_DATABASES: ReadonlySet<DatabaseType> = new Set(["oracle", "dameng", "gaussdb", "yashandb", "oscar", "oceanbase-oracle", "xugu", "argo", "transwarp"]);
-// Mirrors supports_oracle_console_commands in dbx-sql (dbx-sql-core/src/sql.rs)
-// — keep both in sync. SQL*Plus console commands (Oracle, YashanDB yasql) are
-// line-terminated client commands the backend executes client-side.
-const CONSOLE_COMMAND_DATABASES: ReadonlySet<DatabaseType> = new Set(["oracle", "yashandb"]);
+// Mirrors line_console_family in dbx-sql (dbx-sql-core/src/sql.rs)
+// — keep both in sync. SQL*Plus/yasql and DM8 disql commands are
+// line-terminated and execute client-side.
+const CONSOLE_COMMAND_DATABASES: ReadonlySet<DatabaseType> = new Set(["oracle", "yashandb", "dameng"]);
 // Console verbs the backend recognizes (dbx-sql-core/src/console_command.rs),
 // including the ones it only acknowledges-and-skips. A word outside this set
 // never starts a console line, so ordinary SQL is unaffected.
@@ -391,6 +391,73 @@ const CONSOLE_COMMAND_VERBS = new Set([
 ]);
 // `SET TRANSACTION|ROLE|CONSTRAINT[S]` is server SQL, not a console command.
 const CONSOLE_SET_SERVER_SQL_FOLLOWERS = new Set(["TRANSACTION", "ROLE", "CONSTRAINT", "CONSTRAINTS"]);
+// Disql client options only; every other SET stays native DM8 SQL.
+const DISQL_SET_CLIENT_OPTIONS = new Set([
+  "ANSWER",
+  "APPINFO",
+  "ARRAY",
+  "ARRAYSIZE",
+  "AUTOCOMMIT",
+  "AUTOPRINT",
+  "AUTORECOVERY",
+  "AUTOTRACE",
+  "BLOCKTERMINATOR",
+  "BTITLE",
+  "BUFFER",
+  "CMDSEP",
+  "COLSEP",
+  "COMPATIBILITY",
+  "CONCAT",
+  "COPYCOMMIT",
+  "COPYTYPECHECK",
+  "DEFINE",
+  "DESCRIBE",
+  "ECHO",
+  "EDITFILE",
+  "EMBEDDED",
+  "ESCAPE",
+  "FEEDBACK",
+  "FLAGGER",
+  "FLUSH",
+  "HEADING",
+  "HEADSEP",
+  "LINESIZE",
+  "LOBOFFSET",
+  "LONG",
+  "LONGCHUNKSIZE",
+  "MARKUP",
+  "NEWPAGE",
+  "NULL",
+  "NUMFORMAT",
+  "NUMWIDTH",
+  "PAGESIZE",
+  "PAUSE",
+  "RECSEP",
+  "RECSEPCHAR",
+  "SERVEROUTPUT",
+  "SHIFTINOUT",
+  "SHOWMODE",
+  "SILENT",
+  "SPOOL",
+  "SQLBLANKLINES",
+  "SQLCASE",
+  "SQLCODE",
+  "SQLCONTINUE",
+  "SQLNUMBER",
+  "SQLPREFIX",
+  "SQLPROMPT",
+  "SQLTERMINATOR",
+  "SUFFIX",
+  "TAB",
+  "TERMOUT",
+  "TIME",
+  "TIMING",
+  "TRIMOUT",
+  "TRIMSPOOL",
+  "UNDERLINE",
+  "VERIFY",
+  "WRAP",
+]);
 
 export function isConsoleCommandDatabaseType(databaseType?: DatabaseType): boolean {
   return !!databaseType && CONSOLE_COMMAND_DATABASES.has(databaseType);
@@ -429,7 +496,7 @@ function isIgnorablePsqlControlLine(sql: string, index: number): boolean {
  * be followed by whitespace, `;` or end of line (`EXEC(` stays SQL), and no
  * executable statement may be pending from previous lines.
  */
-function startsConsoleCommandLine(sql: string, index: number): boolean {
+function startsConsoleCommandLine(sql: string, index: number, databaseType?: DatabaseType): boolean {
   const lineEnd = findLineEnd(sql, index);
   const line = sql.slice(index, lineEnd).trim();
   if (!line) return false;
@@ -442,6 +509,8 @@ function startsConsoleCommandLine(sql: string, index: number): boolean {
   if (word.toUpperCase() === "SET") {
     const follower = /^[^\s(;]+/.exec(line.slice(word.length).trimStart())?.[0]?.toUpperCase() ?? "";
     if (CONSOLE_SET_SERVER_SQL_FOLLOWERS.has(follower)) return false;
+    if (databaseType === "dameng" && !DISQL_SET_CLIENT_OPTIONS.has(follower)) return false;
+    if (databaseType === "dameng" && follower === "TIME" && !/^TIME\s+(?:ON|OFF)(?:\s|$)/i.test(line.slice(word.length).trimStart().replace(/;\s*$/, ""))) return false;
   }
   return true;
 }
@@ -449,7 +518,7 @@ function startsConsoleCommandLine(sql: string, index: number): boolean {
 export function isConsoleCommandLine(line: string, databaseType?: DatabaseType): boolean {
   const text = line.trim();
   if (!text || text.includes("\n")) return false;
-  return isConsoleCommandDatabaseType(databaseType) ? startsConsoleCommandLine(text, 0) : !!databaseType && PSQL_CONSOLE_DATABASES.has(databaseType) && startsPsqlConsoleCommandLine(text, 0);
+  return isConsoleCommandDatabaseType(databaseType) ? startsConsoleCommandLine(text, 0, databaseType) : !!databaseType && PSQL_CONSOLE_DATABASES.has(databaseType) && startsPsqlConsoleCommandLine(text, 0);
 }
 
 const MYSQL_ROUTINE_BLOCK_DATABASES: ReadonlySet<DatabaseType> = new Set(["mysql", "doris", "starrocks", "manticoresearch", "goldendb"]);
@@ -716,7 +785,7 @@ function scanSqlStatementRanges(sql: string, databaseType?: DatabaseType, parame
     // statement — mirroring the backend splitter. Only at a line start with no
     // pending statement (a console verb never continues an unterminated SQL
     // statement).
-    if (isConsoleCommandDatabaseType(databaseType) && statementStart === -1 && isAtLineStart(sql, i) && startsConsoleCommandLine(sql, i)) {
+    if (isConsoleCommandDatabaseType(databaseType) && statementStart === -1 && isAtLineStart(sql, i) && startsConsoleCommandLine(sql, i, databaseType)) {
       const lineEnd = findLineEnd(sql, i);
       let consoleFrom = i;
       while (consoleFrom < lineEnd && isWhitespace(sql[consoleFrom])) consoleFrom += 1;

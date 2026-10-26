@@ -24,10 +24,10 @@ const POSTGRES_CODEMIRROR_DATABASE_TYPES = new Set<DatabaseType>(["postgres", "r
 const ORACLE_CODEMIRROR_DATABASE_TYPES = new Set<DatabaseType>(["oracle", "dameng", "yashandb", "oscar", "oceanbase-oracle"]);
 const SQLITE_CODEMIRROR_DATABASE_TYPES = new Set<DatabaseType>(["sqlite", "rqlite", "turso", "cloudflare-d1"]);
 // SQL*Plus console commands the backend executes client-side; enabled for the
-// two clients whose syntax they are (mirrors CONSOLE_COMMAND_DATABASES in
+// supported client families (mirrors CONSOLE_COMMAND_DATABASES in
 // lib/sql/sqlStatementRanges.ts). Highlighting only — parsing and dispatch
 // live in dbx-sql-core.
-const SQLPLUS_CONSOLE_CODEMIRROR_DATABASE_TYPES = new Set<DatabaseType>(["oracle", "yashandb"]);
+const SQLPLUS_CONSOLE_CODEMIRROR_DATABASE_TYPES = new Set<DatabaseType>(["oracle", "yashandb", "dameng"]);
 const SQLPLUS_CONSOLE_KEYWORDS = "describe prompt show spool quit";
 // Non-MySQL-wire dialects whose servers still interpret backslash escapes in string
 // literals; the mysql-family types are covered by isMysql at the define() site. Mirrors

@@ -9,7 +9,7 @@ describe("SQL*Plus console command statement ranges", () => {
   it("splits console command lines from SQL for oracle and yashandb", () => {
     const sql = ["SET TIMING ON", "SELECT 1;", "DESC emp", "exec dbms_stats.gather_table_stats('S','T')", "show user", "PROMPT step 1; load", "SPOOL out.txt"].join("\n");
 
-    for (const databaseType of ["oracle", "yashandb"] as const) {
+    for (const databaseType of ["oracle", "yashandb", "dameng"] as const) {
       expect(rangeSqlTexts(splitSqlStatementRanges(sql, databaseType))).toEqual(["SET TIMING ON", "SELECT 1", "DESC emp", "exec dbms_stats.gather_table_stats('S','T')", "show user", "PROMPT step 1; load", "SPOOL out.txt"]);
     }
   });
@@ -21,7 +21,7 @@ describe("SQL*Plus console command statement ranges", () => {
 
   it("keeps console commands disabled for other Oracle-family databases", () => {
     const sql = "DESC emp\nSELECT 1;";
-    for (const databaseType of ["dameng", "gaussdb", "oceanbase-oracle"] as const) {
+    for (const databaseType of ["gaussdb", "oceanbase-oracle"] as const) {
       expect(rangeSqlTexts(splitSqlStatementRanges(sql, databaseType))).toEqual(["DESC emp\nSELECT 1"]);
     }
   });
@@ -31,6 +31,19 @@ describe("SQL*Plus console command statement ranges", () => {
     for (const databaseType of ["oracle", "yashandb"] as const) {
       expect(rangeSqlTexts(splitSqlStatementRanges(sql, databaseType))).toEqual(["SET CONSTRAINTS ALL\nDEFERRED", "SET TIMING ON", "SELECT 1"]);
     }
+  });
+
+  it("keeps DM8 native SET statements separate from disql commands", () => {
+    const sql = "SET SCHEMA\nDBX_TEST;\nSET TIMING ON\nDESC emp\nEXEC p(1); -- note\nRUN\nSHOW USER\nEXIT";
+    const expected = ["SET SCHEMA\nDBX_TEST", "SET TIMING ON", "DESC emp", "EXEC p(1); -- note", "RUN", "SHOW USER", "EXIT"];
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "dameng"))).toEqual(expected);
+    for (const statement of expected) expect(statementRangeAtCursor(sql, sql.indexOf(statement), "dameng")?.sql).toBe(statement);
+    for (const statement of ["SET SESSION TRANSACTION READ WRITE", "SET IDENTITY_INSERT t ON", "SET TIME ZONE '+08:00'"]) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(`${statement};\nDESC t`, "dameng"))).toEqual([statement, "DESC t"]);
+    }
+    expect(rangeSqlTexts(splitSqlStatementRanges("SET\nSELECT 1;", "dameng"))).toEqual(["SET\nSELECT 1"]);
+    expect(rangeSqlTexts(splitSqlStatementRanges("SET TIME\nZONE '+08:00';\nDESC t", "dameng"))).toEqual(["SET TIME\nZONE '+08:00'", "DESC t"]);
+    expect(rangeSqlTexts(splitSqlStatementRanges("SET TIME ON; SELECT 1;", "dameng"))).toEqual(["SET TIME ON", "SELECT 1"]);
   });
 
   it.each(["EXIT", "RUN", "PROMPT", "DESC", "SET"])("isolates argumentless %s before SQL", (command) => {

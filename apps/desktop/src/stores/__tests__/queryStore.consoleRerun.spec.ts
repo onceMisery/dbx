@@ -2,7 +2,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { QueryResult } from "@/types/database";
 
-const mocks = vi.hoisted(() => ({ executeMulti: vi.fn(), subscribe: vi.fn(), cleanup: vi.fn() }));
+const mocks = vi.hoisted(() => ({ executeMulti: vi.fn(), subscribe: vi.fn(), cleanup: vi.fn(), getConfig: vi.fn() }));
 vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => true }));
 vi.mock("@/lib/backend/api", () => ({
   executeMulti: mocks.executeMulti,
@@ -16,7 +16,7 @@ vi.mock("@/lib/backend/api", () => ({
 vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: () => ({
     ensureConnected: vi.fn().mockResolvedValue(undefined),
-    getConfig: () => ({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 }),
+    getConfig: mocks.getConfig,
     lookupLocalCompletionTables: () => [],
     recordConnectionLostError: vi.fn(),
   }),
@@ -28,6 +28,7 @@ const emptyResults: QueryResult[] = [{ columns: [], rows: [], affected_rows: 0, 
 describe("queryStore SQL*Plus rerun (`/`)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.getConfig.mockReturnValue({ id: "oracle-1", name: "Oracle", db_type: "oracle", database: "ORCL", query_timeout_secs: 30 });
     setActivePinia(createPinia());
     mocks.subscribe.mockResolvedValue(mocks.cleanup);
     mocks.executeMulti.mockImplementation(async () => emptyResults.map((result) => ({ ...result })));
@@ -46,6 +47,21 @@ describe("queryStore SQL*Plus rerun (`/`)", () => {
     expect(mocks.executeMulti).toHaveBeenCalledTimes(1);
     expect(mocks.executeMulti.mock.calls[0][2]).toBe("SELECT 1 FROM DUAL");
   }, 30_000);
+
+  it("DM8 query-window slash reruns only the last successful statement", async () => {
+    mocks.getConfig.mockReturnValue({ id: "dm-1", name: "DM8", db_type: "dameng", database: "", query_timeout_secs: 30 });
+    const { useQueryStore } = await import("../queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("dm-1", "", "Query");
+    mocks.executeMulti.mockResolvedValueOnce([
+      { ...emptyResults[0], statement_index: 0 },
+      { ...emptyResults[0], statement_index: 1 },
+    ]);
+    await store.executeTabSql(tabId, "UPDATE t SET v=1 WHERE id=1;\nSELECT 1 FROM DUAL;");
+    mocks.executeMulti.mockClear();
+    await store.executeTabSql(tabId, "/");
+    expect(mocks.executeMulti.mock.calls[0][2]).toBe("SELECT 1 FROM DUAL");
+  });
 
   it("a `/` without execution history is sent unchanged", async () => {
     const { useQueryStore } = await import("../queryStore");

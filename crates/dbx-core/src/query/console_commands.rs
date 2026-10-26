@@ -9,7 +9,7 @@
 //! column API so synonym and current-schema resolution behave exactly like
 //! the object browser.
 
-use dbx_sql::console_command::{parse_sqlplus_console_command, ConsoleCommand, ConsoleCommandFamily};
+use dbx_sql::console_command::{parse_console_command_for_family, ConsoleCommand, ConsoleCommandFamily};
 
 use crate::connection::AppState;
 use crate::db;
@@ -44,7 +44,7 @@ pub(crate) async fn execute_console_command(
 ) -> ConsoleExecution {
     match command {
         ConsoleCommand::Rerun => match previous {
-            Some(previous) => match parse_for_family(previous, family) {
+            Some(previous) => match parse_console_command_for_family(previous, family) {
                 // Re-running a console statement keeps its console semantics
                 // (RUN after EXEC re-wraps the call, RUN after DESC re-reads
                 // the metadata). `previous` never parses as Rerun because the
@@ -75,17 +75,22 @@ pub(crate) async fn execute_console_command(
             }
         }
         ConsoleCommand::ListTables { pattern } => ConsoleExecution::Sql(psql_list_tables_sql(&pattern)),
-        ConsoleCommand::Describe { object } => describe_object(state, connection_id, database, schema, &object).await,
+        ConsoleCommand::Describe { object } => {
+            describe_object(state, connection_id, database, schema, &object, family).await
+        }
+        ConsoleCommand::SetOption { option, value } if family == ConsoleCommandFamily::Disql => {
+            let setting = format!("{option} {value}");
+            ConsoleExecution::Result(console_message_result(&format!(
+                "disql SET {} is not implemented; option was not applied",
+                setting.trim_end()
+            )))
+        }
+        ConsoleCommand::Unsupported { verb } if family == ConsoleCommandFamily::Disql && verb != "REMARK" => {
+            ConsoleExecution::Result(console_message_result(&format!(
+                "disql command {verb} is not supported; statement skipped"
+            )))
+        }
         command => resolve_console_command_locally(command),
-    }
-}
-
-/// Parse a statement with the family's parser (`RUN` re-dispatch).
-fn parse_for_family(statement: &str, family: ConsoleCommandFamily) -> Option<ConsoleCommand> {
-    match family {
-        ConsoleCommandFamily::SqlPlus => parse_sqlplus_console_command(statement, true),
-        // psql has no rerun command, so this arm only exists for symmetry.
-        ConsoleCommandFamily::Psql => dbx_sql::console_command::parse_psql_console_command(statement),
     }
 }
 
@@ -170,14 +175,22 @@ async fn describe_object(
     database: &str,
     schema: Option<&str>,
     object: &str,
+    family: ConsoleCommandFamily,
 ) -> ConsoleExecution {
     let object = object.trim();
     if object.is_empty() {
         return ConsoleExecution::Error("DESCRIBE requires an object name".to_string());
     }
     let (owner, table) = split_qualified_object(object);
-    let owner = owner.map(unquote_identifier);
-    let table = unquote_identifier(table);
+    let normalize = |identifier: &str| {
+        if family == ConsoleCommandFamily::Disql && !identifier.starts_with('"') {
+            identifier.to_uppercase()
+        } else {
+            unquote_identifier(identifier)
+        }
+    };
+    let owner = owner.map(normalize);
+    let table = normalize(table);
     let schema_arg = owner.as_deref().or(schema).unwrap_or("");
     match crate::schema::get_columns_core_for_session_in_context(
         state,

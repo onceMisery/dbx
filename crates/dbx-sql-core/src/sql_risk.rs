@@ -2345,6 +2345,17 @@ mod tests {
     }
 
     #[test]
+    fn disql_commands_do_not_weaken_write_and_native_set_gates() {
+        for sql in ["DESC t", "SHOW USER", "PROMPT hi", "SET TIMING ON", "RUN", "EXIT"] {
+            assert_eq!(classify_sql_risk_for_database(sql, DatabaseType::Dameng).unwrap(), SqlRisk::ReadOnly, "{sql}");
+        }
+        assert_eq!(classify_sql_risk_for_database("EXEC p(1)", DatabaseType::Dameng).unwrap(), SqlRisk::Write);
+        for sql in ["SET SCHEMA DBX_TEST", "SET TIME ZONE '+08:00'", "SET TRANSACTION READ ONLY"] {
+            assert_ne!(classify_sql_risk_for_database(sql, DatabaseType::Dameng).unwrap(), SqlRisk::ReadOnly, "{sql}");
+        }
+    }
+
+    #[test]
     fn classifies_console_client_commands_by_nature() {
         // psql console commands are metadata reads.
         for statement in ["\\dt", "\\d+ emp", "\\d", "\\dt t*"] {

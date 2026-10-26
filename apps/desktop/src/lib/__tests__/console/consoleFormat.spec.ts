@@ -64,6 +64,20 @@ describe("consoleFormat", () => {
     expect(isConsoleCommandLine("\\dv", "postgres")).toBe(false);
   });
 
+  it("recognizes disql commands without consuming DM8 server SET", () => {
+    for (const sql of ["DESC t", "EXEC p(1)", "PROMPT hi", "SHOW USER", "RUN", "EXIT", "SET TIMING ON"]) {
+      expect(isConsoleCommandLine(sql, "dameng")).toBe(true);
+      expect(consoleStatementComplete(sql, "dameng")).toBe(true);
+    }
+    for (const sql of ["SET SCHEMA DBX_TEST", "SET SESSION TRANSACTION READ WRITE", "SET TIME ZONE '+08:00'"]) {
+      expect(isConsoleCommandLine(sql, "dameng")).toBe(false);
+      expect(consoleStatementComplete(sql, "dameng")).toBe(false);
+      expect(consoleStatementComplete(`${sql};`, "dameng")).toBe(true);
+    }
+    expect(consoleStatementComplete("BEGIN\n NULL;\nEND;", "dameng")).toBe(false);
+    expect(consoleStatementComplete("BEGIN\n NULL;\nEND;\n/", "dameng")).toBe(true);
+  });
+
   it.each([
     ["SELECT 'first;", "postgres", false],
     ["SELECT 'first;\nsecond';", "postgres", true],

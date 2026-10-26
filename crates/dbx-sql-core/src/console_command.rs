@@ -1,5 +1,5 @@
 //! Console client commands for the query window, one family per client:
-//! Oracle SQL*Plus / YashanDB yasql (`DESC`, `EXEC`, `SET`, `/`, ...) and
+//! Oracle SQL*Plus / YashanDB yasql / DM8 disql (`DESC`, `EXEC`, `SET`, ...) and
 //! PostgreSQL psql (`\d`, `\dt`). Those commands are line-terminated, live in
 //! the client rather than the server, and must not be forwarded to the
 //! database. This module parses one physical line into a [`ConsoleCommand`];
@@ -20,6 +20,8 @@ use crate::models::connection::DatabaseType;
 pub enum ConsoleCommandFamily {
     /// Oracle SQL*Plus and YashanDB yasql.
     SqlPlus,
+    /// DM8 disql's supported client-command subset; native SET SQL passes through.
+    Disql,
     /// PostgreSQL psql backslash commands.
     Psql,
 }
@@ -164,9 +166,32 @@ const COMMAND_VERBS: &[&str] =
 /// other dialects, multi-line statements, server SQL that merely starts with
 /// a verb word (`SET TRANSACTION`), and any unknown first word.
 pub fn parse_console_command_for_database(statement: &str, db_type: DatabaseType) -> Option<ConsoleCommand> {
-    match crate::sql::console_command_family_for_database(db_type)? {
+    parse_console_command_for_family(statement, crate::sql::console_command_family_for_database(db_type)?)
+}
+
+pub fn parse_console_command_for_family(statement: &str, family: ConsoleCommandFamily) -> Option<ConsoleCommand> {
+    match family {
         ConsoleCommandFamily::SqlPlus => parse_sqlplus_console_command(statement, true),
+        ConsoleCommandFamily::Disql => parse_disql_console_command(statement),
         ConsoleCommandFamily::Psql => parse_psql_console_command(statement),
+    }
+}
+
+pub fn parse_disql_console_command(statement: &str) -> Option<ConsoleCommand> {
+    match parse_sqlplus_console_command(statement, true)? {
+        // DM8 has server-side SET SCHEMA, SESSION, IDENTITY_INSERT, etc. Only
+        // the closed client-option list may be consumed by the console.
+        ConsoleCommand::Unsupported { verb } if verb == "SET" => None,
+        ConsoleCommand::SetOption { option, value }
+            if option == "TIME"
+                && !value
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("ON") || word.eq_ignore_ascii_case("OFF")) =>
+        {
+            None
+        }
+        command => Some(command),
     }
 }
 
@@ -347,6 +372,30 @@ mod tests {
         assert_eq!(parse(";"), None);
         assert_eq!(parse("SELECT 1\nFROM t"), None);
         assert_eq!(parse("/"), None);
+    }
+
+    #[test]
+    fn disql_commands_keep_native_set_sql_on_the_server() {
+        for statement in ["DESC emp", "EXEC p(1)", "SHOW USER", "PROMPT hi", "RUN", "EXIT", "SET TIMING ON"] {
+            assert!(parse_console_command_for_database(statement, DatabaseType::Dameng).is_some(), "{statement}");
+        }
+        for statement in [
+            "SET SCHEMA DBX_TEST",
+            "SET SESSION TRANSACTION READ WRITE",
+            "SET IDENTITY_INSERT t ON",
+            "SET TRANSACTION READ ONLY",
+            "SET CONSTRAINTS ALL IMMEDIATE",
+            "SET TIME ZONE '+08:00'",
+            "SET TIME",
+            "SET",
+        ] {
+            assert_eq!(parse_console_command_for_database(statement, DatabaseType::Dameng), None, "{statement}");
+        }
+        assert_eq!(
+            crate::sql::console_command_family_for_database(DatabaseType::Dameng),
+            Some(ConsoleCommandFamily::Disql)
+        );
+        assert_eq!(crate::sql::console_command_family_for_database(DatabaseType::OceanbaseOracle), None);
     }
 
     #[test]

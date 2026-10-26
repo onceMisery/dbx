@@ -211,11 +211,8 @@ struct SqlDialectProfile {
     preserves_tdsql_leading_directives: bool,
     requires_whitespace_after_line_comment_dashes: bool,
     supports_psql_control_commands: bool,
-    /// Whether SQL*Plus-style console client commands (Oracle SQL*Plus,
-    /// YashanDB yasql) are recognized: line-terminated commands such as
-    /// `DESC emp`, `EXEC proc(...)` or `SET TIMING ON`, plus a standalone `/`
-    /// that re-executes the previous statement.
-    supports_oracle_console_commands: bool,
+    /// The line-terminated client command family, separate from psql controls.
+    line_console_family: Option<crate::console_command::ConsoleCommandFamily>,
 }
 
 impl Default for SqlDialectProfile {
@@ -241,7 +238,7 @@ impl Default for SqlDialectProfile {
             preserves_tdsql_leading_directives: false,
             requires_whitespace_after_line_comment_dashes: false,
             supports_psql_control_commands: false,
-            supports_oracle_console_commands: false,
+            line_console_family: None,
         }
     }
 }
@@ -275,12 +272,13 @@ impl SqlDialectProfile {
         }
 
         if Self::is_oracle_like_database(db_type) {
-            // Console commands are enabled per issue #6513 for the two
-            // databases whose client syntax users actually paste; the rest of
-            // the Oracle-compatible family keeps plain splitting until each
-            // dialect is verified.
-            let supports_oracle_console_commands = matches!(db_type, DatabaseType::Oracle | DatabaseType::Yashandb);
-            return Self { supports_oracle_console_commands, ..Self::oracle_like() };
+            use crate::console_command::ConsoleCommandFamily::{Disql, SqlPlus};
+            let line_console_family = match db_type {
+                DatabaseType::Oracle | DatabaseType::Yashandb => Some(SqlPlus),
+                DatabaseType::Dameng => Some(Disql),
+                _ => None,
+            };
+            return Self { line_console_family, ..Self::oracle_like() };
         }
 
         if matches!(db_type, DatabaseType::SqlServer) {
@@ -450,7 +448,7 @@ impl SqlDialectProfile {
 }
 
 /// Which console client family the database's script syntax uses: Oracle
-/// SQL*Plus / YashanDB yasql, or PostgreSQL psql backslash commands. Single
+/// SQL*Plus / YashanDB yasql / DM8 disql, or PostgreSQL psql commands. Single
 /// gate for the splitter and the executor: both must answer this question the
 /// same way. MySQL and SQL Server are deliberately absent — their console
 /// syntax (`DESC`, `SHOW`, `USE`, `DELIMITER`, `\G`, `GO`) is server-side SQL
@@ -459,8 +457,8 @@ pub fn console_command_family_for_database(
     db_type: DatabaseType,
 ) -> Option<crate::console_command::ConsoleCommandFamily> {
     let profile = SqlDialectProfile::for_database_type(db_type);
-    if profile.supports_oracle_console_commands {
-        Some(crate::console_command::ConsoleCommandFamily::SqlPlus)
+    if let Some(family) = profile.line_console_family {
+        Some(family)
     } else if profile.supports_psql_control_commands {
         Some(crate::console_command::ConsoleCommandFamily::Psql)
     } else {
@@ -1119,7 +1117,7 @@ impl SqlStatementSplitter {
     /// console verb. The moment the verb's first terminator arrives the
     /// splitter takes over the whole line so its text stays literal.
     fn console_line_capture_starts(&self, ch: char) -> bool {
-        if !self.options.profile.supports_oracle_console_commands || self.pending_console_line.is_some() {
+        if self.options.profile.line_console_family.is_none() || self.pending_console_line.is_some() {
             return false;
         }
         if !matches!(ch, ' ' | '\t' | '\r' | '\n' | '(' | ';') {
@@ -1143,15 +1141,21 @@ impl SqlStatementSplitter {
     fn finish_console_line(&mut self, statements: &mut Vec<SqlStatementWithControl>) {
         let line = self.pending_console_line.take().expect("pending console line");
         let trimmed = line.trim();
-        if crate::console_command::parse_sqlplus_console_command(trimmed, true).is_some() {
+        if self
+            .options
+            .profile
+            .line_console_family
+            .and_then(|family| crate::console_command::parse_console_command_for_family(trimmed, family))
+            .is_some()
+        {
             statements.push(SqlStatementWithControl { sql: trimmed.to_string(), stop_on_error: self.stop_on_error });
         } else {
             // A SQL statement that merely starts with a console verb word
             // (SET TRANSACTION …) must still reach the server: re-scan the
             // line with console capture off, mirroring the psql fallback.
-            self.options.profile.supports_oracle_console_commands = false;
+            let family = self.options.profile.line_console_family.take();
             statements.extend(self.push_chunk_with_control(&line));
-            self.options.profile.supports_oracle_console_commands = true;
+            self.options.profile.line_console_family = family;
         }
     }
 
@@ -1596,7 +1600,12 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
             if next_char(sql, i) == '\n' {
                 let newline_index = i;
                 let line = sql[word_start..newline_index].trim();
-                if crate::console_command::parse_sqlplus_console_command(line, true).is_some() {
+                if options
+                    .profile
+                    .line_console_family
+                    .and_then(|family| crate::console_command::parse_console_command_for_family(line, family))
+                    .is_some()
+                {
                     push_statement_range(&mut ranges, sql, word_start, newline_index, options);
                     start = newline_index + 1;
                     i = start;
@@ -1687,7 +1696,6 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
                 }
             }
             if ch == '\n' {
-                suppress_console_capture = false;
                 let line_start = sql[..i].rfind('\n').map_or(0, |pos| pos + 1);
                 let line = sql[line_start..i].trim();
                 if options.profile.supports_slash_line_block_delimiter && line == "/" {
@@ -1741,7 +1749,7 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
         // guard below and re-scanned when the line turns out not to parse.
         if console_capture.is_none()
             && !suppress_console_capture
-            && options.profile.supports_oracle_console_commands
+            && options.profile.line_console_family.is_some()
             && matches!(ch, ' ' | '\t' | '\r' | '\n' | '(' | ';')
             && sql[..i].chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
         {
@@ -1759,6 +1767,9 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
             }
         }
 
+        if ch == '\n' {
+            suppress_console_capture = false;
+        }
         let single_quote_backslash_escapes = if in_single_quote {
             single_quote_escape_string
         } else {
@@ -1856,7 +1867,12 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
     if let Some(word_start) = console_capture {
         // Input ended inside a captured console line.
         let line = sql[word_start..].trim();
-        if crate::console_command::parse_sqlplus_console_command(line, true).is_some() {
+        if options
+            .profile
+            .line_console_family
+            .and_then(|family| crate::console_command::parse_console_command_for_family(line, family))
+            .is_some()
+        {
             push_statement_range(&mut ranges, sql, word_start, sql.len(), options);
             return ranges;
         }
@@ -6723,9 +6739,49 @@ SELECT 1;";
     }
 
     #[test]
+    fn disql_splitter_preserves_server_set_and_statement_boundaries() {
+        let sql = "SET SCHEMA\nDBX_TEST;\nSET TIMING ON\nDESC emp\nEXEC p(1); -- note\nRUN\nPROMPT done; literally\nSELECT 1;";
+        let expected = vec![
+            "SET SCHEMA\nDBX_TEST",
+            "SET TIMING ON",
+            "DESC emp",
+            "EXEC p(1); -- note",
+            "RUN",
+            "PROMPT done; literally",
+            "SELECT 1",
+        ];
+        assert_eq!(split_sql_statements_for_database(sql, DatabaseType::Dameng), expected);
+        for statement in &expected {
+            assert_eq!(
+                find_statement_at_cursor_for_database(sql, sql.find(statement).unwrap(), DatabaseType::Dameng),
+                *statement
+            );
+        }
+        for size in 1..=sql.len() {
+            let mut splitter =
+                SqlStatementSplitter::with_options(SqlParsingOptions::for_database_type(DatabaseType::Dameng));
+            let mut statements = Vec::new();
+            for chunk in sql.as_bytes().chunks(size) {
+                statements.extend(splitter.push_chunk(std::str::from_utf8(chunk).unwrap()));
+            }
+            statements.extend(splitter.finish());
+            assert_eq!(statements, expected, "chunk size {size}");
+        }
+        assert_eq!(find_statement_at_cursor_for_database("SET\nSELECT 1;", 0, DatabaseType::Dameng), "SET\nSELECT 1");
+        assert_eq!(
+            split_sql_statements_for_database("SET TIME ZONE '+08:00';\nDESC emp", DatabaseType::Dameng),
+            vec!["SET TIME ZONE '+08:00'", "DESC emp"]
+        );
+        assert_eq!(
+            split_sql_statements_for_database("SET TIME\nZONE '+08:00';\nDESC emp", DatabaseType::Dameng),
+            vec!["SET TIME\nZONE '+08:00'", "DESC emp"]
+        );
+    }
+
+    #[test]
     fn console_commands_stay_disabled_for_other_oracle_family_databases() {
         let sql = "DESC emp\nSELECT 1;";
-        for database in [DatabaseType::Dameng, DatabaseType::Gaussdb, DatabaseType::OceanbaseOracle] {
+        for database in [DatabaseType::Gaussdb, DatabaseType::OceanbaseOracle] {
             assert_eq!(split_sql_statements_for_database(sql, database), vec!["DESC emp\nSELECT 1"], "{database:?}");
         }
     }

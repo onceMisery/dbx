@@ -13977,6 +13977,52 @@ for line in sys.stdin:
         }
 
         #[tokio::test]
+        async fn disql_commands_share_dispatch_without_swallowing_native_set() {
+            let (state, commands, _directory) = console_state(DatabaseType::Dameng).await;
+            let results = execute_multi_core_with_options_for_client_and_progress_typed(
+                &state,
+                "conn-1",
+                "",
+                "PROMPT DM8\nSET TIMING ON\nSET SCHEMA DBX_TEST;\nEXEC p(1); -- note\nRUN\nSHOW USER\nEXIT\nSELECT 99;",
+                None,
+                None,
+                QueryExecutionOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(results.len(), 7);
+            assert!(results.iter().all(|result| !result.execution_error));
+            assert_eq!(results[0].result.rows[0][0], "DM8");
+            let warning = results[1].result.rows[0][0].as_str().unwrap();
+            assert!(warning.contains("not implemented") && warning.contains("not applied"), "{warning}");
+            let recorded = commands.lock().unwrap();
+            assert!(recorded.iter().any(|sql| sql == "SET SCHEMA DBX_TEST"), "{recorded:?}");
+            assert_eq!(recorded.iter().filter(|sql| sql.as_str() == "BEGIN\np(1);\nEND; -- note").count(), 2);
+            assert!(recorded.iter().any(|sql| sql == "SELECT USER FROM DUAL"));
+            assert!(!recorded.iter().any(|sql| sql.contains("SELECT 99")));
+        }
+
+        #[tokio::test]
+        async fn disql_console_batches_keep_the_transaction_guard() {
+            let (state, commands, _directory) = console_state(DatabaseType::Dameng).await;
+            let error = execute_multi_core_with_options_for_client_and_progress_typed(
+                &state,
+                "conn-1",
+                "",
+                "PROMPT DM8\nSELECT 1;",
+                None,
+                None,
+                QueryExecutionOptions { use_transaction: Some(true), ..Default::default() },
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.into_legacy_string().contains("use_transaction"));
+            assert!(commands.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
         async fn single_statement_entry_resolves_console_commands() {
             let (state, _commands, _directory) = console_state(DatabaseType::Oracle).await;
             let result = execute_sql_statement_with_options_typed(
