@@ -9702,6 +9702,7 @@ export default withEnglishFallback({
       compareCharset: "比较字符集和排序规则",
       ignoreTableNameCase: "忽略表名大小写",
       ignoreColumnNameCase: "忽略字段名大小写",
+      refreshMetadata: "比较前刷新元数据",
       detectRenames: "检测重命名",
       detectTableRenames: "检测表重命名",
       enableRollback: "启用回滚",

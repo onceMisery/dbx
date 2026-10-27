@@ -158,7 +158,7 @@ fn split_trailing_line_comment(text: &str) -> (&str, Option<&str>) {
         match ch {
             '\'' => in_single_quote = !in_single_quote,
             '-' if !in_single_quote && text[index + 1..].starts_with('-') => {
-                return (&text[..index].trim_end(), Some(text[index..].trim_end()));
+                return (text[..index].trim_end(), Some(text[index..].trim_end()));
             }
             _ => {}
         }
@@ -203,7 +203,7 @@ async fn describe_object(
     )
     .await
     {
-        Ok(columns) if !columns.is_empty() => ConsoleExecution::Result(describe_result_from_columns(&columns, object)),
+        Ok(columns) if !columns.is_empty() => ConsoleExecution::Result(describe_result_from_columns(&columns)),
         Ok(_) => ConsoleExecution::Error(format!("DESCRIBE: no columns found for {object}")),
         Err(error) => ConsoleExecution::Error(format!("DESCRIBE {object} failed: {error}")),
     }
@@ -336,7 +336,7 @@ fn pg_string_literal(value: &str) -> String {
 
 /// Column metadata rendered in the SQL*Plus DESCRIBE layout: Name / Null? /
 /// Type. Column order is the metadata order.
-fn describe_result_from_columns(columns: &[db::ColumnInfo], object: &str) -> db::QueryResult {
+fn describe_result_from_columns(columns: &[db::ColumnInfo]) -> db::QueryResult {
     db::QueryResult {
         deferred_large_value_cells: Vec::new(),
         columns: vec!["Name".to_string(), "Null?".to_string(), "Type".to_string()],
@@ -496,7 +496,7 @@ mod tests {
                 ..db::ColumnInfo::default()
             },
         ];
-        let result = describe_result_from_columns(&columns, "emp");
+        let result = describe_result_from_columns(&columns);
         assert_eq!(result.columns, vec!["Name", "Null?", "Type"]);
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], serde_json::json!("EMPNO"));

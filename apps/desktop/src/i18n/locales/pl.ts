@@ -8120,6 +8120,7 @@ export default withEnglishFallback({
       compareCharset: "Porównuj zestawy znaków i collations",
       ignoreTableNameCase: "Ignoruj wielkość liter w nazwach tabel",
       ignoreColumnNameCase: "Ignoruj wielkość liter w nazwach kolumn",
+      refreshMetadata: "Odśwież metadane przed porównaniem",
       detectRenames: "Wykrywaj zmiany nazw",
       detectTableRenames: "Wykrywaj zmiany nazw tabel",
       enableRollback: "Włącz wycofanie (Rollback)",

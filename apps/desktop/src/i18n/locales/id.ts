@@ -8057,6 +8057,7 @@ export default withEnglishFallback({
       compareCharset: "Bandingkan character set dan collation",
       ignoreTableNameCase: "Abaikan huruf besar/kecil pada nama tabel",
       ignoreColumnNameCase: "Abaikan huruf besar/kecil pada nama kolom",
+      refreshMetadata: "Muat ulang metadata sebelum membandingkan",
       detectRenames: "Deteksi penggantian nama",
       detectTableRenames: "Deteksi penggantian nama tabel",
       enableRollback: "Aktifkan rollback",

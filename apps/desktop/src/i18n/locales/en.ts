@@ -9735,6 +9735,7 @@ export default {
       compareCharset: "Compare character sets and collations",
       ignoreTableNameCase: "Ignore table name case",
       ignoreColumnNameCase: "Ignore column name case",
+      refreshMetadata: "Refresh metadata before comparing",
       detectRenames: "Detect renames",
       detectTableRenames: "Detect table renames",
       enableRollback: "Enable rollback",

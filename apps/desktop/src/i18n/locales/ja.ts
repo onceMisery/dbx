@@ -8343,6 +8343,7 @@ export default withEnglishFallback({
       batchSection: "バッチ",
       batchPatterns: "テーブルパターン（カンマ区切り）",
       dialectAuto: "自動",
+      refreshMetadata: "比較前にメタデータを更新",
     },
   },
   tableMultiSelect: {

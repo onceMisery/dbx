@@ -10267,6 +10267,7 @@ export default withEnglishFallback({
       compareCharset: "เปรียบเทียบชุดอักขระและ Collation",
       ignoreTableNameCase: "ละเว้นตัวพิมพ์เล็กใหญ่ของชื่อตาราง",
       ignoreColumnNameCase: "ละเว้นตัวพิมพ์เล็กใหญ่ของชื่อคอลัมน์",
+      refreshMetadata: "รีเฟรชเมทาดาทาก่อนเปรียบเทียบ",
       detectRenames: "ตรวจหาการเปลี่ยนชื่อ",
       detectTableRenames: "ตรวจหาการเปลี่ยนชื่อตาราง",
       enableRollback: "เปิดใช้ Rollback",

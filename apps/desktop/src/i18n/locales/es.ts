@@ -8534,6 +8534,7 @@ export default withEnglishFallback({
       compareCharset: "Comparar conjuntos de caracteres y collations",
       ignoreTableNameCase: "Ignorar mayúsculas y minúsculas del nombre de la tabla",
       ignoreColumnNameCase: "Ignorar mayúsculas y minúsculas del nombre de la columna",
+      refreshMetadata: "Actualizar metadatos antes de comparar",
       detectRenames: "Detectar renombrados",
       detectTableRenames: "Detectar renombrados de tabla",
       enableRollback: "Habilitar reversión",

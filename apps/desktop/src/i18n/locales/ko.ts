@@ -8447,6 +8447,7 @@ export default withEnglishFallback({
       batchSection: "일괄",
       batchPatterns: "테이블 패턴 (쉼표로 구분)",
       dialectAuto: "자동",
+      refreshMetadata: "비교 전 메타데이터 새로 고침",
     },
   },
   dataCompare: {

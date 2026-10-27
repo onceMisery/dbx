@@ -7458,6 +7458,7 @@ export default withEnglishFallback({
       batchSection: "批次模式",
       batchPatterns: "資料表模式（逗號分隔）",
       dialectAuto: "自動",
+      refreshMetadata: "比較前重新整理中繼資料",
     },
   },
   tableMultiSelect: {
