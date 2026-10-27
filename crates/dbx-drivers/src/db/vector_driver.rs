@@ -978,6 +978,7 @@ fn json_to_query_result(
     QueryResult {
         columns: vec!["status".to_string(), "response".to_string()],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -1017,6 +1018,7 @@ fn values_to_query_result(items: Vec<Value>, start: Instant) -> QueryResult {
     QueryResult {
         columns,
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],

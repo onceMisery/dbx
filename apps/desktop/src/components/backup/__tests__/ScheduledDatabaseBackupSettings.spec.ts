@@ -171,6 +171,27 @@ async function selectDialogOption(triggerIndex: number, optionText: string) {
   await flush();
 }
 
+async function openDialogSelect(triggerIndex: number): Promise<HTMLElement[]> {
+  const trigger = currentDialog().querySelectorAll<HTMLButtonElement>('[data-slot="select-trigger"]')[triggerIndex];
+  if (!trigger) throw new Error(`Select trigger not found: ${triggerIndex}`);
+  trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+  await flush();
+  return Array.from(document.body.querySelectorAll<HTMLElement>('[role="option"]'));
+}
+
+function navicatFormatOption(options: HTMLElement[]): HTMLElement {
+  const label = String(i18n.global.t("databaseBackup.formatNb3"));
+  const option = options.find((item) => item.textContent?.trim() === label);
+  if (!option) throw new Error(`Format option not found: ${label}`);
+  return option;
+}
+
+async function chooseOpenSelectOption(option: HTMLElement) {
+  option.focus();
+  option.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  await flush();
+}
+
 async function setTablePattern(pattern: string) {
   await selectDialogOption(TABLE_SCOPE_SELECT, String(i18n.global.t("databaseBackup.includeTables")));
   const input = currentDialog().querySelector<HTMLInputElement>(`input[placeholder="${String(i18n.global.t("databaseBackup.tablePatternsPlaceholder"))}"]`);
@@ -1055,6 +1076,66 @@ describe("ScheduledDatabaseBackupSettings schedule dialog", () => {
 
     expect(addScheduleButton().disabled).toBe(true);
     expect(document.body.textContent).toContain(String(i18n.global.t("databaseBackup.noSupportedConnections")));
+  });
+
+  it("enables create schedule when openGauss connection is available", async () => {
+    mocks.connections.push({ id: "og-1", name: "Local openGauss", db_type: "opengauss" });
+    await mountSettings();
+
+    expect(addScheduleButton().disabled).toBe(false);
+  });
+
+  it.each(["mysql", "postgres"] as const)("offers the Navicat backup format for %s connections", async (dbType) => {
+    mocks.connections.push({ id: `${dbType}-1`, name: `Local ${dbType}`, db_type: dbType });
+    await mountSettings();
+
+    addScheduleButton().click();
+    await flush();
+    const option = navicatFormatOption(await openDialogSelect(0));
+    expect(option.getAttribute("aria-disabled")).not.toBe("true");
+    expect(option.hasAttribute("data-disabled")).toBe(false);
+
+    await chooseOpenSelectOption(option);
+    expect(currentDialog().querySelector("[data-backup-nb3-hint]")).not.toBeNull();
+    expect(currentDialog().querySelector("[data-backup-nb3-unsupported]")).toBeNull();
+  });
+
+  it("disables the Navicat backup format for openGauss connections", async () => {
+    mocks.connections.push({ id: "og-1", name: "Local openGauss", db_type: "opengauss" });
+    await mountSettings();
+
+    addScheduleButton().click();
+    await flush();
+    const option = navicatFormatOption(await openDialogSelect(0));
+    expect(option.getAttribute("aria-disabled")).toBe("true");
+    expect(option.hasAttribute("data-disabled")).toBe(true);
+
+    await chooseOpenSelectOption(option);
+    const formatTrigger = currentDialog().querySelector("[data-backup-output-format]");
+    expect(formatTrigger?.textContent).toContain(String(i18n.global.t("databaseBackup.formatSql")));
+    expect(formatTrigger?.textContent).not.toContain(String(i18n.global.t("databaseBackup.formatNb3")));
+  });
+
+  it.each([
+    ["none", false],
+    ["nb3", true],
+  ] as const)("validates a saved openGauss schedule using the %s format", async (outputCompression, unsupported) => {
+    mocks.connections.push({ id: "og-1", name: "Local openGauss", db_type: "opengauss" });
+    mocks.schedules.push(schedule({ connectionId: "og-1", databases: [], outputCompression }));
+    await mountSettings();
+
+    buttonWithTitle(String(i18n.global.t("databaseBackup.edit"))).click();
+    await flush();
+
+    const hint = currentDialog().querySelector("[data-backup-nb3-unsupported]");
+    expect(saveScheduleButton().disabled).toBe(unsupported);
+    if (unsupported) {
+      expect(hint?.textContent).toContain(String(i18n.global.t("databaseBackup.formatNb3Unsupported")));
+      expect(currentDialog().querySelector("[data-backup-output-format]")?.getAttribute("aria-invalid")).toBe("true");
+      expect(currentDialog().querySelector("[data-backup-output-format]")?.textContent).toContain(String(i18n.global.t("databaseBackup.formatNb3")));
+    } else {
+      expect(hint).toBeNull();
+    }
   });
 
   it("reconfirms a legacy destination before manually running its schedule", async () => {

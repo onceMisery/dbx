@@ -644,6 +644,7 @@ pub async fn execute_query(client: &InfluxdbClient, database: &str, sql: &str) -
     if !series.is_empty() {
         let (columns, rows) = merge_v1_series(&series);
         return Ok(QueryResult {
+            deferred_large_value_cells: Vec::new(),
             column_sortables: columns.iter().map(|_| false).collect(),
             columns,
             column_types: vec![],
@@ -664,6 +665,7 @@ pub async fn execute_query(client: &InfluxdbClient, database: &str, sql: &str) -
     Ok(QueryResult {
         columns: vec![],
         column_types: vec![],
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -863,6 +865,7 @@ fn parse_flux_csv(text: &str, start: Instant) -> Result<QueryResult, String> {
     }
     let columns = headers.unwrap_or_default();
     Ok(QueryResult {
+        deferred_large_value_cells: Vec::new(),
         column_sortables: columns.iter().map(|_| false).collect(),
         spatial_columns: vec![],
         spatial_values: vec![],

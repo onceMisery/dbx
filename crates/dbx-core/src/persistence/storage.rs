@@ -248,6 +248,41 @@ pub struct Storage {
     migration_failure: Arc<Mutex<Option<MigrationFailure>>>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct TunnelProfileSaveSnapshot {
+    pub profiles: Vec<TransportLayerConfig>,
+    metadata: Vec<(String, String)>,
+    secrets: Vec<(String, String, String, Option<String>)>,
+}
+
+impl TunnelProfileSaveSnapshot {
+    pub fn discarded_profile_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .metadata
+            .iter()
+            .filter_map(|(id, json)| match serde_json::from_str::<TransportLayerConfig>(json) {
+                Ok(profile) if profile.id() == id => None,
+                _ => Some(id.clone()),
+            })
+            .collect::<Vec<_>>();
+        for (namespace, key, _, _) in &self.secrets {
+            if let Some(id) = namespace.strip_prefix(TUNNEL_SECRET_NAMESPACE_PREFIX) {
+                if key != CONFIG_SECRET_BLOB_KEY || !self.profiles.iter().any(|profile| profile.id() == id) {
+                    ids.push(id.to_owned());
+                }
+            }
+        }
+        ids.retain(|id| !id.is_empty());
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn same_inventory(&self, other: &Self) -> bool {
+        self.metadata == other.metadata && self.secrets == other.secrets
+    }
+}
+
 /// Key material plus the digest of every key file it was resolved from.
 struct CachedSecretCodec {
     codec: SecretCodec,
@@ -1623,6 +1658,35 @@ impl Storage {
                         .map_err(|error| error.to_string())
                     })
                     .await?;
+                if has_ciphertext {
+                    return Err("ENCRYPTED_DATA_KEY_MISSING".to_string());
+                }
+                self.secret_codec(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn secret_codec_for_write_in_conn(&self, conn: &Connection, needs_key: bool) -> Result<SecretCodec, String> {
+        match self.secret_codec(false) {
+            Ok(codec) => Ok(codec),
+            Err(error)
+                if matches!(
+                    error.as_str(),
+                    "MISSING_MANAGED_KEY" | "MISSING_EXTERNAL_KEY" | "KEY_PROVIDER_UNAVAILABLE"
+                ) =>
+            {
+                if !needs_key {
+                    return Ok(SecretCodec::new([0u8; 32]));
+                }
+                if !self.secret_key_creation_allowed {
+                    return Err(error);
+                }
+                let has_ciphertext = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM connection_secrets WHERE secret_enc IS NOT NULL AND secret_enc <> '')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                ).map_err(|error| error.to_string())?;
                 if has_ciphertext {
                     return Err("ENCRYPTED_DATA_KEY_MISSING".to_string());
                 }
@@ -4822,6 +4886,78 @@ impl Storage {
 // Secret Store and hydrated only when a profile is loaded.
 
 impl Storage {
+    pub async fn load_tunnel_profiles_readonly(&self) -> Result<Vec<TransportLayerConfig>, String> {
+        self.load_tunnel_profile_save_snapshot().await.map(|snapshot| snapshot.profiles)
+    }
+
+    pub async fn load_tunnel_profile_save_snapshot(&self) -> Result<TunnelProfileSaveSnapshot, String> {
+        let storage = self.clone();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred).map_err(|e| e.to_string())?;
+            let mut snapshot = Self::tunnel_profile_raw_snapshot(&tx)?;
+            storage.hydrate_tunnel_profile_snapshot(&mut snapshot)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(snapshot)
+        })
+        .await
+    }
+
+    fn tunnel_profile_raw_snapshot(conn: &Connection) -> Result<TunnelProfileSaveSnapshot, String> {
+        let mut stmt =
+            conn.prepare("SELECT id, config_json FROM tunnel_profiles ORDER BY rowid").map_err(|e| e.to_string())?;
+        let metadata = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT connection_id, key, secret, secret_enc FROM connection_secrets WHERE substr(connection_id, 1, length(?1)) = ?1 COLLATE BINARY ORDER BY connection_id COLLATE BINARY, key COLLATE BINARY"
+        ).map_err(|e| e.to_string())?;
+        let secrets = stmt
+            .query_map([TUNNEL_SECRET_NAMESPACE_PREFIX], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(TunnelProfileSaveSnapshot { profiles: Vec::new(), metadata, secrets })
+    }
+
+    fn hydrate_tunnel_profile_snapshot(&self, snapshot: &mut TunnelProfileSaveSnapshot) -> Result<(), String> {
+        let mut profiles = Vec::new();
+        for (_, json) in &snapshot.metadata {
+            let mut profile = match serde_json::from_str::<TransportLayerConfig>(json) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    warn!("Failed to deserialize tunnel profile: {}", error);
+                    continue;
+                }
+            };
+            let namespace = format!("{TUNNEL_SECRET_NAMESPACE_PREFIX}{}", profile.id());
+            let secret =
+                snapshot.secrets.iter().find(|(id, key, _, _)| id == &namespace && key == CONFIG_SECRET_BLOB_KEY);
+            if let Some((_, _, legacy, encrypted)) = secret {
+                let blob = if let Some(encrypted) = encrypted.as_ref().filter(|value| !value.is_empty()) {
+                    self.secret_codec(false)?.decrypt(&namespace, CONFIG_SECRET_BLOB_KEY, encrypted)?
+                } else {
+                    legacy.clone()
+                };
+                if !blob.is_empty() {
+                    let stored = serde_json::from_str(&blob).map_err(|e| e.to_string())?;
+                    merge_missing_tunnel_profile_secrets(&mut profile, &stored);
+                }
+            }
+            profiles.push(profile);
+        }
+        snapshot.profiles = profiles;
+        Ok(())
+    }
+
     pub async fn load_tunnel_profiles(&self) -> Result<Vec<TransportLayerConfig>, String> {
         let rows: Vec<String> = self
             .with_conn(|conn| {
@@ -4865,6 +5001,22 @@ impl Storage {
     }
 
     pub async fn save_tunnel_profiles(&self, profiles: &[TransportLayerConfig]) -> Result<(), String> {
+        self.save_tunnel_profiles_inner(profiles, None).await.map(|_| ())
+    }
+
+    pub async fn save_tunnel_profiles_if_unchanged(
+        &self,
+        expected: &TunnelProfileSaveSnapshot,
+        profiles: &[TransportLayerConfig],
+    ) -> Result<bool, String> {
+        self.save_tunnel_profiles_inner(profiles, Some(expected)).await
+    }
+
+    async fn save_tunnel_profiles_inner(
+        &self,
+        profiles: &[TransportLayerConfig],
+        expected: Option<&TunnelProfileSaveSnapshot>,
+    ) -> Result<bool, String> {
         for profile in profiles {
             if profile.id().trim().is_empty() {
                 return Err("Tunnel profile id must not be empty".to_string());
@@ -4880,12 +5032,26 @@ impl Storage {
         }
         let needs_key =
             sanitized_profiles.iter().zip(&secret_blobs).any(|(sanitized, (_, profile))| sanitized != profile);
-        let codec = self.secret_codec_for_write(needs_key).await?;
+        let codec = if expected.is_none() { Some(self.secret_codec_for_write(needs_key).await?) } else { None };
+        let expected = expected.cloned();
+        let storage = self.clone();
         self.with_conn(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            if let Some(expected) = expected {
+                if !Self::tunnel_profile_raw_snapshot(&tx)?.same_inventory(&expected) {
+                    return Ok(false);
+                }
+            }
+            let codec = match codec {
+                Some(codec) => codec,
+                None => storage.secret_codec_for_write_in_conn(&tx, needs_key)?,
+            };
             tx.execute("DELETE FROM tunnel_profiles", []).map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM connection_secrets WHERE connection_id LIKE 'tunnel_profile.%'", [])
-                .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM connection_secrets WHERE substr(connection_id, 1, length(?1)) = ?1 COLLATE BINARY",
+                [TUNNEL_SECRET_NAMESPACE_PREFIX],
+            )
+            .map_err(|e| e.to_string())?;
             for profile in &sanitized_profiles {
                 let json = serde_json::to_string(profile).map_err(|e| e.to_string())?;
                 tx.execute(
@@ -4908,7 +5074,8 @@ impl Storage {
                     )?;
                 }
             }
-            tx.commit().map_err(|e| e.to_string())
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(true)
         })
         .await
     }
@@ -11750,6 +11917,113 @@ mod tests {
             proxy_command: String::new(),
             profile_id: String::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn tunnel_profiles_guarded_prepare_and_stale_commit_do_not_migrate_or_create_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            crate::persistence::test_storage::open_unmigrated(&directory.path().join("dbx.db")).await.unwrap();
+        let stale = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        let inline = ssh_profile("inline", "inline-secret");
+        let legacy = ssh_profile("legacy", "legacy-secret");
+        let mut scrubbed = legacy.clone();
+        scrubbed.scrub_secrets();
+        let inline_json = serde_json::to_string(&inline).unwrap();
+        let metadata_json = serde_json::to_string(&scrubbed).unwrap();
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        storage.with_conn(move |conn| {
+            conn.execute("INSERT INTO tunnel_profiles (id, config_json) VALUES ('inline', ?1), ('legacy', ?2)", rusqlite::params![inline_json, metadata_json]).map_err(|e| e.to_string())?;
+            conn.execute("INSERT INTO connection_secrets (connection_id, key, secret) VALUES ('tunnel_profile.legacy', 'config', ?1)", rusqlite::params![legacy_json]).map_err(|e| e.to_string())?;
+            Ok(())
+        }).await.unwrap();
+        let expected_profiles = vec![inline, legacy];
+        let expected = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        let key_path = crate::persistence::secret_codec::managed_key_path(directory.path());
+        assert!(!key_path.exists());
+        assert_eq!(expected.profiles, expected_profiles);
+        let replacement = ssh_profile("new", "new-secret");
+        assert!(!storage.save_tunnel_profiles_if_unchanged(&stale, std::slice::from_ref(&replacement)).await.unwrap());
+        assert!(!key_path.exists());
+        let raw = storage.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*), SUM(CASE WHEN secret <> '' AND (secret_enc IS NULL OR secret_enc = '') THEN 1 ELSE 0 END) FROM connection_secrets WHERE connection_id LIKE 'tunnel_profile.%'", [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).map_err(|e| e.to_string())
+        }).await.unwrap();
+        assert_eq!(raw, (1, 1));
+        assert_eq!(storage.load_tunnel_profiles_readonly().await.unwrap(), expected_profiles);
+        let saved = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            storage.save_tunnel_profiles_if_unchanged(&expected, std::slice::from_ref(&replacement)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(saved);
+        assert!(key_path.exists());
+        assert_eq!(storage.load_tunnel_profiles_readonly().await.unwrap(), vec![replacement]);
+    }
+
+    #[tokio::test]
+    async fn tunnel_profiles_raw_baseline_covers_discarded_rows_and_preserves_similar_namespaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            crate::persistence::test_storage::open_unmigrated(&directory.path().join("dbx.db")).await.unwrap();
+        let same = serde_json::to_string(&ssh_profile("same", "")).unwrap();
+        let mismatched = serde_json::to_string(&ssh_profile("json-id", "")).unwrap();
+        storage.with_conn(move |conn| {
+            conn.execute("INSERT INTO tunnel_profiles (id, config_json) VALUES ('same', ?1), ('db-row', ?2), ('broken', '{')", rusqlite::params![same, mismatched]).map_err(|e| e.to_string())?;
+            for (namespace, key, value) in [
+                ("tunnel_profile.same", "extra", "extra-value"),
+                ("tunnel_profile.orphan", "config", "orphan-value"),
+                ("tunnelXprofile.P", "extra", "keep-1"),
+                ("tunnel_profileX.P", "extra", "keep-2"),
+                ("TUNNEL_PROFILE.P", "extra", "keep-3"),
+            ] {
+                conn.execute("INSERT INTO connection_secrets (connection_id, key, secret) VALUES (?1, ?2, ?3)", rusqlite::params![namespace, key, value]).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }).await.unwrap();
+        let expected = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        assert_eq!(expected.discarded_profile_ids(), vec!["broken", "db-row", "orphan", "same"]);
+        storage
+            .with_conn(|conn| {
+                conn.execute("UPDATE tunnel_profiles SET config_json = '[' WHERE id = 'broken'", [])
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        let changed = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        assert_eq!(changed.profiles, expected.profiles);
+        assert!(!storage.save_tunnel_profiles_if_unchanged(&expected, &expected.profiles).await.unwrap());
+        let key_path = crate::persistence::secret_codec::managed_key_path(directory.path());
+        assert!(!key_path.exists());
+        assert!(storage.save_tunnel_profiles_if_unchanged(&changed, &changed.profiles).await.unwrap());
+        let raw = storage
+            .with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT connection_id, secret FROM connection_secrets ORDER BY connection_id COLLATE BINARY",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            raw,
+            vec![
+                ("TUNNEL_PROFILE.P".into(), "keep-3".into()),
+                ("tunnelXprofile.P".into(), "keep-1".into()),
+                ("tunnel_profileX.P".into(), "keep-2".into())
+            ]
+        );
+        assert!(!key_path.exists());
+        let final_snapshot = storage.load_tunnel_profile_save_snapshot().await.unwrap();
+        assert_eq!(final_snapshot.profiles, changed.profiles);
+        assert!(final_snapshot.discarded_profile_ids().is_empty());
     }
 
     #[tokio::test]

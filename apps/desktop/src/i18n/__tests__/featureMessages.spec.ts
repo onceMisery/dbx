@@ -45,6 +45,7 @@ const under = (namespace: string, keys: string[]) => keys.map((key) => `${namesp
 // leaks the raw key path, and a key missing from a locale silently shows
 // English.
 const FEATURE_MESSAGES: FeatureMessages[] = [
+  { feature: "SQL file includes", keys: under("sqlFile", ["resolveIncludes", "resolveIncludesHint"]), translated: true },
   { feature: "AstraFlow provider", keys: ["ai.astraflowDescription"], translated: true },
   { feature: "AI HTML preview (#6467)", keys: under("ai", ["htmlPreviewLabel", "htmlExpandPreview", "htmlExpandPreviewHint", "htmlSaveSafe", "htmlSaveFailed", "htmlCopySource", "htmlCopyRiskBody", "htmlCopyRiskAccept", "htmlCopyRiskRemember", "htmlCopyRiskToast"]) },
   { feature: "AI conversation export (#6467)", keys: under("ai", ["exportConversation", "conversationExportMarkdown", "conversationExportHtml", "conversationRoleUser", "conversationRoleAssistant", "conversationFailedMarker", "conversationExportEmpty"]) },
@@ -139,6 +140,7 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
     translated: true,
   },
   { feature: "sidebar search skip hint", keys: ["sidebar.searchConnectionSkipped"] },
+  { feature: "sidebar search match mode (#13505)", keys: under("sidebar", ["searchMatchMode", "searchMatchModeFuzzy", "searchMatchModeContains", "searchMatchModeEdges", "searchMatchModeTooltip"]), translated: true },
   { feature: "PostgreSQL legacy TLS", keys: ["connection.postgresLegacyTls", "connection.postgresLegacyTlsHint"] },
   { feature: "settings search sections", keys: ["settings.syncWebDavWebDescription", "settings.performanceSection"] },
   { feature: "local backup selection", keys: ["settings.localBackupSecretsPassphraseRequiredHint", "settings.localBackupPathLabel", "settings.localBackupPathUnset", "settings.localBackupChoosePath", "settings.localBackupPathRequired"], translated: true },
@@ -231,6 +233,11 @@ describe("feature message rendering", () => {
 });
 
 describe("feature message content rules", () => {
+  it.each(ALL_LOCALES)("%s renders include syntax literally instead of resolving an i18n link", (locale) => {
+    const i18n = createI18n({ legacy: false, locale, messages: { [locale]: declared[locale] } });
+    expect(i18n.global.t("sqlFile.resolveIncludesHint")).toContain("-- @include");
+    i18n.dispose();
+  });
   it.each(EXCEPT_AZ_TR)("%s keeps the Dameng validity labels as the database literals", (locale) => {
     const objects = (locale === "en" ? en : declared[locale]).objects as Messages | undefined;
     expect(objects?.validStatus ?? en.objects.validStatus).toBe("VALID");

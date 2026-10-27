@@ -217,7 +217,7 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
     }
     const eagerColumns = eagerMetadata?.metadata.columns ?? [];
     const eagerPrimaryKeys = eagerMetadata?.metadata.primaryKeys ?? [];
-    const defaultSort = resolveTableDefaultSort(settingsStore.editorSettings, effectiveDbType, physicalTablePrimaryKeys(eagerColumns, eagerMetadata?.metadata.indexes), identifierQuote);
+    const defaultSort = resolveTableDefaultSort(settingsStore.editorSettings, effectiveDbType, physicalTablePrimaryKeys(eagerColumns, eagerMetadata?.metadata.indexes, effectiveDbType), identifierQuote);
     const sql = await buildTableSelectSql({
       databaseType: effectiveDbType,
       driverProfile: config.driver_profile,
@@ -232,7 +232,7 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
       columns: eagerColumns.map((column) => column.name),
       primaryKeys: eagerPrimaryKeys,
       orderBy: defaultSort.orderBy,
-      ...tableDataLargeValuePreviewOptions(effectiveDbType, eagerColumns, eagerPrimaryKeys, pageLimit),
+      ...tableDataLargeValuePreviewOptions(effectiveDbType, eagerColumns, eagerPrimaryKeys, pageLimit, config.db_type === "jdbc"),
       whereInput: target.whereInput,
       limit: pageLimit,
     });
@@ -333,7 +333,7 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
           whereInput: target.whereInput,
           primaryKeys,
           columns: columns.map((column) => column.name),
-          ...tableDataLargeValuePreviewOptions(effectiveDbType, columns, primaryKeys, pageLimit),
+          ...tableDataLargeValuePreviewOptions(effectiveDbType, columns, primaryKeys, pageLimit, config.db_type === "jdbc"),
           includeRowId: true,
           orderBy: defaultSort.orderBy,
           limit: pageLimit,

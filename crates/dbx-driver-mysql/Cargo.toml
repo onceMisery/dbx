@@ -27,3 +27,4 @@ tokio-util = { version = "0.7", features = ["compat"] }
 
 [dev-dependencies]
 mysql_common = { git = "https://github.com/t8y2/rust_mysql_common.git", rev = "47740d85a8277167a5717afac785d37b46a36296", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }

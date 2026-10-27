@@ -13,7 +13,7 @@ import * as api from "@/lib/backend/api";
 import { OraclePackageSaveAsFailure, type OraclePackageSaveAsPlan } from "@/lib/table/oraclePackageSaveAs";
 
 const backend = vi.hoisted(() => ({ executeQuery: vi.fn(), buildCreateTableSql: vi.fn(), buildCopyTableDataSql: vi.fn() }));
-const packageSaveAs = vi.hoisted(() => ({ prepare: vi.fn(), execute: vi.fn() }));
+const packageSaveAs = vi.hoisted(() => ({ prepare: vi.fn(), prepareExecution: vi.fn(), execute: vi.fn(), dispose: vi.fn() }));
 vi.mock("@/lib/backend/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/backend/api")>()),
   ...backend,
@@ -23,6 +23,7 @@ vi.mock("@/lib/backend/api", async (importOriginal) => ({
   loadSchemaCache: vi.fn().mockResolvedValue(null),
   deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
   checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+  saveConnectionDatabaseInfo: vi.fn().mockResolvedValue(undefined),
   listSchemas: vi.fn().mockResolvedValue(["APP"]),
   listDatabases: vi.fn().mockResolvedValue(["APP"]),
   listObjects: vi.fn().mockResolvedValue([{ name: "SOURCE", object_type: "TABLE", schema: "APP" }]),
@@ -34,7 +35,7 @@ vi.mock("@/lib/backend/api", async (importOriginal) => ({
 }));
 vi.mock("@/lib/table/oraclePackageSaveAs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/table/oraclePackageSaveAs")>();
-  return { ...actual, prepareOraclePackageSaveAs: (...args: unknown[]) => packageSaveAs.prepare(...args), executeOraclePackageSaveAs: (...args: unknown[]) => packageSaveAs.execute(...args) };
+  return { ...actual, prepareOraclePackageSaveAs: (...args: unknown[]) => packageSaveAs.prepare(...args), prepareOraclePackageSaveAsExecution: (...args: unknown[]) => packageSaveAs.prepareExecution(...args) };
 });
 
 const result = (rows: unknown[][] = []) => ({ columns: [], rows, affected_rows: 0, execution_time_ms: 0 });
@@ -63,6 +64,8 @@ beforeEach(() => {
   backend.buildCopyTableDataSql.mockResolvedValue('INSERT INTO "APP"."MixedCopy" SELECT * FROM "APP"."SOURCE"');
   packageSaveAs.prepare.mockReset();
   packageSaveAs.execute.mockReset();
+  packageSaveAs.dispose.mockReset().mockResolvedValue(undefined);
+  packageSaveAs.prepareExecution.mockReset().mockImplementation(async (...args: unknown[]) => Object.assign(() => packageSaveAs.execute(...args), { dispose: packageSaveAs.dispose }));
   backend.executeQuery.mockImplementation(async (_id, _db, sql: string) => {
     if (sql.includes("ALL_TAB_COMMENTS")) return result([["source comment"]]);
     if (sql.includes("ALL_TABLES")) return result([["NO", "N"]]);
@@ -533,6 +536,21 @@ async function beginPackageSaveAs(surface: "sidebar" | "objects") {
 }
 
 describe.each(["sidebar", "objects"] as const)("%s Oracle package Save As failure refresh", (surface) => {
+  it("binds the execution before production confirmation and releases the unused approval on cancel", async () => {
+    connection.is_production = true;
+    const { controller, plan } = await beginPackageSaveAs(surface);
+    const pending = controller.confirmPackageSaveAs();
+    const safety = useProductionSafetyStore();
+    await vi.waitFor(() => expect(safety.pending).toMatchObject({ sql: plan.statements.join("\n\n") }));
+    expect(packageSaveAs.prepareExecution).toHaveBeenCalledExactlyOnceWith(plan, expect.any(Function));
+    expect(packageSaveAs.execute).not.toHaveBeenCalled();
+    safety.cancel();
+    await pending;
+    expect(packageSaveAs.execute).not.toHaveBeenCalled();
+    expect(packageSaveAs.dispose).toHaveBeenCalledOnce();
+    expect(controller.packageSaveAsOpen).toBe(true);
+  });
+
   it("refreshes the target tree and keeps the failed plan editable for recovery", async () => {
     const { controller, refresh, plan } = await beginPackageSaveAs(surface);
     packageSaveAs.execute.mockRejectedValue(new OraclePackageSaveAsFailure(plan, ["PACKAGE P_NEW"], "PACKAGE BODY P_NEW", new Error("body failed"), true));

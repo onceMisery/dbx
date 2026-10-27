@@ -2792,6 +2792,7 @@ fn query_result(columns: Vec<String>, rows: Vec<Vec<Value>>, affected_rows: u64)
     dbx_core::db::QueryResult {
         columns,
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -3643,6 +3644,7 @@ mod tests {
                     start_position: Some(PeekStartPosition::Offset),
                     partition: Some(2),
                     offset: Some(17),
+                    timestamp: None,
                 },
             )
             .await

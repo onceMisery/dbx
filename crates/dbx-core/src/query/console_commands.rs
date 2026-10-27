@@ -338,6 +338,7 @@ fn pg_string_literal(value: &str) -> String {
 /// Type. Column order is the metadata order.
 fn describe_result_from_columns(columns: &[db::ColumnInfo], object: &str) -> db::QueryResult {
     db::QueryResult {
+        deferred_large_value_cells: Vec::new(),
         columns: vec!["Name".to_string(), "Null?".to_string(), "Type".to_string()],
         column_types: Vec::new(),
         column_sortables: vec![true, false, true],
@@ -369,6 +370,7 @@ fn describe_result_from_columns(columns: &[db::ColumnInfo], object: &str) -> db:
 /// so the frontend renders console output without a new result kind.
 pub(crate) fn console_message_result(message: &str) -> db::QueryResult {
     db::QueryResult {
+        deferred_large_value_cells: Vec::new(),
         columns: vec!["Message".to_string()],
         column_types: Vec::new(),
         column_sortables: vec![false],

@@ -4121,6 +4121,11 @@ async function send() {
   // A background auto-send has no composer of its own, so it runs on the
   // conversation's own database.
   const runDatabases = connection && tab && resolveAiNamespaceSelection(tab, connection).kind === "database" ? (auto || confirmationRetargets ? [runBinding.database] : [...selectedDatabases.value]) : [];
+  // Keep the submitted SQL paired with `text` even if another external fix
+  // replaces the composer while skills or prompt templates are loading.
+  // Like other composer context, selections cannot cross a confirmation target.
+  const selectionContexts = auto || confirmationRetargets ? [] : [...selectedEditorSelections.value];
+  const composerSelectionIds = new Set(selectedEditorSelections.value.map((selection) => selection.id));
   const activeConfig = activeFullConfig.value;
   if (!activeConfig) {
     clearPendingWriteGrant();
@@ -4357,9 +4362,6 @@ async function send() {
   const selectedSqlFiles = auto || confirmationRetargets || runPluginContext ? [] : [...selectedSqlFileMentions.value];
   const csvAttachments = auto || confirmationRetargets ? [] : [...selectedCsvAttachments.value];
   const imageAttachments = auto || confirmationRetargets ? [] : [...selectedImageAttachments.value];
-  // A selection describes the namespace the user picked it in, so it is dropped
-  // exactly like the other composer context when the run targets another one.
-  const selectionContexts = auto || confirmationRetargets ? [] : [...selectedEditorSelections.value];
   const mentionedTables = [...selectedTableMentions, ...parseAiTableMentions(text, runDatabases)];
   const modelInstruction = buildAiModelInstruction({
     tableMentionRaws: selectedTableMentions.map((mention) => mention.raw),
@@ -4385,12 +4387,15 @@ async function send() {
     }
     historyIndex.value = -1;
     draftBeforeHistory.value = "";
-    prompt.value = "";
+    // Consume only this send's selections. A later fix stays staged with its
+    // error, including when both failures have the same error text.
+    const pendingSelections = selectedEditorSelections.value.filter((selection) => !composerSelectionIds.has(selection.id));
+    if (prompt.value.trim() === text && pendingSelections.length === 0) prompt.value = "";
     selectedMentions.value = [];
     selectedSqlFileMentions.value = [];
     selectedCsvAttachments.value = [];
     selectedImageAttachments.value = [];
-    selectedEditorSelections.value = [];
+    selectedEditorSelections.value = pendingSelections;
   }
   if (autoSendVisible) scrollToBottom({ force: true });
 
@@ -6582,6 +6587,9 @@ function openExternalContext(request: AiExternalContextRequest) {
   }
   applyDraftBinding(plan.binding);
   if (!plan.binding.connectionId && request.unresolvedKey) toast(t(request.unresolvedKey), 5000);
+  // An explicit failed result replaces staged SQL selections, including a
+  // previous failed query. It must not be dropped by a full selection budget.
+  if (request.action === "fix" && request.selections?.some((selection) => selection.source === "query-error")) selectedEditorSelections.value = [];
   for (const selection of request.selections ?? []) {
     const budgetError = selectionContextBudgetError(selectedEditorSelections.value);
     if (budgetError) {

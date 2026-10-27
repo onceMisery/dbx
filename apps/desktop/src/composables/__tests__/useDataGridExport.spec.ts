@@ -3007,6 +3007,25 @@ describe("useDataGridExport MySQL BLOB 文本复制 (#12413)", () => {
     expect(extractDataGridSelection).toHaveBeenLastCalledWith(expect.objectContaining({ extractor: "sql-inserts", rows: [[1, "0x616263"]] }));
   });
 
+  it("copies text-like PostgreSQL bytea as text, matching the grid preview (#11987)", async () => {
+    const byteaTable: DataGridTableMeta = {
+      tableName: "test_bytea",
+      primaryKeys: ["id"],
+      columns: [
+        { name: "id", data_type: "int4", is_nullable: false, is_primary_key: true },
+        { name: "payload", data_type: "bytea", is_nullable: false },
+      ],
+    };
+    const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [1], columns: ["payload"], rows: [["0x616263"]] };
+    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({ text: "abc", mimeType: "text/plain", fileExtension: "txt", rowCount: 1, columnCount: 1 });
+    const state = createExportState(byteaTable, ["id", "payload"], matrix, [1, "0x616263"], undefined, undefined, [], DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, false, undefined, false, 1, 1, "postgres");
+
+    await expect(state.copyWithPreference("smart")).resolves.toBe(true);
+
+    expect(extractDataGridSelection).toHaveBeenCalledWith(expect.objectContaining({ extractor: "raw", rows: [["abc"]] }));
+    expect(copyToClipboard).toHaveBeenCalledWith("abc");
+  });
+
   it("copies HTML with both rich and plain clipboard flavors", async () => {
     const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [0], columns: ["name"], rows: [["Ada"]] };
     vi.mocked(extractDataGridSelection).mockResolvedValueOnce({ text: "<table><tr><td>Ada</td></tr></table>", mimeType: "text/html", fileExtension: "html", rowCount: 1, columnCount: 1 });

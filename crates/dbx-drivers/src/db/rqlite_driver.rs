@@ -254,6 +254,7 @@ pub async fn list_triggers(client: &RqliteClient, _schema: &str, table: &str) ->
                 valid: None,
                 comment: None,
                 created_at: None,
+                oracle_metadata: None,
                 statement: value_as_string(row.get(1)),
             }
         })
@@ -297,6 +298,7 @@ pub async fn object_source(
         source,
         editable: None,
         routine_parameters: None,
+        trigger: None,
     })
 }
 
@@ -319,6 +321,7 @@ pub async fn execute_query_with_max_rows(
         Ok(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -374,6 +377,7 @@ fn query_result_from_rqlite_result(
     QueryResult {
         columns: result.columns,
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],

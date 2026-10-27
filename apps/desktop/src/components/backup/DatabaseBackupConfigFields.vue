@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { HelpTooltip } from "@/components/ui/tooltip";
 import { Check, ChevronDown, FolderOpen, Loader2, Search } from "@lucide/vue";
 import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
-import { databaseBackupFileNamePatternHasRunId, databaseBackupFileNamePatternIsValid, type DatabaseBackupExecutionConfig } from "@/lib/backup/scheduledDatabaseBackup";
+import { databaseBackupFileNamePatternHasRunId, databaseBackupFileNamePatternIsValid, supportsNavicatBackupFormat, type DatabaseBackupExecutionConfig } from "@/lib/backup/scheduledDatabaseBackup";
 import type { ConnectionConfig } from "@/types/database";
 import BackupTableSelector from "./BackupTableSelector.vue";
 import type { DatabaseBackupTableSelectionState } from "@/lib/backup/scheduledDatabaseBackup";
@@ -57,6 +57,13 @@ const selectedConnectionName = computed(() => props.connections.find((connection
 const selectedConnectionType = computed(() => props.connections.find((connection) => connection.id === props.draft.connectionId)?.db_type);
 // Database names and exact table lists belong to one connection, so they only apply when a single connection is selected.
 const multipleConnectionsSelected = computed(() => props.multiSelectConnections && props.selectedConnectionIds.length > 1);
+const selectedConnectionTypes = computed(() => {
+  const connectionIds = props.multiSelectConnections ? props.selectedConnectionIds : props.draft.connectionId ? [props.draft.connectionId] : [];
+  return connectionIds.map((connectionId) => props.connections.find((connection) => connection.id === connectionId)?.db_type);
+});
+const navicatFormatSupported = computed(() => supportsNavicatBackupFormat(selectedConnectionTypes.value));
+// A saved schedule may still carry `.nb3` after its connection changed to an unsupported type.
+const navicatFormatUnsupported = computed(() => props.draft.outputCompression === "nb3" && !navicatFormatSupported.value);
 const connectionPickerLabel = computed(() => (multipleConnectionsSelected.value ? t("databaseBackup.connectionsSelected", { count: props.selectedConnectionIds.length }) : selectedConnectionName.value));
 const fileNamePatternNeedsRunId = computed(() => multipleConnectionsSelected.value && !databaseBackupFileNamePatternHasRunId(props.draft.fileNamePattern));
 const filteredConnections = computed(() => {
@@ -240,14 +247,15 @@ watch(
     <div class="space-y-2">
       <Label>{{ t("databaseBackup.backupFormat") }}</Label>
       <Select v-model="draft.outputCompression">
-        <SelectTrigger data-backup-output-format class="w-full sm:w-65"><SelectValue /></SelectTrigger>
+        <SelectTrigger data-backup-output-format class="w-full sm:w-65" :aria-invalid="navicatFormatUnsupported"><SelectValue /></SelectTrigger>
         <SelectContent>
           <SelectItem value="none">{{ t("databaseBackup.formatSql") }}</SelectItem>
           <SelectItem value="gzip">{{ t("databaseBackup.compressionGzip") }}</SelectItem>
-          <SelectItem value="nb3">{{ t("databaseBackup.formatNb3") }}</SelectItem>
+          <SelectItem value="nb3" :disabled="!navicatFormatSupported">{{ t("databaseBackup.formatNb3") }}</SelectItem>
         </SelectContent>
       </Select>
-      <p v-if="draft.outputCompression === 'nb3'" data-backup-nb3-hint class="text-xs text-muted-foreground">{{ t("databaseBackup.formatNb3Hint") }}</p>
+      <p v-if="navicatFormatUnsupported" data-backup-nb3-unsupported class="text-xs text-destructive">{{ t("databaseBackup.formatNb3Unsupported") }}</p>
+      <p v-else-if="draft.outputCompression === 'nb3'" data-backup-nb3-hint class="text-xs text-muted-foreground">{{ t("databaseBackup.formatNb3Hint") }}</p>
     </div>
 
     <div v-if="multipleConnectionsSelected" data-backup-multi-connection-hint class="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">

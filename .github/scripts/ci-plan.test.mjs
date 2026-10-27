@@ -232,7 +232,21 @@ test("code generation and test-only dependencies participate in impact analysis"
   assert.ok(plan(["crates/dbx-formats/src/lib.rs"], { metadata: fixture }).affected_packages.includes("dbx-types"));
 });
 
-for (const file of ["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "rust-toolchain.toml", "vendor/wry/src/lib.rs", "crates/dbx-sql/Cargo.toml", ".github/workflows/ci.yml", ".github/scripts/ci-plan.mjs", ".github/scripts/ci-gate.test.mjs"]) {
+for (const file of [
+  "Cargo.toml",
+  "Cargo.lock",
+  ".cargo/config.toml",
+  "rust-toolchain.toml",
+  "vendor/wry/src/lib.rs",
+  "crates/dbx-sql/Cargo.toml",
+  ".github/workflows/ci.yml",
+  ".github/scripts/ci-plan.mjs",
+  ".github/scripts/ci-gate.test.mjs",
+  ".github/scripts/ci-gradle.py",
+  ".github/scripts/ci-gradle.init.gradle",
+  ".github/scripts/ci-install-system-deps.py",
+  ".github/scripts/ci-install-mold.sh",
+]) {
   test(`shared input ${file} retains full workspace and Agent coverage`, () => {
     const result = plan([file]);
     assert.deepEqual(groups(result), ["workspace"]);

@@ -6,7 +6,7 @@ import { binaryCellDisplayText, binaryCellDownloadPayload } from "@/lib/dataGrid
 import { useDataGridLargeValues } from "@/composables/useDataGridLargeValues";
 import { useDataGridEditor } from "@/composables/useDataGridEditor";
 import { createDataGridRuntimeScope } from "@/lib/dataGrid/dataGridRuntime";
-import type { DatabaseType, QueryResult } from "@/types/database";
+import type { ConnectionConfig, DatabaseType, QueryResult } from "@/types/database";
 
 const mocks = vi.hoisted(() => ({
   buildDataGridContextFilterCondition: vi.fn(),
@@ -43,6 +43,7 @@ afterEach(() => {
 });
 
 function mountLargeValues(databaseType: DatabaseType, result: Ref<QueryResult>, withEditor = false) {
+  const config = ref({ id: `${databaseType}-1`, name: "Test", db_type: databaseType, host: "original" } as ConnectionConfig);
   const runtimeScope = createDataGridRuntimeScope();
   const toast = vi.fn();
   const formatCell = (value: unknown, columnIndex?: number, originalBytes?: number) => binaryCellDisplayText(value, result.value.column_types?.[columnIndex ?? 0], originalBytes, databaseType) ?? String(value ?? "");
@@ -79,7 +80,7 @@ function mountLargeValues(databaseType: DatabaseType, result: Ref<QueryResult>, 
           clearCellFormatCache: vi.fn(),
           invalidateResultEstimate: vi.fn(),
           connectionIdentifierQuote: () => '"',
-          getConnectionConfig: () => undefined,
+          getConnectionConfig: () => config.value,
           includeDatabaseName: computed(() => true),
           globalQueryTimeoutSecs: computed(() => 30),
           resultLifecycle: { beginOperation: () => 1, isCurrent: () => true },
@@ -132,7 +133,7 @@ function mountLargeValues(databaseType: DatabaseType, result: Ref<QueryResult>, 
     app.unmount();
   });
   if (!largeValues) throw new Error("useDataGridLargeValues was not mounted");
-  return { largeValues, toast, item, editor, runtimeScope };
+  return { largeValues, toast, item, editor, runtimeScope, config };
 }
 
 function previewResult(columnType = "bytea", value = "\\x00017f80ff...", originalBytes = 9645) {
@@ -147,6 +148,110 @@ function previewResult(columnType = "bytea", value = "\\x00017f80ff...", origina
 }
 
 describe("useDataGridLargeValues", () => {
+  it.each(["metadata", "target"] as const)("uses target identity rather than incidental connection fields for legacy exports (%s)", async (change) => {
+    const result = previewResult();
+    const { largeValues, config } = mountLargeValues("postgres", result);
+    const run = largeValues.captureSourceValues([{ rowId: 1, sourceIndex: 0, columnIndex: 1 }]);
+    if (change === "metadata") Object.assign(config.value, { note: "updated note", default_schema: "other display schema", database_info: { product_name: "PostgreSQL" } });
+    else config.value.host = "other target";
+    mocks.buildDataGridContextFilterCondition.mockResolvedValue('"ID" = 1');
+    mocks.buildTableSelectSql.mockResolvedValue("original select");
+    mocks.executeMulti.mockResolvedValue([{ columns: ["ID", "APP"], rows: [[1, "complete"]] }]);
+    if (change === "metadata") expect((await run(new AbortController().signal)).get(1)?.get(1)).toBe("complete");
+    else {
+      await expect(run(new AbortController().signal)).rejects.toMatchObject({ status: "failed" });
+      expect(mocks.executeMulti).not.toHaveBeenCalled();
+    }
+  });
+  it("captures legacy PK values and columns before deferred export reads", async () => {
+    const result = previewResult();
+    const { largeValues } = mountLargeValues("postgres", result);
+    const run = largeValues.captureSourceValues([{ rowId: 1, sourceIndex: 0, columnIndex: 1 }]);
+    expect(mocks.executeMulti).not.toHaveBeenCalled();
+    result.value = { ...result.value, columns: ["NEW_ID", "OTHER"], rows: [[99, "different"]] };
+    mocks.buildDataGridContextFilterCondition.mockResolvedValue('"ID" = 1');
+    mocks.buildTableSelectSql.mockResolvedValue("original select");
+    mocks.executeMulti.mockResolvedValue([{ columns: ["ID", "APP"], rows: [[1, "complete"]] }]);
+    const values = await run(new AbortController().signal);
+    expect(mocks.buildDataGridContextFilterCondition).toHaveBeenCalledWith(expect.objectContaining({ columnName: "ID", value: 1 }));
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ tableName: "APP_DATA", columns: ["ID", "APP"] }));
+    expect(mocks.executeMulti).toHaveBeenCalledWith("postgres-1", "MAXIMO", "original select", undefined, "execution-1", expect.objectContaining({ maxRows: 1 }));
+    expect(values.get(1)?.get(1)).toBe("complete");
+  });
+
+  it.each(["resolve", "reject"] as const)("waits for an in-flight legacy export read on cancellation (%s)", async (completion) => {
+    const result = previewResult();
+    const { largeValues } = mountLargeValues("postgres", result);
+    const controller = new AbortController();
+    mocks.buildDataGridContextFilterCondition.mockResolvedValue("ID = 1");
+    mocks.buildTableSelectSql.mockResolvedValue("select");
+    let resolveRead!: (value: unknown) => void;
+    let rejectRead!: (reason: Error) => void;
+    mocks.executeMulti.mockImplementation(
+      () =>
+        new Promise((resolve, reject) => {
+          resolveRead = resolve;
+          rejectRead = reject;
+        }),
+    );
+    const pending = largeValues.captureSourceValues([{ rowId: 1, sourceIndex: 0, columnIndex: 1 }])(controller.signal);
+    const outcome = pending.catch((error) => error);
+    await vi.waitFor(() => expect(mocks.executeMulti).toHaveBeenCalledOnce());
+    let finished = false;
+    void outcome.then(() => {
+      finished = true;
+    });
+    controller.abort();
+    await nextTick();
+    expect(finished).toBe(false);
+    expect(mocks.cancelQuery).not.toHaveBeenCalled();
+    if (completion === "resolve") resolveRead([{ columns: ["ID", "APP"], rows: [[1, "complete"]] }]);
+    else rejectRead(new Error("transport lost"));
+    expect(await outcome).toMatchObject({ status: completion === "resolve" ? "cancelled" : "unknown" });
+  });
+
+  it("keeps distinct quoted result names when resolving a captured legacy value", async () => {
+    const result = previewResult();
+    result.value.columns = ["ID", "id"];
+    const { largeValues } = mountLargeValues("postgres", result);
+    mocks.buildDataGridContextFilterCondition.mockResolvedValue('"ID" = 1');
+    mocks.buildTableSelectSql.mockResolvedValue('SELECT "ID", "id" FROM "APP_DATA"');
+    mocks.executeMulti.mockResolvedValue([{ columns: ["ID", "id"], rows: [[1, "complete"]] }]);
+    const resolved = await largeValues.captureSourceValues([{ rowId: 1, sourceIndex: 0, columnIndex: 1 }])(new AbortController().signal);
+    expect(resolved.get(1)?.get(1)).toBe("complete");
+  });
+
+  it.each(["duplicate_identity", "unknown_after_not_started"] as const)("rejects unsafe legacy export results (%s)", async (reason) => {
+    const result = previewResult();
+    const { largeValues } = mountLargeValues("postgres", result);
+    mocks.buildDataGridContextFilterCondition.mockResolvedValue("ID = 1");
+    mocks.buildTableSelectSql.mockResolvedValue("select");
+    const failed = { columns: ["message"], rows: [["failed"]], execution_error: true, error: { operationOutcome: "not_started" } };
+    mocks.executeMulti.mockResolvedValue(
+      reason === "duplicate_identity"
+        ? [
+            {
+              columns: ["ID", "APP"],
+              rows: [
+                [1, "first"],
+                [1, "second"],
+              ],
+            },
+          ]
+        : [failed, { ...failed, error: { operationOutcome: "unknown" } }],
+    );
+    await expect(largeValues.captureSourceValues([{ rowId: 1, sourceIndex: 0, columnIndex: 1 }])(new AbortController().signal)).rejects.toMatchObject({ status: reason === "duplicate_identity" ? "failed" : "unknown" });
+  });
+
+  it("rejects a legacy export result that still contains a preview", async () => {
+    const result = previewResult();
+    const { largeValues } = mountLargeValues("postgres", result);
+    mocks.buildDataGridContextFilterCondition.mockResolvedValue("ID = 1");
+    mocks.buildTableSelectSql.mockResolvedValue("select");
+    mocks.executeMulti.mockResolvedValue([result.value]);
+    await expect(largeValues.captureSourceValues([{ rowId: 1, sourceIndex: 0, columnIndex: 1 }])(new AbortController().signal)).rejects.toMatchObject({ status: "failed" });
+  });
+
   it.each(["result", "locator", "clientSessionId", "txnSessionId", "catalog", "disposal"] as const)("rejects a captured download target after its %s changes", async (change) => {
     const result = previewResult("CLOB", "preview", 5000);
     result.value.large_value_context = { connectionId: "oceanbase-oracle-1", database: "MAXIMO", clientSessionId: "original-session" };

@@ -16,8 +16,10 @@ import { OptionHelpPanel } from "@/components/ui/option-help-panel";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
 import DateTimePicker from "@/components/ui/date-time-picker/DateTimePicker.vue";
+import KeyCap from "@/components/ui/KeyCap.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
+import { redisDeleteGroupPreview, redisDeleteKeysPreview } from "@/lib/redis/redisCommandPreview";
 import { redisValuePreviewLimitBytes } from "@/lib/redis/redisValuePreviewLimit";
 import RedisValueViewer from "./RedisValueViewer.vue";
 import RedisPubSubPanel from "./RedisPubSubPanel.vue";
@@ -466,7 +468,7 @@ const selectedKey = computed(() => {
   void keyMetadataEpoch.value;
   return selectedKeyRaw.value ? (flatKeyByRaw.get(selectedKeyRaw.value) ?? null) : null;
 });
-const dangerDetails = computed(() => {
+const dangerDetailsText = computed(() => {
   if (!pendingDanger.value) return "";
   if (pendingDanger.value.kind === "delete-keys") {
     return t(pendingDanger.value.loadedSearchResults ? "redis.deleteLoadedSearchKeysDetails" : "redis.deleteGroupDetails", {
@@ -480,6 +482,36 @@ const dangerDetails = computed(() => {
     return t("redis.deleteGroupSubtreeDetails", {
       target: pendingDanger.value.title,
       count: pendingDanger.value.loadedCount,
+    });
+  }
+  return "";
+});
+
+const isClusterMode = computed(() => connectionStore.getConfig(props.connectionId)?.redis_connection_mode === "cluster");
+
+const dangerSql = computed(() => {
+  if (!pendingDanger.value) return "";
+  if (pendingDanger.value.kind === "delete-keys") {
+    return redisDeleteKeysPreview(pendingDanger.value.keyRaws, {
+      raw: true,
+      database: props.db,
+      isCluster: isClusterMode.value,
+    });
+  }
+  if (pendingDanger.value.kind === "delete-group") {
+    const config = connectionStore.getConfig(props.connectionId);
+    return redisDeleteGroupPreview(pendingDanger.value.pattern, {
+      database: props.db,
+      isCluster: isClusterMode.value,
+      connection: config
+        ? {
+            host: config.host,
+            port: config.port,
+            username: config.username,
+            password: config.password,
+            tls: config.ssl,
+          }
+        : undefined,
     });
   }
   return pendingDanger.value.command;
@@ -3929,6 +3961,10 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
                             <span v-if="item.apply && item.apply !== item.label" class="block truncate text-[11px] text-slate-500">{{ item.apply }}</span>
                           </span>
                           <span v-if="item.detail" class="shrink-0 text-slate-400">{{ item.detail }}</span>
+                          <!-- The slot keeps its width on every row so the hint never shifts the text. -->
+                          <span class="flex w-7 shrink-0 justify-end">
+                            <KeyCap v-if="commandCompletionSelectedIndex === index" label="Tab" />
+                          </span>
                         </button>
                       </div>
                     </div>
@@ -3968,7 +4004,16 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
       </Pane>
     </Splitpanes>
 
-    <DangerConfirmDialog v-model:open="showDangerConfirm" :message="dangerMessage" :details="dangerDetails" :confirm-label="dangerConfirmLabel" :loading="deletingKeys" :close-on-confirm="pendingDanger?.kind === 'delete-keys' || pendingDanger?.kind === 'delete-group'" @confirm="applyDangerAction" />
+    <DangerConfirmDialog
+      v-model:open="showDangerConfirm"
+      :message="dangerMessage"
+      :details-text="dangerDetailsText"
+      :sql="dangerSql"
+      :confirm-label="dangerConfirmLabel"
+      :loading="deletingKeys"
+      :close-on-confirm="pendingDanger?.kind === 'delete-keys' || pendingDanger?.kind === 'delete-group'"
+      @confirm="applyDangerAction"
+    />
 
     <Dialog :open="showBatchExpiryDialog" @update:open="onBatchExpiryDialogOpenChange">
       <DialogContent class="sm:max-w-[420px]">

@@ -1116,6 +1116,7 @@ mod tests {
             Ok(QueryResult {
                 columns: Vec::new(),
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: Vec::new(),
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -1218,6 +1219,7 @@ mod tests {
         let mut result = QueryResult {
             columns: Vec::new(),
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -1278,6 +1280,7 @@ mod tests {
         let result = QueryResult {
             columns: vec!["amount".to_string()],
             column_types: vec!["NUMBER(38,12)".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),

@@ -676,6 +676,7 @@ fn parse_soql_response(value: Value, elapsed_ms: u128, max_rows: usize) -> Query
     QueryResult {
         columns,
         column_types,
+        deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns: Vec::new(),
         spatial_values: Vec::new(),
@@ -1176,6 +1177,7 @@ impl SfClient {
                 Ok(QueryResult {
                     columns: vec!["Id".to_string()],
                     column_types: vec!["String".to_string()],
+                    deferred_large_value_cells: Vec::new(),
                     column_sortables: vec![false],
                     spatial_columns: Vec::new(),
                     spatial_values: Vec::new(),
@@ -1212,6 +1214,7 @@ fn salesforce_affected_query_result(affected_rows: u64, started: Instant) -> Que
     QueryResult {
         columns: Vec::new(),
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns: Vec::new(),
         spatial_values: Vec::new(),

@@ -292,6 +292,14 @@ pub fn redact_tunnel(profile: TransportLayerConfig) -> TransportLayerConfig {
     redact(&tunnel_connection(profile)).transport_layers.remove(0)
 }
 
+pub(crate) fn restore_tunnel_from_profiles(
+    profile: TransportLayerConfig,
+    saved: &[TransportLayerConfig],
+) -> Result<TransportLayerConfig, AppError> {
+    let saved = saved.iter().cloned().map(tunnel_connection).map(|config| (config.id.clone(), config)).collect();
+    Ok(restore(tunnel_connection(profile), &saved)?.transport_layers.remove(0))
+}
+
 impl WebState {
     pub fn connection_response(&self, config: ConnectionConfig) -> ConnectionResponse {
         let jdbc_dialect = jdbc_dialect_hint(&config);
@@ -601,15 +609,19 @@ mod tests {
             "connection_string": "jdbc:oceanbase:oracle://host/service"
         }))
         .unwrap();
-        let Json(added) =
-            connection::mcp_add_connection(State(state.clone()), Json(McpAddConnectionRequest { config }))
-                .await
-                .unwrap();
+        let Json(added) = connection::mcp_add_connection(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(McpAddConnectionRequest { config }),
+        )
+        .await
+        .unwrap();
         let value = serde_json::to_value(&added).unwrap();
         assert_eq!(value["jdbc_dialect"], "oceanbase-oracle");
         assert!(value.get("config").is_none());
         let Json(duplicated) = connection::mcp_duplicate_connection(
             State(state.clone()),
+            HeaderMap::new(),
             Json(McpDuplicateConnectionRequest {
                 source_id: "mcp-jdbc".into(),
                 copy_id: "mcp-copy".into(),
@@ -700,6 +712,7 @@ mod tests {
         assert!(!serde_json::to_string(&profiles).unwrap().contains("ssh-secret"));
         let _ = crate::routes::tunnel_profiles::save_tunnel_profiles(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(crate::routes::tunnel_profiles::SaveTunnelProfilesRequest { profiles }),
         )
         .await

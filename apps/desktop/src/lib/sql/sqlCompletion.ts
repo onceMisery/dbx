@@ -2857,7 +2857,7 @@ function isCallRoutineContext(beforeToken: string): boolean {
 }
 
 const SQL_IDENTIFIER_START_CHAR = /[@_\p{ID_Start}]/u;
-const SQL_IDENTIFIER_SUFFIX = /[$@_\u200c\u200d\p{ID_Continue}]+$/u;
+const SQL_IDENTIFIER_SUFFIX_CHAR = /^[$@_\u200c\u200d\p{ID_Continue}]$/u;
 const SQL_IDENTIFIER_CONTINUE_CHAR = /[$_\u200c\u200d\p{ID_Continue}]/u;
 
 function hasTableAliasAfterCursor(sql: string, cursor: number): boolean {
@@ -2934,7 +2934,12 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
   const qualifierParts = trailingIdentifier?.qualifierParts;
   const bareStart = trailingIdentifier?.start ?? beforeCursor.length;
   const beforeToken = beforeCursor.slice(0, Math.max(0, bareStart)).trimEnd();
-  const lastWord = /([A-Za-z_][\w$]*)$/.exec(beforeToken)?.[1]?.toLowerCase() ?? "";
+  let lastWordStart = beforeToken.length;
+  while (lastWordStart > 0 && /[\w$]/.test(beforeToken[lastWordStart - 1] ?? "")) {
+    lastWordStart -= 1;
+  }
+
+  const lastWord = /([A-Za-z_][\w$]*)$/.exec(beforeToken.slice(lastWordStart))?.[1]?.toLowerCase() ?? "";
 
   // CTE bodies are their own scope: resolve them first so the outer query's
   // referenced tables are read from a statement with those bodies blanked out.
@@ -3399,12 +3404,26 @@ function parseTrailingIdentifierPart(input: string, endExclusive: number): { sta
     return null;
   }
 
-  const match = SQL_IDENTIFIER_SUFFIX.exec(input.slice(0, endExclusive));
-  if (!match) return null;
-  const raw = match[0];
+  let start = endExclusive;
+
+  while (start > 0) {
+    let previous = start - 1;
+    const low = input.charCodeAt(previous);
+    if (previous > 0 && low >= 0xdc00 && low <= 0xdfff) {
+      const high = input.charCodeAt(previous - 1);
+      if (high >= 0xd800 && high <= 0xdbff) previous--;
+    }
+    if (!SQL_IDENTIFIER_SUFFIX_CHAR.test(input.slice(previous, start))) break;
+    start = previous;
+  }
+  if (start === endExclusive) return null;
+  const raw = input.slice(start, endExclusive);
   const firstCodePoint = raw.codePointAt(0);
-  if (firstCodePoint === undefined || !SQL_IDENTIFIER_START_CHAR.test(String.fromCodePoint(firstCodePoint))) return null;
-  return { start: match.index, raw };
+  if (firstCodePoint === undefined || !SQL_IDENTIFIER_START_CHAR.test(String.fromCodePoint(firstCodePoint))) {
+    return null;
+  }
+
+  return { start, raw };
 }
 
 /**

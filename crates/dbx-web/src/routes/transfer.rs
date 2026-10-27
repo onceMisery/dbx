@@ -33,6 +33,9 @@ fn send_transfer_progress(channel: &TransferProgressChannel, progress: &transfer
 
 fn terminal_transfer_error(req: &TransferRequest, error: impl ToString) -> transfer::TransferProgress {
     transfer::TransferProgress {
+        oracle_package_approval: None,
+        oracle_package_preflight: None,
+        oracle_routine_operation: None,
         transfer_id: req.transfer_id.clone(),
         table: String::new(),
         table_index: 0,
@@ -425,6 +428,7 @@ mod tests {
             create_table: false,
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
             content: TransferContent::DataOnly,
             objects: Some(Vec::new()),
             mode: TransferMode::Append,

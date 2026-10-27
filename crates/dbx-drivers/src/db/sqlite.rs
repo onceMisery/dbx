@@ -2687,6 +2687,7 @@ pub async fn list_triggers(pool: &SqliteHandle, schema: &str, table: &str) -> Re
                     valid: None,
                     comment: None,
                     created_at: None,
+                    oracle_metadata: None,
                     statement: if sql_text.is_empty() { None } else { Some(sql_text) },
                 }
             })
@@ -2732,6 +2733,7 @@ pub async fn list_triggers(pool: &SqliteHandle, schema: &str, table: &str) -> Re
                         valid: None,
                         comment: None,
                         created_at: None,
+                        oracle_metadata: None,
                         statement: sql_text,
                     })
                 })
@@ -2954,6 +2956,7 @@ fn execute_query_blocking(
             Ok(QueryResult {
                 columns,
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -2973,6 +2976,7 @@ fn execute_query_blocking(
             Ok(QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],

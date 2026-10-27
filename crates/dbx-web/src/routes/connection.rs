@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -44,6 +44,14 @@ struct NoSaveRuntimeSecrets {
 struct SessionCredentialWrites {
     primary: Option<SessionCredentialWriteToken>,
     purposes: Vec<PurposeSessionCredentialWriteToken>,
+}
+
+fn connection_credential_owner(state: &WebState, headers: &HeaderMap) -> String {
+    if state.password_disabled {
+        String::new()
+    } else {
+        session_token_from_headers(headers).unwrap_or_default()
+    }
 }
 
 fn prepare_runtime_config(mut config: ConnectionConfig) -> (ConnectionConfig, NoSaveRuntimeSecrets) {
@@ -290,11 +298,15 @@ async fn apply_mongo_legacy_driver_profile(state: &WebState, config: &Connection
 /// The core connector can choose the Legacy Agent after a native MongoDB
 /// handshake failure. Keep Web's runtime and saved profile aligned so the UI
 /// does not expose native-only collection rename for that session.
-async fn sync_mongo_legacy_driver_fallback(state: &WebState, config: &ConnectionConfig) -> Result<(), AppError> {
+async fn sync_mongo_legacy_driver_fallback(
+    state: &WebState,
+    config: &ConnectionConfig,
+    receipt: &dbx_core::connection::ConnectionPoolReceipt,
+) -> Result<(), AppError> {
     if config.db_type != DatabaseType::MongoDb {
         return Ok(());
     }
-    let uses_legacy_agent = matches!(state.app.pool_handle(&config.id).await, Some(PoolKind::Agent(_)));
+    let uses_legacy_agent = matches!(state.app.pool_handle_for_receipt(receipt).await, Some(PoolKind::Agent(_)));
     if !uses_legacy_agent {
         return Ok(());
     }
@@ -346,12 +358,13 @@ async fn run_prepared_temporary_connection_test(
     include_database_info: bool,
 ) -> Result<ConnectionTestResult, String> {
     if config.db_type == DatabaseType::Plugin {
+        let attempt = app.connection_endpoint_attempt(&temp_id, &config).await?;
         let result = async {
-            let endpoint = app.plugin_connection_endpoint(&temp_id, &config).await?;
+            let endpoint = attempt.endpoint?;
             app.plugin_host.test_connection(&config, &endpoint.host, endpoint.port, endpoint.proxy).await
         }
         .await;
-        app.reset_connection_transport_for_config(&temp_id, &config).await;
+        app.reset_connection_transport_if_current(&temp_id, &attempt.stamp).await;
         return result;
     }
 
@@ -482,87 +495,100 @@ pub async fn connect_db(
     }
     let app = &state.app;
     let connection_id = config.id.clone();
-    let owner = session_token_from_headers(&headers).unwrap_or_default();
-    let attempt = app.begin_connection_attempt_with_client_attempt(&connection_id, body.client_attempt).await;
+    let permit = super::pl_debug::claim_mutation(
+        &state,
+        &headers,
+        dbx_core::query::pl_debug::PlDebugMutationScope::Connections(vec![connection_id.clone()]),
+    )
+    .await?;
+    let owner = connection_credential_owner(&state, &headers);
+    permit
+        .after_debug_cleanup_with_error(async {
+            let attempt = app.begin_connection_attempt_with_client_attempt(&connection_id, body.client_attempt).await;
 
-    // save_password=false 连接：
-    // 1) 先把本次输入的密码按 owner（登录会话）记入内存会话凭据仓库，供池创建/
-    //    池重建按 owner 读取（见 apply_session_credential）；
-    // 2) 存入全局运行态 configs 的配置必须脱敏（password 恒为空），禁止明文驻留
-    //    AppState.configs——否则其他登录会话借池重建即可读到它，绕过 owner 隔离。
-    // 只有本次请求确实写入/替换了会话凭据（输入了非空密码）时，才需要在连接
-    // 失败时回滚它；无密码重连复用的是既有有效凭据，失败不应清掉它，否则瞬时的
-    // 数据库/网络抖动就会让"本次会话内记住密码"失效、下次又弹窗。
-    let (mut runtime_config, runtime_secrets) = prepare_runtime_config(config.clone());
-    dbx_core::query::plugin_plan::invalidate_gaussdb_dws_product_version(&mut runtime_config);
-    let session_credential_writes = record_session_credentials(
-        app,
-        &owner,
-        &connection_id,
-        &runtime_secrets,
-        config.db_type == DatabaseType::Nacos,
-    );
+            // save_password=false 连接：
+            // 1) 先把本次输入的密码按 owner（登录会话）记入内存会话凭据仓库，供池创建/
+            //    池重建按 owner 读取（见 apply_session_credential）；
+            // 2) 存入全局运行态 configs 的配置必须脱敏（password 恒为空），禁止明文驻留
+            //    AppState.configs——否则其他登录会话借池重建即可读到它，绕过 owner 隔离。
+            // 只有本次请求确实写入/替换了会话凭据（输入了非空密码）时，才需要在连接
+            // 失败时回滚它；无密码重连复用的是既有有效凭据，失败不应清掉它，否则瞬时的
+            // 数据库/网络抖动就会让"本次会话内记住密码"失效、下次又弹窗。
+            let (mut runtime_config, runtime_secrets) = prepare_runtime_config(config.clone());
+            dbx_core::query::plugin_plan::invalidate_gaussdb_dws_product_version(&mut runtime_config);
+            let session_credential_writes = record_session_credentials(
+                app,
+                &owner,
+                &connection_id,
+                &runtime_secrets,
+                config.db_type == DatabaseType::Nacos,
+            );
 
-    // Plugin connection/connect refreshes the sidecar's registration in place.
-    // Closing the old pool after this request would send a late
-    // connection/disconnect and remove the refreshed registration.
-    if config.db_type == DatabaseType::Plugin {
-        app.drop_connection_pools_without_close(&connection_id).await;
-    } else {
-        app.remove_connection_pools_detached(&connection_id).await;
-    }
-    app.nacos_registry.drop_connection(&connection_id).await;
-    app.reset_connection_transport_for_config(&connection_id, &runtime_config).await;
-    app.configs.write().await.insert(connection_id.clone(), runtime_config);
-
-    if config.db_type == dbx_core::models::connection::DatabaseType::Plugin {
-        let endpoint = match app.plugin_connection_endpoint(&connection_id, &config).await {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                app.reset_connection_transport_for_config(&connection_id, &config).await;
-                rollback_session_credential_writes(app, &session_credential_writes);
-                return Err(AppError::from(error));
+            // Plugin connection/connect refreshes the sidecar's registration in place.
+            // Closing the old pool after this request would send a late
+            // connection/disconnect and remove the refreshed registration.
+            if config.db_type == DatabaseType::Plugin {
+                app.drop_connection_pools_without_close_checked(&connection_id).await.map_err(AppError::from)?;
+            } else {
+                app.remove_connection_pools_detached_checked(&connection_id).await.map_err(AppError::from)?;
             }
-        };
-        if let Err(error) = app.ensure_current_connection_attempt(&connection_id, Some(attempt)).await {
-            app.reset_connection_transport_for_config(&connection_id, &config).await;
-            rollback_session_credential_writes(app, &session_credential_writes);
-            return Err(AppError::from(error));
-        }
-        let handle =
-            match app.plugin_host.connect_connection(&config, &endpoint.host, endpoint.port, endpoint.proxy).await {
-                Ok(handle) => handle,
-                Err(error) => {
-                    app.reset_connection_transport_for_config(&connection_id, &config).await;
+            app.nacos_registry.drop_connection(&connection_id).await;
+            app.configs.write().await.insert(connection_id.clone(), runtime_config);
+
+            if config.db_type == dbx_core::models::connection::DatabaseType::Plugin {
+                let prepared = match app.connection_endpoint_attempt(&connection_id, &config).await {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        rollback_session_credential_writes(app, &session_credential_writes);
+                        return Err(AppError::from(error));
+                    }
+                };
+                let result = async {
+                    let endpoint = prepared.endpoint?;
+                    app.ensure_current_connection_attempt(&connection_id, Some(attempt)).await?;
+                    let handle = app
+                        .plugin_host
+                        .connect_connection(&config, &endpoint.host, endpoint.port, endpoint.proxy)
+                        .await?;
+                    let pool = PoolKind::PluginConnection(handle);
+                    app.insert_connection_pool_for_attempt_with_transport(
+                        &connection_id,
+                        attempt,
+                        connection_id.clone(),
+                        pool,
+                        &config,
+                        &prepared.stamp,
+                    )
+                    .await
+                }
+                .await;
+                if let Err(error) = result {
+                    app.reset_connection_transport_if_current(&connection_id, &prepared.stamp).await;
                     rollback_session_credential_writes(app, &session_credential_writes);
                     return Err(AppError::from(error));
                 }
-            };
-        let pool = PoolKind::PluginConnection(handle);
-        if let Err(error) =
-            app.insert_connection_pool_for_attempt(&connection_id, attempt, connection_id.clone(), pool, &config).await
-        {
-            app.reset_connection_transport_for_config(&connection_id, &config).await;
-            rollback_session_credential_writes(app, &session_credential_writes);
-            return Err(AppError::from(error));
-        }
-        return Ok(Json(connection_id));
-    }
+                return Ok(Json(connection_id));
+            }
 
-    if let Err(error) = app.get_or_create_pool_for_connection_attempt(&connection_id, None, attempt).await {
-        // 连接失败：仅回滚本次请求刚写入的会话凭据，避免前端误判"已记住密码"而用
-        // 失败密码免弹窗重试；无密码重连复用的既有凭据不受瞬时失败影响。
-        rollback_session_credential_writes(app, &session_credential_writes);
-        return Err(AppError::from(error));
-    }
-    if let Err(error) = sync_mongo_legacy_driver_fallback(&state, &config).await {
-        app.remove_connection_pools_detached(&connection_id).await;
-        app.reset_connection_transport_for_config(&connection_id, &config).await;
-        rollback_session_credential_writes(app, &session_credential_writes);
-        return Err(error);
-    }
+            let receipt =
+                match app.get_or_create_pool_for_connection_attempt_with_receipt(&connection_id, None, attempt).await {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        // 连接失败：仅回滚本次请求刚写入的会话凭据，避免前端误判"已记住密码"而用
+                        // 失败密码免弹窗重试；无密码重连复用的既有凭据不受瞬时失败影响。
+                        rollback_session_credential_writes(app, &session_credential_writes);
+                        return Err(AppError::from(error));
+                    }
+                };
+            if let Err(error) = sync_mongo_legacy_driver_fallback(&state, &config, &receipt).await {
+                app.discard_connection_pool_receipt(&receipt).await;
+                rollback_session_credential_writes(app, &session_credential_writes);
+                return Err(error);
+            }
 
-    Ok(Json(connection_id))
+            Ok(Json(connection_id))
+        })
+        .await
 }
 
 pub async fn connected_database_info(
@@ -591,11 +617,21 @@ pub async fn save_connection_database_info(
 
 pub async fn unlock_connection_writes(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(body): Json<UnlockConnectionWritesRequest>,
 ) -> Result<Json<WriteUnlockStateResponse>, AppError> {
     if !state.app.configs.read().await.contains_key(&body.connection_id) {
         return Err(AppError::from("Connection not found".to_string()));
     }
+    let _permit = super::pl_debug::claim_mutation(
+        &state,
+        &headers,
+        dbx_core::query::pl_debug::PlDebugMutationScope::WriteProtection {
+            connection_id: body.connection_id.clone(),
+            credential_owner: dbx_core::session_credentials::current_credential_owner(),
+        },
+    )
+    .await?;
     let remaining_ms =
         state.app.write_unlock_windows.unlock(&body.connection_id, body.duration_secs).await.map_err(AppError::from)?;
     Ok(Json(WriteUnlockStateResponse { remaining_ms }))
@@ -603,8 +639,18 @@ pub async fn unlock_connection_writes(
 
 pub async fn lock_connection_writes(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(body): Json<ConnectionIdentifierQuoteRequest>,
 ) -> Result<Json<()>, AppError> {
+    let _permit = super::pl_debug::claim_mutation(
+        &state,
+        &headers,
+        dbx_core::query::pl_debug::PlDebugMutationScope::WriteProtection {
+            connection_id: body.connection_id.clone(),
+            credential_owner: dbx_core::session_credentials::current_credential_owner(),
+        },
+    )
+    .await?;
     state.app.write_unlock_windows.lock(&body.connection_id).await;
     Ok(Json(()))
 }
@@ -642,25 +688,64 @@ pub async fn connection_final_proxy_port(
     // Tunnel resolution needs a runtime config lookup, but a no-save password
     // must never enter the shared Web config cache and bypass owner isolation.
     let (stored_config, runtime_secrets) = prepare_runtime_config(runtime_config.clone());
-    app.configs.write().await.insert(connection_id.clone(), stored_config);
-
-    let (_, port) = app.connection_host_port(&connection_id, &db_config).await.map_err(AppError::from)?;
-    let owner = session_token_from_headers(&headers).unwrap_or_default();
-    record_session_credentials(
-        app,
-        &owner,
-        &connection_id,
-        &runtime_secrets,
-        runtime_config.db_type == DatabaseType::Nacos,
-    );
-    Ok(Json(port))
+    for _ in 0..3 {
+        let allowed = {
+            let current = app.configs.read().await;
+            plan_connection_config_sync(
+                &current,
+                ConnectionConfigSyncInput::Delta(std::slice::from_ref(&stored_config), &[]),
+            )
+            .protected_mutation_ids
+        };
+        let permit = super::pl_debug::claim_mutation(
+            &state,
+            &headers,
+            dbx_core::query::pl_debug::PlDebugMutationScope::Connections(allowed.clone()),
+        )
+        .await?;
+        let port = permit
+            .after_debug_cleanup_with_error(async {
+                let mut current = app.configs.write().await;
+                let plan = plan_connection_config_sync(
+                    &current,
+                    ConnectionConfigSyncInput::Delta(std::slice::from_ref(&stored_config), &[]),
+                );
+                if !plan.protected_mutation_ids.iter().all(|id| allowed.contains(id)) {
+                    return Ok(None);
+                }
+                current.insert(connection_id.clone(), stored_config.clone());
+                drop(current);
+                let (_, port) = app.connection_host_port(&connection_id, &db_config).await.map_err(AppError::from)?;
+                let owner = connection_credential_owner(&state, &headers);
+                record_session_credentials(
+                    app,
+                    &owner,
+                    &connection_id,
+                    &runtime_secrets,
+                    runtime_config.db_type == DatabaseType::Nacos,
+                );
+                Ok::<_, AppError>(Some(port))
+            })
+            .await?;
+        if let Some(port) = port {
+            return Ok(Json(port));
+        }
+    }
+    Err(AppError::conflict("Connection configuration changed while preparing the proxy; reload before trying again"))
 }
 
 pub async fn disconnect_db(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(body): Json<DisconnectRequest>,
 ) -> Result<Json<()>, AppError> {
     let app = &state.app;
+    let permit = super::pl_debug::claim_mutation(
+        &state,
+        &headers,
+        dbx_core::query::pl_debug::PlDebugMutationScope::Connections(vec![body.connection_id.clone()]),
+    )
+    .await?;
 
     let should_disconnect = if let Some(client_attempt) = body.client_attempt {
         app.supersede_connection_attempt_if_client_attempt(&body.connection_id, client_attempt).await
@@ -671,15 +756,19 @@ pub async fn disconnect_db(
     if !should_disconnect {
         return Ok(Json(()));
     }
-    app.running_queries.cancel_connection(&body.connection_id);
-    app.remove_connection_pools_detached(&body.connection_id).await;
-    app.nacos_registry.drop_connection(&body.connection_id).await;
-    #[cfg(feature = "mq-admin")]
-    app.mq_registry.drop_connection(&body.connection_id).await;
-    app.reset_connection_transport(&body.connection_id).await;
-    release_runtime_config_on_disconnect(app, &body.connection_id).await;
+    permit
+        .after_debug_cleanup_with_error(async {
+            app.running_queries.cancel_connection(&body.connection_id);
+            app.remove_connection_pools_detached_checked(&body.connection_id).await.map_err(AppError::from)?;
+            app.nacos_registry.drop_connection(&body.connection_id).await;
+            #[cfg(feature = "mq-admin")]
+            app.mq_registry.drop_connection(&body.connection_id).await;
+            app.reset_connection_transport_checked(&body.connection_id).await.map_err(AppError::from)?;
+            release_runtime_config_on_disconnect(app, &body.connection_id).await;
 
-    Ok(Json(()))
+            Ok(Json(()))
+        })
+        .await
 }
 
 pub async fn check_connection_health(
@@ -828,7 +917,7 @@ pub async fn session_credential_status(
     headers: HeaderMap,
     Json(body): Json<SessionCredentialStatusRequest>,
 ) -> Result<Json<bool>, AppError> {
-    let owner = session_token_from_headers(&headers).unwrap_or_default();
+    let owner = connection_credential_owner(&state, &headers);
     Ok(Json(state.app.session_credentials.has(&owner, &body.connection_id)))
 }
 
@@ -839,7 +928,7 @@ pub async fn forget_session_credential(
     headers: HeaderMap,
     Json(body): Json<SessionCredentialStatusRequest>,
 ) -> Result<Json<()>, AppError> {
-    let owner = session_token_from_headers(&headers).unwrap_or_default();
+    let owner = connection_credential_owner(&state, &headers);
     if !state.app.session_credentials.has(&owner, &body.connection_id) {
         return Err(AppError::from(format!(
             "Connection has no transient session credential to forget: {}",
@@ -855,7 +944,7 @@ pub async fn replace_nacos_session_credential(
     headers: HeaderMap,
     Json(body): Json<ReplaceNacosSessionCredentialRequest>,
 ) -> Result<Json<()>, AppError> {
-    let owner = session_token_from_headers(&headers).unwrap_or_default();
+    let owner = connection_credential_owner(&state, &headers);
     state
         .app
         .replace_nacos_session_credential(&owner, &body.connection_id, &body.username, &body.password)
@@ -908,144 +997,299 @@ pub async fn save_connections(
             .map_err(AppError::from)?;
         }
     }
-    if !body.removed_ids.is_empty() {
-        state.app.storage.delete_connections(&body.removed_ids).await.map_err(AppError::from)?;
+    let owner = connection_credential_owner(&state, &headers);
+    let runtime_configs =
+        configs.iter().map(|config| prepare_runtime_config(config.canonicalized())).collect::<Vec<_>>();
+    let upserts = runtime_configs.iter().map(|(config, _)| config.clone()).collect::<Vec<_>>();
+    for _ in 0..3 {
+        let allowed = {
+            let current = state.app.configs.read().await;
+            plan_connection_config_sync(&current, ConnectionConfigSyncInput::Delta(&upserts, &body.removed_ids))
+                .protected_mutation_ids
+        };
+        let permit = super::pl_debug::claim_mutation(
+            &state,
+            &headers,
+            dbx_core::query::pl_debug::PlDebugMutationScope::Connections(allowed.clone()),
+        )
+        .await?;
+        let attempt = permit
+            .after_debug_cleanup(async {
+                let mut current = state.app.configs.write().await;
+                let plan = plan_connection_config_sync(
+                    &current,
+                    ConnectionConfigSyncInput::Delta(&upserts, &body.removed_ids),
+                );
+                if !plan.protected_mutation_ids.iter().all(|id| allowed.contains(id)) {
+                    return Ok(ConnectionConfigSyncAttempt::NeedsReplan);
+                }
+                state.app.storage.delete_connections(&body.removed_ids).await?;
+                state.app.storage.save_connections(&configs).await?;
+                apply_connection_config_sync(&state, &mut current, &plan);
+                for (config, secrets) in &runtime_configs {
+                    record_session_credentials(
+                        &state.app,
+                        &owner,
+                        &config.id,
+                        secrets,
+                        config.db_type == DatabaseType::Nacos,
+                    );
+                }
+                drop(current);
+                remove_connection_pools_for_connection_ids(&state, &plan.connection_pool_ids_to_drop).await?;
+                drop_nacos_adapters_for_connection_ids(&state, &plan.nacos_adapter_ids_to_drop).await;
+                drop_mq_adapters_for_connection_ids(&state, &plan.mq_adapter_ids_to_drop).await;
+                Ok(ConnectionConfigSyncAttempt::Applied(plan))
+            })
+            .await?;
+        if let ConnectionConfigSyncAttempt::Applied(_) = attempt {
+            return Ok(Json(()));
+        }
     }
-    state.app.storage.save_connections(&configs).await.map_err(AppError::from)?;
-    let owner = session_token_from_headers(&headers).unwrap_or_default();
-    let runtime_configs = configs.iter().cloned().map(prepare_runtime_config).collect::<Vec<_>>();
-    // Saving is an upsert, so the request only describes the connections of this
-    // client. Sync the runtime cache against the whole persisted list instead of
-    // the request payload, otherwise a concurrent save from another client would
-    // drop its runtime config, pool and session credentials.
-    let persisted = state.app.storage.load_connections().await.map_err(AppError::from)?;
-    let sync = sync_connection_configs(&state, &persisted).await;
-    for (config, secrets) in &runtime_configs {
-        record_session_credentials(&state.app, &owner, &config.id, secrets, config.db_type == DatabaseType::Nacos);
-    }
-    remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
-    drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
-    drop_mq_adapters_for_connection_ids(&state, &sync.mq_adapter_ids_to_drop).await;
-    Ok(Json(()))
+    Err(AppError::conflict("Connection configuration changed while saving; reload before trying again"))
 }
 
 pub async fn mcp_add_connection(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(body): Json<McpAddConnectionRequest>,
 ) -> Result<Json<ConnectionResponse>, AppError> {
     let config = state.resolve_connection_credentials(body.config).await?;
+    let permit = super::pl_debug::claim_mutation(
+        &state,
+        &headers,
+        dbx_core::query::pl_debug::PlDebugMutationScope::Connections(vec![config.id.clone()]),
+    )
+    .await?;
     let saved = state.app.storage.add_connection_for_mcp(config).await.map_err(AppError::from)?;
-    state.app.session_credentials.clear_connection(&saved.id);
-    state.app.remove_connection_pools_detached(&saved.id).await;
-    state.app.configs.write().await.insert(saved.id.clone(), saved.clone());
-    Ok(Json(state.connection_response(saved)))
+    permit
+        .after_debug_cleanup_with_error(async {
+            state.app.session_credentials.clear_connection(&saved.id);
+            state.app.remove_connection_pools_detached_checked(&saved.id).await.map_err(AppError::from)?;
+            state.app.configs.write().await.insert(saved.id.clone(), saved.clone());
+            Ok(Json(state.connection_response(saved)))
+        })
+        .await
 }
 
 pub async fn mcp_duplicate_connection(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(body): Json<McpDuplicateConnectionRequest>,
 ) -> Result<Json<ConnectionResponse>, AppError> {
+    let permit = super::pl_debug::claim_mutation(
+        &state,
+        &headers,
+        dbx_core::query::pl_debug::PlDebugMutationScope::Connections(vec![body.copy_id.clone()]),
+    )
+    .await?;
     let saved = state
         .app
         .storage
         .duplicate_connection_for_mcp(&body.source_id, &body.copy_id, &body.copy_name)
         .await
         .map_err(AppError::from)?;
-    state.app.session_credentials.clear_connection(&saved.id);
-    state.app.remove_connection_pools_detached(&saved.id).await;
-    state.app.configs.write().await.insert(saved.id.clone(), saved.clone());
-    Ok(Json(state.connection_response(saved)))
+    permit
+        .after_debug_cleanup_with_error(async {
+            state.app.session_credentials.clear_connection(&saved.id);
+            state.app.remove_connection_pools_detached_checked(&saved.id).await.map_err(AppError::from)?;
+            state.app.configs.write().await.insert(saved.id.clone(), saved.clone());
+            Ok(Json(state.connection_response(saved)))
+        })
+        .await
 }
 
 pub async fn mcp_remove_connection(
     State(state): State<Arc<WebState>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<McpRemoveConnectionRequest>,
 ) -> Result<Json<bool>, AppError> {
     let connection_id = body.connection_id;
-    let removed = state.app.storage.remove_connection_for_mcp(&connection_id).await.map_err(AppError::from)?;
-    if removed {
-        state.app.configs.write().await.remove(&connection_id);
-        state.app.session_credentials.clear_connection(&connection_id);
-        state.app.remove_connection_pools_detached(&connection_id).await;
-        state.app.nacos_registry.drop_connection(&connection_id).await;
-        #[cfg(feature = "mq-admin")]
-        state.app.mq_registry.drop_connection(&connection_id).await;
-    }
-    Ok(Json(removed))
+    let permit = super::pl_debug::claim_mutation(
+        &state,
+        &headers,
+        dbx_core::query::pl_debug::PlDebugMutationScope::Connections(vec![connection_id.clone()]),
+    )
+    .await?;
+    permit
+        .after_debug_cleanup_with_error(async {
+            let removed = state.app.storage.remove_connection_for_mcp(&connection_id).await.map_err(AppError::from)?;
+            if removed {
+                state.app.configs.write().await.remove(&connection_id);
+                state.app.session_credentials.clear_connection(&connection_id);
+                state.app.remove_connection_pools_detached_checked(&connection_id).await.map_err(AppError::from)?;
+                state.app.nacos_registry.drop_connection(&connection_id).await;
+                #[cfg(feature = "mq-admin")]
+                state.app.mq_registry.drop_connection(&connection_id).await;
+            }
+            Ok(Json(removed))
+        })
+        .await
 }
 
 pub async fn load_connections(
     State(state): State<Arc<WebState>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<ConnectionResponse>>, AppError> {
-    let configs = state.app.storage.load_connections().await.map_err(AppError::from)?;
-    let sync = sync_connection_configs(&state, &configs).await;
-    remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
-    drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
-    drop_mq_adapters_for_connection_ids(&state, &sync.mq_adapter_ids_to_drop).await;
-    Ok(Json(configs.into_iter().map(|config| state.connection_response(config)).collect()))
+    for _ in 0..3 {
+        let allowed = {
+            let current = state.app.configs.read().await;
+            let configs = state.app.storage.load_connections().await?;
+            plan_connection_config_sync(&current, ConnectionConfigSyncInput::Snapshot(&configs)).protected_mutation_ids
+        };
+        let permit = super::pl_debug::claim_mutation(
+            &state,
+            &headers,
+            dbx_core::query::pl_debug::PlDebugMutationScope::Connections(allowed.clone()),
+        )
+        .await?;
+        let attempt = permit
+            .after_debug_cleanup(async {
+                let mut current = state.app.configs.write().await;
+                let configs = state.app.storage.load_connections().await?;
+                let plan = plan_connection_config_sync(&current, ConnectionConfigSyncInput::Snapshot(&configs));
+                if !plan.protected_mutation_ids.iter().all(|id| allowed.contains(id)) {
+                    return Ok(ConnectionConfigSyncAttempt::NeedsReplan);
+                }
+                apply_connection_config_sync(&state, &mut current, &plan);
+                drop(current);
+                remove_connection_pools_for_connection_ids(&state, &plan.connection_pool_ids_to_drop).await?;
+                drop_nacos_adapters_for_connection_ids(&state, &plan.nacos_adapter_ids_to_drop).await;
+                drop_mq_adapters_for_connection_ids(&state, &plan.mq_adapter_ids_to_drop).await;
+                Ok(ConnectionConfigSyncAttempt::Applied((plan, configs)))
+            })
+            .await?;
+        if let ConnectionConfigSyncAttempt::Applied((_, configs)) = attempt {
+            return Ok(Json(configs.into_iter().map(|config| state.connection_response(config)).collect()));
+        }
+    }
+    Err(AppError::conflict("Connection configuration changed while loading; reload before trying again"))
 }
 
 struct ConnectionConfigSync {
+    config_upserts: Vec<ConnectionConfig>,
+    config_removals: Vec<String>,
+    credential_ids_to_clear: Vec<String>,
+    protected_mutation_ids: Vec<String>,
     nacos_adapter_ids_to_drop: Vec<String>,
     mq_adapter_ids_to_drop: Vec<String>,
     connection_pool_ids_to_drop: Vec<String>,
 }
 
-async fn sync_connection_configs(state: &WebState, configs: &[ConnectionConfig]) -> ConnectionConfigSync {
-    let saved_ids: HashSet<&str> = configs.iter().map(|config| config.id.as_str()).collect();
+#[derive(Clone, Copy)]
+enum ConnectionConfigSyncInput<'a> {
+    Delta(&'a [ConnectionConfig], &'a [String]),
+    Snapshot(&'a [ConnectionConfig]),
+}
+
+enum ConnectionConfigSyncAttempt<T> {
+    Applied(T),
+    NeedsReplan,
+}
+
+fn plan_connection_config_sync(
+    runtime_configs: &HashMap<String, ConnectionConfig>,
+    input: ConnectionConfigSyncInput<'_>,
+) -> ConnectionConfigSync {
+    let configs = match input {
+        ConnectionConfigSyncInput::Delta(configs, _) | ConnectionConfigSyncInput::Snapshot(configs) => configs,
+    };
+    let upserts = configs
+        .iter()
+        .map(|config| {
+            let (config, _) = prepare_runtime_config(config.canonicalized());
+            (config.id.clone(), config)
+        })
+        .collect::<HashMap<_, _>>();
+    let removals = match input {
+        ConnectionConfigSyncInput::Delta(_, ids) => {
+            ids.iter().filter(|id| !upserts.contains_key(*id)).cloned().collect::<HashSet<_>>()
+        }
+        ConnectionConfigSyncInput::Snapshot(_) => runtime_configs
+            .iter()
+            .filter(|(id, config)| !upserts.contains_key(*id) && !should_retain_runtime_config(id, config))
+            .map(|(id, _)| id.clone())
+            .collect(),
+    };
+    let mut credential_ids_to_clear = removals.clone();
+    let mut protected_mutation_ids = removals.clone();
+    if let ConnectionConfigSyncInput::Delta(_, ids) = input {
+        protected_mutation_ids.extend(ids.iter().cloned());
+    }
     let mut nacos_adapter_ids_to_drop = HashSet::new();
     let mut mq_adapter_ids_to_drop = HashSet::new();
-    let mut connection_pool_ids_to_drop = HashSet::new();
-    let mut runtime_configs = state.app.configs.write().await;
-    runtime_configs.retain(|id, existing| {
-        if saved_ids.contains(id.as_str()) || should_retain_runtime_config(id, existing) {
-            true
-        } else {
-            connection_pool_ids_to_drop.insert(id.clone());
-            // 连接已被全局删除：清除所有 Web owner 的临时凭据与池 owner。
-            state.app.session_credentials.clear_connection(id);
+    let mut connection_pool_ids_to_drop = removals.clone();
+    for id in &removals {
+        if let Some(existing) = runtime_configs.get(id) {
             if existing.db_type == dbx_core::models::connection::DatabaseType::Nacos {
                 nacos_adapter_ids_to_drop.insert(id.clone());
             }
             if existing.db_type == dbx_core::models::connection::DatabaseType::MessageQueue {
                 mq_adapter_ids_to_drop.insert(id.clone());
             }
-            false
         }
-    });
-    for config in configs {
+    }
+    for config in upserts.values() {
         if config.db_type == dbx_core::models::connection::DatabaseType::Nacos {
             nacos_adapter_ids_to_drop.insert(config.id.clone());
         }
         if config.db_type == dbx_core::models::connection::DatabaseType::MessageQueue {
             mq_adapter_ids_to_drop.insert(config.id.clone());
         }
-        if let Some(previous) = runtime_configs.insert(config.id.clone(), config.clone()) {
+        if let Some(previous) = runtime_configs.get(&config.id) {
             if previous.db_type == dbx_core::models::connection::DatabaseType::Nacos {
                 nacos_adapter_ids_to_drop.insert(config.id.clone());
             }
             if previous.db_type == dbx_core::models::connection::DatabaseType::MessageQueue {
                 mq_adapter_ids_to_drop.insert(config.id.clone());
             }
-            if !connection_configs_session_credentials_compatible(&previous, config) {
-                // 全局端点或认证身份变化时清除所有 owner 的旧凭据；显示范围等
-                // 本地设置不改变凭据归属，必须保留各 owner 的 no-save 密码。
-                state.app.session_credentials.clear_connection(&config.id);
+            if !connection_configs_session_credentials_compatible(previous, config) {
+                credential_ids_to_clear.insert(config.id.clone());
             }
-            // 仅在真实连接参数变化时销毁池；save_password=false 连接因持久化
-            // 空密码与运行态密码产生的差异被忽略（见 connection_configs_pool_equivalent）。
-            if !connection_configs_pool_equivalent(&previous, config) {
+            if !connection_configs_pool_equivalent(previous, config) {
                 connection_pool_ids_to_drop.insert(config.id.clone());
             }
+        } else {
+            protected_mutation_ids.insert(config.id.clone());
         }
     }
+    protected_mutation_ids.extend(credential_ids_to_clear.iter().cloned());
+    protected_mutation_ids.extend(connection_pool_ids_to_drop.iter().cloned());
+    protected_mutation_ids.extend(nacos_adapter_ids_to_drop.iter().cloned());
+    protected_mutation_ids.extend(mq_adapter_ids_to_drop.iter().cloned());
     ConnectionConfigSync {
+        config_upserts: upserts.into_values().collect(),
+        config_removals: removals.into_iter().collect(),
+        credential_ids_to_clear: credential_ids_to_clear.into_iter().collect(),
+        protected_mutation_ids: protected_mutation_ids.into_iter().collect(),
         nacos_adapter_ids_to_drop: nacos_adapter_ids_to_drop.into_iter().collect(),
         mq_adapter_ids_to_drop: mq_adapter_ids_to_drop.into_iter().collect(),
         connection_pool_ids_to_drop: connection_pool_ids_to_drop.into_iter().collect(),
     }
+}
+
+fn apply_connection_config_sync(
+    state: &WebState,
+    runtime_configs: &mut HashMap<String, ConnectionConfig>,
+    plan: &ConnectionConfigSync,
+) {
+    for id in &plan.config_removals {
+        runtime_configs.remove(id);
+    }
+    for config in &plan.config_upserts {
+        runtime_configs.insert(config.id.clone(), config.clone());
+    }
+    for id in &plan.credential_ids_to_clear {
+        state.app.session_credentials.clear_connection(id);
+    }
+}
+
+#[cfg(test)]
+async fn sync_connection_configs(state: &WebState, configs: &[ConnectionConfig]) -> ConnectionConfigSync {
+    let mut current = state.app.configs.write().await;
+    let plan = plan_connection_config_sync(&current, ConnectionConfigSyncInput::Snapshot(configs));
+    apply_connection_config_sync(state, &mut current, &plan);
+    plan
 }
 
 async fn drop_nacos_adapters_for_connection_ids(state: &WebState, connection_ids: &[String]) {
@@ -1064,10 +1308,11 @@ async fn drop_mq_adapters_for_connection_ids(state: &WebState, connection_ids: &
 #[cfg(not(feature = "mq-admin"))]
 async fn drop_mq_adapters_for_connection_ids(_state: &WebState, _connection_ids: &[String]) {}
 
-async fn remove_connection_pools_for_connection_ids(state: &WebState, connection_ids: &[String]) {
+async fn remove_connection_pools_for_connection_ids(state: &WebState, connection_ids: &[String]) -> Result<(), String> {
     for connection_id in connection_ids {
-        state.app.remove_connection_pools_detached(connection_id).await;
+        state.app.remove_connection_pools_detached_checked(connection_id).await?;
     }
+    Ok(())
 }
 
 // ── Salesforce OAuth ──────────────────────────────────────────────
@@ -1602,6 +1847,7 @@ done
 
         let _ = disconnect_db(
             State(state.clone()),
+            HeaderMap::new(),
             Json(DisconnectRequest { connection_id: config.id.clone(), client_attempt: None }),
         )
         .await
@@ -2022,8 +2268,12 @@ done
         existing.host = dir.join("after.db").to_string_lossy().into_owned();
         state.app.storage.save_connections(std::slice::from_ref(&existing)).await.unwrap();
         let added = sqlite_config("added", &dir.join("added.db").to_string_lossy());
-        let result =
-            mcp_add_connection(State(state.clone()), Json(McpAddConnectionRequest { config: added.clone() })).await;
+        let result = mcp_add_connection(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(McpAddConnectionRequest { config: added.clone() }),
+        )
+        .await;
         assert!(result.is_ok());
 
         let persisted = state.app.storage.load_connections().await.unwrap();
@@ -2051,6 +2301,7 @@ done
             .unwrap();
         let copied = mcp_duplicate_connection(
             State(state.clone()),
+            HeaderMap::new(),
             Json(McpDuplicateConnectionRequest {
                 source_id: existing.id.clone(),
                 copy_id: "copy".to_string(),
@@ -2123,6 +2374,7 @@ done
             .unwrap();
         let read_only_error = mcp_add_connection(
             State(state.clone()),
+            HeaderMap::new(),
             Json(McpAddConnectionRequest { config: sqlite_config("new", &dir.join("new.db").to_string_lossy()) }),
         )
         .await
@@ -2376,6 +2628,7 @@ done
     async fn connection_final_proxy_port_sanitizes_no_save_passwords() {
         let (state, dir) = test_web_state().await;
         let mut config = sqlite_config("conn-a", "127.0.0.1");
+        config.db_type = DatabaseType::Mysql;
         config.port = 3306;
         config.save_password = false;
         config.password = "session-secret".to_string();
@@ -2584,10 +2837,13 @@ done
         let mut recreated = sqlite_config("conn-a", &dir.join("new.db").to_string_lossy());
         recreated.save_password = false;
 
-        let reused =
-            mcp_add_connection(State(state.clone()), Json(McpAddConnectionRequest { config: recreated.clone() }))
-                .await
-                .unwrap_or_else(|error| panic!("{}", error.message));
+        let reused = mcp_add_connection(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(McpAddConnectionRequest { config: recreated.clone() }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(reused.0.config.host, recreated.host);
         assert!(!state.app.session_credentials.has("token-a", "conn-a"));
         assert!(!state.app.session_credentials.has("token-b", "conn-a"));
@@ -2682,6 +2938,7 @@ done
 
         let result = disconnect_db(
             State(state.clone()),
+            HeaderMap::new(),
             Json(DisconnectRequest { connection_id: "conn".to_string(), client_attempt: None }),
         )
         .await;
@@ -2712,6 +2969,7 @@ done
 
         let result = disconnect_db(
             State(state.clone()),
+            HeaderMap::new(),
             Json(DisconnectRequest { connection_id: "conn".to_string(), client_attempt: Some(1) }),
         )
         .await;
@@ -2722,6 +2980,7 @@ done
 
         let result = disconnect_db(
             State(state.clone()),
+            HeaderMap::new(),
             Json(DisconnectRequest { connection_id: "conn".to_string(), client_attempt: Some(2) }),
         )
         .await;
@@ -2753,6 +3012,7 @@ done
 
         let result = disconnect_db(
             State(state.clone()),
+            HeaderMap::new(),
             Json(DisconnectRequest { connection_id: "conn".to_string(), client_attempt: None }),
         )
         .await;
@@ -2780,6 +3040,7 @@ done
 
         let result = disconnect_db(
             State(state.clone()),
+            HeaderMap::new(),
             Json(DisconnectRequest { connection_id: config.id.clone(), client_attempt: None }),
         )
         .await;
@@ -2806,6 +3067,7 @@ done
 
         let result = disconnect_db(
             State(state.clone()),
+            HeaderMap::new(),
             Json(DisconnectRequest { connection_id: draft_id.to_string(), client_attempt: None }),
         )
         .await;
@@ -2848,6 +3110,7 @@ done
 
         let result = disconnect_db(
             State(state.clone()),
+            HeaderMap::new(),
             Json(DisconnectRequest { connection_id: one_time.id.clone(), client_attempt: None }),
         )
         .await;

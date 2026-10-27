@@ -315,6 +315,10 @@ pub struct SendMessageRequest {
     #[schemars(description = "Optional message headers")]
     pub headers: std::collections::HashMap<String, String>,
     #[serde(default)]
+    #[schemars(description = "RabbitMQ AMQP properties using snake_case names and string values")]
+    #[schemars(extend("type" = "object"))]
+    pub properties: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
     #[schemars(description = "Optional target partition")]
     #[schemars(extend("type" = "integer"))]
     pub partition: Option<i32>,
@@ -2500,13 +2504,14 @@ impl DbxMcpServer {
             Ok(argv) => argv,
             Err(error) => return tool_error("REDIS_COMMAND_BLOCKED", error),
         };
-        if argv[0].eq_ignore_ascii_case("SELECT") {
+        let cmd_name = String::from_utf8_lossy(&argv[0]).to_ascii_uppercase();
+        if cmd_name == "SELECT" {
             return tool_error(
                 "REDIS_DATABASE_SELECTION_REQUIRED",
                 "Redis SELECT is not available through MCP. Set the db argument to the logical database number instead; when db is omitted, DBX uses the current scoped database.",
             );
         }
-        let safety = classify_command(&argv[0]);
+        let safety = classify_command(&cmd_name);
         let policy = effective_policy_for_database_with_groups(
             &resolved.policy,
             &resolved.group_ids,
@@ -2529,10 +2534,7 @@ impl DbxMcpServer {
         if safety == RedisCommandSafety::Blocked && !permissions.allow_dangerous {
             return tool_error(
                 "REDIS_COMMAND_BLOCKED",
-                format!(
-                    "Dangerous Redis command \"{}\" is disabled in DBX MCP settings.",
-                    argv[0].to_ascii_uppercase()
-                ),
+                format!("Dangerous Redis command \"{}\" is disabled in DBX MCP settings.", cmd_name),
             );
         }
         if safety != RedisCommandSafety::Allowed && !permissions.allow_writes {
@@ -2618,6 +2620,7 @@ impl DbxMcpServer {
                 start_position: Some(start_position),
                 partition: request.partition,
                 offset: request.offset,
+                timestamp: None,
             };
             match self.backend.peek_messages(&resolved.connection, topic, count, options).await {
                 Ok(result) => text(format_peek_messages_result(result, count as usize)),
@@ -2688,6 +2691,7 @@ impl DbxMcpServer {
                 payload_base64: request.payload_base64,
                 payload_text: request.payload_text,
                 headers: request.headers,
+                properties: request.properties,
                 partition: request.partition,
                 exchange: request.exchange,
                 routing_key: request.routing_key,
@@ -4422,6 +4426,7 @@ fn empty_query_result() -> dbx_core::db::QueryResult {
     dbx_core::db::QueryResult {
         columns: Vec::new(),
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns: Vec::new(),
         spatial_values: Vec::new(),
@@ -5556,6 +5561,7 @@ mod tests {
                 result: dbx_core::db::QueryResult {
                     columns: Vec::new(),
                     column_types: Vec::new(),
+                    deferred_large_value_cells: Vec::new(),
                     column_sortables: Vec::new(),
                     spatial_columns: Vec::new(),
                     spatial_values: Vec::new(),
@@ -6026,6 +6032,7 @@ mod tests {
                 result: dbx_core::db::QueryResult {
                     columns: vec![],
                     column_types: vec![],
+                    deferred_large_value_cells: Vec::new(),
                     column_sortables: vec![],
                     spatial_columns: vec![],
                     spatial_values: vec![],
@@ -6965,8 +6972,10 @@ mod tests {
             ("dbx_get_schema_context", &["database", "schema", "max_tables"]),
         ];
         #[cfg(feature = "mq-admin")]
-        checks
-            .push(("dbx_send_message", &["key", "payload_text", "partition", "exchange", "routing_key", "namespace"]));
+        checks.push((
+            "dbx_send_message",
+            &["key", "payload_text", "properties", "partition", "exchange", "routing_key", "namespace"],
+        ));
 
         #[cfg(feature = "mq-admin")]
         checks.push(("dbx_peek_messages", &["count", "partition", "offset"]));
@@ -7031,7 +7040,7 @@ mod tests {
     #[test]
     fn send_message_request_preserves_binary_payload_and_optional_fields() {
         let request: SendMessageRequest = serde_json::from_str(
-            r#"{"connection_name":"events","topic":"orders","payload_base64":"AP8=","key":"order-1","partition":2,"headers":{"trace":"abc"}}"#,
+            r#"{"connection_name":"events","topic":"orders","payload_base64":"AP8=","key":"order-1","partition":2,"headers":{"trace":"abc"},"properties":{"content_type":"application/json","priority":"0"}}"#,
         )
         .expect("send message request");
 
@@ -7041,6 +7050,9 @@ mod tests {
         assert_eq!(request.key.as_deref(), Some("order-1"));
         assert_eq!(request.partition, Some(2));
         assert_eq!(request.headers.get("trace").map(String::as_str), Some("abc"));
+        let properties = request.properties.expect("RabbitMQ properties");
+        assert_eq!(properties.get("content_type").map(String::as_str), Some("application/json"));
+        assert_eq!(properties.get("priority").map(String::as_str), Some("0"));
     }
 
     #[cfg(feature = "mq-admin")]
@@ -9103,6 +9115,7 @@ mod tests {
             result: dbx_core::db::QueryResult {
                 columns: vec![],
                 column_types: vec![],
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -9136,6 +9149,7 @@ mod tests {
             result: dbx_core::db::QueryResult {
                 columns: vec![],
                 column_types: vec![],
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -9170,6 +9184,7 @@ mod tests {
             result: dbx_core::db::QueryResult {
                 columns: vec!["body".to_string()],
                 column_types: vec![],
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],

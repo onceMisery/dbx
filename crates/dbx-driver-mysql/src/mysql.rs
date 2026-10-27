@@ -1512,6 +1512,7 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
     let mut retry_url = url.to_string();
     let mut retry_ca_cert_path = ca_cert_path;
+    let mut tls_error = None;
     let mut result = connect_pool_attempt(
         url,
         ca_cert_path,
@@ -1528,6 +1529,7 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
     if result.as_ref().err().is_some_and(|error| mysql_error_should_retry_without_ssl(error)) {
         if let Some(fallback_url) = ssl_fallback_url(url) {
             log::info!("SSL handshake failed, retrying with ssl-mode=disabled");
+            tls_error = result.as_ref().err().cloned();
             retry_url = fallback_url;
             retry_ca_cert_path = None;
             result = connect_pool_attempt(
@@ -1547,7 +1549,7 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
 
     if result.as_ref().err().is_some_and(|error| mysql_error_should_retry_with_legacy_eof(error)) {
         log::info!("MySQL proxy returned legacy EOF packets; retrying with CLIENT_DEPRECATE_EOF disabled");
-        return connect_pool_attempt(
+        result = connect_pool_attempt(
             &retry_url,
             retry_ca_cert_path,
             timeout,
@@ -1561,7 +1563,12 @@ async fn connect_with_ca_cert_pool_limit_idle_setup_database_with_mode(
         .await;
     }
 
-    result
+    result.map_err(|error| match tls_error {
+        // MySQL also uses 1045 for REQUIRE SSL accounts, so the final error
+        // alone can conceal why a Preferred connection could not use TLS.
+        Some(tls_error) => format!("MySQL TLS attempt failed: {tls_error}\n\nMySQL plaintext fallback failed: {error}"),
+        None => error,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2731,6 +2738,7 @@ fn mysql_error_should_retry_without_ssl(error: &str) -> bool {
     error.contains("handshakefailure")
         || error.contains("handshake")
         || error.contains("tls connection")
+        || error.contains("serverdoesnotsupporttls12or13")
         || error.contains("server closed session")
         // Some older MySQL proxies report a failed preferred-TLS probe as a
         // protocol packet error instead of a TLS handshake error.
@@ -5566,6 +5574,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
         return Ok(MySqlQueryResult::exact(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -5611,6 +5620,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
         return Ok(MySqlQueryResult::exact(QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns,
             spatial_values,
@@ -5708,6 +5718,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
         result: QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns,
             spatial_values,
@@ -5842,6 +5853,7 @@ async fn execute_result_sets_with_text_protocol_on_conn(
             result: QueryResult {
                 columns,
                 column_types,
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns,
                 spatial_values,
@@ -5870,6 +5882,7 @@ async fn execute_result_sets_with_text_protocol_on_conn(
         results.push(MySqlQueryResult::exact(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -6057,6 +6070,7 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
         result: QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns,
             spatial_values,
@@ -6408,6 +6422,7 @@ pub async fn execute_transaction_statement_on_conn(
         QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -6444,6 +6459,7 @@ pub async fn execute_transaction_statement_on_conn(
         QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns,
             spatial_values,
@@ -6597,6 +6613,7 @@ async fn execute_query_on_conn_with_limits_progress_resolved(
                             return Ok(MySqlQueryResult::exact(QueryResult {
                                 columns: vec![],
                                 column_types: Vec::new(),
+                                deferred_large_value_cells: Vec::new(),
                                 column_sortables: vec![],
                                 spatial_columns: vec![],
                                 spatial_values: vec![],
@@ -6636,6 +6653,7 @@ async fn execute_query_on_conn_with_limits_progress_resolved(
         Ok(MySqlQueryResult::exact(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -6770,6 +6788,7 @@ pub async fn execute_non_result_batch_on_conn(
         let current_result = QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -7345,6 +7364,7 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
             valid: None,
             comment: None,
             created_at: None,
+            oracle_metadata: None,
             statement: Some(get_str_by_name(row, "ACTION_STATEMENT")).filter(|value| !value.is_empty()),
         })
         .collect())
@@ -9461,6 +9481,179 @@ mod tests {
             server closed session with no notification";
 
         assert!(mysql_error_should_retry_without_ssl(error));
+    }
+
+    #[test]
+    fn mysql_tls_legacy_version_error_retries_only_when_tls_is_optional() {
+        let error = "MySQL connection failed: Input/output error: Input/output error: \
+                     peer is incompatible: ServerDoesNotSupportTls12Or13";
+        assert!(mysql_error_should_retry_without_ssl(error));
+        for mode in ["required", "verify_ca", "verify_identity"] {
+            assert_eq!(ssl_fallback_url(&format!("mysql://host/db?ssl-mode={mode}")), None);
+        }
+        assert_eq!(ssl_fallback_url("mysql://host/db?ssl-mode=disabled"), None);
+        assert_eq!(ssl_fallback_url("mysql://host/db?ssl-cert=client.pem&ssl-key=client.key"), None);
+    }
+
+    #[derive(Clone, Copy)]
+    enum MysqlTlsTestReply {
+        LegacyTls,
+        AccessDenied,
+        LegacyEof,
+        Accept,
+    }
+
+    async fn mysql_tls_test_packet(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut header = [0; 4];
+        socket.read_exact(&mut header).await.unwrap();
+        let length = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+        assert!(length < 65536);
+        let mut payload = vec![0; length];
+        socket.read_exact(&mut payload).await.unwrap();
+        payload
+    }
+
+    async fn mysql_tls_test_write(socket: &mut tokio::net::TcpStream, seq: u8, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let length = (payload.len() as u32).to_le_bytes();
+        socket.write_all(&[length[0], length[1], length[2], seq]).await.unwrap();
+        socket.write_all(payload).await.unwrap();
+    }
+
+    async fn mysql_tls_test_server(
+        listener: tokio::net::TcpListener,
+        replies: Vec<MysqlTlsTestReply>,
+    ) -> Vec<mysql_async::consts::CapabilityFlags> {
+        use mysql_async::consts::CapabilityFlags as Caps;
+        use mysql_common::proto::MySerialize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut attempts = Vec::new();
+        for reply in replies {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let greeting = mysql_common::packets::HandshakePacket::new(
+                10,
+                &b"5.6.24-test"[..],
+                1,
+                *b"12345678",
+                Some(&b"abcdefghijkl\0"[..]),
+                Caps::CLIENT_PROTOCOL_41
+                    | Caps::CLIENT_SECURE_CONNECTION
+                    | Caps::CLIENT_PLUGIN_AUTH
+                    | Caps::CLIENT_SSL
+                    | Caps::CLIENT_DEPRECATE_EOF,
+                33,
+                StatusFlags::SERVER_STATUS_AUTOCOMMIT,
+                Some(&b"mysql_native_password"[..]),
+            );
+            let mut payload = Vec::new();
+            greeting.serialize(&mut payload);
+            mysql_tls_test_write(&mut socket, 0, &payload).await;
+            let request = mysql_tls_test_packet(&mut socket).await;
+            let capabilities = Caps::from_bits_truncate(u32::from_le_bytes(request[..4].try_into().unwrap()));
+            attempts.push(capabilities);
+
+            match reply {
+                MysqlTlsTestReply::LegacyTls => {
+                    assert!(capabilities.contains(Caps::CLIENT_SSL));
+                    assert_eq!(request.len(), 32);
+                    let mut header = [0; 5];
+                    socket.read_exact(&mut header).await.unwrap();
+                    let mut client_hello = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+                    socket.read_exact(&mut client_hello).await.unwrap();
+                    // A complete TLS 1.0 ServerHello makes the real rustls connector
+                    // report ServerDoesNotSupportTls12Or13 before authentication.
+                    let mut hello = vec![0x16, 3, 1, 0, 44, 2, 0, 0, 40, 3, 1];
+                    hello.extend_from_slice(&[0; 32]);
+                    hello.extend_from_slice(&[0, 0xc0, 0x2f, 0, 0, 0]);
+                    socket.write_all(&hello).await.unwrap();
+                }
+                MysqlTlsTestReply::AccessDenied => {
+                    assert!(!capabilities.contains(Caps::CLIENT_SSL));
+                    let mut error = vec![0xff, 0x15, 0x04];
+                    error.extend_from_slice(b"#28000Access denied for user 'test'@'localhost' (using password: YES)");
+                    mysql_tls_test_write(&mut socket, 2, &error).await;
+                }
+                MysqlTlsTestReply::LegacyEof => {
+                    assert!(!capabilities.contains(Caps::CLIENT_SSL));
+                    assert!(capabilities.contains(Caps::CLIENT_DEPRECATE_EOF));
+                    mysql_tls_test_write(&mut socket, 3, &[0, 0, 0, 2, 0, 0, 0]).await;
+                }
+                MysqlTlsTestReply::Accept => {
+                    assert!(!capabilities.contains(Caps::CLIENT_SSL));
+                    mysql_tls_test_write(&mut socket, 2, &[0, 0, 0, 2, 0, 0, 0]).await;
+                    loop {
+                        let command = mysql_tls_test_packet(&mut socket).await;
+                        if command[0] == 1 {
+                            break;
+                        }
+                        mysql_tls_test_write(&mut socket, 1, &[0, 0, 0, 2, 0, 0, 0]).await;
+                    }
+                }
+            }
+        }
+        attempts
+    }
+
+    async fn mysql_tls_test_connect(
+        replies: Vec<MysqlTlsTestReply>,
+        mode: &str,
+    ) -> (Result<MySqlPool, String>, tokio::task::JoinSet<Vec<mysql_async::consts::CapabilityFlags>>) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(mysql_tls_test_server(listener, replies));
+        let url = format!("mysql://test:secret@127.0.0.1:{port}/?ssl-mode={mode}&max_allowed_packet=65536&wait_timeout=60&sessionVariables=group_concat_max_len%3D1024");
+        let result = connect_with_ca_cert_and_pool_limit(&url, None, Duration::from_secs(2), 1).await;
+        (result, servers)
+    }
+
+    #[tokio::test]
+    async fn mysql_tls_preferred_retains_legacy_tls_and_plaintext_errors() {
+        let (result, mut servers) =
+            mysql_tls_test_connect(vec![MysqlTlsTestReply::LegacyTls, MysqlTlsTestReply::AccessDenied], "preferred")
+                .await;
+        let error = result.unwrap_err();
+        assert!(error.contains("ServerDoesNotSupportTls12Or13"), "{error}");
+        assert!(error.contains("1045 (28000)"), "{error}");
+        assert_eq!(servers.join_next().await.unwrap().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mysql_tls_preferred_returns_a_working_plaintext_pool() {
+        let (result, mut servers) =
+            mysql_tls_test_connect(vec![MysqlTlsTestReply::LegacyTls, MysqlTlsTestReply::Accept], "preferred").await;
+        let pool = result.unwrap();
+        verify_pool_connection(&pool, Duration::from_secs(2)).await.unwrap();
+        pool.disconnect().await.unwrap();
+        assert_eq!(servers.join_next().await.unwrap().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mysql_tls_preferred_retains_original_error_after_legacy_eof_retry() {
+        let (result, mut servers) = mysql_tls_test_connect(
+            vec![MysqlTlsTestReply::LegacyTls, MysqlTlsTestReply::LegacyEof, MysqlTlsTestReply::AccessDenied],
+            "preferred",
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(error.contains("ServerDoesNotSupportTls12Or13"), "{error}");
+        assert!(error.contains("1045 (28000)"), "{error}");
+        let attempts = servers.join_next().await.unwrap().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert!(!attempts[2].contains(mysql_async::consts::CapabilityFlags::CLIENT_DEPRECATE_EOF));
+    }
+
+    #[tokio::test]
+    async fn mysql_tls_strict_modes_never_retry_in_plaintext() {
+        for mode in ["required", "verify_ca", "verify_identity"] {
+            let (result, mut servers) = mysql_tls_test_connect(vec![MysqlTlsTestReply::LegacyTls], mode).await;
+            let error = result.unwrap_err();
+            assert!(error.contains("ServerDoesNotSupportTls12Or13"), "{mode}: {error}");
+            assert_eq!(servers.join_next().await.unwrap().unwrap().len(), 1);
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod document_ops;
 pub mod hbase_ops;
 pub mod mongo_ops;
 pub mod object_cache;
+pub mod pl_debug;
 pub mod plugin_data;
 pub mod plugin_plan;
 pub mod query_cancel;
@@ -376,10 +377,11 @@ impl ExecuteMultiResult {
         }
     }
 
-    fn success_with_index(result: db::QueryResult, statement_index: usize) -> Self {
+    fn success_with_index(mut result: db::QueryResult, statement_index: usize) -> Self {
+        let large_value_cells = std::mem::take(&mut result.deferred_large_value_cells);
         Self {
             result,
-            large_value_cells: Vec::new(),
+            large_value_cells,
             execution_error: false,
             statement_index: Some(statement_index),
             error: None,
@@ -398,6 +400,8 @@ impl ExecuteMultiResult {
         mut large_value_cells: Vec<db::LargeValueCell>,
         table_data_preview: bool,
     ) -> Self {
+        large_value_cells =
+            merge_large_value_cells(large_value_cells, std::mem::take(&mut result.deferred_large_value_cells));
         let server_cells = if table_data_preview {
             remap_large_value_cells_around_server_markers(&result, &mut large_value_cells);
             extract_server_large_value_markers(&mut result)
@@ -428,8 +432,14 @@ impl ExecuteMultiResult {
     }
 
     fn success_with_optional_server_large_values(mut result: db::QueryResult, table_data_preview: bool) -> Self {
-        let large_value_cells =
-            if table_data_preview { extract_server_large_value_markers(&mut result) } else { Vec::new() };
+        let mut deferred_cells = std::mem::take(&mut result.deferred_large_value_cells);
+        let large_value_cells = if table_data_preview {
+            remap_large_value_cells_around_server_markers(&result, &mut deferred_cells);
+            extract_server_large_value_markers(&mut result)
+        } else {
+            Vec::new()
+        };
+        let large_value_cells = merge_large_value_cells(large_value_cells, deferred_cells);
         Self {
             result,
             large_value_cells,
@@ -752,10 +762,11 @@ fn merge_large_value_cells(
 }
 
 impl From<db::QueryResult> for ExecuteMultiResult {
-    fn from(result: db::QueryResult) -> Self {
+    fn from(mut result: db::QueryResult) -> Self {
+        let large_value_cells = std::mem::take(&mut result.deferred_large_value_cells);
         Self {
             result,
-            large_value_cells: Vec::new(),
+            large_value_cells,
             execution_error: false,
             statement_index: None,
             error: None,
@@ -1210,6 +1221,7 @@ pub enum QueryExecutionMode {
 
 #[derive(Clone, Debug, Default)]
 pub struct QueryExecutionOptions {
+    pub defer_lobs: bool,
     pub max_rows: Option<usize>,
     pub fetch_size: Option<usize>,
     pub page_size: Option<usize>,
@@ -1787,21 +1799,34 @@ async fn do_execute_typed(
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
             let client = client.clone();
+            let operation_cancel = cancel_token.unwrap_or_default();
             if let Some(ref execution_id) = options.execution_id {
-                let cancel_client = client.clone();
+                let operation_cancel = operation_cancel.clone();
                 state.running_queries.register_interrupt(execution_id, move || {
-                    let cancel_client = cancel_client.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = cancel_client.cancel().await {
-                            log::warn!("Failed to cancel DuckDB worker query: {error}");
-                        }
-                    });
+                    operation_cancel.cancel();
                 });
             }
+            let cancel_token = Some(operation_cancel);
             let sql = sql.to_string();
             let database = database.map(str::to_string);
             let max_rows = options.max_rows;
-            match client.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await {
+            let result = if let Some(page_size) = options.page_size.filter(|_| !is_write_sql(&sql)) {
+                client
+                    .execute_query_page(
+                        database,
+                        sql,
+                        max_rows,
+                        page_size,
+                        options.result_session_id.as_deref(),
+                        cancel_token,
+                        query_timeout,
+                    )
+                    .await
+                    .map_err(db::duckdb_worker_protocol::DuckDbWorkerError::from)
+            } else {
+                client.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await
+            };
+            match result {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     let is_control_error = error.message == QUERY_CANCELED
@@ -2752,7 +2777,7 @@ fn external_driver_preview_fallback_sql(sql: &str) -> Option<String> {
     Some(format!("{}{}{}", &sql[..select_end], rewritten_projection, &sql[from_start..]))
 }
 
-fn is_external_driver_method_unsupported(error: &str, method: &str) -> bool {
+pub(crate) fn is_external_driver_method_unsupported(error: &str, method: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     let method = method.to_ascii_lowercase();
     normalized.contains(&method)
@@ -2775,6 +2800,9 @@ pub(crate) fn external_driver_query_params(
         "schema": schema,
         "maxRows": options.max_rows.unwrap_or(MAX_ROWS),
     });
+    if options.defer_lobs {
+        params["deferLobs"] = serde_json::json!(true);
+    }
     if let Some(fetch_size) = options.fetch_size {
         params["fetchSize"] = serde_json::json!(fetch_size);
     }
@@ -3263,6 +3291,82 @@ pub struct LargeValueRequest {
     pub download_encoding: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LargeValueCompletion {
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct LargeValueOperationError {
+    pub status: LargeValueCompletion,
+    pub message: String,
+}
+
+impl std::fmt::Display for LargeValueOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LargeValueOperationError {}
+
+impl From<String> for LargeValueOperationError {
+    fn from(message: String) -> Self {
+        Self { status: LargeValueCompletion::Failed, message }
+    }
+}
+
+impl From<&str> for LargeValueOperationError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl LargeValueOperationError {
+    fn cancelled() -> Self {
+        Self { status: LargeValueCompletion::Cancelled, message: canceled_error() }
+    }
+
+    fn unknown(message: String) -> Self {
+        Self { status: LargeValueCompletion::Unknown, message }
+    }
+
+    fn from_agent(error: AgentCallError) -> Self {
+        use crate::db::agent_driver::AgentErrorCategory;
+        let status = match &error {
+            AgentCallError::Structured { context, .. } if context.category == AgentErrorCategory::Canceled => {
+                LargeValueCompletion::Cancelled
+            }
+            AgentCallError::Structured { .. } | AgentCallError::Legacy { .. } => LargeValueCompletion::Failed,
+            _ => LargeValueCompletion::Unknown,
+        };
+        Self { status, message: error.into_legacy_string() }
+    }
+}
+
+async fn wait_for_large_value_resource<T>(
+    cancel: Option<CancellationToken>,
+    timeout: Option<Duration>,
+    future: impl std::future::Future<Output = T>,
+    report_completion: bool,
+) -> Result<T, LargeValueOperationError> {
+    if !report_completion {
+        return wait_for_value_opt(cancel, timeout, future).await.map_err(Into::into);
+    }
+    if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err(LargeValueOperationError::cancelled()),
+            value = wait_for_value_opt(None, timeout, future) => value.map_err(Into::into),
+        }
+    } else {
+        wait_for_value_opt(None, timeout, future).await.map_err(Into::into)
+    }
+}
+
 /// Fetches only the original captured locator; never retries by selecting the current row.
 pub async fn request_large_value(
     state: &AppState,
@@ -3292,41 +3396,126 @@ async fn request_large_value_with_cancel(
     release: bool,
     cancel_token: Option<CancellationToken>,
 ) -> Result<serde_json::Value, String> {
+    request_large_value_internal(state, request, release, cancel_token, false).await.map_err(|error| error.message)
+}
+
+pub async fn request_large_value_reported(
+    state: &AppState,
+    request: LargeValueRequest,
+) -> Result<serde_json::Value, LargeValueOperationError> {
+    let registered = request.execution_id.as_ref().map(|id| {
+        state.running_queries.register_task(
+            id.clone(),
+            crate::query_cancel::RunningTaskMetadata::query(
+                request.connection_id.clone(),
+                request.database.clone(),
+                request.client_session_id.clone(),
+            ),
+        )
+    });
+    let cancel = registered.as_ref().map(|task| task.token());
+    request_large_value_internal(state, request, false, cancel, true).await
+}
+
+async fn request_large_value_internal(
+    state: &AppState,
+    request: LargeValueRequest,
+    release: bool,
+    cancel_token: Option<CancellationToken>,
+    report_completion: bool,
+) -> Result<serde_json::Value, LargeValueOperationError> {
     if request.value_ref.len() > 128 || (!release && (request.limit == 0 || request.limit > 4096)) {
-        return Err("Invalid LOB chunk request".to_string());
+        return Err("Invalid LOB chunk request".into());
     }
     let method = if release { "release_large_value" } else { "read_large_value_chunk" };
     let params = serde_json::json!({ "valueRef": request.value_ref, "offset": request.offset, "limit": request.limit });
     let timeout = Some(std::time::Duration::from_secs(30));
     if let Some(txn_id) = request.txn_session_id.as_deref() {
         let connection = {
-            let mut sessions =
-                wait_for_value_opt(cancel_token.clone(), timeout, state.transaction_sessions.write()).await?;
+            let mut sessions = wait_for_large_value_resource(
+                cancel_token.clone(),
+                timeout,
+                state.transaction_sessions.write(),
+                report_completion,
+            )
+            .await?;
             let session = sessions.get_mut(txn_id).ok_or(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR)?;
             if session.connection_id != request.connection_id
                 || session.busy
                 || session.last_activity.elapsed() >= session.idle_timeout
             {
-                return Err("LOB transaction context expired or busy".to_string());
+                return Err("LOB transaction context expired or busy".into());
             }
             session.last_activity = std::time::Instant::now();
             Arc::clone(&session.connection)
         };
-        let connection = wait_for_value_opt(cancel_token.clone(), timeout, connection.lock()).await?;
-        let TxnConnection::Agent { client, .. } = &*connection else {
-            return Err("LOB snapshot chunks require an agent transaction".to_string());
+        let connection =
+            wait_for_large_value_resource(cancel_token.clone(), timeout, connection.lock(), report_completion).await?;
+        let result = match &*connection {
+            TxnConnection::Agent { client, .. } => {
+                let mut client =
+                    wait_for_large_value_resource(cancel_token.clone(), timeout, client.lock(), report_completion)
+                        .await?;
+                if report_completion {
+                    if is_canceled(&cancel_token) {
+                        return Err(LargeValueOperationError::cancelled());
+                    }
+                    client
+                        .call_typed_with_timeout_and_cancel(method, params, timeout, None)
+                        .await
+                        .map_err(LargeValueOperationError::from_agent)
+                } else {
+                    client
+                        .call_with_timeout_and_cancel(method, params, timeout, cancel_token.clone())
+                        .await
+                        .map_err(Into::into)
+                }
+            }
+            TxnConnection::ExternalDriver { session, config, .. } => {
+                let mut params = params;
+                params["connection"] = serde_json::json!(config.as_ref());
+                if report_completion {
+                    if is_canceled(&cancel_token) {
+                        return Err(LargeValueOperationError::cancelled());
+                    }
+                    session
+                        .invoke_with_timeout::<serde_json::Value>(method, params, timeout)
+                        .await
+                        .map_err(LargeValueOperationError::unknown)
+                } else {
+                    wait_for_value_opt(
+                        cancel_token.clone(),
+                        timeout,
+                        session.invoke_with_timeout::<serde_json::Value>(method, params, timeout),
+                    )
+                    .await?
+                    .map_err(Into::into)
+                }
+            }
+            _ => return Err("LOB snapshot chunks require a supported transaction".into()),
         };
-        let result = wait_for_value_opt(cancel_token.clone(), timeout, client.lock())
-            .await?
-            .call_with_timeout_and_cancel(method, params, timeout, cancel_token.clone())
-            .await;
+        if report_completion {
+            // An unconfirmed RPC must not become a settled local error after a
+            // concurrent transaction removal or cancellation.
+            let value = result?;
+            if is_canceled(&cancel_token) {
+                return Err(LargeValueOperationError::cancelled());
+            }
+            if !wait_for_large_value_resource(cancel_token, timeout, state.transaction_sessions.read(), true)
+                .await?
+                .contains_key(txn_id)
+            {
+                return Err("LOB transaction context expired".into());
+            }
+            return Ok(value);
+        }
         if !wait_for_value_opt(cancel_token, timeout, state.transaction_sessions.read()).await?.contains_key(txn_id) {
-            return Err("LOB transaction context expired".to_string());
+            return Err("LOB transaction context expired".into());
         }
         return result;
     }
     let pool_database = query_pool_database(&request.database, request.catalog.as_deref());
-    let (pool_key, handle) = wait_for_value_opt(
+    let (pool_key, handle) = wait_for_large_value_resource(
         cancel_token.clone(),
         timeout,
         state.existing_workload_pool_for_session(
@@ -3334,15 +3523,58 @@ async fn request_large_value_with_cancel(
             pool_database,
             request.client_session_id.as_deref(),
         ),
+        report_completion,
     )
     .await?
     .ok_or_else(|| "LOB context has expired; rerun the query".to_string())?;
     let _activity = state.pool_activity_touch(pool_key.as_str());
-    let PoolKind::Agent(client) = handle else {
-        return Err("LOB snapshot chunks require an agent connection".to_string());
-    };
-    let mut client = wait_for_value_opt(cancel_token.clone(), timeout, client.lock()).await?;
-    client.call_with_timeout_and_cancel(method, params, timeout, cancel_token).await
+    match handle {
+        PoolKind::Agent(client) => {
+            let mut client =
+                wait_for_large_value_resource(cancel_token.clone(), timeout, client.lock(), report_completion).await?;
+            if report_completion {
+                if is_canceled(&cancel_token) {
+                    return Err(LargeValueOperationError::cancelled());
+                }
+                let value = client
+                    .call_typed_with_timeout_and_cancel(method, params, timeout, None)
+                    .await
+                    .map_err(LargeValueOperationError::from_agent)?;
+                if is_canceled(&cancel_token) {
+                    return Err(LargeValueOperationError::cancelled());
+                }
+                Ok(value)
+            } else {
+                client.call_with_timeout_and_cancel(method, params, timeout, cancel_token).await.map_err(Into::into)
+            }
+        }
+        PoolKind::ExternalDriver { session, config, .. } => {
+            let mut params = params;
+            params["connection"] = serde_json::json!(config.as_ref());
+            if report_completion {
+                if is_canceled(&cancel_token) {
+                    return Err(LargeValueOperationError::cancelled());
+                }
+                let value = session
+                    .invoke_with_timeout::<serde_json::Value>(method, params, timeout)
+                    .await
+                    .map_err(LargeValueOperationError::unknown)?;
+                if is_canceled(&cancel_token) {
+                    return Err(LargeValueOperationError::cancelled());
+                }
+                Ok(value)
+            } else {
+                wait_for_value_opt(
+                    cancel_token,
+                    timeout,
+                    session.invoke_with_timeout::<serde_json::Value>(method, params, timeout),
+                )
+                .await?
+                .map_err(Into::into)
+            }
+        }
+        _ => Err("LOB snapshot chunks require a supported connection".into()),
+    }
 }
 
 pub async fn write_large_value_snapshot(
@@ -3464,6 +3696,8 @@ pub async fn close_query_session(
     let pool_handle = state.pool_handle(&pool_key).await;
     let pool = pool_handle.as_ref().ok_or("Connection not found")?;
     match pool {
+        #[cfg(feature = "duckdb-sidecar")]
+        PoolKind::DuckDbWorker(client) => client.close_query_session(session_id).await,
         PoolKind::Agent(client) => {
             let client = client.clone();
             let mut client = client.lock().await;
@@ -4751,6 +4985,7 @@ fn error_query_result(message: String) -> db::QueryResult {
     db::QueryResult {
         columns: vec!["Error".to_string()],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -4771,6 +5006,7 @@ fn empty_query_result(execution_time_ms: u128) -> db::QueryResult {
     db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -5185,6 +5421,7 @@ async fn execute_statements_inner(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -5790,6 +6027,7 @@ async fn exec_tx_pg_inner(
         (Ok(total_affected), Ok(_)) => Ok(db::QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -5887,6 +6125,7 @@ async fn exec_tx_mysql_inner(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -6084,6 +6323,7 @@ async fn exec_tx_sqlite_inner(
                     conn.execute_batch("COMMIT").map_err(|e| format!("COMMIT failed: {}", e)).map(|_| db::QueryResult {
                         columns: vec![],
                         column_types: Vec::new(),
+                        deferred_large_value_cells: Vec::new(),
                         column_sortables: vec![],
                         spatial_columns: vec![],
                         spatial_values: vec![],
@@ -6218,6 +6458,7 @@ async fn exec_tx_explicit_inner(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -6646,6 +6887,7 @@ pub async fn execute_in_manual_transaction(
 
 #[derive(Clone, Debug, Default)]
 pub struct ManualTransactionExecutionOptions {
+    pub defer_lobs: bool,
     pub bound_statements: Option<Vec<dbx_types::types::BlobBoundStatement>>,
     pub max_rows: Option<usize>,
     pub table_data_preview: bool,
@@ -6867,8 +7109,16 @@ pub async fn execute_in_manual_transaction_with_options(
                 }
             }
             TxnConnection::ExternalDriver { session, config, .. } => {
-                execute_manual_txn_external_driver_statement(session, config, statement, database, schema, row_limit)
-                    .await
+                execute_manual_txn_external_driver_statement(
+                    session,
+                    config,
+                    statement,
+                    database,
+                    schema,
+                    row_limit,
+                    options.defer_lobs,
+                )
+                .await
             }
         };
         match result {
@@ -7388,9 +7638,11 @@ async fn execute_manual_txn_external_driver_statement(
     database: &str,
     schema: Option<&str>,
     row_limit: usize,
+    defer_lobs: bool,
 ) -> Result<db::QueryResult, String> {
     let timeout_secs = config.effective_query_timeout_secs();
     let options = QueryExecutionOptions {
+        defer_lobs,
         max_rows: Some(row_limit.max(1)),
         timeout_secs: Some(timeout_secs),
         ..QueryExecutionOptions::default()
@@ -7480,6 +7732,7 @@ async fn execute_manual_txn_mysql_statement(
             return Ok(db::QueryResult {
                 columns: Vec::new(),
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -7513,6 +7766,7 @@ async fn execute_manual_txn_mysql_statement(
         Ok(db::QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -7534,6 +7788,7 @@ async fn execute_manual_txn_mysql_statement(
         Ok(db::QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -7596,6 +7851,7 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -7630,6 +7886,7 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -7652,6 +7909,54 @@ mod tests {
     use crate::query_cancel::RunningTaskMetadata;
     use std::sync::atomic::Ordering;
     use tokio::time::timeout;
+
+    #[test]
+    fn deferred_cells_reach_all_multi_result_success_constructors_once() {
+        let sample = || {
+            serde_json::from_value::<db::QueryResult>(serde_json::json!({
+                "columns": ["__DBX_LARGE_VALUE_BYTES_user_column"], "rows": [["preview"]],
+                "affected_rows": 0, "execution_time_ms": 0,
+                "large_value_cells": [{ "row_index": 0, "column_index": 0,
+                    "original_bytes": 67108864, "value_ref": "original-reference" }]
+            }))
+            .unwrap()
+        };
+        for result in [
+            ExecuteMultiResult::from(sample()),
+            ExecuteMultiResult::success_with_index(sample(), 0),
+            ExecuteMultiResult::success_with_index_and_large_values(sample(), 0, Vec::new(), false),
+            ExecuteMultiResult::success_with_optional_server_large_values(sample(), false),
+        ] {
+            assert!(result.result.deferred_large_value_cells.is_empty());
+            assert_eq!(result.large_value_cells.len(), 1);
+            assert_eq!(result.result.columns, vec!["__DBX_LARGE_VALUE_BYTES_user_column"]);
+            let wire = serde_json::to_string(&result).unwrap();
+            assert_eq!(wire.matches("\"large_value_cells\":").count(), 1);
+            assert!(wire.contains("original-reference"));
+        }
+    }
+
+    #[test]
+    fn deferred_cells_follow_columns_when_nclob_markers_are_removed() {
+        let sample = || {
+            serde_json::from_value::<db::QueryResult>(serde_json::json!({
+            "columns": ["ID", "N", "__DBX_LARGE_VALUE_BYTES_T_1", "C"],
+            "rows": [[1, "national preview", "T:3", "clob preview"]],
+            "affected_rows": 0, "execution_time_ms": 0,
+            "large_value_cells": [{"row_index":0,"column_index":3,"original_bytes":67108864,"value_ref":"clob-original"}]
+        })).unwrap()
+        };
+        for result in [
+            ExecuteMultiResult::success_with_optional_server_large_values(sample(), true),
+            ExecuteMultiResult::success_with_index_and_large_values(sample(), 0, Vec::new(), true),
+        ] {
+            assert_eq!(result.result.columns, vec!["ID", "N", "C"]);
+            let deferred = result.large_value_cells.iter().find(|cell| cell.value_ref.is_some()).unwrap();
+            assert_eq!(deferred.column_index, 2);
+            assert_eq!(deferred.value_ref.as_deref(), Some("clob-original"));
+            assert!(result.large_value_cells.iter().any(|cell| cell.column_index == 1 && cell.value_ref.is_none()));
+        }
+    }
 
     mod manual_transaction_snapshot_tests {
         use super::*;
@@ -10108,6 +10413,7 @@ for line in sys.stdin:
                 mysql_batch_result(db::QueryResult {
                     columns: vec!["COUNT(*)".to_string()],
                     column_types: vec!["BIGINT".to_string()],
+                    deferred_large_value_cells: Vec::new(),
                     column_sortables: vec![],
                     spatial_columns: vec![],
                     spatial_values: vec![],
@@ -10384,6 +10690,7 @@ for line in sys.stdin:
         let result_set = |value| db::QueryResult {
             columns: vec!["value".to_string()],
             column_types: vec!["INT".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -11277,7 +11584,30 @@ for line in sys.stdin:
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')\n  case \"$line\" in\n    *'\"method\":\"executeInManualTransaction\"'*)\n      echo executeInManualTransaction >> '{}'\n      printf '{{\"id\":%s,\"result\":{{\"columns\":[\"value\"],\"column_types\":[],\"column_sortables\":[],\"rows\":[[42]],\"affected_rows\":0,\"execution_time_ms\":1,\"truncated\":false,\"session_id\":null,\"has_more\":false}}}}\\n' \"$id\"\n      ;;\n    *'\"method\":\"beginManualTransaction\"'*)\n      echo beginManualTransaction >> '{}'\n      printf '{{\"id\":%s,\"result\":{{\"ok\":true}}}}\\n' \"$id\"\n      ;;\n    *'\"method\":\"commitManualTransaction\"'*)\n      echo commitManualTransaction >> '{}'\n      printf '{{\"id\":%s,\"result\":{{\"ok\":true}}}}\\n' \"$id\"\n      ;;\n  esac\ndone\n",
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+  case "$line" in
+    *'"method":"executeInManualTransaction"'*)
+      echo executeInManualTransaction >> '{}'
+      printf '{{"id":%s,"result":{{"columns":["value"],"column_types":[],"column_sortables":[],"rows":[[42]],"affected_rows":0,"execution_time_ms":1,"truncated":false,"session_id":null,"has_more":false}}}}\n' "$id"
+      ;;
+    *'"method":"beginManualTransaction"'*)
+      echo beginManualTransaction >> '{}'
+      printf '{{"id":%s,"result":{{"ok":true}}}}\n' "$id"
+      ;;
+    *'"method":"read_large_value_chunk"'*|*'"method":"release_large_value"'*)
+      echo lob >> '{}'
+      printf '{{"id":%s,"result":{{"status":"ok","data":"original","next_offset":8,"eof":true,"value_kind":"text"}}}}\n' "$id"
+      ;;
+    *'"method":"commitManualTransaction"'*)
+      echo commitManualTransaction >> '{}'
+      printf '{{"id":%s,"result":{{"ok":true}}}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+                calls.display(),
                 calls.display(),
                 calls.display(),
                 calls.display()
@@ -11375,11 +11705,45 @@ for line in sys.stdin:
         let results =
             execute_in_manual_transaction(&state, "txn-test", "SELECT 42", "dbx_test", None, Some(10)).await.unwrap();
         assert_eq!(results[0].rows, vec![vec![serde_json::json!(42)]]);
+        let request: LargeValueRequest = serde_json::from_value(serde_json::json!({
+            "connectionId":"jdbc-conn", "database":"dbx_test", "txnSessionId":"txn-test",
+            "valueRef":"original-ref", "offset":0, "limit":4096
+        }))
+        .unwrap();
+        for release in [false, true] {
+            let mut other_connection = request.clone();
+            other_connection.connection_id = "other-connection".into();
+            assert_eq!(
+                request_large_value(&state, other_connection, release).await.unwrap_err(),
+                "LOB transaction context expired or busy"
+            );
+            state.transaction_sessions.write().await.get_mut("txn-test").unwrap().busy = true;
+            assert_eq!(
+                request_large_value(&state, request.clone(), release).await.unwrap_err(),
+                "LOB transaction context expired or busy"
+            );
+            state.transaction_sessions.write().await.get_mut("txn-test").unwrap().busy = false;
+            state.transaction_sessions.write().await.get_mut("txn-test").unwrap().last_activity =
+                std::time::Instant::now() - Duration::from_secs(MANUAL_TRANSACTION_IDLE_TIMEOUT_SECS + 1);
+            assert_eq!(
+                request_large_value(&state, request.clone(), release).await.unwrap_err(),
+                "LOB transaction context expired or busy"
+            );
+            state.transaction_sessions.write().await.get_mut("txn-test").unwrap().last_activity =
+                std::time::Instant::now();
+            assert_eq!(request_large_value(&state, request.clone(), release).await.unwrap()["data"], "original");
+        }
         commit_manual_transaction(&state, "txn-test").await.unwrap();
         assert!(state.pool_handle(pool_key).await.is_none());
+        for release in [false, true] {
+            assert_eq!(
+                request_large_value(&state, request.clone(), release).await.unwrap_err(),
+                MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap(),
-            "beginManualTransaction\nexecuteInManualTransaction\ncommitManualTransaction\n"
+            "beginManualTransaction\nexecuteInManualTransaction\nlob\nlob\ncommitManualTransaction\n"
         );
 
         state.shutdown(Duration::from_secs(1)).await;
@@ -11557,6 +11921,7 @@ for line in sys.stdin:
             Ok(db::QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -11584,6 +11949,7 @@ for line in sys.stdin:
             Ok(db::QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -12666,6 +13032,7 @@ for line in sys.stdin:
             part_cooldown_ms: 0,
             skip_relational_constraints: false,
             failure_log_enabled: true,
+            resolve_includes: false,
             encoding: Default::default(),
         }
     }
@@ -13069,6 +13436,7 @@ for line in sys.stdin:
         let result = db::QueryResult {
             columns: vec!["id".to_string(), "nested".to_string()],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -13103,6 +13471,7 @@ for line in sys.stdin:
                 "note".to_string(),
             ],
             column_types: vec!["integer".to_string(), "text".to_string(), "bigint".to_string(), "text".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true, true, true, true],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -13163,6 +13532,7 @@ for line in sys.stdin:
                 "varchar2".to_string(),
                 "varchar2".to_string(),
             ],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true, true, true, true],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -13223,6 +13593,7 @@ for line in sys.stdin:
                 "text".to_string(),
                 "text".to_string(),
             ],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true; 5],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -13289,6 +13660,7 @@ for line in sys.stdin:
                 format!("{}B_0", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX),
             ],
             column_types: vec!["bytea".to_string(), "text".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true, true],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -13451,6 +13823,7 @@ for line in sys.stdin:
                 format!("{}C_1", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX),
             ],
             column_types: vec!["number".to_string(), "varchar2".to_string(), "varchar2".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true; 3],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -13492,6 +13865,7 @@ for line in sys.stdin:
         let mut result = db::QueryResult {
             columns: vec!["embedding".to_string(), marker],
             column_types: vec!["text".to_string(), "text".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true, true],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),
@@ -13529,6 +13903,7 @@ for line in sys.stdin:
                 format!("{}K_1", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX),
             ],
             column_types: vec!["text".to_string(), "text".to_string(), "text".to_string(), "text".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true; 4],
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),

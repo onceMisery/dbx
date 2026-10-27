@@ -20,12 +20,20 @@ use crate::table_structure_sql::{
     build_sqlserver_drop_default_constraint_sql, build_sqlserver_table_comment_sql, sqlserver_unicode_string_literal,
 };
 use crate::types::{
-    ColumnInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, OwnerInfo, RuleInfo, SequenceInfo, TableInfo, TriggerInfo,
+    ColumnInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectSourceKind, OwnerInfo, RuleInfo, SequenceInfo,
+    TableInfo, TriggerInfo,
 };
 
+mod oracle_indexes;
 mod oracle_routines;
 mod sqlserver_dependencies;
-pub use oracle_routines::{diff_oracle_routines, oracle_routine_diff_sql, OracleRoutineCompareContext};
+pub use oracle_indexes::{
+    OracleSchemaSyncDdlOptions, OracleSchemaSyncDdlSources, OracleSchemaSyncEndpoint, OracleSchemaSyncTableDdl,
+    SchemaSyncGenerationIssue,
+};
+pub use oracle_routines::{
+    diff_oracle_routines, oracle_routine_diff_sql, OracleRoutineCompareContext, OracleRoutineCompareIdentity,
+};
 
 use sqlserver_dependencies::build_dependency_aware_alter_column_batch;
 
@@ -168,6 +176,8 @@ pub struct FunctionDiff {
     #[serde(rename = "type")]
     pub diff_type: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_kind: Option<ObjectSourceKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<FunctionInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -629,6 +639,10 @@ pub struct SchemaDiffPreparation {
 #[serde(rename_all = "camelCase")]
 pub struct SchemaSyncSqlPlan {
     pub sync_sql: String,
+    #[serde(default = "default_rollback_complete")]
+    pub forward_completeness: RollbackCompleteness,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generation_issues: Vec<SchemaSyncGenerationIssue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback_sync_sql: Option<String>,
     pub rollback_completeness: RollbackCompleteness,
@@ -2236,6 +2250,16 @@ pub fn prepare_schema_diff(options: SchemaDiffPreparationOptions) -> SchemaDiffP
     );
     if let Some(context) = &options.oracle_routines {
         for diff in &function_diffs {
+            if diff.diff_type == "removed"
+                && diff.program_kind == Some(ObjectSourceKind::PackageBody)
+                && function_diffs.iter().any(|other| {
+                    other.name == diff.name
+                        && other.diff_type == "removed"
+                        && other.program_kind == Some(ObjectSourceKind::Package)
+                })
+            {
+                continue;
+            }
             if let Ok(sql) = oracle_routine_diff_sql(diff, context) {
                 if !sql.is_empty() {
                     if !sync_sql.is_empty() {
@@ -4067,6 +4091,7 @@ pub fn diff_functions(source: &[FunctionInfo], target: &[FunctionInfo]) -> Vec<F
         let Some(target_fn) = target_map.get(&key) else {
             diffs.push(FunctionDiff {
                 diff_type: "added".to_string(),
+                program_kind: None,
                 name: source_fn.name.clone(),
                 source: Some(source_fn.clone()),
                 target: None,
@@ -4088,6 +4113,7 @@ pub fn diff_functions(source: &[FunctionInfo], target: &[FunctionInfo]) -> Vec<F
         if !changes.is_empty() {
             diffs.push(FunctionDiff {
                 diff_type: "modified".to_string(),
+                program_kind: None,
                 name: source_fn.name.clone(),
                 source: Some(source_fn.clone()),
                 target: Some((*target_fn).clone()),
@@ -4101,6 +4127,7 @@ pub fn diff_functions(source: &[FunctionInfo], target: &[FunctionInfo]) -> Vec<F
         if !source_map.contains_key(&key) {
             diffs.push(FunctionDiff {
                 diff_type: "removed".to_string(),
+                program_kind: None,
                 name: target_fn.name.clone(),
                 source: None,
                 target: Some(target_fn.clone()),
@@ -5975,6 +6002,23 @@ fn generate_create_table_sql(
         }
     }
 
+    let (trigger_sql, missing) = generate_table_trigger_sql(name, triggers, db_type, schema, source_dialect);
+    if !trigger_sql.is_empty() {
+        lines.push(trigger_sql);
+    }
+    (lines.join("\n"), missing)
+}
+
+fn generate_table_trigger_sql(
+    name: &str,
+    triggers: &[TriggerInfo],
+    db_type: DatabaseType,
+    schema: Option<&str>,
+    source_dialect: Option<DialectKind>,
+) -> (String, Vec<MissingRollbackObject>) {
+    let mut lines = Vec::new();
+    let profile = profile_for(db_type);
+    let table = qualified_name(name, db_type, schema);
     // Trigger recreation — collect structured missing objects (do not rely on SQL comments alone).
     let mut missing: Vec<MissingRollbackObject> = Vec::new();
     if !triggers.is_empty() {
@@ -6207,7 +6251,7 @@ pub fn generate_schema_sync_sql_plan(
     enable_rollback: bool,
     ignore_foreign_key_checks: bool,
 ) -> SchemaSyncSqlPlan {
-    let (sync_sql, _) = generate_schema_sync_sql_inner(
+    generate_schema_sync_sql_plan_with_oracle_ddl(
         diffs,
         function_diffs,
         sequence_diffs,
@@ -6218,6 +6262,41 @@ pub fn generate_schema_sync_sql_plan(
         cascade_delete,
         source_dialect,
         field_mappings,
+        enable_rollback,
+        ignore_foreign_key_checks,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_schema_sync_sql_plan_with_oracle_ddl(
+    diffs: &[TableDiff],
+    function_diffs: &[FunctionDiff],
+    sequence_diffs: &[SequenceDiff],
+    rule_diffs: &[RuleDiff],
+    owner_diffs: &[OwnerDiff],
+    db_type: DatabaseType,
+    schema: Option<&str>,
+    cascade_delete: bool,
+    source_dialect: Option<DialectKind>,
+    field_mappings: &[FieldMapping],
+    enable_rollback: bool,
+    ignore_foreign_key_checks: bool,
+    oracle_ddl: Option<&OracleSchemaSyncDdlSources>,
+) -> SchemaSyncSqlPlan {
+    let (sync_sql, forward_issues) = generate_schema_sync_sql_inner_with_oracle_ddl(
+        diffs,
+        function_diffs,
+        sequence_diffs,
+        rule_diffs,
+        owner_diffs,
+        db_type,
+        schema,
+        cascade_delete,
+        source_dialect,
+        field_mappings,
+        oracle_ddl.map(|sources| sources.forward.as_slice()),
+        oracle_ddl.map_or(&[], |sources| sources.table_mappings.as_slice()),
     );
     let sync_sql =
         if ignore_foreign_key_checks { wrap_script_with_foreign_key_checks(&sync_sql, db_type) } else { sync_sql };
@@ -6225,7 +6304,26 @@ pub fn generate_schema_sync_sql_plan(
     let (rollback_sync_sql, missing_rollback_objects) = if enable_rollback {
         let dependency_graph = DependencyGraph { nodes: HashMap::new(), topological_order: Vec::new() };
         let rollback_graph = RollbackGraph::from_forward_diffs(diffs, &[], &dependency_graph);
-        let (sql, missing) = generate_rollback_sync_sql_with_missing(&rollback_graph, db_type, schema, cascade_delete);
+        let (sql, missing) = if let Some(sources) = oracle_ddl {
+            let rollback_diffs =
+                rollback_graph.rollback_nodes.iter().map(|node| node.table_diff.clone()).collect::<Vec<_>>();
+            generate_schema_sync_sql_inner_with_oracle_ddl(
+                &rollback_diffs,
+                &[],
+                &[],
+                &[],
+                &[],
+                db_type,
+                schema,
+                cascade_delete,
+                None,
+                &[],
+                Some(&sources.rollback),
+                &[],
+            )
+        } else {
+            generate_rollback_sync_sql_with_missing(&rollback_graph, db_type, schema, cascade_delete)
+        };
         let sql = if ignore_foreign_key_checks { wrap_script_with_foreign_key_checks(&sql, db_type) } else { sql };
         (Some(sql), missing)
     } else {
@@ -6237,7 +6335,35 @@ pub fn generate_schema_sync_sql_plan(
         RollbackCompleteness::Incomplete
     };
 
-    SchemaSyncSqlPlan { sync_sql, rollback_sync_sql, rollback_completeness, missing_rollback_objects }
+    let forward_completeness = if oracle_ddl.is_some() && !forward_issues.is_empty() {
+        RollbackCompleteness::Incomplete
+    } else {
+        RollbackCompleteness::Complete
+    };
+    let generation_issues = if oracle_ddl.is_some() {
+        forward_issues
+            .iter()
+            .map(|issue| ("forward", issue))
+            .chain(missing_rollback_objects.iter().map(|issue| ("rollback", issue)))
+            .map(|(direction, issue)| SchemaSyncGenerationIssue {
+                direction: direction.into(),
+                kind: issue.kind.clone(),
+                name: issue.name.clone(),
+                table: issue.table.clone(),
+                reason: issue.reason.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    SchemaSyncSqlPlan {
+        sync_sql,
+        forward_completeness,
+        generation_issues,
+        rollback_sync_sql,
+        rollback_completeness,
+        missing_rollback_objects,
+    }
 }
 
 /// Names of the objects a diff's own statements reference.
@@ -6399,7 +6525,40 @@ fn generate_schema_sync_sql_inner(
     source_dialect: Option<DialectKind>,
     field_mappings: &[FieldMapping],
 ) -> (String, Vec<MissingRollbackObject>) {
+    generate_schema_sync_sql_inner_with_oracle_ddl(
+        diffs,
+        function_diffs,
+        sequence_diffs,
+        rule_diffs,
+        owner_diffs,
+        db_type,
+        schema,
+        cascade_delete,
+        source_dialect,
+        field_mappings,
+        None,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_schema_sync_sql_inner_with_oracle_ddl(
+    diffs: &[TableDiff],
+    function_diffs: &[FunctionDiff],
+    sequence_diffs: &[SequenceDiff],
+    rule_diffs: &[RuleDiff],
+    owner_diffs: &[OwnerDiff],
+    db_type: DatabaseType,
+    schema: Option<&str>,
+    cascade_delete: bool,
+    source_dialect: Option<DialectKind>,
+    field_mappings: &[FieldMapping],
+    oracle_ddl: Option<&[OracleSchemaSyncTableDdl]>,
+    table_mappings: &[SchemaDiffTableMapping],
+) -> (String, Vec<MissingRollbackObject>) {
     let mut lines = Vec::new();
+    let mut deferred_oracle_foreign_keys = Vec::new();
+    let mut deferred_oracle_triggers = Vec::new();
     let mut missing_objects: Vec<MissingRollbackObject> = Vec::new();
     let profile = profile_for(db_type);
     // SQL Server has no DROP ... CASCADE syntax (related constraints are handled explicitly
@@ -6426,6 +6585,10 @@ fn generate_schema_sync_sql_inner(
     for diff in order_diffs_for_execution(diffs) {
         let target_name = target_table_name(diff);
         let table = qualified_name(target_name, db_type, schema);
+        let captured = oracle_ddl.and_then(|sources| sources.iter().find(|source| source.diff_name == diff.name));
+        if let Some(captured) = captured {
+            missing_objects.extend(captured.issues.clone());
+        }
 
         if diff.diff_type == "added" && diff.object_type.as_deref() == Some("view") {
             if let Some(ddl) = &diff.ddl {
@@ -6449,6 +6612,44 @@ fn generate_schema_sync_sql_inner(
         }
 
         if diff.diff_type == "added" && diff.object_type.as_deref() != Some("view") {
+            if let Some(captured) = captured {
+                let trigger_snapshots = diff
+                    .triggers
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|trigger| trigger.source.clone())
+                    .collect::<Vec<_>>();
+                match captured.render_table(
+                    schema.unwrap_or(&captured.owner),
+                    target_name,
+                    table_mappings,
+                    &trigger_snapshots,
+                ) {
+                    Ok(parts) => {
+                        lines.push(parts.table_ddl);
+                        lines.extend(parts.indexes);
+                        lines.extend(parts.supporting_constraints);
+                        lines.push(parts.trailing_ddl);
+                        deferred_oracle_foreign_keys.extend(parts.foreign_keys);
+                        let (trigger_sql, missing) = captured.render_triggers(
+                            parts.triggers,
+                            &trigger_snapshots,
+                            schema.unwrap_or(&captured.owner),
+                            target_name,
+                        );
+                        deferred_oracle_triggers.extend(trigger_sql);
+                        missing_objects.extend(missing);
+                        continue;
+                    }
+                    Err(reason) => missing_objects.push(MissingRollbackObject {
+                        kind: "table".into(),
+                        name: diff.name.clone(),
+                        table: Some(target_name.into()),
+                        reason,
+                    }),
+                }
+            }
             let has_structured_snapshot = diff.columns.as_ref().is_some_and(|columns| !columns.is_empty());
             let is_rollback_recreation = diff.ddl.is_none() && diff.target_ddl.is_some();
             if is_rollback_recreation {
@@ -6841,6 +7042,43 @@ fn generate_schema_sync_sql_inner(
 
         if let Some(indexes) = &diff.indexes {
             for index in indexes {
+                if let Some(captured) = captured {
+                    if matches!(index.diff_type.as_str(), "added" | "removed" | "modified") {
+                        let drops = matches!(index.diff_type.as_str(), "removed" | "modified");
+                        if drops && captured.protected_drop_indexes.contains(&index.name) {
+                            missing_objects.push(MissingRollbackObject { kind: "index".into(), name: index.name.clone(), table: Some(target_name.into()), reason: "Index supports a retained primary or unique constraint; its dependencies must be migrated before replacement".into() });
+                            continue;
+                        }
+                        let creates = matches!(index.diff_type.as_str(), "added" | "modified");
+                        let create = if creates {
+                            match captured.render_index(
+                                index.source.as_ref().map_or(index.name.as_str(), |source| source.name.as_str()),
+                                schema.unwrap_or(&captured.owner),
+                                target_name,
+                            ) {
+                                Ok(sql) => Some(sql),
+                                Err(reason) => {
+                                    missing_objects.push(MissingRollbackObject {
+                                        kind: "index".into(),
+                                        name: index.name.clone(),
+                                        table: Some(target_name.into()),
+                                        reason,
+                                    });
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if drops {
+                            lines.push(drop_index_sql(target_name, &index.name, db_type, schema));
+                        }
+                        if let Some(create) = create {
+                            lines.push(create);
+                        }
+                        continue;
+                    }
+                }
                 match index.diff_type.as_str() {
                     "added" => {
                         if let Some(source) = &index.source {
@@ -6881,6 +7119,14 @@ fn generate_schema_sync_sql_inner(
                     "-- Trigger {}: {} on {}; review trigger definition manually.",
                     trigger.diff_type, trigger.name, diff.name
                 ));
+                if matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
+                    missing_objects.push(MissingRollbackObject {
+                        kind: "trigger".into(),
+                        name: trigger.name.clone(),
+                        table: Some(target_name.into()),
+                        reason: "Trigger synchronization requires a complete reviewed definition; no trigger DDL was generated".into(),
+                    });
+                }
             }
         }
 
@@ -6904,6 +7150,10 @@ fn generate_schema_sync_sql_inner(
         lines.push(String::new());
         lines.push("-- Functions".to_string());
         for diff in function_diffs {
+            if matches!(diff.program_kind, Some(ObjectSourceKind::Package | ObjectSourceKind::PackageBody)) {
+                lines.push("-- Package DDL requires a reviewed package plan.".into());
+                continue;
+            }
             match diff.diff_type.as_str() {
                 "added" | "modified" => {
                     if let Some(source) = &diff.source {
@@ -7065,6 +7315,8 @@ fn generate_schema_sync_sql_inner(
         }
     }
 
+    lines.extend(deferred_oracle_foreign_keys);
+    lines.extend(deferred_oracle_triggers);
     (lines.join("\n").trim().to_string(), missing_objects)
 }
 
@@ -8372,6 +8624,7 @@ mod tests {
     fn sqlserver_function_and_sequence_changes_use_tsql_verbs() {
         let function = FunctionDiff {
             diff_type: "modified".into(),
+            program_kind: None,
             name: "next_value".into(),
             source: Some(FunctionInfo {
                 name: "next_value".into(),
@@ -8385,6 +8638,7 @@ mod tests {
         };
         let removed_function = FunctionDiff {
             diff_type: "removed".into(),
+            program_kind: None,
             name: "old_value".into(),
             source: None,
             target: None,
@@ -8662,6 +8916,7 @@ mod tests {
         }];
         let trigger = TriggerInfo {
             name: "trg_events_insert".into(),
+            oracle_metadata: None,
             event: "INSERT".into(),
             timing: "AFTER".into(),
             level: None,
@@ -8723,6 +8978,7 @@ mod tests {
 
         let native_function = FunctionDiff {
             diff_type: "modified".into(),
+            program_kind: None,
             name: "next_value".into(),
             source: Some(FunctionInfo {
                 name: "next_value".into(),
@@ -8770,6 +9026,7 @@ mod tests {
 
         let foreign_function = FunctionDiff {
             diff_type: "added".into(),
+            program_kind: None,
             name: "pg_only".into(),
             source: Some(FunctionInfo {
                 name: "pg_only".into(),
@@ -11442,6 +11699,7 @@ mod tests {
                     valid: None,
                     comment: None,
                     created_at: None,
+                    oracle_metadata: None,
                     statement: None,
                 }],
                 ddl: None,
@@ -15473,6 +15731,7 @@ mod tests {
     fn postgres_function_sequence_rule_owner_use_profile_templates() {
         let fn_diff = FunctionDiff {
             diff_type: "added".into(),
+            program_kind: None,
             name: "f1".into(),
             source: Some(FunctionInfo {
                 name: "f1".into(),
@@ -15543,6 +15802,7 @@ mod tests {
     fn postgres_function_sync_reuses_native_functiondef_header_once() {
         let function = |arguments: &str, definition: &str| FunctionDiff {
             diff_type: "added".into(),
+            program_kind: None,
             name: "armor".into(),
             source: Some(FunctionInfo {
                 name: "armor".into(),
@@ -15588,6 +15848,7 @@ mod tests {
     fn mysql_skips_function_sequence_when_templates_absent() {
         let fn_diff = FunctionDiff {
             diff_type: "added".into(),
+            program_kind: None,
             name: "f1".into(),
             source: Some(FunctionInfo {
                 name: "f1".into(),

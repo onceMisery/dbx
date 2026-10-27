@@ -1,5 +1,6 @@
 use super::*;
 use crate::models::connection::DatabaseType;
+use crate::table_structure_sql::dialect::StructureDialect;
 use crate::types::PgPartitionKind;
 
 fn column(name: &str) -> EditableStructureColumn {
@@ -693,6 +694,7 @@ fn trigger(name: &str, timing: &str, event: &str, statement: &str) -> EditableSt
     EditableStructureTrigger {
         id: name.to_string(),
         name: name.to_string(),
+        oracle_exact: None,
         timing: timing.to_string(),
         event: event.to_string(),
         statement: statement.to_string(),
@@ -10926,6 +10928,19 @@ fn pg_family_concurrent_flag_is_ignored() {
             "{database_type:?} must not emit CONCURRENTLY"
         );
     }
+}
+
+#[test]
+fn firebird_column_default_precedes_not_null() {
+    let mut col = column("raiz");
+    col.data_type = "varchar(20)".to_string();
+    col.is_nullable = false;
+    col.default_value = "'ECF'".to_string();
+
+    assert_eq!(
+        super::column_format::column_definition(StructureDialect::Postgres, &col, Some(DatabaseType::Firebird)),
+        "\"raiz\" varchar(20) DEFAULT 'ECF' NOT NULL"
+    );
 }
 
 #[test]

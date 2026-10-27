@@ -95,6 +95,26 @@ describe("failure detail copy text", () => {
 });
 
 describe("data dictionary background task", () => {
+  it("keeps a snapshot export active and preserves cancellation across preparation updates", async () => {
+    const tracker = useExportTracker();
+    const task = tracker.addTask("settlements", "csv", "/tmp/settlements.csv", "snapshot-task");
+    const progress = { exportId: task.exportId, tableName: "settlements", rowsExported: 0, totalRows: 20000, status: "PreparingSnapshot" as const };
+    tracker.updateTableExportTask(task.exportId, progress);
+    const cancel = vi.fn();
+    tracker.registerTaskCancelHandler(task.exportId, cancel);
+    await mountPopover();
+    expect(tracker.activeCount.value).toBe(1);
+    expect(document.body.textContent).toContain("Preparing a consistent export snapshot");
+    expect(document.querySelector('button[title="Cancel"]')).toBeTruthy();
+    await tracker.cancelTask(task.exportId);
+    expect(cancel).toHaveBeenCalledOnce();
+    // A delayed preparation event must not turn a cancelling task back into running.
+    tracker.unregisterTaskCancelHandler(task.exportId);
+    task.status = "Cancelling";
+    tracker.updateTableExportTask(task.exportId, progress);
+    expect(task.status).toBe("Cancelling");
+  });
+
   it("shows actual collected-object progress and retains the finished output after the wizard closes", async () => {
     const tracker = useExportTracker();
     tracker.addDataDictionaryTask("dictionary-task", "shop", 2);
@@ -631,6 +651,47 @@ describe("ExportProgressPopover task duration", () => {
 });
 
 describe("ExportProgressPopover file name and reveal action", () => {
+  it("shows a queued saved file without running progress and cancels it from the task row", async () => {
+    const tracker = useExportTracker();
+    let finish!: (outcome: "settled") => void;
+    tracker.submitExportTask(
+      tracker.addTask("first", "csv", "/tmp/first.csv"),
+      "queued",
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const waiting = tracker.addTask("Query Result", "csv", "/tmp/waiting.csv");
+    const run = vi.fn(async () => "settled" as const);
+    tracker.submitExportTask(waiting, "queued", run);
+
+    await mountPopover();
+    const title = Array.from(document.body.querySelectorAll("span")).find((node) => node.textContent === "waiting.csv");
+    const row = title?.closest("div.flex.items-start");
+    expect(row?.textContent).toContain("Queued");
+    expect(row?.textContent).not.toContain("Elapsed:");
+    expect(row?.querySelector(".export-progress-indeterminate")).toBeNull();
+    row?.querySelector<HTMLButtonElement>('button[title="Cancel"]')?.click();
+    await nextTick();
+    expect(waiting.status).toBe("Cancelled");
+    finish("settled");
+    await Promise.resolve();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("does not offer deletion or animate progress for an unknown export", async () => {
+    const tracker = useExportTracker();
+    const task = tracker.addTask("Query Result", "csv", "/tmp/unknown.csv");
+    task.status = "Unknown";
+    task.errorMessage = "transport interrupted";
+    await mountPopover();
+    expect(document.body.textContent).toContain("Export status unknown; the queue is blocked");
+    expect(document.body.textContent).toContain("transport interrupted");
+    expect(document.body.querySelector('button[title="Delete"]')).toBeNull();
+    expect(document.body.querySelector(".export-progress-indeterminate")).toBeNull();
+  });
+
   it("shows the saved file name instead of the synthetic query-result label", async () => {
     const tracker = useExportTracker();
     tracker.addTask("Query Result", "sql", "C:\\exports\\自定义.sql");

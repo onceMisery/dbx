@@ -142,6 +142,8 @@ pub struct PostgresTablePartitionLocalObjects {
     pub has_primary_key: bool,
     pub unique_constraints: BTreeSet<String>,
     pub foreign_keys: BTreeSet<String>,
+    /// Native definitions retained by the batched partition-tree DDL path.
+    pub foreign_key_definitions: BTreeMap<String, String>,
     pub indexes: BTreeSet<String>,
     /// CHECK constraints with a local definition on this partition, as
     /// reported by pg_constraint.conislocal. A merged constraint may remain
@@ -2179,6 +2181,7 @@ async fn execute_select_prepared(
     Ok(PreparedSelectOutcome::Complete(Box::new(QueryResult {
         columns,
         column_types,
+        deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns,
         spatial_values,
@@ -2288,6 +2291,7 @@ async fn execute_select_text(
     Ok(QueryResult {
         column_types: matching_pg_text_column_types(&columns, prepared_column_types),
         columns,
+        deferred_large_value_cells: Vec::new(),
         column_sortables: Vec::new(),
         spatial_columns,
         spatial_values,
@@ -5772,7 +5776,13 @@ pub async fn get_table_partition_local_objects_for_relations_with_sql(
         let object_kind = row.try_get::<_, String>(1).unwrap_or_default();
         let object_name = row.try_get::<_, String>(2).unwrap_or_default();
         let object_type = row.try_get::<_, Option<String>>(3).ok().flatten().unwrap_or_default();
-        apply_partition_local_object_row(result.entry(relid).or_default(), &object_kind, object_name, &object_type);
+        let entry = result.entry(relid).or_default();
+        if object_kind == "constraint" && object_type == "f" {
+            if let Some(definition) = pg_row_try_optional_text(row, 4) {
+                entry.foreign_key_definitions.insert(object_name.clone(), definition);
+            }
+        }
+        apply_partition_local_object_row(entry, &object_kind, object_name, &object_type);
     }
     Ok(result)
 }
@@ -5785,23 +5795,24 @@ fn postgres_table_partition_local_objects_for_relations_query_tiers() -> [&'stat
 }
 
 pub fn postgres_table_partition_local_objects_for_relations_sql() -> &'static str {
-    "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
+    "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type, \
+            CASE WHEN con.contype = 'f' THEN pg_catalog.pg_get_constraintdef(con.oid, true) END AS definition \
      FROM pg_catalog.pg_constraint con \
      WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
        AND COALESCE(NULLIF(pg_catalog.row_to_json(con)->>'conparentid', '')::oid, 0) = 0 \
      UNION ALL \
-     SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
+     SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type, NULL::text \
      FROM pg_catalog.pg_constraint con \
      WHERE con.conrelid = ANY($1::bigint[]) AND con.contype = 'c' AND con.conislocal \
      UNION ALL \
-     SELECT ix.indrelid::bigint, 'index'::text AS object_kind, idx.relname AS object_name, NULL::text AS object_type \
+     SELECT ix.indrelid::bigint, 'index'::text AS object_kind, idx.relname AS object_name, NULL::text AS object_type, NULL::text \
      FROM pg_catalog.pg_index ix \
      JOIN pg_catalog.pg_class idx ON idx.oid = ix.indexrelid \
      WHERE ix.indrelid = ANY($1::bigint[]) \
        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = idx.oid) \
      UNION ALL \
      SELECT a.attrelid::bigint, 'column_default'::text AS object_kind, a.attname AS object_name, \
-            CASE WHEN ad.oid IS NOT NULL THEN 'overridden' ELSE 'dropped' END AS object_type \
+            CASE WHEN ad.oid IS NOT NULL THEN 'overridden' ELSE 'dropped' END AS object_type, NULL::text \
      FROM pg_catalog.pg_attribute a \
      JOIN pg_catalog.pg_inherits i ON i.inhrelid = a.attrelid \
      JOIN pg_catalog.pg_attribute pa \
@@ -5824,22 +5835,23 @@ pub fn postgres_table_partition_local_objects_for_relations_sql() -> &'static st
 // compatibility tier can omit only that filter and keep the same batched
 // result shape.
 pub fn postgres_table_partition_local_objects_for_relations_compat_sql() -> &'static str {
-    "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
+    "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type, \
+            CASE WHEN con.contype = 'f' THEN pg_catalog.pg_get_constraintdef(con.oid, true) END AS definition \
      FROM pg_catalog.pg_constraint con \
      WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
      UNION ALL \
-     SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
+     SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type, NULL::text \
      FROM pg_catalog.pg_constraint con \
      WHERE con.conrelid = ANY($1::bigint[]) AND con.contype = 'c' AND con.conislocal \
      UNION ALL \
-     SELECT ix.indrelid::bigint, 'index'::text AS object_kind, idx.relname AS object_name, NULL::text AS object_type \
+     SELECT ix.indrelid::bigint, 'index'::text AS object_kind, idx.relname AS object_name, NULL::text AS object_type, NULL::text \
      FROM pg_catalog.pg_index ix \
      JOIN pg_catalog.pg_class idx ON idx.oid = ix.indexrelid \
      WHERE ix.indrelid = ANY($1::bigint[]) \
        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = idx.oid) \
      UNION ALL \
      SELECT a.attrelid::bigint, 'column_default'::text AS object_kind, a.attname AS object_name, \
-            CASE WHEN ad.oid IS NOT NULL THEN 'overridden' ELSE 'dropped' END AS object_type \
+            CASE WHEN ad.oid IS NOT NULL THEN 'overridden' ELSE 'dropped' END AS object_type, NULL::text \
      FROM pg_catalog.pg_attribute a \
      JOIN pg_catalog.pg_inherits i ON i.inhrelid = a.attrelid \
      JOIN pg_catalog.pg_attribute pa \
@@ -8897,7 +8909,9 @@ fn postgres_query_body_dml(body: &SetExpr) -> Option<&Statement> {
 /// retrieval path. DML without `RETURNING` needs `execute` for its command
 /// tag/affected-row count, while DML with `RETURNING` produces a result set.
 pub fn postgres_statement_returns_rows(sql: &str) -> bool {
-    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "TABLE"]) {
+    // FETCH returns a cursor result set (including column metadata when empty),
+    // unlike MOVE, which only reports the number of cursor rows skipped.
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "EXPLAIN", "TABLE", "FETCH"]) {
         return true;
     }
 
@@ -8955,6 +8969,7 @@ pub async fn execute_query_with_max_rows(
             QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: Vec::new(),
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -9795,6 +9810,7 @@ async fn execute_query_with_max_rows_inner(
         affected.map_err(pg_error_to_string).map(|affected| QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -10374,6 +10390,7 @@ pub async fn list_triggers(pool: &Pool, schema: &str, table: &str) -> Result<Vec
             valid: None,
             comment: None,
             created_at: None,
+            oracle_metadata: None,
             statement: None,
         })
         .collect())
@@ -12551,6 +12568,82 @@ mod tests {
         assert!(!postgres_requires_single_schema_search_path(
             "ERROR: syntax error at or near \"$\" in context \"SELECT * FROM t WHERE id = $1\", at line 1"
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
+    async fn live_postgres_cursor_fetch_returns_result_sets() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect");
+        let client = pool.get().await.expect("checkout pinned session");
+        client
+            .batch_execute(
+                "CREATE OR REPLACE PROCEDURE pg_temp.open_test_cursors(INOUT c1 refcursor, INOUT c2 refcursor) \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             OPEN c1 FOR SELECT 42::integer AS id, 'cursor value'::text AS label; \
+             OPEN c2 FOR SELECT 7::integer AS id WHERE false; END $$;",
+            )
+            .await
+            .expect("create session-local procedure");
+
+        // Exercise cached prepared, unnamed, and text-protocol execution on
+        // one pinned session, as required by transaction-scoped refcursors.
+        for (prefer_text, unnamed) in [(false, false), (false, true), (true, false)] {
+            client.batch_execute("BEGIN; CALL pg_temp.open_test_cursors('c1', 'c2')").await.expect("open cursors");
+            let result = execute_query_with_max_rows_inner(
+                &client,
+                "FETCH ALL FROM \"c1\"",
+                Some(100),
+                prefer_text,
+                None,
+                unnamed,
+            )
+            .await
+            .expect("fetch rows");
+            assert_eq!(result.columns, vec!["id", "label"]);
+            let expected_id = if prefer_text { serde_json::json!("42") } else { serde_json::json!(42) };
+            assert_eq!(
+                result.rows,
+                vec![vec![expected_id, serde_json::json!("cursor value")]],
+                "text={prefer_text}, unnamed={unnamed}"
+            );
+
+            for sql in ["FETCH ALL FROM c1", "FETCH ALL FROM c2"] {
+                let empty = execute_query_with_max_rows_inner(&client, sql, Some(100), prefer_text, None, unnamed)
+                    .await
+                    .expect("fetch empty cursor");
+                assert!(!empty.columns.is_empty(), "empty FETCH must retain column metadata: {sql}");
+                assert!(empty.rows.is_empty());
+            }
+            client.batch_execute("ROLLBACK").await.expect("rollback");
+        }
+    }
+
+    #[test]
+    fn postgres_statement_returns_rows_for_cursor_fetch() {
+        for sql in [
+            "FETCH ALL FROM \"c1\"",
+            "fetch next from c1",
+            "FETCH FORWARD 10 FROM c1",
+            "FETCH BACKWARD ALL IN c1",
+            "FETCH ABSOLUTE 2 FROM c1",
+            "FETCH RELATIVE -1 FROM c1",
+            "FETCH FIRST FROM c1",
+            "FETCH LAST FROM c1",
+            "FETCH 0 FROM c1",
+            "-- read a refcursor\n/* result set */ FETCH ALL FROM c1",
+        ] {
+            assert!(postgres_statement_returns_rows(sql), "expected cursor rows for: {sql}");
+        }
+        for sql in [
+            "MOVE ALL FROM c1",
+            "DECLARE c1 CURSOR FOR SELECT 1",
+            "CLOSE c1",
+            "FETCHING c1",
+            "DO $$ BEGIN FETCH c1 INTO value; END $$",
+        ] {
+            assert!(!postgres_statement_returns_rows(sql), "expected command result for: {sql}");
+        }
     }
 
     #[test]
@@ -16444,6 +16537,7 @@ mod tests {
                 "character_maximum_length".to_string(),
             ],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: Vec::new(),
             spatial_values: Vec::new(),

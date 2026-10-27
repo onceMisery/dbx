@@ -2375,6 +2375,7 @@ fn parse_elasticsearch_response_with_sql_parser(
             Ok(crate::types::QueryResult {
                 columns,
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -2403,6 +2404,7 @@ fn parse_elasticsearch_response_with_sql_parser(
         Ok(crate::types::QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -2577,6 +2579,7 @@ fn raw_json_response_result(
     crate::types::QueryResult {
         columns: vec!["status".to_string(), "response".to_string()],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -2646,6 +2649,7 @@ fn parse_elasticsearch_rest_response_with_sql_parser(
     Ok(crate::types::QueryResult {
         columns: vec!["response".to_string()],
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],
@@ -3154,6 +3158,7 @@ pub fn parse_tabular_sql_response(
     Some(QueryResult {
         columns: column_names,
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],

@@ -161,6 +161,13 @@ pub fn build_query_pagination_execution_plan(
             }
         }
         TablePaginationStrategy::LimitOffset => top_level_limit_row_count(&options.query_base_sql),
+        // Dameng accepts MySQL-style `LIMIT n` alongside its ROWNUM pagination.
+        // A user-written LIMIT is an exact bound there too, so a `LIMIT 1000`
+        // query with 258 matching rows is fetched in one shot instead of
+        // stopping at the first 100-row agent page (#13502).
+        TablePaginationStrategy::Rownum if options.database_type == Some(DatabaseType::Dameng) => {
+            top_level_limit_row_count(&options.query_base_sql)
+        }
         _ => None,
     };
     let mut plan = QueryPaginationExecutionPlan {
@@ -176,6 +183,16 @@ pub fn build_query_pagination_execution_plan(
         pagination_row_number_column: None,
         single_execution: false,
     };
+    // DynamoDB paginates ExecuteStatement with opaque API tokens, not SQL
+    // LIMIT/OFFSET or derived COUNT queries. Keep PartiQL byte-for-byte intact.
+    if options.database_type == Some(DatabaseType::DynamoDb) {
+        plan.exact_query_row_bound = None;
+        plan.single_execution = true;
+        if options.pagination.offset > 0 || options.pagination.session_id.is_some() {
+            plan.pagination_error = Some("DynamoDB PartiQL does not support SQL offset pagination".into());
+        }
+        return plan;
+    }
     let execution_hint = options.execution_hint.as_deref().filter(|hint| !hint.trim().is_empty());
 
     let sql_server_cte =
@@ -204,7 +221,9 @@ pub fn build_query_pagination_execution_plan(
     // example Db2 for z/OS before V12). DBX connections use the Agent/JDBC
     // cursor for DB2, so keep every page on that cursor path instead of
     // generating OFFSET ... FETCH FIRST SQL that fails with SQLCODE -104.
-    if options.database_type == Some(DatabaseType::Db2) && options.use_agent_cursor {
+    // DuckDB must also keep offset replay on one result session: independent
+    // LIMIT/OFFSET executions can return overlapping rows even with ORDER BY.
+    if matches!(options.database_type, Some(DatabaseType::Db2 | DatabaseType::DuckDb)) && options.use_agent_cursor {
         if !options.first_page_uses_actual_sql && options.sql == options.query_base_sql {
             plan.sql_to_execute = options.query_base_sql;
         }
@@ -735,6 +754,7 @@ fn unsupported_pagination_type(database_type: Option<DatabaseType>) -> bool {
                 | DatabaseType::Salesforce
                 | DatabaseType::Solr
                 | DatabaseType::CouchDb
+                | DatabaseType::DynamoDb
         )
     )
 }
@@ -2956,6 +2976,77 @@ fn fallback_alias(index: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duckdb_pages_and_offset_replays_keep_a_single_result_session() {
+        for offset in [0, 100, 500] {
+            for session_id in [None, Some("duckdb-result".to_string())] {
+                let sql = "SELECT * FROM settlements ORDER BY period";
+                let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+                    sql: sql.into(),
+                    query_base_sql: sql.into(),
+                    database_type: Some(DatabaseType::DuckDb),
+                    pagination: QueryPagination { limit: 100, offset, session_id },
+                    use_agent_cursor: true,
+                    first_page_uses_actual_sql: true,
+                    execution_hint: None,
+                });
+                assert!(plan.use_agent_result_session);
+                assert_eq!(plan.sql_to_execute, sql);
+                assert_eq!(plan.page_offset, Some(offset));
+                assert_eq!(plan.page_limit, Some(100));
+                assert!(plan.pagination_error.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn dynamodb_partiql_uses_api_bounds_without_sql_rewrites() {
+        for sql in [
+            "SELECT * FROM \"orders\" WHERE status = 'PAID';",
+            "SELECT VALUE {'id': o.id} FROM \"orders\" o;",
+            "SELECT * FROM \"orders\"; SELECT * FROM \"archive\";",
+            "UPDATE \"orders\" SET status = 'PAID' WHERE id = '1';",
+        ] {
+            for (offset, session_id) in [(0, None), (100, None), (0, Some("opaque".into()))] {
+                let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+                    sql: sql.into(),
+                    query_base_sql: sql.into(),
+                    database_type: Some(DatabaseType::DynamoDb),
+                    pagination: QueryPagination { limit: 100, offset, session_id: session_id.clone() },
+                    use_agent_cursor: false,
+                    first_page_uses_actual_sql: false,
+                    execution_hint: None,
+                });
+                assert_eq!(plan.sql_to_execute, sql);
+                assert!(plan.page_sql.is_none());
+                assert!(plan.page_limit.is_none());
+                assert!(plan.page_offset.is_none());
+                assert!(plan.count_sql.is_none());
+                assert!(plan.exact_query_row_bound.is_none());
+                assert!(!plan.use_agent_result_session);
+                assert!(plan.single_execution);
+                assert_eq!(plan.pagination_error.is_some(), offset > 0 || session_id.is_some());
+            }
+        }
+        let sql = "SELECT * FROM \"orders\"";
+        assert!(
+            !build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: sql.into(),
+                database_type: Some(DatabaseType::DynamoDb),
+                limit: 100,
+                offset: 0,
+            })
+            .ok
+        );
+        assert!(
+            !build_count_query_sql(CountQuerySqlOptions {
+                original_sql: sql.into(),
+                database_type: Some(DatabaseType::DynamoDb),
+            })
+            .ok
+        );
+    }
+
     fn oceanbase_plan(sql: &str, limit: usize, offset: usize, cursor: bool) -> QueryPaginationExecutionPlan {
         build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
             sql: sql.into(),
@@ -5320,6 +5411,28 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn dameng_user_limit_bounds_the_query_row_count() {
+        // DM8 accepts MySQL-style LIMIT alongside ROWNUM pagination; a
+        // user-written LIMIT must bound the fetch so the whole result comes
+        // back in one shot instead of stopping at the first agent page (#13502).
+        let sql = "SELECT DATE, COUNT(*) FROM t GROUP BY DATE ORDER BY DATE LIMIT 1000";
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: Some(DatabaseType::Dameng),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+            execution_hint: None,
+        });
+        assert_eq!(plan.exact_query_row_bound, Some(1000));
+
+        // ROWNUM remains the pagination strategy, so the bound does not change
+        // generated page SQL.
+        assert_eq!(plan.page_limit, Some(100));
+    }
+
+    #[test]
     fn mysql_pagination_keeps_the_user_limit_without_a_probe() {
         let sql = "SELECT id FROM people LIMIT 10";
         let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
@@ -6810,6 +6923,15 @@ WHERE u.id = picked.id;
             (Some(DatabaseType::ClickHouse), "SELECT * FROM events LIMIT 10 WITH TIES", None),
             (Some(DatabaseType::DuckDb), "SELECT * FROM events LIMIT 10%", None),
             (Some(DatabaseType::DuckDb), "SELECT * FROM events LIMIT 10 PERCENT", None),
+            // Dameng accepts MySQL-style LIMIT alongside its ROWNUM pagination
+            // (#13502); the other ROWNUM dialects reject LIMIT syntax, so a
+            // top-level LIMIT must not bound them.
+            (Some(DatabaseType::Dameng), "SELECT * FROM events LIMIT 1000", Some(1000)),
+            (Some(DatabaseType::Dameng), "SELECT * FROM events LIMIT 1000 OFFSET 50", Some(1000)),
+            (Some(DatabaseType::Dameng), "SELECT * FROM events LIMIT 50, 1000", Some(1000)),
+            (Some(DatabaseType::Dameng), "SELECT * FROM (SELECT * FROM events LIMIT 5) t", None),
+            (Some(DatabaseType::Oracle), "SELECT * FROM events LIMIT 100", None),
+            (Some(DatabaseType::OceanbaseOracle), "SELECT * FROM events LIMIT 100", None),
             (None, "SELECT * FROM events LIMIT 100", Some(100)),
             (Some(DatabaseType::Postgres), "SELECT * FROM events", None),
         ] {

@@ -887,6 +887,7 @@ fn server_messages_query_result(messages: Vec<String>, start: Instant) -> Option
         QueryResult {
             columns: vec![],
             column_types: vec![],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -1010,6 +1011,7 @@ fn collect_first_result_finish(
         QueryResult {
             columns,
             column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns,
             spatial_values,
@@ -1946,6 +1948,7 @@ fn push_sqlserver_result_set(results: &mut Vec<QueryResult>, result: Option<SqlS
         results.push(QueryResult {
             columns: result.columns,
             column_types: result.column_types,
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -2006,6 +2009,7 @@ fn push_sqlserver_ordered_events(
                     result: QueryResult {
                         columns: vec![],
                         column_types: vec![],
+                        deferred_large_value_cells: Vec::new(),
                         column_sortables: vec![],
                         spatial_columns: vec![],
                         spatial_values: vec![],
@@ -3579,6 +3583,7 @@ pub async fn list_triggers(
             valid: None,
             comment: None,
             created_at: None,
+            oracle_metadata: None,
             statement: row.get::<&str, _>(3).map(str::to_string),
         })
         .collect())
@@ -3895,6 +3900,7 @@ async fn execute_query_with_max_rows_inner(
             QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -3962,6 +3968,7 @@ async fn execute_batch_with_max_rows_metadata_inner(
             QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -4062,6 +4069,7 @@ pub async fn execute_simple_batch_with_max_rows_metadata(
             result: QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -4686,6 +4694,7 @@ mod tests {
         let empty = QueryResult {
             columns: vec![],
             column_types: vec![],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -4712,6 +4721,7 @@ mod tests {
             QueryResult {
                 columns: vec![],
                 column_types: vec![],
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],
@@ -4733,6 +4743,7 @@ mod tests {
         let select = QueryResult {
             columns: vec!["id".to_string()],
             column_types: vec!["int".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -5992,6 +6003,7 @@ mod tests {
         let context = completion_context_from_query_result(QueryResult {
             columns: vec!["default_schema".to_string(), "engine_edition".to_string()],
             column_types: vec![],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -6555,6 +6567,7 @@ mod tests {
         let mut result = QueryResult {
             columns: vec!["id".to_string(), "__dbx_row_num".to_string()],
             column_types: vec!["int".to_string(), "bigint".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],

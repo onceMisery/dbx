@@ -220,7 +220,8 @@ export function tableDataPreviewRowBudget(options: { limit: number; offset: numb
   return remainingRows;
 }
 
-export function tableDataLargeValuePreviewOptions(databaseType: DatabaseType | undefined, columns: readonly ColumnInfo[], primaryKeys: readonly string[], pageSize?: number): { columnTypes: string[]; largeValuePreviewSize: number } | Record<string, never> {
+export function tableDataLargeValuePreviewOptions(databaseType: DatabaseType | undefined, columns: readonly ColumnInfo[], primaryKeys: readonly string[], pageSize?: number, jdbcDeferredLobs = false): { columnTypes: string[]; largeValuePreviewSize: number } | Record<string, never> {
+  if (databaseType === "oracle" && jdbcDeferredLobs) columns = columns.map((column) => (/^(?:CLOB|BLOB)$/i.test(column.data_type.trim()) ? { ...column, data_type: "" } : column));
   if (!canUseTableDataLargeValuePreview(databaseType, columns, primaryKeys)) return {};
   const keyColumns = new Set(primaryKeys.map((column) => column.toLocaleLowerCase()));
   const mysqlBudget = databaseType === "mysql" ? mysqlPreviewBudget(columns, keyColumns, pageSize) : null;
