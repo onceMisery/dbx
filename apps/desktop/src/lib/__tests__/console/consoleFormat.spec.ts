@@ -30,6 +30,8 @@ describe("consoleFormat", () => {
     expect(consoleStatementComplete("show databases\n    ;", "mysql")).toBe(true);
     expect(consoleStatementComplete("SELECT 1;", "mysql")).toBe(true);
     expect(consoleStatementComplete("SELECT 1", "mysql")).toBe(false);
+    expect(consoleStatementComplete("EXIT", "mysql")).toBe(true);
+    expect(consoleStatementComplete("quit", "mysql")).toBe(true);
     // Oracle: console commands run immediately; SQL needs `;` or a `/` line.
     expect(consoleStatementComplete("DESC emp", "oracle")).toBe(true);
     expect(consoleStatementComplete("SET TIMING ON", "oracle")).toBe(true);

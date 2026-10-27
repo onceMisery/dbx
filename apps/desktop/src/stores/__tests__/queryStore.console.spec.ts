@@ -53,16 +53,20 @@ describe("queryStore command console", () => {
     mocks.executeMulti.mockImplementation(async () => [{ ...emptyResult }]);
   });
 
-  it("opens a console tab titled after the connection host, reusing it per scope", async () => {
+  it("opens a distinct console tab for each request", async () => {
     const { store, tabId } = await setup();
     const tab = store.tabs.find((t) => t.id === tabId);
     expect(tab?.mode).toBe("console");
     expect(tab?.title.startsWith("10.0.0.9 - ")).toBe(true);
     const second = store.openConsoleTab({ connectionId: "oracle-1", database: "ORCL" });
-    expect(second).toBe(tabId);
+    expect(second).not.toBe(tabId);
     const session = store.consoleSessionFor(tabId);
     expect(session.entries).toHaveLength(1);
     expect(session.entries[0].kind).toBe("notice");
+    expect(store.consoleSessionFor(second as string)).not.toBe(session);
+    session.input = "SELECT 1;";
+    expect(store.consoleSessionFor(second as string).input).toBe("");
+    expect(store.consoleSessionFor(tabId).input).toBe("SELECT 1;");
   });
 
   it("executes a statement and records the terminal echo, output and rerun target", async () => {
@@ -121,10 +125,10 @@ describe("queryStore command console", () => {
 
   it("closes the tab on EXIT", async () => {
     const { store, tabId } = await setup();
-    mocks.executeMulti.mockResolvedValueOnce([{ columns: ["Message"], rows: [["EXIT acknowledged; remaining statements were skipped (the query window stays open)"]], affected_rows: 0, execution_time_ms: 1 }]);
+    mocks.executeMulti.mockClear();
     await store.executeConsoleStatement(tabId, "EXIT");
     await vi.waitFor(() => expect(store.tabs.find((t) => t.id === tabId)).toBeUndefined());
-    expect(mocks.executeMulti).toHaveBeenCalledOnce();
+    expect(mocks.executeMulti).not.toHaveBeenCalled();
   });
 
   it("records backend failures as error entries and keeps the previous rerun target", async () => {
@@ -216,6 +220,14 @@ describe("queryStore command console", () => {
     for (const call of mocks.executeMulti.mock.calls) expect(call[5]).toMatchObject({ clientSessionId: tabId, preserveExplicitTransaction: true, timeoutSecs: 30 });
   });
 
+  it("handles MySQL EXIT locally instead of sending it to the server", async () => {
+    mocks.getConfig.mockReturnValue({ id: "mysql-1", name: "MySQL", db_type: "mysql", database: "app", query_timeout_secs: 30 });
+    const { store, tabId } = await setup("mysql-1", "app");
+    await store.executeConsoleStatement(tabId, "exit");
+    expect(mocks.executeMulti).not.toHaveBeenCalled();
+    expect(store.tabs.find((tab) => tab.id === tabId)).toBeUndefined();
+  });
+
   it("ignores an old target's response without clearing a newer execution", async () => {
     const { store, tabId } = await setup();
     let resolveOld!: (results: QueryResult[]) => void;
@@ -247,21 +259,6 @@ describe("queryStore command console", () => {
     await newRun;
     await store.executeConsoleStatement(tabId, "/");
     expect(mocks.executeMulti.mock.calls.at(-1)?.slice(0, 3)).toEqual(["oracle-1", "OTHER", "SELECT 2 FROM DUAL;"]);
-  });
-
-  it("does not let an old EXIT close a console after its target changes", async () => {
-    const { store, tabId } = await setup();
-    let resolveOld!: (results: QueryResult[]) => void;
-    mocks.executeMulti.mockReturnValueOnce(
-      new Promise<QueryResult[]>((resolve) => {
-        resolveOld = resolve;
-      }),
-    );
-    const run = store.executeConsoleStatement(tabId, "EXIT");
-    store.updateDatabase(tabId, "OTHER");
-    resolveOld([{ ...emptyResult }]);
-    await run;
-    expect(store.tabs.find((tab) => tab.id === tabId)?.database).toBe("OTHER");
   });
 
   it("exposes its busy state to generic cancellation and does not remember cancelled SQL", async () => {

@@ -7867,8 +7867,8 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   // ---------------------------------------------------------------------------
-  // Navicat-style command console (命令列界面): one terminal tab per connection
-  // scope. Session state lives here (not persisted); execution reuses the same
+  // Navicat-style command console (命令列界面): independent terminal tabs.
+  // Session state lives here (not persisted); execution reuses the same
   // executeMulti path as the query editor, which includes the SQL*Plus/psql
   // console-command dispatch in dbx-core.
   // ---------------------------------------------------------------------------
@@ -7876,6 +7876,7 @@ export const useQueryStore = defineStore("query", () => {
   interface ConsoleSession {
     /** Terminal scrollback (echoed commands, output, errors, notices). */
     entries: ConsoleEntry[];
+    input: string;
     /** Lines typed so far that have not run yet (statement incomplete). */
     buffer: string;
     /** Successfully submitted statements, oldest first. */
@@ -7895,7 +7896,7 @@ export const useQueryStore = defineStore("query", () => {
   function consoleSessionFor(tabId: string): ConsoleSession {
     let session = consoleSessions.get(tabId);
     if (!session) {
-      session = { entries: [], buffer: "", history: [], historyIndex: -1, lastGoodSql: undefined, isExecuting: false, executionId: undefined, pendingInput: "" };
+      session = { entries: [], input: "", buffer: "", history: [], historyIndex: -1, lastGoodSql: undefined, isExecuting: false, executionId: undefined, pendingInput: "" };
       consoleSessions.set(tabId, session);
     }
     return consoleSessions.get(tabId)!;
@@ -7919,7 +7920,7 @@ export const useQueryStore = defineStore("query", () => {
     const conn = useConnectionStore().getConfig(options.connectionId);
     if (!conn) return;
     const hostLabel = conn.host || conn.name;
-    const id = createTab(options.connectionId, options.database, `${hostLabel} - ${t("console.title")}`, "console", options.schema, "", options.catalog);
+    const id = createTab(options.connectionId, options.database, `${hostLabel} - ${t("console.title")}`, "console", options.schema, "", options.catalog, { forceNew: true });
     const session = consoleSessionFor(id);
     if (session.entries.length === 0) {
       session.entries.push({ kind: "notice", text: t("console.welcome", { name: `${conn.name} (${hostLabel})` }) });
@@ -7976,8 +7977,12 @@ export const useQueryStore = defineStore("query", () => {
     const targetEpoch = manualTransactionTargetEpoch(tab);
     const cancelRequestCount = tab.cancelRequestCount ?? 0;
     const isCurrent = () => tabs.value.includes(tab) && consoleSessions.get(tabId) === session && tab.executionId === executionId && manualTransactionTargetEpoch(tab) === targetEpoch;
-    let exitAcknowledged = false;
+    const exitAcknowledged = /^(?:EXIT|QUIT)\s*;?\s*$/i.test(effectiveSql.trim());
     try {
+      if (exitAcknowledged) {
+        session.entries.push({ kind: "notice", text: t("console.exitAcknowledged") });
+        return;
+      }
       const results = await api.executeMulti(tab.connectionId, tab.database, effectiveSql, tab.schema, executionId, {
         maxRows: effectiveQueryResultMaxRows(settingsStore.editorSettings.queryResultMaxRowsEnabled, settingsStore.editorSettings.queryResultMaxRows),
         // Pin every console statement to one physical connection (the same
@@ -8000,7 +8005,6 @@ export const useQueryStore = defineStore("query", () => {
         if (!result.execution_error && source && !/^(?:EXIT|QUIT|RUN)\b/i.test(source.sql)) {
           session.lastGoodSql = statements.length === 1 ? effectiveSql : source.sql;
         }
-        if (!result.execution_error && /^(?:EXIT|QUIT)\s*;?\s*$/i.test(effectiveSql.trim())) exitAcknowledged = true;
       }
     } catch (error) {
       if (isCurrent()) session.entries.push({ kind: "error", text: error instanceof Error ? error.message : String(error) });

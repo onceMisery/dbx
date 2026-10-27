@@ -66,6 +66,7 @@ export const CONSOLE_CONTINUATION_PROMPT = "    -> ";
 export function consoleStatementComplete(buffer: string, dbType?: DatabaseType, parameterOptions?: SqlParameterOptions): boolean {
   const text = buffer.trim();
   if (!text) return false;
+  if (/^(?:EXIT|QUIT)\s*;?$/i.test(text)) return true;
   if (text === "/" && isOracleLikeDatabase(dbType, parameterOptions)) return true;
   return isSqlInputComplete(text, dbType, parameterOptions);
 }
