@@ -11960,4 +11960,15 @@ export default withEnglishFallback({
     noEligibleColumns: "지원되는 열 없음",
     bucketCountHint: "자동 버킷 수는 클러스터 리소스와 데이터 양에 따라 데이터베이스가 결정하며 고정되지 않습니다. 숫자를 입력하면 각 파티션에 지정된 버킷 수를 사용합니다.",
   },
+  console: {
+    title: "명령줄 인터페이스",
+    welcome: "{name}에 연결되었습니다. SQL 또는 클라이언트 명령을 입력하고 Enter로 실행하세요. 완료되지 않은 문은 ->로 이어서 입력하며, EXIT로 종료합니다. ↑/↓로 기록을 탐색하고, Ctrl+C로 취소하거나 지웁니다.",
+    noPreviousStatement: "다시 실행할 이전 문이 없습니다.",
+    exitAcknowledged: "EXIT가 확인되었습니다. 명령줄 인터페이스를 닫는 중입니다.",
+    paste: "붙여넣기",
+    copy: "복사",
+    clipboardFailed: "클립보드 작업에 실패했습니다: {message}",
+    running: "실행 중…",
+    unsupportedType: "이 연결 유형은 SQL 명령줄 인터페이스를 지원하지 않습니다.",
+  },
 });

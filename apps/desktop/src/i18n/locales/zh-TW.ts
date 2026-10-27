@@ -676,6 +676,10 @@ export default withEnglishFallback({
     noPreviousStatement: "沒有可重新執行的上一條語句。",
     running: "執行中…",
     unsupportedType: "此連線類型不支援 SQL 命令列介面",
+    exitAcknowledged: "EXIT 已確認，正在關閉命令列介面。",
+    paste: "貼上",
+    copy: "複製",
+    clipboardFailed: "剪貼簿操作失敗：{message}",
   },
   toolbar: {
     fileEncoding: "檔案編碼",
