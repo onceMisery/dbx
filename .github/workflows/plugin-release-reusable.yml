@@ -123,7 +123,7 @@ jobs:
           cache: ${{ steps.node-cache.outputs.cache }}
           cache-dependency-path: ${{ steps.node-cache.outputs.dependency-path }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         if: inputs.go-version != ''
         with:
           go-version: ${{ inputs.go-version }}

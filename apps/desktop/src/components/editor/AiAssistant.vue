@@ -255,6 +255,8 @@ import { buildAiConversationSearchIndex, filterAiConversationSearchIndex } from 
 import { applyCapabilities, resolveConversationPicker, resolveDefaultPickerAction, type AiPickerAmbient, type AiPickerConversationRecord, type AiPickerSelection } from "@/lib/ai/aiConversationPicker";
 import { createAiConversationPickerController } from "@/lib/ai/aiConversationPickerState";
 import AiAttachmentCard from "@/components/editor/AiAttachmentCard.vue";
+import { cancelSessionToolApprovals } from "@/lib/ai/aiAgentStepPresentation";
+import { useAiToolApprovalDock } from "@/composables/useAiToolApprovalDock";
 import AiToolApprovalCard from "@/components/editor/AiToolApprovalCard.vue";
 import { resolveAiMessageCopyText } from "@/lib/ai/aiMessageCopy";
 import { buildPluginAiRequest, createPluginAiConversation, pluginComposerConnectionLabel, pluginContextConnectionId, pluginContextFromMessages, pluginContextText, streamPluginAiConversation, type AiPluginContext, type AiPluginConversationRequest } from "@/lib/ai/aiPluginConversation";
@@ -2147,6 +2149,7 @@ async function resolveAutoAction(text: string, mode: AiAssistantMode, showProgre
 
 /** Messages visible in the chat UI (excludes hidden context summaries). */
 const visibleMessages = computed(() => messages.value.filter((m) => m.kind !== "contextSummary"));
+const pendingApprovalSteps = useAiToolApprovalDock(() => visibleMessages.value);
 
 function messagesForAgentHistory(historyMessages: ChatMessage[]): AiMessage[] {
   const toModelMessage = (message: ChatMessage): AiMessage => ({
@@ -2893,15 +2896,24 @@ function parseExplainFromData(explainData: unknown, dbType: string): ParsedExpla
 }
 
 /** Sends the user's answer for a pending plugin tool approval back to the run that asked. */
+const cancelledToolApprovalSessions = new Set<string>();
+function cancelToolApprovals(sessionId: string, transcript = messages.value) {
+  if (!sessionId) return;
+  cancelledToolApprovalSessions.add(sessionId);
+  cancelSessionToolApprovals(transcript, sessionId);
+}
+
 async function resolveToolApproval(step: AiAgentStepItem, approved: boolean) {
   const approval = step.approval;
-  if (!approval || approval.status !== "pending") return;
+  if (!approval || approval.status !== "pending" || cancelledToolApprovalSessions.has(approval.sessionId)) return;
   approval.status = "submitting";
   try {
     // The final status arrives with `tool_approval_resolved`; `false` means
     // the run stopped waiting (timed out, cancelled, or app restarted).
-    if (!(await resolveAiToolApproval(approval.sessionId, approval.approvalId, approved))) approval.status = "expired";
+    const accepted = await resolveAiToolApproval(approval.sessionId, approval.approvalId, approved);
+    if (!accepted && !cancelledToolApprovalSessions.has(approval.sessionId)) approval.status = "expired";
   } catch (error) {
+    if (cancelledToolApprovalSessions.has(approval.sessionId)) return;
     approval.status = "pending";
     toast(t("ai.toolApproval.answerFailed", { message: error instanceof Error ? error.message : String(error) }), 5000);
   }
@@ -4675,8 +4687,8 @@ async function send() {
         }
       }
       // A plugin tool call waits for (or got) the user's approval: keep the
-      // state on the tool card so the answer buttons live next to the call.
-      if (event.type === "tool_approval_required" || event.type === "tool_approval_resolved") {
+      // state on the tool step; pending decisions are docked above the composer.
+      if ((event.type === "tool_approval_required" || event.type === "tool_approval_resolved") && !cancelledToolApprovalSessions.has(sessionId)) {
         const msg = runMessages[assistantIdx];
         if (msg?.agentSteps) {
           const key = toolCallStepKey(event.tool_call_id, agentEvents.length - 1, "tool_call_start");
@@ -5092,6 +5104,8 @@ function releaseDeletedRunSlot(run: DesktopAiRunRuntime<ChatMessage>) {
  *  force-finalized so the queue can never wedge. */
 async function stopDesktopAiRun(run: DesktopAiRunRuntime<ChatMessage>) {
   run.cancelRequested = true;
+  for (const sessionId of run.sessionIds) cancelToolApprovals(sessionId, run.messages);
+  cancelToolApprovals(run.currentSessionId, run.messages);
   if (run.status === "queued") {
     // Never admitted: no backend session and no slot - finalize immediately.
     cancelQueuedDesktopAiRun(run);
@@ -5138,6 +5152,7 @@ async function stopDesktopAiRun(run: DesktopAiRunRuntime<ChatMessage>) {
 }
 
 async function cancelStream() {
+  cancelToolApprovals(currentSessionId.value);
   // User explicitly requested stop — reflect it in the status line (phase=cancelling)
   // so it reads "正在取消…" while the backend cancellation is still settling.
   if (isGenerating.value) {
@@ -5220,6 +5235,7 @@ function abandonInFlightRequest(alreadyCancelledSessionId?: string) {
   // they can't write into the array this call is about to replace. See
   // lib/ai/aiGenerationGuard.ts.
   const sessionId = currentSessionId.value;
+  cancelToolApprovals(sessionId);
   aiGenerationGuard.invalidate();
   isGenerating.value = false;
   currentSessionId.value = "";
@@ -7097,7 +7113,7 @@ async function openExternalUrl(url: string) {
                       <span v-else-if="step.durationMs !== undefined" class="ml-auto shrink-0 tabular-nums" :class="step.tone === 'danger' ? 'text-red-600 dark:text-red-400' : 'text-chart-2'">{{ formatToolDurationMs(step.durationMs) }}</span>
                       <ChevronRight v-if="step.toolResult || step.toolArgs?.sql" class="h-3 w-3 shrink-0 transition-transform duration-150" :class="[{ 'rotate-90': expandedSteps.has(step.key) }, !agentStepHasTail(step) ? 'ml-auto' : '']" />
                     </button>
-                    <AiToolApprovalCard v-if="step.approval" :approval="step.approval" @resolve="resolveToolApproval(step, $event)" />
+                    <AiToolApprovalCard v-if="step.approval && !pendingApprovalSteps.includes(step)" :approval="step.approval" @resolve="resolveToolApproval(step, $event)" />
                     <div v-if="expandedSteps.has(step.key)" class="border-t border-current/10 px-2 pb-2 pt-1">
                       <div v-if="step.toolArgs?.sql" class="mb-1 rounded bg-background/50 px-2 py-1 font-mono text-[10px] text-foreground/80 whitespace-pre-wrap">{{ step.toolArgs.sql }}</div>
                       <Button v-if="step.toolName === 'explain_query' && step.toolArgs?.sql" size="sm" variant="outline" class="mb-1 h-6 gap-1 text-[10px]" @click="emit('openExplainPlan', step.toolArgs.sql as string, conversationBinding)">
@@ -7289,7 +7305,13 @@ async function openExternalUrl(url: string) {
       </button>
     </div>
 
-    <div class="p-2">
+    <!-- Pending approvals live outside the transcript scroll area so long
+         model output cannot scroll the decision controls out of view. -->
+    <div v-if="pendingApprovalSteps.length" class="max-h-[40%] shrink-0 overflow-y-auto border-t border-border/60 bg-background/95 px-2 py-2" data-ai-tool-approval-dock>
+      <AiToolApprovalCard v-for="step in pendingApprovalSteps" :key="`${step.approval!.sessionId}:${step.approval!.approvalId}`" :approval="step.approval!" @resolve="resolveToolApproval(step, $event)" />
+    </div>
+
+    <div class="shrink-0 p-2">
       <div ref="promptPanelRef" class="ai-prompt-context-container relative rounded-[6px] border bg-background">
         <div v-if="isAttachmentDragging" class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-[6px] border-2 border-dashed border-primary bg-background/90 text-sm font-medium text-foreground shadow-sm backdrop-blur-sm">
           {{ t("ai.attachmentDropHint") }}

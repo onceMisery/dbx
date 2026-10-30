@@ -339,6 +339,7 @@ fn pg_string_literal(value: &str) -> String {
 fn describe_result_from_columns(columns: &[db::ColumnInfo]) -> db::QueryResult {
     db::QueryResult {
         deferred_large_value_cells: Vec::new(),
+        raw_key_cells: Vec::new(),
         columns: vec!["Name".to_string(), "Null?".to_string(), "Type".to_string()],
         column_types: Vec::new(),
         column_sortables: vec![true, false, true],
@@ -371,6 +372,7 @@ fn describe_result_from_columns(columns: &[db::ColumnInfo]) -> db::QueryResult {
 pub(crate) fn console_message_result(message: &str) -> db::QueryResult {
     db::QueryResult {
         deferred_large_value_cells: Vec::new(),
+        raw_key_cells: Vec::new(),
         columns: vec!["Message".to_string()],
         column_types: Vec::new(),
         column_sortables: vec![false],

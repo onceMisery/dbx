@@ -68,6 +68,7 @@ export const plDebugRead = forward("plDebugRead", false);
 
 // Connection
 export const testConnection = forward("testConnection");
+export const connectionParameters = forward("connectionParameters", false);
 export const testSshTunnel = forward("testSshTunnel");
 export const testConnectionWithInfo = forward("testConnectionWithInfo");
 export const salesforceOauthBrowserAuthorize = forward("salesforceOauthBrowserAuthorize");
@@ -432,6 +433,14 @@ export const loadDesktopSettings = forward("loadDesktopSettings");
 export const saveDesktopSettings = forward("saveDesktopSettings");
 export const loadMcpGlobalPolicy = forward("loadMcpGlobalPolicy");
 export const saveMcpGlobalPolicy = forward("saveMcpGlobalPolicy");
+export const loadMcpToolCatalog = forward("loadMcpToolCatalog");
+export const listPluginMcpViews = forward("listPluginMcpViews");
+export const loadMcpAccessPolicy = forward("loadMcpAccessPolicy");
+export const resetInvalidMcpAccessPolicy = forward("resetInvalidMcpAccessPolicy");
+export const setMcpPluginScopeRule = forward("setMcpPluginScopeRule");
+export const loadPluginMcpView = forward("loadPluginMcpView");
+export const listMcpPluginScopes = forward("listMcpPluginScopes");
+export const savePluginMcpGrant = forward("savePluginMcpGrant");
 export const loadMaxAgentTurns = forward("loadMaxAgentTurns");
 export const loadSqlFileUploadMaxBytes = forward("loadSqlFileUploadMaxBytes");
 export const saveSqlFileUploadMaxMb = forward("saveSqlFileUploadMaxMb");
@@ -659,6 +668,7 @@ export type { DamengDumpKind, DamengDumpRequest, DamengDumpProgress } from "./da
 export const redisListDatabases = forward("redisListDatabases");
 export const redisScanKeys = forward("redisScanKeys");
 export const redisScanKeysBatch = forward("redisScanKeysBatch");
+export const redisKeyMetadataBatch = forward("redisKeyMetadataBatch");
 export const redisScanValues = forward("redisScanValues");
 export const redisGetValue = forward("redisGetValue");
 export const redisGetRawValue = forward("redisGetRawValue");
@@ -1119,6 +1129,7 @@ export type {
   RedisDatabaseInfo,
   RedisHashItem,
   RedisKeyInfo,
+  RedisKeyMetadata,
   RedisKeysExpiryResult,
   RedisListItem,
   RedisSetItem,
@@ -1219,6 +1230,7 @@ export type {
   TableImportRequest,
   TableImportSummary,
   TableImportProgress,
+  TableImportFailure,
   MongoImportFormat,
   MongoImportTypeMode,
   MongoImportInferredType,

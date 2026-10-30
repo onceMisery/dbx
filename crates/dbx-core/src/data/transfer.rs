@@ -9871,6 +9871,18 @@ pub fn should_transfer_schema_objects(
 /// outcome. Executes in dependency order (sequence → view → function →
 /// procedure → trigger → event). Errors are collected per object and the
 /// transfer continues.
+pub async fn check_data_charset_transfer(state: &AppState, request: &TransferRequest) -> Result<(), String> {
+    for connection_id in [&request.source_connection_id, &request.target_connection_id] {
+        crate::query::mysql_data_charset_policy::reject_operation(
+            state,
+            connection_id,
+            crate::query::mysql_data_charset_policy::TRANSFER_UNSUPPORTED,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn transfer_schema_objects<F>(
     state: &AppState,
     request: &TransferRequest,
@@ -9881,6 +9893,7 @@ pub async fn transfer_schema_objects<F>(
 where
     F: FnMut(TransferProgress),
 {
+    check_data_charset_transfer(state, request).await?;
     if request.has_package_selection() {
         let source_db_type = get_db_type(state, &request.source_connection_id).await?;
         let target_db_type = get_db_type(state, &request.target_connection_id).await?;
@@ -9940,6 +9953,7 @@ pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
 where
     F: FnMut(TransferProgress),
 {
+    check_data_charset_transfer(state, request).await?;
     if matches!(request.content, TransferContent::DataOnly) && !request.has_package_selection() {
         return Ok(TransferObjectOutcome::default());
     }
@@ -10829,12 +10843,12 @@ fn postgres_table_dependency_selection_sql(schema: &str, tables: &[String]) -> O
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = {source_schema} AND c.relkind IN ('r','p','f') AND c.relname IN ({table_list}) \
          ), selected_dependencies(classid, objid) AS ( \
-             SELECT 'pg_catalog.pg_class'::regclass, oid FROM selected_tables \
-             UNION SELECT 'pg_catalog.pg_attrdef'::regclass, a.oid \
+             SELECT 'pg_catalog.pg_class'::regclass::oid, oid FROM selected_tables \
+             UNION SELECT 'pg_catalog.pg_attrdef'::regclass::oid, a.oid \
              FROM pg_catalog.pg_attrdef a JOIN selected_tables t ON t.oid = a.adrelid \
-             UNION SELECT 'pg_catalog.pg_constraint'::regclass, c.oid \
+             UNION SELECT 'pg_catalog.pg_constraint'::regclass::oid, c.oid \
              FROM pg_catalog.pg_constraint c JOIN selected_tables t ON t.oid = c.conrelid \
-             UNION SELECT 'pg_catalog.pg_class'::regclass, i.indexrelid \
+             UNION SELECT 'pg_catalog.pg_class'::regclass::oid, i.indexrelid \
              FROM pg_catalog.pg_index i JOIN selected_tables t ON t.oid = i.indrelid \
              UNION \
              SELECT d.refclassid, d.refobjid \
@@ -12511,6 +12525,7 @@ pub async fn rename_tables_to_backup<F>(
 where
     F: FnMut(TransferProgress),
 {
+    check_data_charset_transfer(state, request).await?;
     let source_pool_key = ensure_transfer_pool(
         state,
         &request.source_connection_id,
@@ -14236,6 +14251,7 @@ pub async fn drop_backup_tables(
     backup_names: &HashMap<String, String>,
     drop_order: &[String],
 ) -> Result<(), String> {
+    check_data_charset_transfer(state, request).await?;
     let mut ordered: Vec<&String> = drop_order.iter().filter(|table| backup_names.contains_key(*table)).collect();
     let mut leftovers: Vec<&String> = backup_names.keys().filter(|table| !drop_order.contains(*table)).collect();
     leftovers.sort();
@@ -14350,6 +14366,7 @@ where
     F: FnMut(TransferProgress),
     C: FnMut(Option<u64>),
 {
+    check_data_charset_transfer(state, request).await?;
     validate_transfer_database_pair(request, source_db_type, target_db_type)?;
     let state = state.clone();
     if mysql_xugu::is_pair(source_db_type, target_db_type) {
@@ -15349,6 +15366,8 @@ for line in sys.stdin:
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
             show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -15710,6 +15729,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
+            raw_key_cells: Vec::new(),
             spatial_values: vec![],
             rows,
             affected_rows: 0,
@@ -17447,6 +17467,19 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             assert!(sql.contains("'ENUM'::text"));
             assert!(sql.contains("'DOMAIN'::text"));
             assert!(sql.contains("'EXTENSION'::text"));
+        }
+
+        #[test]
+        fn postgres_table_dependency_recursive_cte_unifies_classid_to_oid() {
+            let sql = postgres_table_dependency_selection_sql("public", &["orders".into()]).unwrap();
+            for needle in [
+                "SELECT 'pg_catalog.pg_class'::regclass::oid, oid FROM selected_tables",
+                "UNION SELECT 'pg_catalog.pg_attrdef'::regclass::oid, a.oid",
+                "UNION SELECT 'pg_catalog.pg_constraint'::regclass::oid, c.oid",
+                "UNION SELECT 'pg_catalog.pg_class'::regclass::oid, i.indexrelid",
+            ] {
+                assert!(sql.contains(needle));
+            }
         }
 
         #[test]
@@ -23644,6 +23677,8 @@ SELECT 1 FROM dual"#
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
             show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,

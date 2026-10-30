@@ -62,6 +62,17 @@ func TestHandshakeResponse(t *testing.T) {
 	}
 }
 
+func TestConnectionInfoMethodIsSupported(t *testing.T) {
+	s := newServer()
+	resp, _ := s.handleLine(`{"jsonrpc":"2.0","id":8,"method":"connection_info","params":{}}`)
+	if resp.Error == nil {
+		t.Fatal("connection_info must fail on a disconnected server")
+	}
+	if !strings.Contains(resp.Error.Message, "not connected") {
+		t.Fatalf("connection_info must use the active connection: %s", resp.Error.Message)
+	}
+}
+
 func TestRuntimeHandshakeAdvertisesMultiSessionProtocol(t *testing.T) {
 	runtime := newRuntimeServer()
 	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":7,"method":"handshake","params":{"appVersion":"dev"}}`)
@@ -332,6 +343,7 @@ func TestExecuteOracleSelectRetriesXMLTypeDecodeFailures(t *testing.T) {
 			}
 			return rewrittenSQL, nil
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -359,6 +371,7 @@ func TestExecuteOracleSelectDoesNotRewriteSuccessfulQueries(t *testing.T) {
 			rewriteCalled = true
 			return sqlText, nil
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -386,6 +399,7 @@ func TestExecuteOracleSelectDoesNotRetryOrdinaryErrors(t *testing.T) {
 			rewriteCalled = true
 			return sqlText, nil
 		},
+		nil,
 	)
 	if !errors.Is(err, originalErr) {
 		t.Fatalf("error = %v, want original error", err)
@@ -409,6 +423,7 @@ func TestExecuteOracleSelectKeepsDecodeErrorWhenNoXMLTypeRewriteApplies(t *testi
 		func(input string) (string, error) {
 			return input, nil
 		},
+		nil,
 	)
 	if !errors.Is(err, originalErr) {
 		t.Fatalf("error = %v, want original error", err)
@@ -3312,7 +3327,7 @@ func TestIsOracleExtprocAgentFailure(t *testing.T) {
 	}
 }
 
-func TestOracleExtprocFallbackSQL(t *testing.T) {
+func TestOracleGeometryFunctionFallbackSQL(t *testing.T) {
 	sdeColumns := func(schema, table string) ([]oracleColumnMeta, error) {
 		return []oracleColumnMeta{
 			{Name: "ID", DataType: "NUMBER"},
@@ -3320,7 +3335,7 @@ func TestOracleExtprocFallbackSQL(t *testing.T) {
 		}, nil
 	}
 	t.Run("returns placeholder projection for extproc failure", func(t *testing.T) {
-		sqlText, ok := oracleExtprocFallbackSQL(
+		sqlText, ok := oracleGeometryFunctionFallbackSQL(
 			`SELECT * FROM SDE.TEST_GEOM`,
 			sdeColumns,
 			errors.New("ORA-28595: Extproc agent: Invalid DLL Path"),
@@ -3336,7 +3351,7 @@ func TestOracleExtprocFallbackSQL(t *testing.T) {
 		}
 	})
 	t.Run("keeps ST_AsText error for unrelated failures", func(t *testing.T) {
-		sqlText, ok := oracleExtprocFallbackSQL(
+		sqlText, ok := oracleGeometryFunctionFallbackSQL(
 			`SELECT * FROM SDE.TEST_GEOM`,
 			sdeColumns,
 			errors.New("ORA-12170: TNS:Connect timeout occurred"),
@@ -3346,7 +3361,7 @@ func TestOracleExtprocFallbackSQL(t *testing.T) {
 		}
 	})
 	t.Run("no fallback without rewriteable columns", func(t *testing.T) {
-		sqlText, ok := oracleExtprocFallbackSQL(
+		sqlText, ok := oracleGeometryFunctionFallbackSQL(
 			`SELECT * FROM SDE.TEST_GEOM`,
 			func(schema, table string) ([]oracleColumnMeta, error) {
 				return []oracleColumnMeta{{Name: "ID", DataType: "NUMBER"}}, nil
@@ -3358,7 +3373,7 @@ func TestOracleExtprocFallbackSQL(t *testing.T) {
 		}
 	})
 	t.Run("no fallback when column metadata fails", func(t *testing.T) {
-		sqlText, ok := oracleExtprocFallbackSQL(
+		sqlText, ok := oracleGeometryFunctionFallbackSQL(
 			`SELECT * FROM SDE.TEST_GEOM`,
 			func(schema, table string) ([]oracleColumnMeta, error) {
 				return nil, errors.New("ORA-00942: table or view does not exist")
@@ -4268,10 +4283,10 @@ func TestOracleQueryRowsFallsBackToPlaceholderOnExtprocFailure(t *testing.T) {
 		{queryContains: "SDE.ST_AsText", args: []driver.Value{}, err: errors.New("ORA-28595: Extproc agent: Invalid DLL Path")},
 		metadataStep,
 		{
-			queryContains: "'<ST_GEOMETRY>'",
+			queryContains: `SELECT "ID", CASE WHEN "GEOM" IS NULL THEN NULL ELSE '<ST_GEOMETRY>' END AS "GEOM" FROM SDE.TEST_GEOM`,
 			args:          []driver.Value{},
-			columns:       []string{"ID", "GEOM", "__DBX_LARGE_VALUE_BYTES_C_1"},
-			rows:          [][]driver.Value{{int64(1), "<ST_GEOMETRY>", "D:1"}},
+			columns:       []string{"ID", "GEOM"},
+			rows:          [][]driver.Value{{int64(1), "<ST_GEOMETRY>"}},
 		},
 	})
 	s := newServer()
@@ -4281,23 +4296,16 @@ func TestOracleQueryRowsFallsBackToPlaceholderOnExtprocFailure(t *testing.T) {
 		t.Fatalf("expected placeholder fallback to serve rows, got %v", err)
 	}
 	defer rows.Close()
-	columns, err := rows.Columns()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(columns, []string{"ID", "GEOM", "__DBX_LARGE_VALUE_BYTES_C_1"}) {
-		t.Fatalf("unexpected placeholder columns: %v", columns)
-	}
 	if !rows.Next() {
 		t.Fatalf("expected one placeholder row, got %v", rows.Err())
 	}
 	var id int64
-	var geom, marker string
-	if err := rows.Scan(&id, &geom, &marker); err != nil {
+	var geom string
+	if err := rows.Scan(&id, &geom); err != nil {
 		t.Fatal(err)
 	}
-	if id != 1 || geom != "<ST_GEOMETRY>" || marker != "D:1" {
-		t.Fatalf("unexpected placeholder row: %v %v %v", id, geom, marker)
+	if id != 1 || geom != "<ST_GEOMETRY>" {
+		t.Fatalf("unexpected placeholder row: %v %v", id, geom)
 	}
 }
 
@@ -4454,6 +4462,72 @@ func TestManualTransactionRewritesObjectColumnsBeforeTheFirstAttempt(t *testing.
 	}
 	if err := s.rollbackManualTransaction(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// sdoGeometryDecodeErrorFallbackSteps scripts a SELECT whose response go-ora
+// misreads (a NULL MDSYS.SDO_GEOMETRY value), followed by the WKT rewrite. The
+// retry must not run on the session that misread the response (issue #13667).
+func sdoGeometryDecodeErrorFallbackSteps(decodeErr error, rows [][]driver.Value) []oracleViewSourceQueryStep {
+	return []oracleViewSourceQueryStep{
+		{exec: true, queryContains: `ALTER SESSION SET CURRENT_SCHEMA = "DBXT"`},
+		{queryContains: `SELECT * FROM "T_GEOM"`, args: []driver.Value{}, err: decodeErr},
+		// The poisoned pinned connection is replaced and gets the editor schema back.
+		{exec: true, queryContains: `ALTER SESSION SET CURRENT_SCHEMA = "DBXT"`},
+		{queryContains: "CURRENT_SCHEMA", args: []driver.Value{}, columns: []string{"SCHEMA"}, rows: [][]driver.Value{{"DBXT"}}},
+		{
+			queryContains: "ALL_TAB_COLUMNS",
+			args:          []driver.Value{"DBXT", "T_GEOM"},
+			columns:       []string{"COLUMN_NAME", "DATA_TYPE", "DATA_TYPE_OWNER"},
+			rows:          [][]driver.Value{{"ID", "NUMBER", nil}, {"GEOM", "SDO_GEOMETRY", "MDSYS"}},
+		},
+		{queryContains: "SDO_UTIL.TO_WKTGEOMETRY", args: []driver.Value{}, columns: []string{"ID", "GEOM"}, rows: rows},
+	}
+}
+
+func TestExecuteQueryRetriesDecodeErrorOnFreshPinnedConnection(t *testing.T) {
+	steps := sdoGeometryDecodeErrorFallbackSteps(
+		errors.New("TTC error: received code 3 during response reading"),
+		[][]driver.Value{{int64(1), nil}, {int64(2), "POINT (121.5 25.03)"}},
+	)
+	db, scripted := openGuardedOracleViewSourceTestDB(t, steps)
+	s := newServer()
+	s.db = db
+	result, err := s.executeQuery(queryOptions{SQL: `SELECT * FROM "T_GEOM"`, Schema: "DBXT", MaxRows: 10})
+	if err != nil {
+		t.Fatalf("expected the WKT rewrite to recover the decode error, got %v", err)
+	}
+	if !reflect.DeepEqual(result.Rows, [][]any{{int64(1), nil}, {int64(2), "POINT (121.5 25.03)"}}) {
+		t.Fatalf("unexpected rows: %#v", result.Rows)
+	}
+	if scripted.next != len(steps) {
+		t.Fatalf("expected all %d scripted steps, ran %d", len(steps), scripted.next)
+	}
+	if s.statementConn != nil || s.repinnedStatementConn != nil || s.statementSchema != "" || db.Stats().InUse != 0 {
+		t.Fatalf("statement leaked its pinned connections: %+v", db.Stats())
+	}
+}
+
+func TestExecuteQueryPageRetriesNonTTCDecodeErrorOnFreshPinnedConnection(t *testing.T) {
+	steps := sdoGeometryDecodeErrorFallbackSteps(
+		errors.New("invalid NUMBER"),
+		[][]driver.Value{{int64(1), nil}},
+	)
+	db, scripted := openGuardedOracleViewSourceTestDB(t, steps)
+	s := newServer()
+	s.db = db
+	result, err := s.executeQueryPage(queryOptions{SQL: `SELECT * FROM "T_GEOM"`, Schema: "DBXT", MaxRows: 10}, 10)
+	if err != nil {
+		t.Fatalf("expected the WKT rewrite to recover the decode error, got %v", err)
+	}
+	if !reflect.DeepEqual(result.Rows, [][]any{{int64(1), nil}}) || result.HasMore {
+		t.Fatalf("unexpected page: %+v", result)
+	}
+	if scripted.next != len(steps) {
+		t.Fatalf("expected all %d scripted steps, ran %d", len(steps), scripted.next)
+	}
+	if s.statementConn != nil || s.repinnedStatementConn != nil || db.Stats().InUse != 0 {
+		t.Fatalf("statement leaked its pinned connections: %+v", db.Stats())
 	}
 }
 
