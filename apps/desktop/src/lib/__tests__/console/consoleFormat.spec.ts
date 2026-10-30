@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CONSOLE_CONTINUATION_PROMPT, consoleEntriesForResult, consolePrompt, consoleStatementComplete, echoCommandText, isConsoleCommandLine, queryResultToConsoleText, supportsSqlConsole } from "@/lib/console/consoleFormat";
+import { CONSOLE_CONTINUATION_PROMPT, consoleEntriesForResult, consolePrompt, consoleSqlForSafety, consoleStatementComplete, echoCommandText, isConsoleCommandLine, queryResultToConsoleText, supportsSqlConsole } from "@/lib/console/consoleFormat";
 import type { QueryResult } from "@/types/database";
 
 function result(overrides: Partial<QueryResult>): QueryResult {
@@ -7,6 +7,16 @@ function result(overrides: Partial<QueryResult>): QueryResult {
 }
 
 describe("consoleFormat", () => {
+  it("classifies real statement boundaries without letting client literals hide writes", () => {
+    expect(consoleSqlForSafety("PROMPT literal ' ;\nDESC emp\nDELETE FROM users;", "oracle")).toBe("DELETE FROM users");
+    expect(consoleSqlForSafety("DESC emp\nEXEC mutate(1)\nRUN\nSET CONSTRAINTS ALL IMMEDIATE;", "oracle")).toBe("EXEC mutate(1);\nRUN;\nSET CONSTRAINTS ALL IMMEDIATE");
+    expect(consoleSqlForSafety("\\d emp\nDELETE FROM users;", "postgres")).toBe("DELETE FROM users");
+    expect(consoleSqlForSafety("PROMPT local-only; literal ' ", "oracle")).toBe("SELECT 1");
+    expect(consoleSqlForSafety("SET SCHEMA DBX_TEST;", "dameng")).toBe("SET SCHEMA DBX_TEST;");
+    for (const sql of ["/*!80000 DELETE FROM users */;", "/*!80000 DELETE FROM users */; SELECT 1;"]) {
+      expect(consoleSqlForSafety(sql, "mysql")).toBe(sql);
+    }
+  });
   it("prompts match the native clients per family", () => {
     expect(consolePrompt("mysql")).toBe("mysql> ");
     expect(consolePrompt("doris")).toBe("mysql> ");

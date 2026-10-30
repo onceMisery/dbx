@@ -1097,6 +1097,7 @@ export default {
     paste: "Paste",
     copy: "Copy",
     clipboardFailed: "Clipboard operation failed: {message}",
+    executionNotSent: "Execution cancelled or blocked by policy; no statement was sent to the database.",
     running: "running…",
     unsupportedType: "This connection type does not support the SQL command console",
   },

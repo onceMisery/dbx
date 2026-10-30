@@ -129,7 +129,13 @@ import { simpleDataGridOrderByReferencesMissingColumn, sortDataGridRowIndexes, t
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { agentProtocolQueryResultMaxRows, capQueryResultTotal, effectiveQueryResultMaxRows, limitQueryPagination, queryResultLimitReached } from "@/lib/dataGrid/queryResultRowLimit";
 import { elasticsearchRestRequestRanges, executableStatementRanges, isConsoleCommandDatabaseType, splitSqlStatementRanges, sqlStatementParameterOptionsForCompatibility, stripMysqlClientDisplayCommand } from "@/lib/sql/sqlStatementRanges";
-import { consoleEntriesForResult, consoleStatementComplete, echoCommandText, supportsSqlConsole, type ConsoleEntry } from "@/lib/console/consoleFormat";
+import { consoleEntriesForResult, consoleSqlForSafety, consoleStatementComplete, echoCommandText, supportsSqlConsole, type ConsoleEntry } from "@/lib/console/consoleFormat";
+import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
+import { assessProductionSql } from "@/lib/database/productionSafety";
+import { isDangerousSql } from "@/lib/sql/sqlExecutionSafety";
+import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
+import { useSqlExecutionDangerStore } from "@/stores/sqlExecutionDangerStore";
+import { useReadOnlyUnlockStore } from "@/stores/readOnlyUnlockStore";
 import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
 import { replaceSqlServerLeadingUseQuery, sqlServerLeadingUseScript, switchesDatabaseWithUseStatement, useDatabaseFromStatement } from "@/lib/sql/sqlCompletionLookupTarget";
 import { classifySqlRisk } from "@/lib/sql/sqlRisk";
@@ -8159,6 +8165,7 @@ export const useQueryStore = defineStore("query", () => {
     /** Last statement that produced a non-error result: `/` and RUN target. */
     lastGoodSql?: string;
     isExecuting: boolean;
+    awaitingApproval?: boolean;
     executionId?: string;
   }
 
@@ -8208,14 +8215,13 @@ export const useQueryStore = defineStore("query", () => {
     const connStore = useConnectionStore();
     const conn = connStore.getConfig(tab.connectionId);
     const dbType = effectiveDatabaseTypeForConnection(conn);
-    if (!supportsSqlConsole(dbType)) return;
+    if (!conn || !dbType || !supportsSqlConsole(dbType)) return;
     const parameterOptions = sqlStatementParameterOptionsForCompatibility(dbType, dbType === "opengauss" ? connStore.databaseCompatibilityMode(tab.connectionId, tab.database || conn?.database) : conn?.database_info?.compatibilityMode);
     const trimmedLine = line.trim();
     if (!trimmedLine && !session.buffer) return;
     session.buffer = session.buffer ? `${session.buffer}\n${line}` : line;
 
-    // History: every submitted line joins once the statement completes; the
-    // buffer itself is what history navigates.
+    // Incomplete lines stay local. Only dispatched statements enter execution history.
     if (!consoleStatementComplete(session.buffer, dbType, parameterOptions)) return;
 
     const statement = session.buffer;
@@ -8232,11 +8238,6 @@ export const useQueryStore = defineStore("query", () => {
       effectiveSql = session.lastGoodSql;
     }
     session.entries.push({ kind: "command", text: isRerun ? `${echoCommandText(statement, dbType)} → ${effectiveSql}` : echoCommandText(statement, dbType) });
-    if (!isRerun) {
-      const historyTail = session.history[session.history.length - 1];
-      if (historyTail !== statement) session.history.push(statement);
-      session.historyIndex = -1;
-    }
 
     session.isExecuting = true;
     const executionId = uuid();
@@ -8248,24 +8249,73 @@ export const useQueryStore = defineStore("query", () => {
     const targetEpoch = manualTransactionTargetEpoch(tab);
     const cancelRequestCount = tab.cancelRequestCount ?? 0;
     const isCurrent = () => tabs.value.includes(tab) && consoleSessions.get(tabId) === session && tab.executionId === executionId && manualTransactionTargetEpoch(tab) === targetEpoch;
+    const { connectionId, database, schema, catalog } = tab;
+    const fingerprint = connectionConfigFingerprint(conn);
+    const canExecute = () => {
+      const currentConnection = connStore.getConfig(connectionId);
+      return isCurrent() && (tab.cancelRequestCount ?? 0) === cancelRequestCount && tab.connectionId === connectionId && tab.database === database && tab.schema === schema && tab.catalog === catalog && !!currentConnection && fingerprint === connectionConfigFingerprint(currentConnection);
+    };
+    const production = useProductionSafetyStore();
+    const danger = useSqlExecutionDangerStore();
+    const unlock = useReadOnlyUnlockStore();
+    const cancelConfirmations = () => {
+      production.cancelScope(executionId);
+      danger.cancelScope(executionId);
+      unlock.cancelScope(executionId);
+    };
+    const stopReview = watch(
+      canExecute,
+      (current) => {
+        if (!current) cancelConfirmations();
+      },
+      { flush: "sync" },
+    );
     const exitAcknowledged = /^(?:EXIT|QUIT)\s*;?\s*$/i.test(effectiveSql.trim());
     try {
       if (exitAcknowledged) {
         session.entries.push({ kind: "notice", text: t("console.exitAcknowledged") });
         return;
       }
-      const results = await api.executeMulti(tab.connectionId, tab.database, effectiveSql, tab.schema, executionId, {
-        maxRows: effectiveQueryResultMaxRows(settingsStore.editorSettings.queryResultMaxRowsEnabled, settingsStore.editorSettings.queryResultMaxRows),
-        // Pin every console statement to one physical connection (the same
-        // tab-scoped session the query editor uses): session state — `USE db`,
-        // SET variables, temp tables — must survive between submissions.
-        // The existing closeClientConnectionSession cleanup releases this
-        // exact id when the tab closes or its context changes.
-        clientSessionId: tab.id,
-        preserveExplicitTransaction: true,
-        timeoutSecs: queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs),
-        ...(tab.catalog ? { catalog: tab.catalog } : {}),
+      const assessmentSql = consoleSqlForSafety(effectiveSql, dbType, parameterOptions);
+      // USE/session state can outlive the tab's database label: marked connections
+      // conservatively require production review for every console mutation.
+      const safetyConnection = { ...conn, db_type: dbType, is_production: conn.is_production || !!conn.production_databases?.length };
+      session.awaitingApproval = true;
+      const results = await executeWithProductionSqlGuard({
+        connection: safetyConnection,
+        database,
+        sql: effectiveSql,
+        assessmentSql,
+        source: t("console.title"),
+        scopeId: executionId,
+        isCurrent: canExecute,
+        execute: async () => {
+          const assessment = assessProductionSql(assessmentSql, safetyConnection, database);
+          // Match the SQL editor: production review supersedes the optional danger dialog.
+          if (!(assessment.active && assessment.isMutation) && settingsStore.editorSettings.confirmDangerousSqlExecution && isDangerousSql(assessmentSql, dbType)) {
+            const confirmed = await danger.requestConfirmation({ sql: effectiveSql, kind: "sql", connectionName: conn?.name, database, databaseType: dbType, scopeId: executionId });
+            if (!confirmed) return undefined;
+          }
+          if (!canExecute()) return undefined;
+          session.awaitingApproval = false;
+          if (!isRerun) {
+            if (session.history[session.history.length - 1] !== statement) session.history.push(statement);
+            session.historyIndex = -1;
+          }
+          return api.executeMulti(connectionId, database, effectiveSql, schema, executionId, {
+            maxRows: effectiveQueryResultMaxRows(settingsStore.editorSettings.queryResultMaxRowsEnabled, settingsStore.editorSettings.queryResultMaxRows),
+            // Keep the same physical session across approved console submissions.
+            clientSessionId: tab.id,
+            preserveExplicitTransaction: true,
+            timeoutSecs: queryTimeoutSecsForConnection(conn, settingsStore.editorSettings.globalQueryTimeoutSecs),
+            ...(catalog ? { catalog } : {}),
+          });
+        },
       });
+      if (!results) {
+        if (isCurrent()) session.entries.push({ kind: "notice", text: t("console.executionNotSent") });
+        return;
+      }
       if (!isCurrent() || (tab.cancelRequestCount ?? 0) !== cancelRequestCount) return;
       applyAutoCommitTransactionReport(tab, results);
       const statements = splitSqlStatementRanges(effectiveSql, dbType, parameterOptions);
@@ -8280,6 +8330,9 @@ export const useQueryStore = defineStore("query", () => {
     } catch (error) {
       if (isCurrent()) session.entries.push({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     } finally {
+      stopReview();
+      cancelConfirmations();
+      session.awaitingApproval = false;
       session.isExecuting = false;
       session.executionId = undefined;
       if (isCurrent()) {
@@ -8324,6 +8377,10 @@ export const useQueryStore = defineStore("query", () => {
     tab.cancelRequestCount = (tab.cancelRequestCount ?? 0) + 1;
     session.entries.push({ kind: "notice", text: "^C" });
     try {
+      useProductionSafetyStore().cancelScope(executionId);
+      useSqlExecutionDangerStore().cancelScope(executionId);
+      useReadOnlyUnlockStore().cancelScope(executionId);
+      if (session.awaitingApproval) return true;
       return await api.cancelQuery(executionId);
     } catch {
       return false;

@@ -1033,6 +1033,7 @@ export default withEnglishFallback({
     paste: "粘贴",
     copy: "复制",
     clipboardFailed: "剪贴板操作失败：{message}",
+    executionNotSent: "执行已取消或被安全策略阻止，未向数据库发送语句。",
     running: "执行中…",
     unsupportedType: "此连接类型不支持 SQL 命令列界面",
   },

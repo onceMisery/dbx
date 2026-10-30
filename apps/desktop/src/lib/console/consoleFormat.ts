@@ -3,7 +3,7 @@
 // and QueryResult → terminal text rendering. No Vue/store imports here so the
 // rules are unit-testable in isolation.
 import type { DatabaseType, QueryResult } from "@/types/database";
-import { isOracleLikeDatabase, isSqlInputComplete } from "@/lib/sql/sqlStatementRanges";
+import { isConsoleCommandLine, isOracleLikeDatabase, isSqlInputComplete, splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
 import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
 export { isConsoleCommandLine } from "@/lib/sql/sqlStatementRanges";
 
@@ -69,6 +69,16 @@ export function consoleStatementComplete(buffer: string, dbType?: DatabaseType, 
   if (/^(?:EXIT|QUIT)\s*;?$/i.test(text)) return true;
   if (text === "/" && isOracleLikeDatabase(dbType, parameterOptions)) return true;
   return isSqlInputComplete(text, dbType, parameterOptions);
+}
+
+/** Separate line commands before classification: a DESC/PROMPT must not hide a later write. */
+export function consoleSqlForSafety(sql: string, dbType?: DatabaseType, parameterOptions?: SqlParameterOptions): string {
+  const ranges = splitSqlStatementRanges(sql, dbType, parameterOptions);
+  // Keep ordinary SQL verbatim, including MySQL executable comments the editor ranges may omit.
+  if (!ranges.some(({ sql }) => isConsoleCommandLine(sql, dbType))) return sql;
+  const statements = ranges.filter(({ sql }) => !isConsoleCommandLine(sql, dbType) || /^(?:EXEC(?:UTE)?|RUN)\b/i.test(sql.trimStart())).map(({ sql }) => sql);
+  // An entirely client-only/read-metadata request is read-only; this token is never executed.
+  return statements.length ? statements.join(";\n") : "SELECT 1";
 }
 
 /// One echoed console entry.
