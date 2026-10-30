@@ -13517,6 +13517,7 @@ export default withEnglishFallback({
     clipboardFailed: "クリップボード操作に失敗しました：{message}",
     running: "実行中…",
     unsupportedType: "この接続タイプでは SQL コマンドラインインターフェースはサポートされていません。",
+    executionNotSent: "実行はキャンセルされたか、セキュリティポリシーによってブロックされたため、データベースにステートメントは送信されませんでした。",
   },
   tableCopyTask: {
     backgroundFinished: "テーブルのコピー：{status}。「バックグラウンドタスク」で詳細を確認できます。",

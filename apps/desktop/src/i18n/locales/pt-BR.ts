@@ -13497,6 +13497,7 @@ export default withEnglishFallback({
     clipboardFailed: "Falha na operação da área de transferência: {message}",
     running: "Executando…",
     unsupportedType: "Este tipo de conexão não suporta a interface de linha de comando SQL",
+    executionNotSent: "A execução foi cancelada ou bloqueada por uma política de segurança; nenhuma instrução foi enviada ao banco de dados.",
   },
   tableCopyTask: {
     backgroundFinished: "Copiar tabela: {status}. Veja os detalhes em “Tarefas em segundo plano”.",

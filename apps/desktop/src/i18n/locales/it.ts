@@ -13480,6 +13480,7 @@ export default withEnglishFallback({
     clipboardFailed: "Operazione con gli appunti non riuscita: {message}",
     running: "Esecuzione in corso…",
     unsupportedType: "L'interfaccia a riga di comando SQL non è supportata per questo tipo di connessione.",
+    executionNotSent: "Esecuzione annullata o bloccata da un criterio di sicurezza; l'istruzione non è stata inviata al database.",
   },
   tableCopyTask: {
     backgroundFinished: "Copia tabella: {status}. Puoi visualizzare i dettagli in «Attività in background».",

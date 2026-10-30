@@ -13939,6 +13939,7 @@ export default withEnglishFallback({
     clipboardFailed: "Error en la operación del portapapeles: {message}",
     running: "Ejecutando…",
     unsupportedType: "Este tipo de conexión no admite la interfaz de línea de comandos SQL",
+    executionNotSent: "La ejecución se canceló o fue bloqueada por la política de seguridad; no se envió ninguna sentencia a la base de datos.",
   },
   tableCopyTask: {
     backgroundFinished: "Copia de tabla: {status}. Puedes ver los detalles en «Tareas en segundo plano».",

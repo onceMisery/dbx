@@ -14767,6 +14767,7 @@ export default withEnglishFallback({
     clipboardFailed: "การดำเนินการกับคลิปบอร์ดล้มเหลว: {message}",
     running: "กำลังรัน…",
     unsupportedType: "ประเภทการเชื่อมต่อนี้ไม่รองรับอินเทอร์เฟซบรรทัดคำสั่ง SQL",
+    executionNotSent: "การดำเนินการถูกยกเลิกหรือถูกบล็อกโดยนโยบายความปลอดภัย จึงไม่ได้ส่งคำสั่งไปยังฐานข้อมูล",
   },
   tableCopyTask: {
     backgroundFinished: "การคัดลอกตาราง: {status} สามารถดูรายละเอียดได้ใน 'งานเบื้องหลัง'",

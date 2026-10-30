@@ -12973,6 +12973,7 @@ export default withEnglishFallback({
     clipboardFailed: "클립보드 작업에 실패했습니다: {message}",
     running: "실행 중…",
     unsupportedType: "이 연결 유형은 SQL 명령줄 인터페이스를 지원하지 않습니다.",
+    executionNotSent: "실행이 취소되었거나 보안 정책으로 인해 차단되어 데이터베이스에 명령문을 전송하지 않았습니다.",
   },
   tableCopyTask: {
     backgroundFinished: "테이블 복사: {status}. '백그라운드 작업'에서 세부 정보를 확인할 수 있습니다.",

@@ -874,6 +874,7 @@ export default withEnglishFallback({
     paste: "貼上",
     copy: "複製",
     clipboardFailed: "剪貼簿操作失敗：{message}",
+    executionNotSent: "執行已取消或被安全策略阻止，未向資料庫傳送語句。",
   },
   toolbar: {
     fileEncoding: "檔案編碼",
